@@ -7,9 +7,9 @@ its own once its inputs exist:
 
     python scripts/build_index.py --stage ingest
 
-The stages are described in plans/place-index.md. Only ``ingest`` exists so
-far, of its sources the Transitland Atlas, the Mobility Database catalogue
-and the GBFS systems catalogue.
+The stages are described in plans/place-index.md. ``ingest`` reads the
+Transitland Atlas, the Mobility Database catalogue and the GBFS systems
+catalogue; ``crosswalk`` resolves the same feed across them into one table.
 """
 
 import argparse
@@ -20,7 +20,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from index_build import atlas, gbfs, mdb  # noqa: E402
+from index_build import atlas, crosswalk, gbfs, mdb  # noqa: E402
 
 DEFAULT_CACHE_DIR = pathlib.Path("cache")
 
@@ -58,7 +58,11 @@ def run_ingest(arguments):
     return summaries
 
 
-STAGES = {"ingest": run_ingest}
+def run_crosswalk(arguments):
+    return [crosswalk.crosswalk(arguments.cache_dir)]
+
+
+STAGES = {"ingest": run_ingest, "crosswalk": run_crosswalk}
 
 
 def parse_args(argv=None):
