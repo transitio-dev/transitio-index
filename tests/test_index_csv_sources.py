@@ -13,7 +13,7 @@ SCRIPT = REPO / "scripts" / "build_index.py"
 
 sys.path.insert(0, str(REPO / "scripts"))
 
-from index_build import csv_source, mdb, store  # noqa: E402
+from index_build import csv_source, gbfs, mdb, store  # noqa: E402
 
 
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
@@ -35,6 +35,17 @@ def mdb_csv(*rows):
     lines = [",".join(COLUMNS)]
     for row in rows:
         lines.append(",".join(str(row.get(column, "")) for column in COLUMNS))
+    return "\n".join(lines) + "\n"
+
+
+GBFS_COLUMNS = sorted(gbfs.REQUIRED_HEADERS)
+
+
+def gbfs_csv(*rows):
+    """A systems.csv with every required column; rows fill what they name."""
+    lines = [",".join(GBFS_COLUMNS)]
+    for row in rows:
+        lines.append(",".join(str(row.get(column, "")) for column in GBFS_COLUMNS))
     return "\n".join(lines) + "\n"
 
 
@@ -297,6 +308,87 @@ def test_mdb_blank_status_becomes_a_string_key(tmp_path):
     assert summary["records_by_status"] == {"unknown": 1, "active": 1}
 
 
+def test_gbfs_normalizes_and_keeps_colliding_system_ids(tmp_path):
+    csv = write(
+        tmp_path / "systems.csv",
+        gbfs_csv(
+            {
+                "System ID": "careem_bike",
+                "Name": "Careem BIKE",
+                "Location": "Dubai",
+                "Country Code": "AE",
+                "URL": "https://careem.com",
+                "Auto-Discovery URL": "https://careem/gbfs.json",
+                "Supported Versions": "1.1 ; 2.3 ; 3.0",
+            },
+            {
+                "System ID": "seville",
+                "Name": "Cooltra Seville",
+                "Location": "Seville",
+                "Country Code": "ES",
+                "Supported Versions": "2.3",
+            },
+            {
+                "System ID": "seville",
+                "Name": "Sevici",
+                "Location": "Seville",
+                "Country Code": "ES",
+                "Supported Versions": "2.3",
+            },
+        ),
+    )
+
+    summary = gbfs.ingest(tmp_path / "cache", csv_path=csv)
+    records = records_of(tmp_path, "gbfs.json", "gbfs_systems.jsonl")
+
+    first = records[0]
+    assert first["spec"] == "gbfs"
+    assert first["system_id"] == "careem_bike"
+    assert first["supported_versions"] == ["1.1", "2.3", "3.0"]
+    assert first["requires_auth"] is False
+    # Both Seville systems are kept; the collision is reported, not merged.
+    assert [r["name"] for r in records if r["system_id"] == "seville"] == [
+        "Cooltra Seville",
+        "Sevici",
+    ]
+    assert summary["system_id_collisions"] == ["seville"]
+    assert summary["countries"] == 2
+
+
+def test_gbfs_requires_auth_when_authentication_type_is_set(tmp_path):
+    csv = write(
+        tmp_path / "systems.csv",
+        gbfs_csv(
+            {"System ID": "open", "Authentication Type": ""},
+            {"System ID": "keyed", "Authentication Type": "2"},
+        ),
+    )
+
+    records = {
+        record["system_id"]: record
+        for record in (
+            gbfs.ingest(tmp_path / "cache", csv_path=csv)
+            and records_of(tmp_path, "gbfs.json", "gbfs_systems.jsonl")
+        )
+    }
+    assert records["open"]["requires_auth"] is False
+    assert records["keyed"]["requires_auth"] is True
+    assert records["keyed"]["authentication_type"] == "2"
+
+
+def test_gbfs_blank_system_id_is_an_error(tmp_path):
+    csv = write(tmp_path / "systems.csv", gbfs_csv({"Name": "x", "Location": "y"}))
+    with pytest.raises(csv_source.IngestError, match="no usable id"):
+        gbfs.ingest(tmp_path / "cache", csv_path=csv)
+
+
+def test_gbfs_missing_required_column_is_an_error(tmp_path):
+    header = ",".join(c for c in GBFS_COLUMNS if c != "System ID")
+    csv = write(tmp_path / "systems.csv", header + "\n")
+    with pytest.raises(csv_source.IngestError, match="missing CSV columns: System ID"):
+        gbfs.ingest(tmp_path / "cache", csv_path=csv)
+
+
 def test_row_count_over_the_cap_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(csv_source, "MAX_ROWS", 1)
     csv = write(
@@ -398,6 +490,20 @@ def test_mdb_and_atlas_coexist_in_one_cache(tmp_path):
     mdb_generation.close()
 
 
+def test_gbfs_pointer_survives_mdb_republish_pruning(tmp_path):
+    # One store, three catalogue pointers: re-publishing MDB past the keep
+    # window must not prune GBFS's live generation.
+    cache = tmp_path / "cache"
+    gbfs.ingest(cache, csv_path=write(tmp_path / "g.csv", gbfs_csv({"System ID": "s"})))
+    for _ in range(store.KEEP_GENERATIONS + 2):
+        mdb.ingest(cache, csv_path=write(tmp_path / "m.csv", mdb_csv(GTFS)))
+
+    gbfs_generation, gbfs_manifest = store.resolve(cache / "raw", "gbfs.json")
+    with gbfs_generation:
+        assert gbfs_manifest["source"] == "gbfs"
+        assert gbfs_generation.read_bytes("gbfs_systems.jsonl")
+
+
 def test_cli_ingests_mdb_offline(tmp_path):
     cache = tmp_path / "cache"
     completed = subprocess.run(
@@ -425,3 +531,44 @@ def test_cli_ingests_mdb_offline(tmp_path):
     summary = json.loads(completed.stdout)
     assert summary["source"] == "mdb"
     assert summary["records"] == 2
+
+
+def test_cli_ingests_mdb_and_gbfs_offline(tmp_path):
+    cache = tmp_path / "cache"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--stage",
+            "ingest",
+            "--source",
+            "mdb",
+            "--source",
+            "gbfs",
+            "--cache-dir",
+            str(cache),
+            "--mdb-csv",
+            str(write(tmp_path / "m.csv", mdb_csv(GTFS))),
+            "--gbfs-csv",
+            str(write(tmp_path / "g.csv", gbfs_csv({"System ID": "s"}))),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    sources = {json.loads(block)["source"] for block in _json_blocks(completed.stdout)}
+    assert sources == {"mdb", "gbfs"}
+
+
+def _json_blocks(text):
+    depth = 0
+    start = None
+    for index, char in enumerate(text):
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                yield text[start : index + 1]
