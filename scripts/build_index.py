@@ -8,7 +8,8 @@ its own once its inputs exist:
     python scripts/build_index.py --stage ingest
 
 The stages are described in plans/place-index.md. Only ``ingest`` exists so
-far, and of its sources only the Transitland Atlas.
+far, of its sources the Transitland Atlas and the Mobility Database
+catalogue.
 """
 
 import argparse
@@ -19,11 +20,11 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from index_build import atlas  # noqa: E402
+from index_build import atlas, mdb  # noqa: E402
 
 DEFAULT_CACHE_DIR = pathlib.Path("cache")
 
-SOURCES = ("atlas",)
+SOURCES = ("atlas", "mdb")
 
 
 def commit_sha(value):
@@ -50,6 +51,8 @@ def run_ingest(arguments):
                 commit=arguments.commit,
             )
         )
+    if "mdb" in arguments.sources:
+        summaries.append(mdb.ingest(arguments.cache_dir, csv_path=arguments.mdb_csv))
     return summaries
 
 
@@ -80,6 +83,11 @@ def parse_args(argv=None):
         "--archive",
         type=pathlib.Path,
         help="ingest this local Atlas tarball instead of downloading one",
+    )
+    parser.add_argument(
+        "--mdb-csv",
+        type=pathlib.Path,
+        help="ingest this local feeds_v2.csv instead of downloading it",
     )
     parser.add_argument(
         "--commit",
