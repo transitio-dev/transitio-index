@@ -247,17 +247,6 @@ def build_records(atlas_feeds, mdb_feeds):
     return records, summary
 
 
-def _jsonl_chunks(records):
-    def chunks():
-        for record in records:
-            yield json.dumps(
-                record, ensure_ascii=False, sort_keys=True, allow_nan=False
-            )
-            yield "\n"
-
-    return chunks
-
-
 def crosswalk(cache_dir):
     """Run the crosswalk stage, publishing a ``feeds.json`` generation."""
     atlas_feeds = _read_feeds(cache_dir, "atlas.json", "atlas_feeds.jsonl")
@@ -274,7 +263,7 @@ def crosswalk(cache_dir):
             return store.publish(
                 out,
                 FEEDS_POINTER,
-                {FEEDS_ARTIFACT: _jsonl_chunks(records)},
+                {FEEDS_ARTIFACT: store.jsonl_chunks(records)},
                 manifest,
                 held=directory,
             )

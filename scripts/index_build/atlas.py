@@ -593,19 +593,6 @@ def parse(archive):
     }
 
 
-def jsonl_chunks(records):
-    """Text chunks for a JSONL artifact, for the store to write and hash."""
-
-    def chunks():
-        for record in records:
-            yield json.dumps(
-                record, ensure_ascii=False, sort_keys=True, allow_nan=False
-            )
-            yield "\n"
-
-    return chunks
-
-
 def _spec_counts(feeds):
     counts = {spec: 0 for spec in SPECS}
     for feed in feeds:
@@ -760,8 +747,8 @@ def ingest(cache_dir, archive=None, commit=ATLAS_COMMIT):
                 raw,
                 "atlas.json",
                 {
-                    "atlas_feeds.jsonl": jsonl_chunks(parsed["feeds"]),
-                    "atlas_operators.jsonl": jsonl_chunks(parsed["operators"]),
+                    "atlas_feeds.jsonl": store.jsonl_chunks(parsed["feeds"]),
+                    "atlas_operators.jsonl": store.jsonl_chunks(parsed["operators"]),
                 },
                 manifest,
                 held=directory,

@@ -10,7 +10,6 @@ import csv
 import datetime
 import hashlib
 import io
-import json
 import os
 import urllib.request
 
@@ -171,17 +170,6 @@ def id_list(value, kind, source_file, position, separator="|"):
     ]
 
 
-def _jsonl_chunks(records):
-    def chunks():
-        for record in records:
-            yield json.dumps(
-                record, ensure_ascii=False, sort_keys=True, allow_nan=False
-            )
-            yield "\n"
-
-    return chunks
-
-
 def _read_local(path):
     """Read a caller-supplied CSV outside the cache, guarded like any read.
 
@@ -270,7 +258,7 @@ def ingest_csv(
             return store.publish(
                 raw,
                 pointer,
-                {artifact: _jsonl_chunks(records)},
+                {artifact: store.jsonl_chunks(records)},
                 manifest,
                 held=directory,
             )
