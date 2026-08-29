@@ -205,6 +205,8 @@ def test_the_reader_requires_a_feeds_sha256(tmp_path):
 
 
 def test_the_reader_refuses_a_symlinked_index_file(tmp_path):
+    if not getattr(os, "O_NOFOLLOW", 0):
+        pytest.skip("platform lacks O_NOFOLLOW; a symlink is followed (documented)")
     cache, _ = _build_index(tmp_path)
     parquet = cache / "index" / "feeds.parquet"
     real = parquet.rename(parquet.with_name("real.parquet"))
