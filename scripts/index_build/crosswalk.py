@@ -256,7 +256,9 @@ def crosswalk(cache_dir):
         raise CrosswalkError("crosswalk produced no feeds")
 
     out = cache_dir / "crosswalk"
-    directory = store.open_directory(out)
+    # Reach the store through `cache_dir` so a symlink at the cache root cannot
+    # redirect the publish; reads go through store.resolve, which guards it too.
+    directory = store.open_subdir(cache_dir, "crosswalk")
     try:
         with store.exclusive_writer(directory):
             manifest = {"source": "crosswalk", **summary}

@@ -669,13 +669,9 @@ def ingest(cache_dir, archive=None, commit=ATLAS_COMMIT):
     match the manifest describing it.
     """
     raw = cache_dir / "raw"
-    # `cache_dir` is opened first and `raw` created relative to it: opening
-    # only the leaf would follow a symlink or junction planted at the parent.
-    parent = store.open_directory(cache_dir)
-    try:
-        directory = parent.child("raw")
-    finally:
-        parent.close()
+    # `raw` is opened through `cache_dir` so a symlink planted at the cache
+    # root cannot redirect the stage; opening only the leaf would follow it.
+    directory = store.open_subdir(cache_dir, "raw")
     try:
         with store.exclusive_writer(directory):
             expected = None
