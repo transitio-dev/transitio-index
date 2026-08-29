@@ -21,7 +21,6 @@ verbatim under ``atlas`` / ``mdb`` so nothing downstream must re-read raw.
 
 import collections
 import itertools
-import json
 import re
 import unicodedata
 import urllib.parse
@@ -71,32 +70,37 @@ def _clean_url(value):
     return value
 
 
-def _parse_jsonl(raw):
-    # Split only on the LF the writer inserts: str.splitlines() would also
-    # break on U+2028/U+2029/U+0085, which ensure_ascii=False writes raw inside
-    # a feed name, corrupting the record.
-    return [json.loads(line) for line in raw.decode("utf-8").split("\n") if line]
-
-
-def _read_feeds(cache_dir, pointer, artifact):
-    generation, _ = store.resolve(cache_dir / "raw", pointer)
-    with generation:
-        return _parse_jsonl(generation.read_bytes(artifact))
-
-
 def _read_atlas(cache_dir):
-    """Atlas feeds and operators from one generation.
+    """Atlas feeds, operators and manifest from one generation.
 
-    Both are read while a single resolved generation is held, so an ingest that
-    republishes Atlas mid-crosswalk cannot pair feeds from one generation with
-    operator associations from another.
+    Both artifacts are read while a single resolved generation is held, so an
+    ingest that republishes Atlas mid-crosswalk cannot pair feeds from one
+    generation with operator associations from another.
     """
-    generation, _ = store.resolve(cache_dir / "raw", "atlas.json")
+    generation, manifest = store.resolve(cache_dir / "raw", "atlas.json")
     with generation:
         return (
-            _parse_jsonl(generation.read_bytes("atlas_feeds.jsonl")),
-            _parse_jsonl(generation.read_bytes("atlas_operators.jsonl")),
+            store.parse_jsonl(generation.read_bytes("atlas_feeds.jsonl")),
+            store.parse_jsonl(generation.read_bytes("atlas_operators.jsonl")),
+            manifest,
         )
+
+
+def _source_versions(atlas, mdb, gbfs):
+    """The source versions the crosswalk read, recorded so the publish stage
+    labels the snapshot with exactly these rather than re-resolving them."""
+    return {
+        "atlas": {
+            "commit": atlas.get("commit"),
+            "commit_verified": atlas.get("commit_verified"),
+            "archive_sha256": atlas.get("archive_sha256"),
+        },
+        "mdb": {"csv_sha256": mdb.get("csv_sha256"), "csv_label": mdb.get("csv_label")},
+        "gbfs": {
+            "csv_sha256": gbfs.get("csv_sha256"),
+            "csv_label": gbfs.get("csv_label"),
+        },
+    }
 
 
 def _unique_url_index(records, spec, url_of):
@@ -929,9 +933,13 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
 
 def crosswalk(cache_dir):
     """Run the crosswalk stage, publishing a ``feeds.json`` generation."""
-    atlas_feeds, atlas_operators = _read_atlas(cache_dir)
-    mdb_feeds = _read_feeds(cache_dir, "mdb.json", "mdb_feeds.jsonl")
-    systems = _read_feeds(cache_dir, "gbfs.json", "gbfs_systems.jsonl")
+    atlas_feeds, atlas_operators, atlas_manifest = _read_atlas(cache_dir)
+    mdb_feeds, mdb_manifest = store.read_jsonl(
+        cache_dir / "raw", "mdb.json", "mdb_feeds.jsonl"
+    )
+    systems, gbfs_manifest = store.read_jsonl(
+        cache_dir / "raw", "gbfs.json", "gbfs_systems.jsonl"
+    )
     records, summary = build_records(atlas_feeds, mdb_feeds, atlas_operators, systems)
     if not records:
         raise CrosswalkError("crosswalk produced no feeds")
@@ -939,7 +947,12 @@ def crosswalk(cache_dir):
     # The provisional links are their own artifact, with only their count in the
     # manifest, so the pointer stays small however many accumulate.
     provisional = summary.pop("provisional_links")
-    manifest = {"source": "crosswalk", **summary, "provisional_links": len(provisional)}
+    manifest = {
+        "source": "crosswalk",
+        "sources": _source_versions(atlas_manifest, mdb_manifest, gbfs_manifest),
+        **summary,
+        "provisional_links": len(provisional),
+    }
 
     out = cache_dir / "crosswalk"
     # Reach the store through `cache_dir` so a symlink at the cache root cannot
