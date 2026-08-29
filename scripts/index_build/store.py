@@ -359,6 +359,23 @@ def open_directory(path):
     return Directory(path)
 
 
+def open_subdir(parent_path, name, *, create=True):
+    """Open ``parent_path/name`` with ``parent_path`` itself guarded.
+
+    ``open_directory(parent_path / name)`` only guards ``name``: a symlink at
+    ``parent_path`` — the cache root — would still redirect the whole cache,
+    because ``O_NOFOLLOW`` checks the final component only. Opening the parent
+    first (which refuses a symlinked parent) and then reaching the child
+    through its descriptor closes that, the same way a generation is opened
+    beneath a held directory. ``create=False`` requires ``name`` to exist.
+    """
+    parent = open_directory(parent_path)
+    try:
+        return parent.child(name) if create else parent.subdirectory(name)
+    finally:
+        parent.close()
+
+
 def _temporary_name():
     return f".tmp-{os.urandom(8).hex()}"
 
@@ -890,7 +907,9 @@ def resolve(directory, pointer):
 
 
 def _resolve_once(directory, pointer):
-    with open_directory(directory) as opened:
+    # Guard the cache root, not just the store directory: a symlink swapped in
+    # at `directory.parent` would otherwise redirect the read.
+    with open_subdir(directory.parent, directory.name) as opened:
         try:
             manifest = json.loads(read_text(opened, pointer))
         except MissingEntry:

@@ -462,6 +462,34 @@ def test_a_fifo_csv_path_is_refused_not_blocked_on(tmp_path):
         mdb.ingest(tmp_path / "cache", csv_path=fifo)
 
 
+def _symlink_or_skip(link, target):
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform cannot create symlinks")
+
+
+def test_a_symlinked_cache_root_is_refused_on_write(tmp_path):
+    # A symlink swapped in at the cache root would redirect the whole publish;
+    # opening `raw` through it must refuse the link, not follow it.
+    (tmp_path / "real").mkdir()
+    link = tmp_path / "cache"
+    _symlink_or_skip(link, tmp_path / "real")
+    with pytest.raises(store.StoreError, match="symlink"):
+        mdb.ingest(link, csv_path=write(tmp_path / "m.csv", mdb_csv(GTFS)))
+
+
+def test_a_symlinked_cache_root_is_refused_on_read(tmp_path):
+    # Publish into a real cache, then resolve through a symlink standing in for
+    # its root: the read guards the cache root too, not only the store dir.
+    real = tmp_path / "real"
+    mdb.ingest(real, csv_path=write(tmp_path / "m.csv", mdb_csv(GTFS)))
+    link = tmp_path / "cache"
+    _symlink_or_skip(link, real)
+    with pytest.raises(store.StoreError, match="symlink"):
+        store.resolve(link / "raw", "mdb.json")
+
+
 def _atlas_archive(tmp_path):
     payload = json.dumps({"feeds": [{"id": "f-x", "spec": "gtfs"}]}).encode("utf-8")
     path = tmp_path / "atlas.tar.gz"

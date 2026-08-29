@@ -212,7 +212,9 @@ def ingest_csv(
     human tag only, never a content claim.
     """
     raw = cache_dir / "raw"
-    directory = store.open_directory(raw)
+    # Reach `raw` through `cache_dir` so a symlink at the cache root cannot
+    # redirect the publish.
+    directory = store.open_subdir(cache_dir, "raw")
     try:
         with store.exclusive_writer(directory):
             if csv_path is not None:
