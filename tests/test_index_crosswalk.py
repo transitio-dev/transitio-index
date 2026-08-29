@@ -1221,7 +1221,8 @@ def test_read_atlas_reads_feeds_and_operators_from_one_generation(tmp_path):
         ),
         commit="a" * 40,
     )
-    feeds, operators = crosswalk._read_atlas(cache)
+    feeds, operators, manifest = crosswalk._read_atlas(cache)
+    assert manifest["source"] == "atlas"
     assert [feed["onestop_id"] for feed in feeds] == ["f-a"]
     # Both artifacts come from the one resolved generation, so the operator's
     # association names a feed that generation actually contains.

@@ -424,6 +424,36 @@ def write_file(directory, name, write):
     return digest.hexdigest(), written
 
 
+def write_bytes(directory, name, data):
+    """Create ``name`` under ``directory`` from ``data``; return its sha256.
+
+    Like :func:`write_file` but for a binary payload produced whole rather than
+    as text chunks (the Parquet index). Written to an ``O_EXCL`` temporary,
+    fsynced, then replaced into place, so the name is never half-written.
+    """
+    if len(data) > MAX_ARTIFACT_BYTES:
+        raise StoreError(
+            f"{directory.path / name}: over the "
+            f"{MAX_ARTIFACT_BYTES}-byte artifact ceiling"
+        )
+    temporary = _temporary_name()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_BINARY
+    handle = directory.open(temporary, flags)
+    try:
+        with os.fdopen(handle, "wb") as opened_file:
+            handle = None
+            opened_file.write(data)
+            opened_file.flush()
+            os.fsync(opened_file.fileno())
+        directory.replace(temporary, name)
+    except BaseException:
+        if handle is not None:
+            os.close(handle)
+        directory.unlink(temporary)
+        raise
+    return hashlib.sha256(data).hexdigest()
+
+
 def unlink(directory, name):
     directory.unlink(name)
 
@@ -589,6 +619,23 @@ def jsonl_chunks(records):
             yield "\n"
 
     return chunks
+
+
+def parse_jsonl(raw):
+    """Records from JSON Lines bytes, the inverse of :func:`jsonl_chunks`.
+
+    Split only on the LF the writer inserts: ``str.splitlines()`` would also
+    break on U+2028/U+2029/U+0085, which ``ensure_ascii=False`` writes raw
+    inside a string, corrupting the record.
+    """
+    return [json.loads(line) for line in raw.decode("utf-8").split("\n") if line]
+
+
+def read_jsonl(directory, pointer, artifact):
+    """Resolve a generation and parse one JSONL artifact into ``(records, manifest)``."""
+    generation, manifest = resolve(directory, pointer)
+    with generation:
+        return parse_jsonl(generation.read_bytes(artifact)), manifest
 
 
 def publish(directory, pointer, artifacts, manifest, keep=KEEP_GENERATIONS, held=None):
