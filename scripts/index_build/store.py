@@ -556,6 +556,24 @@ def _generation_names(directory):
     return sorted(names, key=lambda name: directory.stat(name).st_mtime)
 
 
+def jsonl_chunks(records):
+    """A :func:`publish` chunk function writing ``records`` as JSON Lines.
+
+    Deterministic and non-ASCII-safe: sorted keys, no NaN/Infinity, one record
+    per line. The bytes are what the digest is taken over, so they must be
+    stable across runs.
+    """
+
+    def chunks():
+        for record in records:
+            yield json.dumps(
+                record, ensure_ascii=False, sort_keys=True, allow_nan=False
+            )
+            yield "\n"
+
+    return chunks
+
+
 def publish(directory, pointer, artifacts, manifest, keep=KEEP_GENERATIONS, held=None):
     """Write ``artifacts`` as a new generation and point ``pointer`` at it.
 
