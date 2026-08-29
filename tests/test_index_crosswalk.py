@@ -13,7 +13,7 @@ SCRIPT = REPO / "scripts" / "build_index.py"
 
 sys.path.insert(0, str(REPO / "scripts"))
 
-from index_build import crosswalk, mdb, store  # noqa: E402
+from index_build import crosswalk, gbfs, mdb, store  # noqa: E402
 
 
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
@@ -49,7 +49,9 @@ def operator(name, *feed_ids):
     return {"name": name, "associated_feed_ids": list(feed_ids)}
 
 
-def mdb_feed(mdb_id, *, spec="gtfs", url=None, name=None, provider=None):
+def mdb_feed(
+    mdb_id, *, spec="gtfs", url=None, name=None, provider=None, bounding_box=None
+):
     urls = {"direct_download": url} if url is not None else {}
     return {
         "source": "mdb",
@@ -58,6 +60,22 @@ def mdb_feed(mdb_id, *, spec="gtfs", url=None, name=None, provider=None):
         "urls": urls,
         "name": name,
         "provider": provider,
+        "bounding_box": bounding_box,
+    }
+
+
+def point_box(lat, lon):
+    return {"min_lat": lat, "max_lat": lat, "min_lon": lon, "max_lon": lon}
+
+
+def gbfs_system(system_id, *, url=None, name=None, country_code=None):
+    return {
+        "source": "gbfs",
+        "system_id": system_id,
+        "spec": "gbfs",
+        "name": name,
+        "auto_discovery_url": url,
+        "country_code": country_code,
     }
 
 
@@ -89,8 +107,19 @@ def test_url_exact_match_makes_one_both_record(tmp_path):
     # The contributing rows are kept verbatim for downstream stages.
     assert both["atlas"]["onestop_id"] == "f-a"
     assert both["mdb"]["mdb_id"] == "mdb-7"
-    assert summary["crosswalk_by_method"] == {"url_exact": 1, "same_host": 0, "none": 0}
-    assert summary["feeds_by_source"] == {"atlas": 0, "mdb": 0, "both": 1}
+    assert summary["crosswalk_by_method"] == {
+        "url_exact": 1,
+        "same_host": 0,
+        "geohash": 0,
+        "systems_csv": 0,
+        "none": 0,
+    }
+    assert summary["feeds_by_source"] == {
+        "atlas": 0,
+        "mdb": 0,
+        "both": 1,
+        "systems_csv": 0,
+    }
 
 
 def test_unmatched_feeds_are_kept_separate_and_minted(tmp_path):
@@ -220,7 +249,12 @@ def test_every_feed_appears_exactly_once_with_a_unique_id(tmp_path):
     assert len(ids) == len(set(ids))
     # 3 atlas + 2 mdb feeds, one pair merged -> 4 records.
     assert summary["feeds"] == 4
-    assert summary["feeds_by_source"] == {"atlas": 2, "mdb": 1, "both": 1}
+    assert summary["feeds_by_source"] == {
+        "atlas": 2,
+        "mdb": 1,
+        "both": 1,
+        "systems_csv": 0,
+    }
 
 
 # --- identity is refused when ambiguous ----------------------------------
@@ -481,6 +515,343 @@ def test_summary_counts_candidates_pairs_and_provisional_separately(tmp_path):
     assert len(summary["provisional_links"]) == 2
 
 
+# --- geohash-confirm ------------------------------------------------------
+
+
+def test_geohash_encode_matches_the_reference_value(tmp_path):
+    # The classic geohash example: (57.64911, 10.40744) -> "u4pruydqqvj".
+    assert crosswalk._geohash_encode(57.64911, 10.40744, 5) == "u4pru"
+
+
+def test_geohash_confirms_a_same_host_candidate(tmp_path):
+    # Same host, names disagree, but the Onestop geohash meets the MDB centroid.
+    geohash = crosswalk._geohash_encode(37.5, -122.3, 4)
+    feed_id = f"f-{geohash}z-alpha"
+    records, summary = crosswalk.build_records(
+        [atlas_feed(feed_id, url="https://v.example/a", name="Alpha")],
+        [
+            mdb_feed(
+                "mdb-1",
+                url="https://v.example/b",
+                provider="Beta",
+                bounding_box=point_box(37.5, -122.3),
+            )
+        ],
+    )
+    both = by_feed_id(records)[feed_id]
+    assert both["source"] == "both"
+    assert both["mdb_id"] == "mdb-1"
+    assert both["crosswalk_method"] == "geohash"
+    assert both["crosswalk_confidence"] == crosswalk.GEOHASH_CONFIDENCE
+    assert summary["geohash_pairs"] == 1
+
+
+def test_a_geohash_below_four_chars_does_not_confirm(tmp_path):
+    records, _ = crosswalk.build_records(
+        [atlas_feed("f-9q-alpha", url="https://v.example/a", name="Alpha")],
+        [
+            mdb_feed(
+                "mdb-1",
+                url="https://v.example/b",
+                provider="Beta",
+                bounding_box=point_box(37.5, -122.3),
+            )
+        ],
+    )
+    assert {record["source"] for record in records} == {"atlas", "mdb"}
+
+
+def test_geohash_confirms_only_within_a_shared_host(tmp_path):
+    geohash = crosswalk._geohash_encode(37.5, -122.3, 4)
+    records, _ = crosswalk.build_records(
+        [atlas_feed(f"f-{geohash}z-alpha", url="https://one.example/a", name="Alpha")],
+        [
+            mdb_feed(
+                "mdb-1",
+                url="https://two.example/b",
+                provider="Beta",
+                bounding_box=point_box(37.5, -122.3),
+            )
+        ],
+    )
+    assert {record["source"] for record in records} == {"atlas", "mdb"}
+
+
+def test_an_ambiguous_geohash_is_not_confirmed(tmp_path):
+    geohash = crosswalk._geohash_encode(37.5, -122.3, 4)
+    feed_id = f"f-{geohash}z-alpha"
+    box = point_box(37.5, -122.3)
+    records, summary = crosswalk.build_records(
+        [atlas_feed(feed_id, url="https://v.example/a", name="Alpha")],
+        [
+            mdb_feed(
+                "mdb-1", url="https://v.example/b", provider="Beta", bounding_box=box
+            ),
+            mdb_feed(
+                "mdb-2", url="https://v.example/c", provider="Gamma", bounding_box=box
+            ),
+        ],
+    )
+    # Two MDB feeds in the same cell: ambiguous, so not confirmed but recorded.
+    assert {record["feed_id"] for record in records} == {feed_id, "f-mdb-1", "f-mdb-2"}
+    assert summary["geohash_pairs"] == 0
+    assert {(p["onestop_id"], p["mdb_id"]) for p in summary["provisional_links"]} == {
+        (feed_id, "mdb-1"),
+        (feed_id, "mdb-2"),
+    }
+    assert all("geohash" in link for link in summary["provisional_links"])
+
+
+def test_name_agreement_takes_precedence_over_geohash(tmp_path):
+    geohash = crosswalk._geohash_encode(37.5, -122.3, 4)
+    feed_id = f"f-{geohash}z-metro"
+    records, summary = crosswalk.build_records(
+        [atlas_feed(feed_id, url="https://v.example/a", name="Metro")],
+        [
+            mdb_feed(
+                "mdb-1",
+                url="https://v.example/b",
+                provider="Metro",
+                bounding_box=point_box(37.5, -122.3),
+            )
+        ],
+    )
+    assert by_feed_id(records)[feed_id]["crosswalk_method"] == "same_host"
+    assert summary["geohash_pairs"] == 0
+
+
+def test_an_antimeridian_box_yields_no_centroid_geohash(tmp_path):
+    box = {"min_lat": -10.0, "max_lat": 10.0, "min_lon": 170.0, "max_lon": -170.0}
+    assert crosswalk._mdb_centroid_geohash({"bounding_box": box}) is None
+
+
+def test_geohash_resolves_a_name_ambiguous_candidate(tmp_path):
+    # "JR East" matches two MDB feeds by name (ambiguous), but the Onestop
+    # geohash meets only one centroid, resolving it and clearing the report.
+    geohash = crosswalk._geohash_encode(37.5, -122.3, 4)
+    feed_id = f"f-{geohash}z-jr"
+    records, summary = crosswalk.build_records(
+        [atlas_feed(feed_id, url="https://v.example/a", name="JR East")],
+        [
+            mdb_feed(
+                "mdb-1",
+                url="https://v.example/b",
+                provider="JR East",
+                bounding_box=point_box(37.5, -122.3),
+            ),
+            mdb_feed(
+                "mdb-2",
+                url="https://v.example/c",
+                provider="JR East",
+                bounding_box=point_box(0.0, 0.0),
+            ),
+        ],
+    )
+    both = by_feed_id(records)[feed_id]
+    assert both["crosswalk_method"] == "geohash"
+    assert both["mdb_id"] == "mdb-1"
+    assert summary["geohash_pairs"] == 1
+    assert summary["provisional_links"] == []
+
+
+# --- GBFS systems.csv link ------------------------------------------------
+
+
+def test_a_gbfs_system_links_to_its_atlas_feed(tmp_path):
+    url = "https://gbfs.example/gbfs.json"
+    records, summary = crosswalk.build_records(
+        [atlas_feed("f-a", spec="gbfs", urls={"gbfs_auto_discovery": url})],
+        [],
+        systems=[gbfs_system("careem_bike", url=url, name="Careem BIKE")],
+    )
+    linked = by_feed_id(records)["f-a"]
+    assert linked["source"] == "atlas"
+    assert linked["crosswalk_method"] == "systems_csv"
+    assert linked["crosswalk_confidence"] == crosswalk.SYSTEMS_CSV_CONFIDENCE
+    assert linked["gbfs"]["system_id"] == "careem_bike"
+    assert summary["gbfs_linked"] == 1
+    assert summary["gbfs_minted"] == 0
+
+
+def test_an_orphan_gbfs_system_is_minted(tmp_path):
+    records, summary = crosswalk.build_records(
+        [], [], systems=[gbfs_system("careem_bike", name="Careem BIKE")]
+    )
+    minted = by_feed_id(records)["f-gbfs-careem_bike"]
+    assert minted["source"] == "systems_csv"
+    assert minted["id_minted"] is True
+    assert minted["spec"] == "gbfs"
+    assert minted["crosswalk_method"] == "none"
+    assert summary["gbfs_minted"] == 1
+    assert summary["gbfs_linked"] == 0
+
+
+def test_duplicate_orphan_system_ids_get_the_country_code(tmp_path):
+    records, summary = crosswalk.build_records(
+        [],
+        [],
+        systems=[
+            gbfs_system("seville", country_code="ES"),
+            gbfs_system("seville", country_code="FR"),
+        ],
+    )
+    assert {record["feed_id"] for record in records} == {
+        "f-gbfs-seville-es",
+        "f-gbfs-seville-fr",
+    }
+    # The collision is reported, not resolved silently.
+    assert summary["gbfs_system_id_collisions"] == ["seville"]
+
+
+def test_a_linked_gbfs_system_keeps_its_minted_id_as_alias(tmp_path):
+    url = "https://gbfs.example/gbfs.json"
+    records, _ = crosswalk.build_records(
+        [atlas_feed("f-a", spec="gbfs", urls={"gbfs_auto_discovery": url})],
+        [],
+        systems=[gbfs_system("careem_bike", url=url)],
+    )
+    assert by_feed_id(records)["f-a"]["aliases"] == ["f-gbfs-careem_bike"]
+
+
+def test_an_ambiguous_linked_system_id_gets_no_alias(tmp_path):
+    # Two systems share the id "seville" (both ES) but link to different feeds;
+    # the minted id would be ambiguous, so neither feed claims it as an alias.
+    records, _ = crosswalk.build_records(
+        [
+            atlas_feed("f-a", spec="gbfs", urls={"gbfs_auto_discovery": "https://a/g"}),
+            atlas_feed("f-b", spec="gbfs", urls={"gbfs_auto_discovery": "https://b/g"}),
+        ],
+        [],
+        systems=[
+            gbfs_system("seville", url="https://a/g", country_code="ES"),
+            gbfs_system("seville", url="https://b/g", country_code="ES"),
+        ],
+    )
+    found = by_feed_id(records)
+    assert found["f-a"]["aliases"] == []
+    assert found["f-b"]["aliases"] == []
+
+
+def test_an_ambiguous_orphan_system_id_is_refused(tmp_path):
+    # One "seville" system links to an Atlas feed, another is an orphan; both
+    # mint the same id, so the orphan cannot claim a well-defined identity.
+    url = "https://gbfs.example/g"
+    with pytest.raises(crosswalk.CrosswalkError, match="no unambiguous id"):
+        crosswalk.build_records(
+            [atlas_feed("f-a", spec="gbfs", urls={"gbfs_auto_discovery": url})],
+            [],
+            systems=[
+                gbfs_system("seville", url=url, country_code="ES"),
+                gbfs_system("seville", country_code="ES"),
+            ],
+        )
+
+
+def test_a_duplicate_orphan_without_a_country_code_is_refused(tmp_path):
+    # A duplicated system id with no country code cannot be disambiguated.
+    with pytest.raises(crosswalk.CrosswalkError, match="no unambiguous id"):
+        crosswalk.build_records(
+            [],
+            [],
+            systems=[gbfs_system("seville"), gbfs_system("seville", country_code="FR")],
+        )
+
+
+def test_a_gbfs_alias_colliding_with_an_onestop_id_is_omitted_not_raised(tmp_path):
+    # The minted alias equals another Atlas feed's Onestop ID; it is dropped
+    # (a convenience alias), not published, and the build does not fail.
+    url = "https://gbfs.example/gbfs.json"
+    records, _ = crosswalk.build_records(
+        [
+            atlas_feed("f-x", spec="gbfs", urls={"gbfs_auto_discovery": url}),
+            atlas_feed("f-gbfs-careem_bike", url="https://other.example/g.zip"),
+        ],
+        [],
+        systems=[gbfs_system("careem_bike", url=url)],
+    )
+    # f-x links to the system but cannot alias f-gbfs-careem_bike (taken by f-y).
+    assert by_feed_id(records)["f-x"]["aliases"] == []
+    assert "f-gbfs-careem_bike" in by_feed_id(records)
+
+
+def test_provisional_drops_when_its_mdb_endpoint_is_geohash_resolved(tmp_path):
+    # Both f-a and f-b name-match mdb-1 (ambiguous); geohash resolves mdb-1 to
+    # f-a, so the impossible f-b <-> mdb-1 provisional link is dropped too.
+    geohash = crosswalk._geohash_encode(37.5, -122.3, 4)
+    records, summary = crosswalk.build_records(
+        [
+            atlas_feed(f"f-{geohash}z-a", url="https://v.example/a", name="Metro"),
+            atlas_feed("f-bcde-b", url="https://v.example/b", name="Metro"),
+        ],
+        [
+            mdb_feed(
+                "mdb-1",
+                url="https://v.example/c",
+                provider="Metro",
+                bounding_box=point_box(37.5, -122.3),
+            )
+        ],
+    )
+    assert by_feed_id(records)[f"f-{geohash}z-a"]["crosswalk_method"] == "geohash"
+    assert summary["provisional_links"] == []
+
+
+# --- the whole cascade ----------------------------------------------------
+
+
+def test_the_full_cascade_over_one_fixture(tmp_path):
+    # One fixture exercising every branch, as a regression gate on the summary.
+    geohash = crosswalk._geohash_encode(37.5, -122.3, 4)
+    atlas_feeds = [
+        atlas_feed("f-url", url="https://exact.example/f.zip"),
+        atlas_feed("f-name", url="https://host.example/a", name="Namematch"),
+        atlas_feed(f"f-{geohash}z-geo", url="https://geo.example/a", name="AlphaGeo"),
+        atlas_feed("f-amb", url="https://amb.example/a", name="Ambiguous"),
+        atlas_feed("f-solo"),
+        atlas_feed("f-gbfs", spec="gbfs", urls={"gbfs_auto_discovery": "https://g/x"}),
+    ]
+    mdb_feeds = [
+        mdb_feed("mdb-url", url="https://exact.example/f.zip"),
+        mdb_feed("mdb-name", url="https://host.example/b", provider="Namematch"),
+        mdb_feed(
+            "mdb-geo",
+            url="https://geo.example/b",
+            provider="Different",
+            bounding_box=point_box(37.5, -122.3),
+        ),
+        mdb_feed("mdb-amb1", url="https://amb.example/b", provider="Ambiguous"),
+        mdb_feed("mdb-amb2", url="https://amb.example/c", provider="Ambiguous"),
+        mdb_feed("mdb-solo", url="https://solo.example/z"),
+    ]
+    systems = [
+        gbfs_system("linked", url="https://g/x"),
+        gbfs_system("orphan"),
+    ]
+    records, summary = crosswalk.build_records(atlas_feeds, mdb_feeds, (), systems)
+
+    assert summary["feeds"] == 10
+    assert summary["url_exact_pairs"] == 1
+    assert summary["same_host_candidates"] == 7
+    assert summary["same_host_pairs"] == 1
+    assert summary["geohash_pairs"] == 1
+    assert summary["gbfs_linked"] == 1
+    assert summary["gbfs_minted"] == 1
+    assert len(summary["provisional_links"]) == 2
+    assert summary["crosswalk_by_method"] == {
+        "url_exact": 1,
+        "same_host": 1,
+        "geohash": 1,
+        "systems_csv": 1,
+        "none": 6,
+    }
+    assert summary["feeds_by_source"] == {
+        "atlas": 3,
+        "mdb": 3,
+        "both": 3,
+        "systems_csv": 1,
+    }
+
+
 # --- the stage, end to end ------------------------------------------------
 
 COLUMNS = sorted(mdb.REQUIRED_HEADERS)
@@ -491,6 +862,22 @@ def mdb_csv(*rows):
     for row in rows:
         lines.append(",".join(str(row.get(column, "")) for column in COLUMNS))
     return "\n".join(lines) + "\n"
+
+
+GBFS_COLUMNS = sorted(gbfs.REQUIRED_HEADERS)
+
+
+def gbfs_csv(*rows):
+    lines = [",".join(GBFS_COLUMNS)]
+    for row in rows:
+        lines.append(",".join(str(row.get(column, "")) for column in GBFS_COLUMNS))
+    return "\n".join(lines) + "\n"
+
+
+def ingest_gbfs(cache, tmp_path, *rows):
+    if not rows:
+        rows = ({"System ID": "s"},)
+    gbfs.ingest(cache, csv_path=_write(tmp_path / "systems.csv", gbfs_csv(*rows)))
 
 
 def atlas_archive(tmp_path, feeds, operators=None):
@@ -533,6 +920,7 @@ def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
         ),
     )
 
+    ingest_gbfs(cache, tmp_path)
     manifest = crosswalk.crosswalk(cache)
     assert manifest["url_exact_pairs"] == 1
 
@@ -590,6 +978,7 @@ def test_crosswalk_stage_publishes_provisional_links(tmp_path):
         ),
     )
 
+    ingest_gbfs(cache, tmp_path)
     manifest = crosswalk.crosswalk(cache)
     assert manifest["provisional_links"] == 2
 
@@ -661,6 +1050,7 @@ def test_a_line_separator_in_a_name_survives_the_read(tmp_path):
         ),
     )
 
+    ingest_gbfs(cache, tmp_path)
     crosswalk.crosswalk(cache)
     generation, _ = store.resolve(cache / "crosswalk", "feeds.json")
     with generation:
@@ -693,6 +1083,7 @@ def test_cli_runs_the_crosswalk_stage(tmp_path):
             mdb_csv({"id": "mdb-1", "data_type": "gtfs", "urls.direct_download": url}),
         ),
     )
+    ingest_gbfs(cache, tmp_path)
 
     completed = subprocess.run(
         [
