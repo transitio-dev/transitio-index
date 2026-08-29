@@ -9,8 +9,10 @@ names agree), then geohash-confirm (a same-host candidate whose Onestop-ID
 geohash meets the MDB centroid geohash). GBFS ``systems.csv`` systems are linked
 to their Atlas feed by auto-discovery URL, or minted ``f-gbfs-*`` where no Atlas
 feed carries them. Ambiguous same-host candidates are not merged — they go to a
-``provisional_links`` report for a human to adjudicate. The GTFS-RT static link
-is a later step, refining the records left at ``crosswalk_method = "none"``.
+``provisional_links`` report for a human to adjudicate. GTFS-RT feeds are not
+merged (their URL match is one-to-many) but are given a ``static_feed_id`` — the
+static feed they belong to, declared on the operator or inferred — which a later
+stage uses to propagate that feed's places.
 
 Identity follows decision L: ``feed_id`` is the Onestop ID where one exists,
 else a minted ``f-mdb-<mdb_id>``. A record keeps the contributing source rows
@@ -18,6 +20,7 @@ verbatim under ``atlas`` / ``mdb`` so nothing downstream must re-read raw.
 """
 
 import collections
+import itertools
 import json
 import re
 import unicodedata
@@ -35,6 +38,11 @@ PROVISIONAL_ARTIFACT = "provisional_links.jsonl"
 # linkage is the static-link step, not this one.
 ATLAS_STATIC_URL = "static_current"
 MDB_DOWNLOAD_URL = "direct_download"
+ATLAS_REALTIME_URLS = (
+    "realtime_trip_updates",
+    "realtime_vehicle_positions",
+    "realtime_alerts",
+)
 
 
 class CrosswalkError(RuntimeError):
@@ -648,6 +656,118 @@ def _gbfs_system_record(system, feed_id):
     }
 
 
+def _rt_hosts(feed):
+    urls = feed.get("urls") or {}
+    return {_host(urls.get(key)) for key in ATLAS_REALTIME_URLS} - {None}
+
+
+def _static_link_graph(atlas_feeds, operators):
+    """An undirected feed-association graph from the operator declarations.
+
+    An operator inline on a feed associates that feed with each feed it lists;
+    a top-level operator associates the feeds it lists with each other. Both
+    kinds are how a static feed and its realtime companion are declared together
+    upstream (the link is on the operator, never on the feed).
+    """
+    present = {feed["onestop_id"] for feed in atlas_feeds}
+    graph = collections.defaultdict(set)
+
+    def link(left, right):
+        if left != right and left in present and right in present:
+            graph[left].add(right)
+            graph[right].add(left)
+
+    for feed in atlas_feeds:
+        for operator in feed.get("operators") or []:
+            for feed_id in operator.get("associated_feed_ids") or []:
+                link(feed["onestop_id"], feed_id)
+    for operator in operators:
+        listed = [
+            feed_id
+            for feed_id in operator.get("associated_feed_ids") or []
+            if feed_id in present
+        ]
+        for left, right in itertools.combinations(listed, 2):
+            link(left, right)
+    return graph
+
+
+def _static_link(rt_feed, graph, atlas_by_id, gtfs_by_file, gtfs_by_host):
+    """A GTFS-RT feed's ``(static_feed_id, static_link_method)``.
+
+    Declared first — a single associated static feed, or the one of several that
+    shares the RT feed's DMFR — then inferred: a lone static feed in the same
+    DMFR (``same_file``), or a single static feed sharing a realtime URL host
+    (``same_host``); ``none`` when nothing resolves it to exactly one feed.
+    """
+    onestop_id = rt_feed["onestop_id"]
+    source_file = rt_feed.get("source_file")
+    candidates = sorted(
+        feed_id
+        for feed_id in graph.get(onestop_id, ())
+        if atlas_by_id[feed_id]["spec"] == "gtfs"
+    )
+    if len(candidates) == 1:
+        return candidates[0], "declared"
+    if len(candidates) > 1:
+        in_file = [
+            c for c in candidates if atlas_by_id[c].get("source_file") == source_file
+        ]
+        if len(in_file) == 1:
+            return in_file[0], "declared"
+    else:
+        file_statics = gtfs_by_file.get(source_file, [])
+        if len(file_statics) == 1:
+            return file_statics[0]["onestop_id"], "same_file"
+        host_statics = {
+            feed["onestop_id"]
+            for host in _rt_hosts(rt_feed)
+            for feed in gtfs_by_host.get(host, [])
+        }
+        if len(host_statics) == 1:
+            return next(iter(host_statics)), "same_host"
+    return None, "none"
+
+
+def _apply_static_links(records, atlas_feeds, operators):
+    """Stamp ``static_feed_id`` / ``static_link_method`` on every record.
+
+    GTFS-RT feeds inherit their static feed's identity here; the propagation of
+    that feed's places is a later stage. The link is computed from the Atlas
+    operator declarations, so an MDB-only RT feed — which no operator claims —
+    stays ``none``, and a non-RT feed carries the fields as null.
+    """
+    graph = _static_link_graph(atlas_feeds, operators)
+    atlas_by_id = {feed["onestop_id"]: feed for feed in atlas_feeds}
+    gtfs_feeds = [feed for feed in atlas_feeds if feed["spec"] == "gtfs"]
+    gtfs_by_file = collections.defaultdict(list)
+    for feed in gtfs_feeds:
+        gtfs_by_file[feed.get("source_file")].append(feed)
+    gtfs_by_host = collections.defaultdict(list)
+    for feed in gtfs_feeds:
+        host = _host((feed.get("urls") or {}).get(ATLAS_STATIC_URL))
+        if host is not None:
+            gtfs_by_host[host].append(feed)
+
+    counts = collections.Counter()
+    for record in records:
+        if record["spec"] != "gtfs-rt":
+            record["static_feed_id"] = None
+            record["static_link_method"] = None
+            continue
+        atlas_rt = record.get("atlas")
+        if atlas_rt is None:
+            static_feed_id, method = None, "none"
+        else:
+            static_feed_id, method = _static_link(
+                atlas_rt, graph, atlas_by_id, gtfs_by_file, gtfs_by_host
+            )
+        record["static_feed_id"] = static_feed_id
+        record["static_link_method"] = method
+        counts[method] += 1
+    return counts
+
+
 def _require_unique_ids(feeds, key, kind):
     """Refuse a duplicate source id.
 
@@ -777,6 +897,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         _gbfs_system_record(system, orphan_feed_id(system)) for system in orphan_systems
     )
     _require_unique_namespace(records)
+    rt_static_links = _apply_static_links(records, atlas_feeds, operators)
 
     by_source = {"atlas": 0, "mdb": 0, "both": 0, "systems_csv": 0}
     by_method = {
@@ -800,6 +921,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         "gbfs_linked": len(gbfs_pairs),
         "gbfs_minted": len(orphan_systems),
         "gbfs_system_id_collisions": sorted(duplicate_ids),
+        "rt_static_links": dict(rt_static_links),
         "provisional_links": provisional,
     }
     return records, summary

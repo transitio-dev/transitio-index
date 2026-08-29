@@ -28,7 +28,14 @@ def addressing(request, monkeypatch, tmp_path):
 
 
 def atlas_feed(
-    onestop_id, *, spec="gtfs", url=None, name=None, urls=None, operators=None
+    onestop_id,
+    *,
+    spec="gtfs",
+    url=None,
+    name=None,
+    urls=None,
+    operators=None,
+    source_file=None,
 ):
     if urls is None:
         urls = {}
@@ -42,6 +49,7 @@ def atlas_feed(
         "urls": urls,
         "name": name,
         "operators": operators or [],
+        "source_file": source_file,
     }
 
 
@@ -849,6 +857,206 @@ def test_the_full_cascade_over_one_fixture(tmp_path):
         "mdb": 3,
         "both": 3,
         "systems_csv": 1,
+    }
+
+
+# --- GTFS-RT static link --------------------------------------------------
+
+
+def test_rt_declared_static_link_via_top_level_operator(tmp_path):
+    records, summary = crosswalk.build_records(
+        [
+            atlas_feed("f-static", url="https://s.example/g"),
+            atlas_feed("f-rt", spec="gtfs-rt", url="https://s.example/rt"),
+        ],
+        [],
+        operators=[operator("Metro", "f-static", "f-rt")],
+    )
+    rt = by_feed_id(records)["f-rt"]
+    assert rt["static_feed_id"] == "f-static"
+    assert rt["static_link_method"] == "declared"
+    assert rt["static_feed_id"] in by_feed_id(records)  # the link resolves
+    assert summary["rt_static_links"]["declared"] == 1
+
+
+def test_rt_declared_static_link_via_inline_operator(tmp_path):
+    records, _ = crosswalk.build_records(
+        [
+            atlas_feed("f-static", url="https://s.example/g"),
+            atlas_feed(
+                "f-rt",
+                spec="gtfs-rt",
+                url="https://s.example/rt",
+                operators=[operator("Metro", "f-static")],
+            ),
+        ],
+        [],
+    )
+    rt = by_feed_id(records)["f-rt"]
+    assert rt["static_feed_id"] == "f-static"
+    assert rt["static_link_method"] == "declared"
+
+
+def test_ambiguous_declared_is_disambiguated_by_source_file(tmp_path):
+    records, _ = crosswalk.build_records(
+        [
+            atlas_feed("f-s1", url="https://a.example/g", source_file="x.dmfr.json"),
+            atlas_feed("f-s2", url="https://b.example/g", source_file="y.dmfr.json"),
+            atlas_feed(
+                "f-rt",
+                spec="gtfs-rt",
+                url="https://a.example/rt",
+                source_file="x.dmfr.json",
+                operators=[operator("Op", "f-s1", "f-s2")],
+            ),
+        ],
+        [],
+    )
+    rt = by_feed_id(records)["f-rt"]
+    assert rt["static_feed_id"] == "f-s1"
+    assert rt["static_link_method"] == "declared"
+
+
+def test_ambiguous_declared_without_a_file_tiebreak_is_none(tmp_path):
+    records, _ = crosswalk.build_records(
+        [
+            atlas_feed("f-s1", url="https://a.example/g", source_file="x.dmfr.json"),
+            atlas_feed("f-s2", url="https://b.example/g", source_file="x.dmfr.json"),
+            atlas_feed(
+                "f-rt",
+                spec="gtfs-rt",
+                url="https://a.example/rt",
+                source_file="x.dmfr.json",
+                operators=[operator("Op", "f-s1", "f-s2")],
+            ),
+        ],
+        [],
+    )
+    rt = by_feed_id(records)["f-rt"]
+    assert rt["static_feed_id"] is None
+    assert rt["static_link_method"] == "none"
+
+
+def test_rt_same_file_inference(tmp_path):
+    records, _ = crosswalk.build_records(
+        [
+            atlas_feed(
+                "f-static", url="https://s.example/g", source_file="x.dmfr.json"
+            ),
+            atlas_feed(
+                "f-rt",
+                spec="gtfs-rt",
+                url="https://other.example/rt",
+                source_file="x.dmfr.json",
+            ),
+        ],
+        [],
+    )
+    rt = by_feed_id(records)["f-rt"]
+    assert rt["static_feed_id"] == "f-static"
+    assert rt["static_link_method"] == "same_file"
+
+
+def test_rt_same_host_inference(tmp_path):
+    records, _ = crosswalk.build_records(
+        [
+            atlas_feed(
+                "f-static", url="https://shared.example/g", source_file="a.json"
+            ),
+            atlas_feed("f-other", url="https://x.example/g", source_file="b.json"),
+            atlas_feed(
+                "f-rt",
+                spec="gtfs-rt",
+                url="https://shared.example/rt",
+                source_file="c.json",
+            ),
+        ],
+        [],
+    )
+    rt = by_feed_id(records)["f-rt"]
+    assert rt["static_feed_id"] == "f-static"
+    assert rt["static_link_method"] == "same_host"
+
+
+def test_rt_with_no_link_is_none(tmp_path):
+    records, _ = crosswalk.build_records(
+        [
+            atlas_feed(
+                "f-rt", spec="gtfs-rt", url="https://x.example/rt", source_file="c"
+            )
+        ],
+        [],
+    )
+    rt = by_feed_id(records)["f-rt"]
+    assert rt["static_feed_id"] is None
+    assert rt["static_link_method"] == "none"
+
+
+def test_non_rt_feeds_carry_null_static_fields(tmp_path):
+    records, _ = crosswalk.build_records(
+        [atlas_feed("f-a", url="https://a.example/g")], []
+    )
+    feed = by_feed_id(records)["f-a"]
+    assert feed["static_feed_id"] is None
+    assert feed["static_link_method"] is None
+
+
+def test_an_mdb_only_rt_feed_has_no_static_link(tmp_path):
+    records, _ = crosswalk.build_records(
+        [], [mdb_feed("mdb-1", spec="gtfs-rt", url="https://x.example/rt")]
+    )
+    rt = by_feed_id(records)["f-mdb-1"]
+    assert rt["static_feed_id"] is None
+    assert rt["static_link_method"] == "none"
+
+
+def test_the_rt_static_link_cascade_over_one_fixture(tmp_path):
+    # One fixture exercising each branch, as a regression gate on the counts.
+    atlas_feeds = [
+        atlas_feed("f-s1", url="https://s1.example/g", source_file="f1.dmfr.json"),
+        atlas_feed(
+            "f-rt1",
+            spec="gtfs-rt",
+            url="https://s1.example/rt",
+            source_file="f1.dmfr.json",
+        ),
+        atlas_feed("f-s2", url="https://s2.example/g", source_file="f2.dmfr.json"),
+        atlas_feed(
+            "f-rt2",
+            spec="gtfs-rt",
+            url="https://other2.example/rt",
+            source_file="f2.dmfr.json",
+        ),
+        atlas_feed("f-s3", url="https://shared3.example/g", source_file="f3.dmfr.json"),
+        atlas_feed(
+            "f-rt3",
+            spec="gtfs-rt",
+            url="https://shared3.example/rt",
+            source_file="rt3.dmfr.json",
+        ),
+        atlas_feed(
+            "f-rt4",
+            spec="gtfs-rt",
+            url="https://nowhere4.example/rt",
+            source_file="rt4.dmfr.json",
+        ),
+    ]
+    records, summary = crosswalk.build_records(
+        atlas_feeds,
+        [mdb_feed("mdb-rt", spec="gtfs-rt", url="https://m.example/rt")],
+        operators=[operator("Op1", "f-s1", "f-rt1")],
+    )
+    found = by_feed_id(records)
+    assert found["f-rt1"]["static_link_method"] == "declared"
+    assert found["f-rt2"]["static_link_method"] == "same_file"
+    assert found["f-rt3"]["static_link_method"] == "same_host"
+    assert found["f-rt4"]["static_link_method"] == "none"
+    assert found["f-mdb-rt"]["static_link_method"] == "none"
+    assert summary["rt_static_links"] == {
+        "declared": 1,
+        "same_file": 1,
+        "same_host": 1,
+        "none": 2,
     }
 
 
