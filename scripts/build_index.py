@@ -26,6 +26,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from index_build import (  # noqa: E402
     atlas,
     crosswalk,
+    expand,
     gbfs,
     geometry,
     mdb,
@@ -33,6 +34,7 @@ from index_build import (  # noqa: E402
     names,
     overture,
     publish,
+    resolve,
     seed,
 )
 
@@ -86,6 +88,14 @@ def run_gazetteer(arguments):
     ]
 
 
+def run_resolve(arguments):
+    return [resolve.resolve(arguments.cache_dir, overrides_dir=arguments.overrides_dir)]
+
+
+def run_expand(arguments):
+    return [expand.expand(arguments.cache_dir)]
+
+
 def run_publish(arguments):
     return [publish.publish(arguments.cache_dir)]
 
@@ -94,6 +104,8 @@ STAGES = {
     "ingest": run_ingest,
     "crosswalk": run_crosswalk,
     "gazetteer": run_gazetteer,
+    "resolve": run_resolve,
+    "expand": run_expand,
     "publish": run_publish,
 }
 
@@ -138,6 +150,12 @@ def parse_args(argv=None):
         type=commit_sha,
         default=atlas.ATLAS_COMMIT,
         help="Atlas commit to pin (default: the commit this build is pinned to)",
+    )
+    parser.add_argument(
+        "--overrides-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("overrides"),
+        help="directory of override YAML files (default: overrides)",
     )
     arguments = parser.parse_args(argv)
     if not arguments.sources:
