@@ -70,6 +70,17 @@ def test_no_overrides_pass_feeds_through_as_crawlable(tmp_path):
     assert manifest["uncrawlable"] == 0
 
 
+def test_rt_and_gbfs_feeds_default_to_not_crawlable(tmp_path):
+    # Indexed but never fetched in v1; only static GTFS is crawled.
+    cache = tmp_path / "cache"
+    _crosswalk(cache, [_feed("f-rt", spec="gtfs-rt"), _feed("f-bike", spec="gbfs")])
+    resolve.resolve(cache, overrides_dir=None)
+    feeds, manifest = _resolved(cache)
+    assert feeds["f-rt"]["crawlable"] is False
+    assert feeds["f-bike"]["crawlable"] is False
+    assert manifest["uncrawlable"] == 2
+
+
 def test_set_identity_rewrites_the_named_fields(tmp_path):
     cache = tmp_path / "cache"
     _crosswalk(cache, [_feed("f-a", name="Old", onestop_id="o-old")])

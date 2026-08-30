@@ -283,7 +283,9 @@ def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
     if wikidata is None:
         wikidata = overture.WikidataClient()
 
-    feeds, _ = store.read_jsonl(cache_dir / "crosswalk", "feeds.json", "feeds.jsonl")
+    feeds, crosswalk_manifest = store.read_jsonl(
+        cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
+    )
     resolved_divisions, _ = store.read_jsonl(
         cache_dir / "gazetteer", "overture.json", "overture_divisions.jsonl"
     )
@@ -306,9 +308,10 @@ def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
 
     places = {}
     report = []
-    placed = 0
+    placements = []
     for location in locations:
         if location["municipality"]:
+            level = "municipality"
             division, reason = match(
                 city_index,
                 location["country"],
@@ -317,6 +320,7 @@ def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
                 skeleton,
             )
         elif location["subdivision"]:
+            level = "subdivision"
             regions = _lookup(
                 region_index, location["country"], location["subdivision"]
             )
@@ -328,6 +332,7 @@ def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
                     "no region of that name in the declared country",
                 )
         else:
+            level = "country"
             division = country_index.get(location["country"])
             reason = None if division else "no country division for the declared code"
         if division is None:
@@ -341,14 +346,25 @@ def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
                 }
             )
             continue
-        placed += 1
+        # The feed -> place link is persisted alongside the places: declared
+        # coverage derives its membership edges from it without re-resolving.
+        placements.append(
+            {
+                "feed_id": location["feed_id"],
+                "place_id": division["qid"],
+                "level": level,
+            }
+        )
         _add_place(places, skeleton, division)
 
     manifest = {
         "source": "seed",
         "overture_release": overture.OVERTURE_RELEASE,
+        # The catalogue versions the placements were derived from, carried
+        # forward so coverage can refuse a mixed-lineage input set.
+        "sources": crosswalk_manifest.get("sources"),
         "feeds_with_location": len(locations),
-        "feeds_placed": placed,
+        "feeds_placed": len(placements),
         "places": len(places),
         "reported": len(report),
         "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -361,6 +377,7 @@ def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
                 "seed.json",
                 {
                     "places_seed.jsonl": store.jsonl_chunks(list(places.values())),
+                    "feed_places.jsonl": store.jsonl_chunks(placements),
                     "seed_report.jsonl": store.jsonl_chunks(report),
                 },
                 manifest,
