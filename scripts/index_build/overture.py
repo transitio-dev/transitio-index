@@ -66,6 +66,7 @@ PROJECT = [
 _OSM_RELATION = re.compile(r"\Arelation[/:]?(\d+)\Z|\A(\d+)\Z")
 
 WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
+WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 QID_PATTERN = re.compile(r"\AQ[1-9][0-9]*\Z")
 # Wikimedia asks automated clients to identify themselves; a generic urllib
 # agent is liable to be refused, which only shows up on the live build path.
@@ -192,9 +193,10 @@ def normalize_division(row):
 class WikidataClient:
     """Batched lookups against the Wikidata SPARQL endpoint.
 
-    Resolves OSM relations to QIDs (``p402``) and a city's US metropolitan area
-    (``statistical_metros``), each in id-keyed batches. Only the Overture release
-    is pinned; this endpoint is live, so results track Wikidata at build time.
+    Resolves OSM relations to QIDs (``p402``), a city's US metropolitan area
+    (``statistical_metros``) and a place's labels and aliases
+    (``labels_and_aliases``), each in id-keyed batches. Only the Overture release
+    is pinned; these endpoints are live, so results track Wikidata at build time.
     Tests substitute a stub exposing the same methods rather than reaching the
     network.
     """
@@ -285,6 +287,52 @@ class WikidataClient:
             elif osm not in found:
                 found[osm] = qid
 
+    def labels_and_aliases(self, qids):
+        """``{qid: {"labels": {lang: label}, "aliases": [str, ...]}}`` per QID.
+
+        From the ``wbgetentities`` action (all-language labels and aliases in one
+        call), batched to the API's 50-id limit. A QID Wikidata reports as missing
+        is simply absent from the result.
+        """
+        ids = sorted({str(q) for q in qids if q and QID_PATTERN.match(str(q))})
+        out = {}
+        for start in range(0, len(ids), 50):
+            self._entities_batch(ids[start : start + 50], out)
+        return out
+
+    def _entities_batch(self, batch, out):
+        url = (
+            WIKIDATA_API
+            + "?"
+            + urllib.parse.urlencode(
+                {
+                    "action": "wbgetentities",
+                    "ids": "|".join(batch),
+                    "props": "labels|aliases",
+                    "format": "json",
+                }
+            )
+        )
+        entities = self._get_json(url).get("entities")
+        if not isinstance(entities, dict):
+            raise GazetteerError(f"{WIKIDATA_API}: response has no entities")
+        for qid, entity in entities.items():
+            if not QID_PATTERN.match(qid) or "missing" in entity:
+                continue
+            labels = {
+                lang: value.get("value")
+                for lang, value in (entity.get("labels") or {}).items()
+            }
+            aliases = sorted(
+                {
+                    alias.get("value")
+                    for values in (entity.get("aliases") or {}).values()
+                    for alias in values
+                    if alias.get("value")
+                }
+            )
+            out[qid] = {"labels": labels, "aliases": aliases}
+
     def _get(self, query):
         """The SPARQL result bindings for ``query``."""
         url = (
@@ -292,15 +340,7 @@ class WikidataClient:
             + "?"
             + urllib.parse.urlencode({"query": query, "format": "json"})
         )
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/sparql-results+json",
-                "User-Agent": USER_AGENT,
-            },
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        payload = self._get_json(url, accept="application/sparql-results+json")
         results = payload.get("results")
         if not isinstance(results, dict) or not isinstance(
             results.get("bindings"), list
@@ -309,6 +349,14 @@ class WikidataClient:
             # not read as "no matches" and silently publish an empty answer.
             raise GazetteerError(f"{self.endpoint}: response has no result bindings")
         return results["bindings"]
+
+    def _get_json(self, url, *, accept="application/json"):
+        """The parsed JSON body of ``url`` (GET), with the descriptive agent."""
+        request = urllib.request.Request(
+            url, headers={"Accept": accept, "User-Agent": USER_AGENT}
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
 
 
 def resolve_qid(record, p402_map):

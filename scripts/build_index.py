@@ -30,6 +30,7 @@ from index_build import (  # noqa: E402
     geometry,
     mdb,
     metros,
+    names,
     overture,
     publish,
     seed,
@@ -81,6 +82,7 @@ def run_gazetteer(arguments):
         seed.resolve_seed(arguments.cache_dir),
         metros.attach_metros(arguments.cache_dir),
         geometry.attach_geometry(arguments.cache_dir),
+        names.merge_names(arguments.cache_dir),
     ]
 
 
