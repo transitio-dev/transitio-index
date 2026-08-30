@@ -6,149 +6,78 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 pytest.importorskip("pyarrow")
-import pyarrow as pa  # noqa: E402
-import pyarrow.dataset as pa_ds  # noqa: E402
-import pyarrow.parquet as pq  # noqa: E402
+import overture_fixture as fx  # noqa: E402
 
 from index_build import overture, store  # noqa: E402
-
-_NAMES = pa.struct(
-    [("primary", pa.string()), ("common", pa.map_(pa.string(), pa.string()))]
-)
-_SOURCE = pa.struct(
-    [
-        ("property", pa.string()),
-        ("dataset", pa.string()),
-        ("license", pa.string()),
-        ("record_id", pa.string()),
-    ]
-)
-_STEP = pa.struct(
-    [("division_id", pa.string()), ("subtype", pa.string()), ("name", pa.string())]
-)
-_SCHEMA = pa.schema(
-    [
-        ("id", pa.string()),
-        ("country", pa.string()),
-        ("subtype", pa.string()),
-        ("admin_level", pa.int32()),
-        ("class", pa.string()),
-        ("names", _NAMES),
-        ("wikidata", pa.string()),
-        ("sources", pa.list_(_SOURCE)),
-        ("hierarchies", pa.list_(pa.list_(_STEP))),
-    ]
-)
-
-
-def _names(primary, common):
-    return {"primary": primary, "common": common}
-
-
-def _osm(record_id):
-    return {"dataset": "OpenStreetMap", "license": "ODbL", "record_id": record_id}
-
-
-def _chain(*steps):
-    return [[{"division_id": i, "subtype": s, "name": n} for i, s, n in steps]]
-
 
 US = ("ov-us", "country", "United States")
 NY = ("ov-ny", "region", "New York")
 
-
-def _fixture(tmp_path):
-    """A small division table across the skeleton subtypes plus rejected ones."""
-    rows = [
-        {
-            "id": "ov-us",
-            "country": "US",
-            "subtype": "country",
-            "admin_level": 0,
-            "class": None,
-            "names": _names("United States", {"en": "United States", "es": "EE. UU."}),
-            "wikidata": "Q30",
-            "sources": [_osm("relation/148838")],
-            "hierarchies": _chain(US),
-        },
-        {
-            "id": "ov-ny",
-            "country": "US",
-            "subtype": "region",
-            "admin_level": 1,
-            "class": None,
-            "names": _names("New York", {"en": "New York"}),
-            "wikidata": "Q1384",
-            "sources": [_osm("relation/61320")],
-            "hierarchies": _chain(US, NY),
-        },
-        {
-            "id": "ov-nyc-county",
-            "country": "US",
-            "subtype": "county",
-            "admin_level": 2,
-            "class": None,
-            "names": _names("New York County", {"en": "New York County"}),
-            "wikidata": None,
-            "sources": [_osm("relation/2552450")],
-            "hierarchies": _chain(
-                US, NY, ("ov-nyc-county", "county", "New York County")
-            ),
-        },
-        {
-            "id": "ov-noqid",
-            "country": "US",
-            "subtype": "localadmin",
-            "admin_level": 3,
-            "class": None,
-            "names": _names("Nowhere", {"en": "Nowhere"}),
-            "wikidata": None,
-            "sources": [
-                {"dataset": "geoBoundaries", "license": "CC-BY-4.0", "record_id": "X"}
-            ],
-            "hierarchies": _chain(US, ("ov-noqid", "localadmin", "Nowhere")),
-        },
-        {
-            "id": "ov-loc",
-            "country": "US",
-            "subtype": "locality",
-            "admin_level": 4,
-            "class": None,
-            "names": _names("Sometown", {"en": "Sometown"}),
-            "wikidata": "Q1",
-            "sources": [_osm("relation/9")],
-            "hierarchies": _chain(US, ("ov-loc", "locality", "Sometown")),
-        },
-        {
-            "id": "ov-fi",
-            "country": "FI",
-            "subtype": "country",
-            "admin_level": 0,
-            "class": None,
-            "names": _names("Finland", {"en": "Finland"}),
-            "wikidata": "Q33",
-            "sources": [_osm("relation/54224")],
-            "hierarchies": _chain(("ov-fi", "country", "Finland")),
-        },
-    ]
-    path = tmp_path / "divisions.parquet"
-    pq.write_table(pa.Table.from_pylist(rows, schema=_SCHEMA), path)
-    return pa_ds.dataset(path)
-
-
-class StubWikidata:
-    endpoint = "stub://wikidata"
-
-    def __init__(self, mapping):
-        self.mapping = mapping
-        self.queried = []
-
-    def p402(self, osm_relation_ids):
-        ids = sorted({str(i) for i in osm_relation_ids})
-        self.queried.append(ids)
-        return {i: self.mapping[i] for i in ids if i in self.mapping}
+# The skeleton subtypes plus a locality and a rejected finer subtype.
+ROWS = [
+    fx.division(
+        "ov-us",
+        "US",
+        "country",
+        wikidata="Q30",
+        name="United States",
+        common={"en": "United States", "es": "EE. UU."},
+        sources=[fx.osm("relation/148838")],
+        hierarchies=fx.chain(US),
+    ),
+    fx.division(
+        "ov-ny",
+        "US",
+        "region",
+        wikidata="Q1384",
+        name="New York",
+        admin_level=1,
+        sources=[fx.osm("relation/61320")],
+        hierarchies=fx.chain(US, NY),
+    ),
+    fx.division(
+        "ov-nyc-county",
+        "US",
+        "county",
+        name="New York County",
+        admin_level=2,
+        sources=[fx.osm("relation/2552450")],
+        hierarchies=fx.chain(US, NY, ("ov-nyc-county", "county", "New York County")),
+    ),
+    fx.division(
+        "ov-noqid",
+        "US",
+        "localadmin",
+        name="Nowhere",
+        admin_level=3,
+        sources=[
+            {"dataset": "geoBoundaries", "license": "CC-BY-4.0", "record_id": "X"}
+        ],
+        hierarchies=fx.chain(US, ("ov-noqid", "localadmin", "Nowhere")),
+    ),
+    fx.division(
+        "ov-loc",
+        "US",
+        "locality",
+        wikidata="Q1",
+        name="Sometown",
+        admin_level=4,
+        sources=[fx.osm("relation/9")],
+        hierarchies=fx.chain(US, ("ov-loc", "locality", "Sometown")),
+    ),
+    fx.division(
+        "ov-fi",
+        "FI",
+        "country",
+        wikidata="Q33",
+        name="Finland",
+        sources=[fx.osm("relation/54224")],
+        hierarchies=fx.chain(("ov-fi", "country", "Finland")),
+    ),
+]
 
 
 def _read(cache, artifact):
@@ -158,8 +87,8 @@ def _read(cache, artifact):
 
 def _resolve(tmp_path, *, mapping=None):
     cache = tmp_path / "cache"
-    dataset = _fixture(tmp_path)
-    wikidata = StubWikidata({"2552450": "Q11299"} if mapping is None else mapping)
+    dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
+    wikidata = fx.StubWikidata({"2552450": "Q11299"} if mapping is None else mapping)
     manifest = overture.resolve(cache, dataset=dataset, wikidata=wikidata)
     return cache, manifest, wikidata
 
@@ -237,17 +166,15 @@ def test_a_conflicting_p402_relation_is_reported_not_minted(tmp_path):
 
 
 def test_a_malformed_direct_wikidata_value_is_not_minted(tmp_path):
-    row = {
-        "id": "ov-bad",
-        "country": "US",
-        "subtype": "region",
-        "admin_level": 1,
-        "class": None,
-        "names": _names("Bad", {"en": "Bad"}),
-        "wikidata": "not-a-qid",
-        "sources": [],
-        "hierarchies": _chain(US, ("ov-bad", "region", "Bad")),
-    }
+    row = fx.division(
+        "ov-bad",
+        "US",
+        "region",
+        wikidata="not-a-qid",
+        name="Bad",
+        admin_level=1,
+        hierarchies=fx.chain(US, ("ov-bad", "region", "Bad")),
+    )
     record = overture.normalize_division(row)
     assert record["wikidata"] is None
     assert overture.resolve_qid(record, {}) == (

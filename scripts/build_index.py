@@ -10,9 +10,9 @@ its own once its inputs exist:
 The stages are described in plans/place-index.md. ``ingest`` reads the
 Transitland Atlas, the Mobility Database catalogue and the GBFS systems
 catalogue; ``crosswalk`` resolves the same feed across them into one table;
-``gazetteer`` resolves the Overture administrative divisions to Wikidata QIDs;
-``publish`` writes the feed table as the shippable ``index/`` (Parquet +
-manifest).
+``gazetteer`` resolves the Overture administrative divisions to Wikidata QIDs and
+seeds the feed cities from their declared locations; ``publish`` writes the feed
+table as the shippable ``index/`` (Parquet + manifest).
 """
 
 import argparse
@@ -23,7 +23,15 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from index_build import atlas, crosswalk, gbfs, mdb, overture, publish  # noqa: E402
+from index_build import (  # noqa: E402
+    atlas,
+    crosswalk,
+    gbfs,
+    mdb,
+    overture,
+    publish,
+    seed,
+)
 
 DEFAULT_CACHE_DIR = pathlib.Path("cache")
 
@@ -66,7 +74,10 @@ def run_crosswalk(arguments):
 
 
 def run_gazetteer(arguments):
-    return [overture.resolve(arguments.cache_dir)]
+    return [
+        overture.resolve(arguments.cache_dir),
+        seed.resolve_seed(arguments.cache_dir),
+    ]
 
 
 def run_publish(arguments):

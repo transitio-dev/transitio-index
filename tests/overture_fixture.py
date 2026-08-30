@@ -1,0 +1,101 @@
+"""Shared builder for a small Overture ``division`` dataset in tests.
+
+Mirrors the real theme's nested schema (names struct, sources list, nested
+hierarchies) so the gazetteer and seed stages read a fixture exactly as they
+read the pinned release — no live network, no live counts.
+"""
+
+import pyarrow as pa
+import pyarrow.dataset as pa_ds
+import pyarrow.parquet as pq
+
+NAMES = pa.struct(
+    [("primary", pa.string()), ("common", pa.map_(pa.string(), pa.string()))]
+)
+SOURCE = pa.struct(
+    [
+        ("property", pa.string()),
+        ("dataset", pa.string()),
+        ("license", pa.string()),
+        ("record_id", pa.string()),
+    ]
+)
+STEP = pa.struct(
+    [("division_id", pa.string()), ("subtype", pa.string()), ("name", pa.string())]
+)
+SCHEMA = pa.schema(
+    [
+        ("id", pa.string()),
+        ("country", pa.string()),
+        ("subtype", pa.string()),
+        ("admin_level", pa.int32()),
+        ("class", pa.string()),
+        ("names", NAMES),
+        ("wikidata", pa.string()),
+        ("sources", pa.list_(SOURCE)),
+        ("hierarchies", pa.list_(pa.list_(STEP))),
+    ]
+)
+
+
+def names(primary, common):
+    return {"primary": primary, "common": common}
+
+
+def osm(record_id, license="ODbL"):
+    return {"dataset": "OpenStreetMap", "license": license, "record_id": record_id}
+
+
+def chain(*steps):
+    """One hierarchy chain of ``(id, subtype, name)`` steps, country → leaf."""
+    return [[{"division_id": i, "subtype": s, "name": n} for i, s, n in steps]]
+
+
+def division(
+    id,
+    country,
+    subtype,
+    *,
+    wikidata=None,
+    name=None,
+    common=None,
+    admin_level=0,
+    sources=None,
+    hierarchies=None,
+):
+    """One division row with sensible defaults for the fields a test omits."""
+    label = name if name is not None else id
+    return {
+        "id": id,
+        "country": country,
+        "subtype": subtype,
+        "admin_level": admin_level,
+        "class": None,
+        "names": names(label, common or {"en": label}),
+        "wikidata": wikidata,
+        "sources": sources if sources is not None else [],
+        "hierarchies": (
+            hierarchies if hierarchies is not None else chain((id, subtype, label))
+        ),
+    }
+
+
+def write_dataset(path, rows):
+    """Write ``rows`` as a parquet file and return it as a pyarrow dataset."""
+    pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), path)
+    return pa_ds.dataset(path)
+
+
+class StubWikidata:
+    """A Wikidata client stand-in: a fixed P402 map, no network."""
+
+    endpoint = "stub://wikidata"
+
+    def __init__(self, mapping=None):
+        self.mapping = mapping or {}
+        self.queried = []
+
+    def p402(self, osm_relation_ids):
+        ids = sorted({str(i) for i in osm_relation_ids})
+        self.queried.append(ids)
+        return {i: self.mapping[i] for i in ids if i in self.mapping}
