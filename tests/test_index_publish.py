@@ -15,6 +15,8 @@ from index_build import atlas, crosswalk, gbfs, mdb, store  # noqa: E402
 # Skip only if pyarrow is genuinely absent; then import publish directly, so an
 # internal ImportError in the publish code fails loudly rather than skipping.
 pytest.importorskip("pyarrow")
+import shapely  # noqa: E402
+
 from index_build import publish  # noqa: E402
 
 # Import the read layer directly too, so an old installed transitio shadowing
@@ -59,7 +61,58 @@ def _atlas_archive(tmp_path, feeds):
     return path
 
 
-def _build_index(tmp_path, archive=None):
+def _publish_gen(cache, pointer, artifact, records, manifest):
+    directory = store.open_subdir(cache, "gazetteer")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "gazetteer",
+                pointer,
+                {artifact: store.jsonl_chunks(records)},
+                manifest,
+                held=directory,
+            )
+    finally:
+        directory.close()
+
+
+def _place(place_id, kind, *, geometry=None, **kw):
+    return {
+        "place_id": place_id,
+        "kind": kind,
+        "source_subtype": kw.get("source_subtype", kind),
+        "name": kw.get("name", place_id),
+        "names": kw.get("names", {"en": place_id}),
+        "aliases": kw.get("aliases", []),
+        "resolution_method": kw.get("resolution_method", "overture_wikidata"),
+        "default_metro_id": kw.get("default_metro_id"),
+        "parent_id": kw.get("parent_id"),
+        "country_code": kw.get("country_code", "FI"),
+        "overture_id": kw.get("overture_id"),
+        "osm_relation_id": None,
+        "statistical_area_id": kw.get("statistical_area_id"),
+        "metro_ids": kw.get("metro_ids", []),
+        "member_ids": kw.get("member_ids", []),
+        "geometry": geometry,
+        "geometry_source": "overture" if geometry else None,
+    }
+
+
+GEOM_HEX = shapely.to_wkb(shapely.box(24.9, 60.1, 25.1, 60.3)).hex()
+PLACES = [
+    _place(
+        "Q1757",
+        "city",
+        geometry=GEOM_HEX,
+        names={"en": "Helsinki", "sv": "Helsingfors"},
+        aliases=["Stadi"],
+        metro_ids=["Q-metro"],
+    ),
+    _place("Q-metro", "metro", member_ids=["Q1757"]),  # no geometry
+]
+
+
+def _build_index(tmp_path, archive=None, places=None, release="2026-08-19.0"):
     """Ingest a small fixture through crosswalk and publish; return the cache."""
     cache = tmp_path / "cache"
     url = "https://example.org/gtfs.zip"
@@ -99,6 +152,14 @@ def _build_index(tmp_path, archive=None):
         csv_path=_write(tmp_path / "s.csv", _csv(GBFS_COLUMNS, [{"System ID": "sys"}])),
     )
     crosswalk.crosswalk(cache)
+    if places is not None:
+        _publish_gen(
+            cache,
+            "names.json",
+            "places_seed.jsonl",
+            places,
+            {"source": "names", "overture_release": release},
+        )
     manifest = publish.publish(cache)
     return cache, manifest
 
@@ -259,3 +320,97 @@ def test_the_reader_refuses_a_parquet_with_the_wrong_columns(tmp_path):
     snap.write_text(json.dumps(manifest))
     with pytest.raises(IncompatibleIndexError, match="columns"):
         transitio_index.read_index(cache / "index")
+
+
+def test_places_round_trip_through_the_reader(tmp_path):
+    pytest.importorskip("geopandas")
+    cache, manifest = _build_index(tmp_path, places=PLACES)
+    index = transitio_index.read_index(cache / "index")
+
+    assert index.places is not None
+    assert len(index.places) == 2
+    by_id = {row["place_id"]: row for _, row in index.places.iterrows()}
+    helsinki = by_id["Q1757"]
+    assert helsinki["kind"] == "city"
+    assert helsinki.geometry.area > 0  # the boundary round-tripped
+    assert dict(helsinki["names"])["sv"] == "Helsingfors"  # a map column
+    assert list(helsinki["aliases"]) == ["Stadi"]
+    assert helsinki["default_metro_id"] == "Q-metro"  # the sole metro
+    # The metro has no geometry here.
+    assert by_id["Q-metro"].geometry is None
+    assert manifest["places_sha256"]
+    assert manifest["overture_release"] == "2026-08-19.0"
+    assert manifest["counts"]["places"] == 2
+    assert manifest["counts"]["places_by_kind"] == {"city": 1, "metro": 1}
+
+
+def test_a_feeds_only_index_has_no_places(tmp_path):
+    cache, manifest = _build_index(tmp_path)  # no gazetteer
+    assert "places_sha256" not in manifest
+    index = transitio_index.read_index(cache / "index")
+    assert index.places is None
+    assert not (cache / "index" / "places.parquet").exists()
+
+
+def test_the_reader_refuses_a_places_parquet_that_does_not_match(tmp_path):
+    pytest.importorskip("geopandas")
+    cache, _ = _build_index(tmp_path, places=PLACES)
+    (cache / "index" / "places.parquet").write_bytes(b"not the published parquet")
+    with pytest.raises(IncompatibleIndexError, match="places_sha256"):
+        transitio_index.read_index(cache / "index")
+
+
+def test_the_snapshot_id_folds_in_the_overture_release(tmp_path):
+    # Same feeds (one reused archive), but a places build adds the release to the
+    # snapshot id, so it differs from the feeds-only build's id.
+    archive = _atlas_archive(
+        tmp_path, [{"id": "f-a", "spec": "gtfs", "urls": {"static_current": "u"}}]
+    )
+    _, feeds_only = _build_index(tmp_path / "a", archive=archive)
+    _, with_places = _build_index(tmp_path / "b", archive=archive, places=PLACES)
+    assert feeds_only["snapshot_id"] != with_places["snapshot_id"]
+
+
+def test_the_snapshot_id_reflects_distinct_places_content(tmp_path):
+    # Same feeds and same Overture release, but different places (a Wikidata edit
+    # the release does not pin) must not collide on one snapshot id.
+    pytest.importorskip("geopandas")
+    archive = _atlas_archive(
+        tmp_path, [{"id": "f-a", "spec": "gtfs", "urls": {"static_current": "u"}}]
+    )
+    other = [_place("Q1757", "city", geometry=GEOM_HEX, names={"en": "Helsinki"})]
+    _, a = _build_index(tmp_path / "a", archive=archive, places=PLACES)
+    _, b = _build_index(tmp_path / "b", archive=archive, places=other)
+    assert a["snapshot_id"] != b["snapshot_id"]
+
+
+def test_an_empty_gazetteer_is_a_places_index_not_feeds_only(tmp_path):
+    # A gazetteer that ran with zero places is still a places index, distinct
+    # from a feeds-only build that never ran the gazetteer.
+    pytest.importorskip("geopandas")
+    archive = _atlas_archive(
+        tmp_path, [{"id": "f-a", "spec": "gtfs", "urls": {"static_current": "u"}}]
+    )
+    _, feeds_only = _build_index(tmp_path / "a", archive=archive)
+    cache, manifest = _build_index(tmp_path / "b", archive=archive, places=[])
+    assert manifest["places_sha256"]
+    assert manifest["counts"]["places"] == 0
+    assert manifest["snapshot_id"] != feeds_only["snapshot_id"]
+    index = transitio_index.read_index(cache / "index")
+    assert index.places is not None
+    assert len(index.places) == 0
+
+
+def test_an_explicit_default_metro_wins_over_metro_derivation(tmp_path):
+    pytest.importorskip("geopandas")
+    places = [
+        _place("Q-pick", "city", metro_ids=["Q-a", "Q-b"], default_metro_id="Q-b"),
+    ]
+    cache, _ = _build_index(tmp_path, places=places)
+    index = transitio_index.read_index(cache / "index")
+    assert index.places.iloc[0]["default_metro_id"] == "Q-b"
+
+
+def test_places_without_an_overture_release_are_refused(tmp_path):
+    with pytest.raises(publish.PublishError, match="overture_release"):
+        _build_index(tmp_path, places=PLACES, release="")
