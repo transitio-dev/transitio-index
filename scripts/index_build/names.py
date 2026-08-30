@@ -37,7 +37,7 @@ def merge_names(cache_dir, *, wikidata=None):
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
         with store.exclusive_writer(directory):
-            places, _ = store.read_jsonl(
+            places, geometry_manifest = store.read_jsonl(
                 cache_dir / "gazetteer", "geometry.json", "places_seed.jsonl"
             )
             qids = [
@@ -59,6 +59,9 @@ def merge_names(cache_dir, *, wikidata=None):
             manifest = {
                 "source": "names",
                 "wikidata_api": overture.WIKIDATA_API,
+                # Carried forward so the publish stage reads the pinned release
+                # from the same generation as the places, not a separate pointer.
+                "overture_release": geometry_manifest.get("overture_release"),
                 "places": len(places),
                 "enriched": enriched,
                 "retrieved_at": datetime.datetime.now(
