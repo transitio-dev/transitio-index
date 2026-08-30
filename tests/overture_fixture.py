@@ -117,9 +117,10 @@ class StubWikidata:
 
     endpoint = "stub://wikidata"
 
-    def __init__(self, mapping=None, metros=None):
+    def __init__(self, mapping=None, metros=None, labels=None):
         self.mapping = mapping or {}
         self.metros = metros or {}
+        self.labels = labels or {}
         self.queried = []
 
     def p402(self, osm_relation_ids):
@@ -129,3 +130,6 @@ class StubWikidata:
 
     def statistical_metros(self, city_qids):
         return {c: self.metros[c] for c in city_qids if c in self.metros}
+
+    def labels_and_aliases(self, qids):
+        return {q: self.labels[q] for q in qids if q in self.labels}
