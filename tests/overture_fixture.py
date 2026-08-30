@@ -86,6 +86,32 @@ def write_dataset(path, rows):
     return pa_ds.dataset(path)
 
 
+AREA_SCHEMA = pa.schema(
+    [
+        ("division_id", pa.string()),
+        ("geometry", pa.binary()),
+        ("sources", pa.list_(SOURCE)),
+        ("is_land", pa.bool_()),
+    ]
+)
+
+
+def area(division_id, wkb, sources, *, is_land=True):
+    """One ``division_area`` row: a division's polygon and its licence sources."""
+    return {
+        "division_id": division_id,
+        "geometry": wkb,
+        "sources": sources,
+        "is_land": is_land,
+    }
+
+
+def write_area_dataset(path, rows):
+    """Write ``division_area`` ``rows`` as parquet and return a dataset."""
+    pq.write_table(pa.Table.from_pylist(rows, schema=AREA_SCHEMA), path)
+    return pa_ds.dataset(path)
+
+
 class StubWikidata:
     """A Wikidata client stand-in: fixed P402 and metro maps, no network."""
 
