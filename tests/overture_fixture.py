@@ -87,15 +87,19 @@ def write_dataset(path, rows):
 
 
 class StubWikidata:
-    """A Wikidata client stand-in: a fixed P402 map, no network."""
+    """A Wikidata client stand-in: fixed P402 and metro maps, no network."""
 
     endpoint = "stub://wikidata"
 
-    def __init__(self, mapping=None):
+    def __init__(self, mapping=None, metros=None):
         self.mapping = mapping or {}
+        self.metros = metros or {}
         self.queried = []
 
     def p402(self, osm_relation_ids):
         ids = sorted({str(i) for i in osm_relation_ids})
         self.queried.append(ids)
         return {i: self.mapping[i] for i in ids if i in self.mapping}
+
+    def statistical_metros(self, city_qids):
+        return {c: self.metros[c] for c in city_qids if c in self.metros}
