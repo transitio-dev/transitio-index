@@ -79,7 +79,7 @@ def resolve(cache_dir, *, overrides_dir=None):
     directory = store.open_subdir(cache_dir, "resolve")
     try:
         with store.exclusive_writer(directory):
-            feeds, _ = store.read_jsonl(
+            feeds, crosswalk_manifest = store.read_jsonl(
                 cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
             )
             # Build the whole feed<->override match graph first, so neither an
@@ -87,7 +87,9 @@ def resolve(cache_dir, *, overrides_dir=None):
             # feed can slip through a first-match shortcut.
             ref_to_feeds = collections.defaultdict(list)
             for feed in feeds:
-                feed.setdefault("crawlable", True)
+                # Only static GTFS is crawled in v1; GTFS-RT and GBFS are
+                # indexed but never fetched.
+                feed.setdefault("crawlable", feed.get("spec") == "gtfs")
                 feed.setdefault("uncrawlable_reason", None)
                 refs = _matching_refs(feed_overrides, feed)
                 if len(refs) > 1:
@@ -108,6 +110,9 @@ def resolve(cache_dir, *, overrides_dir=None):
             _check_namespace(feeds)
             manifest = {
                 "source": "resolve",
+                # The catalogue versions the feeds were built from, carried
+                # forward so later stages label their output with the same ones.
+                "sources": crosswalk_manifest.get("sources"),
                 "feeds": len(feeds),
                 "overridden_feeds": len(matched),
                 "uncrawlable": sum(1 for feed in feeds if not feed["crawlable"]),

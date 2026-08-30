@@ -238,6 +238,26 @@ def test_a_gbfs_location_places_a_city(tmp_path):
     assert places["Q13291"]["name"] == "Espoo"
 
 
+def test_the_feed_to_place_link_is_persisted_with_its_level(tmp_path):
+    manifest, _, _ = _seed(tmp_path)
+    placements, _ = store.read_jsonl(
+        tmp_path / "cache" / "gazetteer", "seed.json", "feed_places.jsonl"
+    )
+    by_feed = {p["feed_id"]: p for p in placements}
+    assert by_feed["f-hel"] == {
+        "feed_id": "f-hel",
+        "place_id": "Q1757",
+        "level": "municipality",
+    }
+    assert by_feed["f-subdiv"]["place_id"] == "Q1508"
+    assert by_feed["f-subdiv"]["level"] == "subdivision"
+    assert by_feed["f-country"]["level"] == "country"
+    # Reported (unplaced) feeds have no link.
+    assert "f-nowhere" not in by_feed
+    assert "f-spring-amb" not in by_feed
+    assert manifest["feeds_placed"] == len(placements)
+
+
 def test_a_subdivision_disambiguates_a_shared_city_name(tmp_path):
     _, places, _ = _seed(tmp_path)
     # "Springfield" in Illinois must resolve to the Illinois one, not Missouri.
