@@ -70,6 +70,9 @@ QID_PATTERN = re.compile(r"\AQ[1-9][0-9]*\Z")
 # Wikimedia asks automated clients to identify themselves; a generic urllib
 # agent is liable to be refused, which only shows up on the live build path.
 USER_AGENT = "transitio-index-build (+https://github.com/cafein-py/transitio)"
+# Wikidata class for a US metropolitan statistical area, and the properties that
+# link a city to its metro (P8138) and carry the metro's CBSA code (P882).
+US_MSA_CLASS = "Q1768043"
 
 
 class GazetteerError(RuntimeError):
@@ -187,12 +190,13 @@ def normalize_division(row):
 
 
 class WikidataClient:
-    """Reverse OSM-relation → QID lookups against the Wikidata SPARQL endpoint.
+    """Batched lookups against the Wikidata SPARQL endpoint.
 
-    Queried once per build, in batches keyed by the relation id. Only the
-    Overture release is pinned; this endpoint is live, so results track Wikidata
-    at build time. Tests substitute a stub with the same ``p402`` method rather
-    than reaching the network.
+    Resolves OSM relations to QIDs (``p402``) and a city's US metropolitan area
+    (``statistical_metros``), each in id-keyed batches. Only the Overture release
+    is pinned; this endpoint is live, so results track Wikidata at build time.
+    Tests substitute a stub exposing the same methods rather than reaching the
+    network.
     """
 
     def __init__(self, endpoint=WIKIDATA_SPARQL, *, timeout=60, batch_size=200):
@@ -213,12 +217,76 @@ class WikidataClient:
             self._query_batch(ids[start : start + self.batch_size], found)
         return found
 
+    def statistical_metros(self, city_qids):
+        """``{city_qid: [{"qid", "name", "cbsa"}, ...]}`` — US metros per city.
+
+        Each city is linked to the metropolitan statistical area it is *located
+        in the statistical territorial entity* of (P8138, class P31 =
+        ``US_MSA_CLASS``), carrying the metro's CBSA code (P882) where present. A
+        city outside any US MSA — including every non-US city — is simply absent.
+        """
+        ids = sorted({str(qid) for qid in city_qids if qid})
+        raw = {}
+        for start in range(0, len(ids), self.batch_size):
+            self._metros_batch(ids[start : start + self.batch_size], raw)
+        result = {}
+        for city, found in sorted(raw.items()):
+            result[city] = [
+                {
+                    "qid": metro,
+                    "name": info["name"],
+                    # A metro can carry several CBSA codes and SPARQL order is
+                    # unspecified, so pick one deterministically.
+                    "cbsa": min(info["cbsas"]) if info["cbsas"] else None,
+                }
+                for metro, info in sorted(found.items())
+            ]
+        return result
+
+    def _metros_batch(self, batch, raw):
+        values = " ".join(f"wd:{qid}" for qid in batch)
+        query = (
+            "SELECT ?city ?metro ?metroLabel ?cbsa WHERE { "
+            f"VALUES ?city {{ {values} }} "
+            f"?city wdt:P8138 ?metro . ?metro wdt:P31 wd:{US_MSA_CLASS} . "
+            "OPTIONAL { ?metro wdt:P882 ?cbsa } "
+            'SERVICE wikibase:label { bd:serviceParam wikibase:language "en". } }'
+        )
+        for binding in self._get(query):
+            city = binding.get("city", {}).get("value", "").rsplit("/", 1)[-1]
+            metro = binding.get("metro", {}).get("value", "").rsplit("/", 1)[-1]
+            if not (QID_PATTERN.match(city) and QID_PATTERN.match(metro)):
+                continue
+            info = raw.setdefault(city, {}).setdefault(
+                metro, {"name": None, "cbsas": set()}
+            )
+            if info["name"] is None:
+                info["name"] = binding.get("metroLabel", {}).get("value")
+            cbsa = binding.get("cbsa", {}).get("value")
+            if cbsa:
+                info["cbsas"].add(cbsa)
+
     def _query_batch(self, batch, found):
         values = " ".join(f'"{rid}"' for rid in batch)
         query = (
             "SELECT ?osm ?item WHERE { "
             f"VALUES ?osm {{ {values} }} ?item wdt:P402 ?osm . }}"
         )
+        for binding in self._get(query):
+            osm = binding.get("osm", {}).get("value")
+            item = binding.get("item", {}).get("value", "")
+            qid = item.rsplit("/", 1)[-1]
+            if not osm or not QID_PATTERN.match(qid):
+                continue
+            # A relation mapped to a second, different item is ambiguous:
+            # record None so neither is minted.
+            if osm in found and found[osm] != qid:
+                found[osm] = None
+            elif osm not in found:
+                found[osm] = qid
+
+    def _get(self, query):
+        """The SPARQL result bindings for ``query``."""
         url = (
             self.endpoint
             + "?"
@@ -233,18 +301,14 @@ class WikidataClient:
         )
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        for binding in payload.get("results", {}).get("bindings", []):
-            osm = binding.get("osm", {}).get("value")
-            item = binding.get("item", {}).get("value", "")
-            qid = item.rsplit("/", 1)[-1]
-            if not osm or not QID_PATTERN.match(qid):
-                continue
-            # A relation mapped to a second, different item is ambiguous:
-            # record None so neither is minted.
-            if osm in found and found[osm] != qid:
-                found[osm] = None
-            elif osm not in found:
-                found[osm] = qid
+        results = payload.get("results")
+        if not isinstance(results, dict) or not isinstance(
+            results.get("bindings"), list
+        ):
+            # A 200 that is a SPARQL error/status object, not a result set, must
+            # not read as "no matches" and silently publish an empty answer.
+            raise GazetteerError(f"{self.endpoint}: response has no result bindings")
+        return results["bindings"]
 
 
 def resolve_qid(record, p402_map):

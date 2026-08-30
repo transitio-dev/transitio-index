@@ -28,6 +28,7 @@ from index_build import (  # noqa: E402
     crosswalk,
     gbfs,
     mdb,
+    metros,
     overture,
     publish,
     seed,
@@ -77,6 +78,7 @@ def run_gazetteer(arguments):
     return [
         overture.resolve(arguments.cache_dir),
         seed.resolve_seed(arguments.cache_dir),
+        metros.attach_metros(arguments.cache_dir),
     ]
 
 
