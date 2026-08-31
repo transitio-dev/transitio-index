@@ -112,6 +112,88 @@ PLACES = [
 ]
 
 
+SOURCES = {
+    "atlas": {"commit": "a" * 40, "archive_sha256": "x"},
+    "mdb": {"csv_sha256": "y"},
+    "gbfs": {"csv_sha256": "z"},
+}
+
+
+def _covered_feed(feed_id, **kw):
+    return {
+        "feed_id": feed_id,
+        "onestop_id": kw.get("onestop_id"),
+        "mdb_id": None,
+        "id_minted": kw.get("id_minted", False),
+        "source": "atlas",
+        "spec": kw.get("spec", "gtfs"),
+        "name": kw.get("name", feed_id),
+        "aliases": [],
+        "crosswalk_method": "url_exact",
+        "crosswalk_confidence": 1.0,
+        "crawlable": kw.get("crawlable", True),
+        "uncrawlable_reason": None,
+        "coverage_source": kw.get("coverage_source", "declared"),
+    }
+
+
+def _edge(place_id, feed_id, **kw):
+    return {
+        "place_id": place_id,
+        "feed_id": feed_id,
+        "tier": kw.get("tier", "unknown"),
+        "confidence": kw.get("confidence", 0.5),
+        "tier_confidence": 0.0,
+        "method": "inferred",
+        "rehomed_from": [],
+        "evidence": {"declared_level": "municipality", "declared_place_id": place_id},
+        "curation": None,
+        "merged_evidence": [],
+        "curation_history": [],
+        "classification_fingerprint": None,
+        "fingerprint_kind": "none",
+        "selector_state": "unavailable",
+        "selector": None,
+        "needs_review": True,
+    }
+
+
+def _edges_index(tmp_path, edges, feeds=None, release="2026-08-19.0", places=None):
+    """A cache with expanded places and a coverage generation, published."""
+    cache = tmp_path / "cache"
+    _publish_gen(
+        cache,
+        "expanded.json",
+        "places_expanded.jsonl",
+        PLACES if places is None else places,
+        {"source": "expand", "overture_release": release},
+    )
+    if feeds is None:
+        feeds = [_covered_feed("f-a"), _covered_feed("f-b", coverage_source=None)]
+    directory = store.open_subdir(cache, "coverage")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "coverage",
+                "coverage.json",
+                {
+                    "feeds_covered.jsonl": store.jsonl_chunks(feeds),
+                    "edges_candidate.jsonl": store.jsonl_chunks(edges),
+                },
+                {
+                    "source": "coverage",
+                    "mode": "declared",
+                    "sources": SOURCES,
+                    "overture_release": "2026-08-19.0",
+                },
+                held=directory,
+            )
+    finally:
+        directory.close()
+    manifest = publish.publish(cache)
+    return cache, manifest
+
+
 def _build_index(tmp_path, archive=None, places=None, release="2026-08-19.0"):
     """Ingest a small fixture through crosswalk and publish; return the cache."""
     cache = tmp_path / "cache"
@@ -414,3 +496,110 @@ def test_an_explicit_default_metro_wins_over_metro_derivation(tmp_path):
 def test_places_without_an_overture_release_are_refused(tmp_path):
     with pytest.raises(publish.PublishError, match="overture_release"):
         _build_index(tmp_path, places=PLACES, release="")
+
+
+def test_edges_round_trip_through_the_reader(tmp_path):
+    pytest.importorskip("geopandas")
+    edges = [_edge("Q1757", "f-a"), _edge("Q-metro", "f-a")]
+    cache, manifest = _edges_index(tmp_path, edges)
+    index = transitio_index.read_index(cache / "index")
+
+    assert index.edges is not None
+    assert len(index.edges) == 2
+    row = index.edges.set_index("place_id").loc["Q1757"]
+    assert row["feed_id"] == "f-a"
+    assert row["tier"] == "unknown"
+    assert row["confidence"] == 0.5
+    assert row["selector_state"] == "unavailable"
+    assert bool(row["needs_review"]) is True
+    assert json.loads(row["evidence"])["declared_level"] == "municipality"
+    # The feeds come from the coverage generation, stamped with their coverage.
+    import pandas
+
+    by_id = {r["feed_id"]: r for _, r in index.feeds.iterrows()}
+    assert by_id["f-a"]["coverage_source"] == "declared"
+    assert pandas.isna(by_id["f-b"]["coverage_source"])  # null reads back as NaN
+    assert manifest["edges_sha256"]
+    assert manifest["coverage_mode"] == "declared"
+    assert manifest["counts"]["edges"] == 2
+    assert manifest["counts"]["edges_by_tier"] == {"unknown": 2}
+
+
+def test_a_feeds_only_index_has_no_edges(tmp_path):
+    cache, manifest = _build_index(tmp_path)
+    assert "edges_sha256" not in manifest
+    index = transitio_index.read_index(cache / "index")
+    assert index.edges is None
+    assert not (cache / "index" / "edges.parquet").exists()
+
+
+def test_the_reader_refuses_an_edges_parquet_that_does_not_match(tmp_path):
+    pytest.importorskip("geopandas")
+    cache, _ = _edges_index(tmp_path, [_edge("Q1757", "f-a")])
+    (cache / "index" / "edges.parquet").write_bytes(b"not the published parquet")
+    with pytest.raises(IncompatibleIndexError, match="edges_sha256"):
+        transitio_index.read_index(cache / "index")
+
+
+def test_a_duplicate_column_label_is_refused_even_when_correctly_hashed(tmp_path):
+    pytest.importorskip("geopandas")
+    import hashlib
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    cache, _ = _edges_index(tmp_path, [_edge("Q1757", "f-a")])
+    # Every expected edge column plus a second "tier": a set comparison alone
+    # would accept it; the load itself refuses it, as a controlled error.
+    from index_build.publish import _EDGES_SCHEMA
+
+    fields = list(_EDGES_SCHEMA) + [pa.field("tier", pa.string())]
+    table = pa.Table.from_arrays(
+        [pa.array([], type=field.type) for field in fields],
+        schema=pa.schema(fields),
+    )
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    data = sink.getvalue()
+    (cache / "index" / "edges.parquet").write_bytes(data)
+    snap_path = cache / "index" / "snapshot.json"
+    snapshot = json.loads(snap_path.read_text())
+    snapshot["edges_sha256"] = hashlib.sha256(data).hexdigest()
+    snap_path.write_text(json.dumps(snapshot))
+    with pytest.raises(IncompatibleIndexError, match="not a readable edges table"):
+        transitio_index.read_index(cache / "index")
+
+
+def test_the_snapshot_id_reflects_distinct_edges_content(tmp_path):
+    pytest.importorskip("geopandas")
+    _, a = _edges_index(tmp_path / "a", [_edge("Q1757", "f-a")])
+    _, b = _edges_index(tmp_path / "b", [_edge("Q1757", "f-a", confidence=0.35)])
+    assert a["snapshot_id"] != b["snapshot_id"]
+
+
+def test_coverage_without_a_places_generation_is_refused(tmp_path):
+    cache = tmp_path / "cache"
+    directory = store.open_subdir(cache, "coverage")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "coverage",
+                "coverage.json",
+                {
+                    "feeds_covered.jsonl": store.jsonl_chunks([_covered_feed("f-a")]),
+                    "edges_candidate.jsonl": store.jsonl_chunks(
+                        [_edge("Q1757", "f-a")]
+                    ),
+                },
+                {"source": "coverage", "mode": "declared", "sources": SOURCES},
+                held=directory,
+            )
+    finally:
+        directory.close()
+    with pytest.raises(publish.PublishError, match="no places generation"):
+        publish.publish(cache)
+
+
+def test_mismatched_coverage_and_places_releases_are_refused(tmp_path):
+    with pytest.raises(publish.PublishError, match="different Overture releases"):
+        _edges_index(tmp_path, [_edge("Q1757", "f-a")], release="2026-07-01.0")

@@ -1,12 +1,15 @@
-"""Publish stage: the crosswalk feeds and gazetteer places as a shippable index.
+"""Publish stage: the feeds, places and membership edges as a shippable index.
 
-Reads the crosswalk ``feeds.json`` generation and, when the gazetteer has run,
-its ``names.json`` places generation, and writes ``<cache>/index/`` —
-``feeds.parquet`` (one row per feed), ``places.parquet`` (one row per place, a
-GeoParquet with the simplified boundary), and ``snapshot.json`` (the manifest: a
-deterministic snapshot id, the schema version, the source versions, the counts,
-and each Parquet's SHA-256). Places are optional: an index built before the
-gazetteer ran is feeds only, and the reader treats places the same way.
+Writes ``<cache>/index/`` — ``feeds.parquet`` (one row per feed),
+``places.parquet`` (one row per place, a GeoParquet with the simplified
+boundary), ``edges.parquet`` (one membership row per place/feed/tier) and
+``snapshot.json`` (the manifest: a deterministic snapshot id, the schema
+version, the source versions, the counts, and each Parquet's SHA-256). The
+feeds come from the coverage generation when it exists (stamped with
+``coverage_source`` and ``crawlable``, alongside the candidate edges), else from
+the crosswalk; the places from the expanded generation, else the names one.
+Places and edges are optional: an index built before those stages ran is feeds
+only, and the reader treats the missing tables the same way.
 
 The flat identity and crosswalk fields are their own columns; the verbatim Atlas,
 MDB and GBFS source rows are kept as JSON-string columns, so nothing is lost and
@@ -29,6 +32,7 @@ from index_build import store
 SCHEMA_VERSION = 1
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
+EDGES_FILE = "edges.parquet"
 SNAPSHOT_FILE = "snapshot.json"
 
 
@@ -53,6 +57,9 @@ _SCHEMA = pa.schema(
         ("atlas", pa.string()),
         ("mdb", pa.string()),
         ("gbfs", pa.string()),
+        ("crawlable", pa.bool_()),
+        ("uncrawlable_reason", pa.string()),
+        ("coverage_source", pa.string()),
         ("snapshot", pa.string()),
     ]
 )
@@ -81,6 +88,9 @@ def _row(record, snapshot_id):
         "atlas": _json_block(record.get("atlas")),
         "mdb": _json_block(record.get("mdb")),
         "gbfs": _json_block(record.get("gbfs")),
+        "crawlable": record.get("crawlable"),
+        "uncrawlable_reason": record.get("uncrawlable_reason"),
+        "coverage_source": record.get("coverage_source"),
         "snapshot": snapshot_id,
     }
 
@@ -114,18 +124,19 @@ def _place_row(record, snapshot_id):
     }
 
 
-def _places_digest(places):
-    """A stable digest of the raw place records the gazetteer produced."""
-    canonical = json.dumps(places, sort_keys=True, ensure_ascii=False, allow_nan=False)
+def _content_digest(records):
+    """A stable digest of raw records whose content no source version pins."""
+    canonical = json.dumps(records, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _snapshot_id(sources, overture_release=None, places_digest=None):
+def _snapshot_id(sources, overture_release=None, digests=()):
     # Deterministic in the source versions, so the same inputs always produce the
-    # same snapshot id; the build time is metadata and is left out of it. Feeds
-    # are fully determined by those versions. Places also draw on live Wikidata,
-    # which no release pins, so the places' own digest joins the id — otherwise
-    # two builds with the same Overture release but edited Wikidata would collide.
+    # same snapshot id; the build time is metadata and is left out of it.
+    # Crosswalk feeds are fully determined by those versions. Places also draw on
+    # live Wikidata, and covered feeds and edges on the override files — neither
+    # pinned by any source version — so their content digests join the id;
+    # otherwise two builds with the same pins but different content would collide.
     atlas = sources["atlas"]
     parts = [
         str(SCHEMA_VERSION),
@@ -136,8 +147,7 @@ def _snapshot_id(sources, overture_release=None, places_digest=None):
     ]
     if overture_release:
         parts.append(overture_release)
-    if places_digest:
-        parts.append(places_digest)
+    parts.extend(digests)
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
@@ -220,23 +230,101 @@ def _places_parquet_bytes(places, snapshot_id):
     return sink.getvalue()
 
 
+_EDGES_SCHEMA = pa.schema(
+    [
+        ("place_id", pa.string()),
+        ("feed_id", pa.string()),
+        ("tier", pa.string()),
+        ("confidence", pa.float64()),
+        ("tier_confidence", pa.float64()),
+        ("method", pa.string()),
+        ("rehomed_from", pa.list_(pa.string())),
+        ("evidence", pa.string()),
+        ("curation", pa.string()),
+        ("merged_evidence", pa.string()),
+        ("curation_history", pa.string()),
+        ("classification_fingerprint", pa.string()),
+        ("fingerprint_kind", pa.string()),
+        ("selector_state", pa.string()),
+        ("selector", pa.string()),
+        ("needs_review", pa.bool_()),
+        ("snapshot", pa.string()),
+    ]
+)
+
+
+def _edge_row(record, snapshot_id):
+    return {
+        "place_id": record["place_id"],
+        "feed_id": record["feed_id"],
+        "tier": record["tier"],
+        "confidence": record["confidence"],
+        "tier_confidence": record["tier_confidence"],
+        "method": record["method"],
+        "rehomed_from": record.get("rehomed_from") or [],
+        "evidence": _json_block(record.get("evidence")),
+        "curation": _json_block(record.get("curation")),
+        "merged_evidence": _json_block(record.get("merged_evidence") or []),
+        "curation_history": _json_block(record.get("curation_history") or []),
+        "classification_fingerprint": record.get("classification_fingerprint"),
+        "fingerprint_kind": record["fingerprint_kind"],
+        "selector_state": record["selector_state"],
+        "selector": _json_block(record.get("selector")),
+        "needs_review": record["needs_review"],
+        "snapshot": snapshot_id,
+    }
+
+
+def _edges_parquet_bytes(edges, snapshot_id):
+    table = pa.Table.from_pylist(
+        [_edge_row(record, snapshot_id) for record in edges], schema=_EDGES_SCHEMA
+    )
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    return sink.getvalue()
+
+
 def _read_places(cache_dir):
     """The gazetteer places and the Overture release, or ``(None, None)``.
 
-    The release is taken from the ``names.json`` generation's own manifest — the
-    same generation the places come from — so it cannot be labelled with a
-    different Overture pointer read separately.
+    The expanded generation is preferred (it is what coverage derived edges
+    from), falling back to the names one for a build that has not run the
+    expand stage. The release is taken from the same generation's own manifest,
+    so the places cannot be labelled with a different pointer read separately.
     """
     if not (cache_dir / "gazetteer").is_dir():
         return None, None
+    for pointer, artifact in (
+        ("expanded.json", "places_expanded.jsonl"),
+        ("names.json", "places_seed.jsonl"),
+    ):
+        try:
+            places, manifest = store.read_jsonl(
+                cache_dir / "gazetteer", pointer, artifact
+            )
+        except store.StoreError:
+            continue
+        return places, manifest.get("overture_release")
+    # No published places generation: the index is feeds only.
+    return None, None
+
+
+def _read_coverage(cache_dir):
+    """The covered feeds, candidate edges and manifest, or ``(None, None, None)``.
+
+    One pointer resolution serves both artifacts, so a coverage republish racing
+    this read cannot pair feeds from one generation with edges from another.
+    """
+    if not (cache_dir / "coverage").is_dir():
+        return None, None, None
     try:
-        places, manifest = store.read_jsonl(
-            cache_dir / "gazetteer", "names.json", "places_seed.jsonl"
-        )
+        generation, manifest = store.resolve(cache_dir / "coverage", "coverage.json")
     except store.StoreError:
-        # No published places generation: the index is feeds only.
-        return None, None
-    return places, manifest.get("overture_release")
+        return None, None, None
+    with generation:
+        feeds = store.parse_jsonl(generation.read_bytes("feeds_covered.jsonl"))
+        edges = store.parse_jsonl(generation.read_bytes("edges_candidate.jsonl"))
+    return feeds, edges, manifest
 
 
 def publish(cache_dir):
@@ -250,14 +338,20 @@ def publish(cache_dir):
     publish can therefore only ever see a new Parquet with the old manifest — a
     digest mismatch it refuses — never a mismatched pair read as valid.
     """
-    records, crosswalk = store.read_jsonl(
-        cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
-    )
+    # The coverage generation supersedes the crosswalk as the feed source: its
+    # feeds carry coverage_source and crawlability, and its edges ship alongside.
+    records, edges, coverage = _read_coverage(cache_dir)
+    if records is None:
+        records, crosswalk = store.read_jsonl(
+            cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
+        )
+        sources = crosswalk.get("sources")
+    else:
+        sources = coverage.get("sources")
     if not records:
-        raise PublishError("crosswalk produced no feeds to publish")
-    sources = crosswalk.get("sources")
+        raise PublishError("no feeds to publish")
     if not sources:
-        raise PublishError("crosswalk manifest records no source versions")
+        raise PublishError("the feed manifest records no source versions")
 
     # A gazetteer that ran but produced no places is a places index of zero
     # places, distinct from a feeds-only build (no gazetteer at all) — hence
@@ -267,8 +361,22 @@ def publish(cache_dir):
         # The release folds into the snapshot id; without it a places index would
         # share the feeds-only id for the same feeds.
         raise PublishError("gazetteer places carry no overture_release")
-    places_digest = _places_digest(places) if places is not None else None
-    snapshot_id = _snapshot_id(sources, overture_release, places_digest)
+    if edges is not None:
+        if places is None:
+            raise PublishError("coverage edges exist but no places generation does")
+        if coverage.get("overture_release") != overture_release:
+            raise PublishError(
+                "coverage and places come from different Overture releases; "
+                "re-run the pipeline in stage order"
+            )
+    digests = []
+    if places is not None:
+        digests.append(_content_digest(places))
+    if edges is not None:
+        # Covered feeds and edges also fold in: the override files shape them.
+        digests.append(_content_digest(records))
+        digests.append(_content_digest(edges))
+    snapshot_id = _snapshot_id(sources, overture_release, digests)
     feeds_data = _parquet_bytes(records, snapshot_id)
     counts = _counts(records)
     manifest = {
@@ -288,12 +396,22 @@ def publish(cache_dir):
         counts["places"] = len(places)
         counts["places_by_kind"] = dict(collections.Counter(p["kind"] for p in places))
 
+    edges_data = None
+    if edges is not None:
+        edges_data = _edges_parquet_bytes(edges, snapshot_id)
+        manifest["edges_sha256"] = hashlib.sha256(edges_data).hexdigest()
+        manifest["coverage_mode"] = coverage.get("mode")
+        counts["edges"] = len(edges)
+        counts["edges_by_tier"] = dict(collections.Counter(e["tier"] for e in edges))
+
     directory = store.open_subdir(cache_dir, "index")
     try:
         with store.exclusive_writer(directory):
             store.write_bytes(directory, FEEDS_FILE, feeds_data)
             if places_data is not None:
                 store.write_bytes(directory, PLACES_FILE, places_data)
+            if edges_data is not None:
+                store.write_bytes(directory, EDGES_FILE, edges_data)
             store.write_file(
                 directory,
                 SNAPSHOT_FILE,
