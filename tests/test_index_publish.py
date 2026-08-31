@@ -525,6 +525,16 @@ def test_edges_round_trip_through_the_reader(tmp_path):
     assert manifest["counts"]["edges_by_tier"] == {"unknown": 2}
 
 
+def test_a_manifest_snapshot_id_that_disagrees_with_the_rows_is_refused(tmp_path):
+    cache, _ = _build_index(tmp_path)
+    snap_path = cache / "index" / "snapshot.json"
+    snapshot = json.loads(snap_path.read_text())
+    snapshot["snapshot_id"] = "somethingelse0000"
+    snap_path.write_text(json.dumps(snapshot))
+    with pytest.raises(IncompatibleIndexError, match="snapshot other than"):
+        transitio_index.read_index(cache / "index")
+
+
 def test_a_feeds_only_index_has_no_edges(tmp_path):
     cache, manifest = _build_index(tmp_path)
     assert "edges_sha256" not in manifest
