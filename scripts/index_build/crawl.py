@@ -107,9 +107,7 @@ def _members_intact(feed_dir, state):
         if not path.is_file():
             return False
         try:
-            # O_NOFOLLOW refuses a symlink atomically at open, where a
-            # check-then-open pair could be raced by a replacement.
-            handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            handle = store.open_nofollow(path)
         except OSError:
             return False
         digest = hashlib.sha256()
