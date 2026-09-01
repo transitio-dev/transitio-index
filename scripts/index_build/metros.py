@@ -99,6 +99,9 @@ def attach_metros(cache_dir, *, wikidata=None):
 
             manifest = {
                 "source": "metros",
+                # Carried forward so downstream lineage checks can prove the
+                # expanded places descend from this catalogue snapshot.
+                "sources": seed_manifest.get("sources"),
                 "seed_places": seed_manifest.get("places"),
                 "metros": len(metros),
                 "cities_with_metro": sum(

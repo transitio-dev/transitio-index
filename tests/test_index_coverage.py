@@ -6,7 +6,10 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
-from index_build import coverage, store  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
+
+from index_build import coverage, crawl, store  # noqa: E402
 
 
 def _publish(cache, subdir, pointer, artifact, records, manifest=None):
@@ -92,6 +95,10 @@ def _cover(
     placements=PLACEMENTS,
     seed_sources=SOURCES,
     seed_release=RELEASE,
+    crawls=None,
+    lookup=None,
+    tamper=None,
+    **cover_args,
 ):
     cache = tmp_path / "cache"
     _publish(
@@ -108,7 +115,7 @@ def _cover(
         "expanded.json",
         "places_expanded.jsonl",
         places,
-        {"source": "expand", "overture_release": RELEASE},
+        {"source": "expand", "overture_release": RELEASE, "sources": SOURCES},
     )
     _publish(
         cache,
@@ -118,7 +125,12 @@ def _cover(
         placements,
         {"source": "seed", "sources": seed_sources, "overture_release": seed_release},
     )
-    manifest = coverage.cover(cache)
+    for feed_id, stops_rows in (crawls or {}).items():
+        _write_crawl(cache, feed_id, stops_rows)
+    if tamper:
+        stops = cache / "crawl" / crawl._dir_name(tamper) / "stops.txt"
+        stops.write_bytes(stops.read_bytes() + b"sx,1.0,10.0\n")
+    manifest = coverage.cover(cache, lookup=lookup, **cover_args)
     covered, _ = store.read_jsonl(
         cache / "coverage", "coverage.json", "feeds_covered.jsonl"
     )
@@ -129,6 +141,218 @@ def _cover(
     for edge in edges:
         grouped.setdefault(edge["feed_id"], {})[edge["place_id"]] = edge
     return manifest, {f["feed_id"]: f for f in covered}, grouped
+
+
+def _write_crawl(cache, feed_id, stops_rows):
+    feed_dir = cache / "crawl" / crawl._dir_name(feed_id)
+    feed_dir.mkdir(parents=True, exist_ok=True)
+    stops = ("stop_id,stop_lat,stop_lon\n" + "".join(stops_rows)).encode()
+    (feed_dir / "stops.txt").write_bytes(stops)
+    (feed_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "feed_id": feed_id,
+                "members": ["stops.txt"],
+                "member_sha256": {"stops.txt": hashlib.sha256(stops).hexdigest()},
+            }
+        )
+    )
+    log_path = cache / "crawl" / "crawl_log.jsonl"
+    existing = log_path.read_text() if log_path.is_file() else ""
+    log_path.write_text(
+        existing
+        + json.dumps({"feed_id": feed_id, "directory": crawl._dir_name(feed_id)})
+        + "\n"
+    )
+
+
+class StubLookup:
+    """Answers divisions_at from a fixed table, keyed by stop longitude."""
+
+    def __init__(self, by_x):
+        self.by_x = by_x
+
+    def ensure(self, boxes):
+        return 0
+
+    def divisions_at(self, x, y):
+        return self.by_x.get(x, [])
+
+
+# Longitude 10.0 sits in Q-city (and its region and country); 20.0 in Q-other.
+LOOKUP = StubLookup(
+    {
+        10.0: [
+            {"kind": "city", "wikidata": "Q-city"},
+            {"kind": "region", "wikidata": "Q-reg"},
+            {"kind": "country", "wikidata": "Q-c"},
+        ],
+        20.0: [
+            {"kind": "city", "wikidata": "Q-other"},
+            {"kind": "region", "wikidata": "Q-reg"},
+            {"kind": "country", "wikidata": "Q-c"},
+        ],
+    }
+)
+
+
+def _rows(count, lon):
+    return [f"s{lon}-{i},1.0,{lon}\n" for i in range(count)]
+
+
+def test_crawled_stops_supersede_declared_and_pin_the_cutoff(tmp_path):
+    # 245 of 250 stops in Q-city (confidence 1.0), 5 in Q-other — exactly the
+    # admission threshold, so its confidence 0.68 sits below the 0.70 cutoff.
+    manifest, covered, edges = _cover(
+        tmp_path,
+        crawls={"f-city": _rows(245, 10.0) + _rows(5, 20.0)},
+        lookup=LOOKUP,
+    )
+    assert manifest["mode"] == "crawled"
+    assert manifest["feeds_crawl_covered"] == 1
+    assert covered["f-city"]["coverage_source"] == "crawl"
+    assert covered["f-city"]["stop_count"] == 250
+    assert covered["f-city"]["coverage"]  # measured hull replaces declared
+    city = edges["f-city"]
+    assert city["Q-city"]["method"] == "crawl"
+    assert set(city) == {"Q-city", "Q-other", "Q-reg", "Q-c", "Q-metro", "Q-csa"}
+    assert city["Q-city"]["confidence"] == 1.0
+    assert city["Q-city"]["needs_review"] is False
+    assert city["Q-other"]["confidence"] == pytest.approx(0.68)
+    assert city["Q-other"]["needs_review"] is True
+    assert city["Q-other"]["evidence"] == {
+        "stops_in_place": 5,
+        "stop_share": pytest.approx(0.02),
+        "min_stops": 5,
+        "min_stop_share": 0.02,
+        "review_cutoff": 0.70,
+    }
+    # The metros propagate from the member city at its confidence, and no
+    # declared evidence survives on a superseded feed.
+    assert city["Q-metro"]["confidence"] == 1.0
+    assert "declared_level" not in city["Q-city"]["evidence"]
+
+
+def test_a_tiny_feed_passes_on_share_and_a_sparse_place_fails(tmp_path):
+    # Two of three stops in Q-other: below min_stops but at two-thirds share,
+    # the override admits it; the one Q-city stop fails both rules.
+    _, _, edges = _cover(
+        tmp_path,
+        crawls={"f-none": _rows(2, 20.0) + _rows(1, 10.0)},
+        lookup=LOOKUP,
+    )
+    tiny = edges["f-none"]
+    assert "Q-city" not in tiny
+    assert tiny["Q-other"]["confidence"] == 1.0
+    assert set(tiny) == {"Q-other", "Q-reg", "Q-c"}
+
+
+def test_the_admission_thresholds_are_configurable(tmp_path):
+    _, _, edges = _cover(
+        tmp_path,
+        crawls={"f-city": _rows(245, 10.0) + _rows(5, 20.0)},
+        lookup=LOOKUP,
+        min_stops=6,
+    )
+    # With min_stops raised past the five Q-other stops, only the share
+    # override could admit it, and 0.02 is far below half.
+    assert "Q-other" not in edges["f-city"]
+    assert edges["f-city"]["Q-city"]["evidence"]["min_stops"] == 6
+
+
+def test_dropped_rows_stay_in_the_share_denominator(tmp_path):
+    # Five good stops among 245 unparsable rows must not read as 100% share:
+    # the share is 5/250, exactly the threshold, and confidence 0.68.
+    rows = _rows(5, 20.0) + ["s-bad%d,not-a-lat,20.0\n" % i for i in range(245)]
+    _, covered, edges = _cover(tmp_path, crawls={"f-none": rows}, lookup=LOOKUP)
+    edge = edges["f-none"]["Q-other"]
+    assert edge["confidence"] == pytest.approx(0.68)
+    assert edge["evidence"]["stop_share"] == pytest.approx(0.02)
+    assert covered["f-none"]["stop_count"] == 250
+
+
+def test_the_coverage_hull_respects_the_antimeridian(tmp_path):
+    shapely = pytest.importorskip("shapely")
+    lookup = StubLookup(
+        {
+            179.9: [{"kind": "city", "wikidata": "Q-other"}],
+            -179.9: [{"kind": "city", "wikidata": "Q-other"}],
+        }
+    )
+    _, covered, _ = _cover(
+        tmp_path,
+        crawls={"f-none": _rows(3, 179.9) + _rows(3, -179.9)},
+        lookup=lookup,
+    )
+    hull = shapely.from_wkb(bytes.fromhex(covered["f-none"]["coverage"]))
+    assert hull.covers(shapely.Point(179.9, 1.0))
+    assert hull.covers(shapely.Point(-179.9, 1.0))
+    assert not hull.covers(shapely.Point(0.0, 1.0))
+
+
+def test_the_hull_frame_survives_a_greenwich_and_dateline_mix(tmp_path):
+    # -1, 0 and 180: the naive "shift every negative" frame would span 359
+    # degrees; the largest-gap frame keeps the hull to the short way round.
+    shapely = pytest.importorskip("shapely")
+    records = [{"kind": "city", "wikidata": "Q-other"}]
+    lookup = StubLookup({-1.0: records, 0.0: records, 180.0: records})
+    _, covered, _ = _cover(
+        tmp_path,
+        crawls={"f-none": _rows(2, -1.0) + _rows(2, 0.0) + _rows(2, 180.0)},
+        lookup=lookup,
+    )
+    hull = shapely.from_wkb(bytes.fromhex(covered["f-none"]["coverage"]))
+    assert hull.covers(shapely.Point(-0.5, 1.0))
+    assert hull.covers(shapely.Point(180.0, 1.0))
+    assert not hull.covers(shapely.Point(90.0, 1.0))
+
+
+def test_all_unparsable_stops_still_supersede_declared(tmp_path):
+    # A digest-valid stops.txt whose rows are all unparsable is the crawl's
+    # answer: declared edges go, the row count is kept, nothing is placed.
+    manifest, covered, edges = _cover(
+        tmp_path,
+        crawls={"f-city": ["s%d,not-a-lat,10.0\n" % i for i in range(4)]},
+        lookup=LOOKUP,
+    )
+    assert covered["f-city"]["coverage_source"] == "crawl"
+    assert covered["f-city"]["stop_count"] == 4
+    assert covered["f-city"]["coverage"] is None
+    assert "f-city" not in edges
+
+
+def test_a_state_mismatched_crawl_falls_back_to_declared(tmp_path):
+    manifest, covered, edges = _cover(
+        tmp_path,
+        crawls={"f-city": _rows(10, 10.0)},
+        lookup=LOOKUP,
+        tamper="f-city",
+    )
+    assert manifest["crawl_state_mismatches"] == 1
+    assert covered["f-city"]["coverage_source"] == "declared"
+    assert edges["f-city"]["Q-city"]["confidence"] == 0.50
+
+
+def test_an_unknown_qid_division_means_a_stale_gazetteer(tmp_path):
+    # A QID-bearing division the gazetteer does not know can only mean
+    # places_expanded predates this crawl: refuse, never drop edges silently.
+    lookup = StubLookup(
+        {30.0: [{"kind": "city", "wikidata": "Q999999", "overture_id": "xx"}]}
+    )
+    with pytest.raises(coverage.CoverageError, match="expand stage"):
+        _cover(tmp_path, crawls={"f-city": _rows(6, 30.0)}, lookup=lookup)
+
+
+def test_an_uncovered_lookup_is_a_stage_order_error(tmp_path):
+    class Refusing:
+        def ensure(self, boxes):
+            raise store.StoreError("needs its datasets")
+
+        def divisions_at(self, x, y):
+            return []
+
+    with pytest.raises(coverage.CoverageError, match="expand stage"):
+        _cover(tmp_path, crawls={"f-city": _rows(6, 10.0)}, lookup=Refusing())
 
 
 def test_a_city_placement_reaches_its_ancestors_and_every_metro(tmp_path):

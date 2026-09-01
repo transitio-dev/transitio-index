@@ -69,11 +69,12 @@ def _server(feeds, *, honour_ranges=True):
     return httpx.MockTransport(handler)
 
 
-def _feed(feed_id, url, *, crawlable=True):
+def _feed(feed_id, url, *, crawlable=True, aliases=()):
     return {
         "feed_id": feed_id,
         "spec": "gtfs",
         "crawlable": crawlable,
+        "aliases": list(aliases),
         "atlas": {"urls": {"static_current": url}} if url else None,
         "mdb": None,
     }
@@ -105,11 +106,193 @@ def _feed_dir(cache, feed_id):
     return cache / "crawl" / crawl._dir_name(feed_id)
 
 
-def _crawl(cache, transport, *, range_threshold=10**9):
+def _crawl(cache, transport, *, range_threshold=10**9, lookup=None):
     with _fetcher(transport) as fetcher:
-        summary = crawl.crawl(cache, fetcher=fetcher, range_threshold=range_threshold)
+        summary = crawl.crawl(
+            cache, fetcher=fetcher, range_threshold=range_threshold, lookup=lookup
+        )
     log = store.parse_jsonl((cache / "crawl" / "crawl_log.jsonl").read_bytes())
     return summary, {record["feed_id"]: record for record in log}
+
+
+ROUTES_FIXED = b"route_id,route_type\nr1,0\nr2,715\n"
+CITY_RECORDS = [
+    {"country": "AA", "kind": "city", "overture_id": "aa-city", "wikidata": "Q1"},
+    {"country": "AA", "kind": "region", "overture_id": "aa-reg", "wikidata": "Q2"},
+]
+
+
+class StubLookup:
+    """Answers divisions_at from a fixed table, keyed by stop longitude."""
+
+    def __init__(self, by_x):
+        self.by_x = by_x
+
+    def ensure(self, boxes):
+        return 0
+
+    def divisions_at(self, x, y):
+        return self.by_x.get(x, [])
+
+
+def _members(routes=ROUTES_FIXED, stops=STOPS):
+    members = dict(FULL_MEMBERS)
+    members["routes.txt"] = routes
+    members["stops.txt"] = stops
+    return members
+
+
+@pytest.mark.parametrize("range_threshold", [10**9, 1])
+def test_a_single_city_fixed_tier_feed_skips_stop_times(tmp_path, range_threshold):
+    cache = tmp_path / "cache"
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    data = _zip_bytes(_members())
+    summary, log = _crawl(
+        cache,
+        _server({"/a.zip": (data, '"v1"')}),
+        range_threshold=range_threshold,
+        lookup=StubLookup({24.9: CITY_RECORDS}),
+    )
+    assert log["f-a"]["stop_times"] == "skipped"
+    assert "stop_times.txt" not in log["f-a"]["members"]
+    assert summary["stop_times_skipped"] == 1
+    feed_dir = _feed_dir(cache, "f-a")
+    assert not (feed_dir / "stop_times.txt").exists()
+    state = json.loads((feed_dir / "state.json").read_text())
+    assert state["stop_times"] == {"state": "skipped", "reason": None}
+
+
+TWO_STOPS = b"stop_id,stop_lat,stop_lon\ns1,60.1,24.9\ns2,60.1,25.9\n"
+OTHER_CITY = [
+    {"country": "AA", "kind": "city", "overture_id": "aa-other", "wikidata": "Q3"}
+]
+OTHER_COUNTRY = [
+    {"country": "BB", "kind": "city", "overture_id": "aa-city", "wikidata": "Q1"}
+]
+
+
+@pytest.mark.parametrize(
+    ("members", "lookup", "reason"),
+    [
+        (
+            _members(routes=ROUTES),
+            StubLookup({24.9: CITY_RECORDS}),
+            "route types need geography",
+        ),
+        (_members(), StubLookup({24.9: CITY_RECORDS[1:]}), "a stop matches no city"),
+        (_members(), StubLookup({}), "a stop matches no division"),
+        (
+            _members(stops=TWO_STOPS),
+            StubLookup({24.9: CITY_RECORDS, 25.9: OTHER_CITY}),
+            "stops span cities",
+        ),
+        (
+            _members(),
+            StubLookup({24.9: CITY_RECORDS + OTHER_CITY}),
+            "a stop matches several cities",
+        ),
+        (
+            _members(stops=STOPS + b"sx,not-a-lat,24.9\n"),
+            StubLookup({24.9: CITY_RECORDS}),
+            "unparsable stop rows",
+        ),
+        (
+            _members(stops=TWO_STOPS),
+            StubLookup({24.9: CITY_RECORDS, 25.9: OTHER_COUNTRY}),
+            "stops span countries",
+        ),
+    ],
+)
+def test_the_predicate_refuses_and_reads_complete(tmp_path, members, lookup, reason):
+    cache = tmp_path / "cache"
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    summary, log = _crawl(
+        cache, _server({"/a.zip": (_zip_bytes(members), '"v1"')}), lookup=lookup
+    )
+    assert log["f-a"]["stop_times"] == "complete"
+    assert log["f-a"]["stop_times_reason"] == reason
+    assert (_feed_dir(cache, "f-a") / "stop_times.txt").exists()
+    assert summary["stop_times_skipped"] == 0
+
+
+def test_without_memo_coverage_the_feed_reads_complete(tmp_path):
+    # The default lookup is memo-only; with nothing covered the predicate
+    # must fall back to the full read, never fail the feed.
+    cache = tmp_path / "cache"
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_members()), '"v1"')}))
+    assert log["f-a"]["stop_times"] == "complete"
+    assert log["f-a"]["stop_times_reason"].startswith("predicate error")
+
+
+def test_a_missing_member_is_absent_and_still_fulfils_a_recrawl(tmp_path):
+    # "complete" must mean the member exists AND was read; and a forced read
+    # that finds no member has read everything there is to read.
+    cache = tmp_path / "cache"
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    members = {k: v for k, v in FULL_MEMBERS.items() if k != "stop_times.txt"}
+    server = _server({"/a.zip": (_zip_bytes(members), '"v1"')})
+    _, log = _crawl(cache, server)
+    assert log["f-a"]["stop_times"] == "absent"
+    (cache / "recrawl_requests.jsonl").write_text(json.dumps({"feed_id": "f-a"}) + "\n")
+    summary, log = _crawl(cache, server)
+    assert log["f-a"]["stop_times"] == "absent"
+    assert summary["recrawl_cleared"] == 1
+
+
+def test_a_cached_skip_is_rejudged_against_the_current_lookup(tmp_path):
+    # The archive is unchanged, but the boundary memo now shows a second
+    # city: the cached whole-feed skip no longer holds, so the unchanged
+    # feed is refetched and the complete member lands.
+    cache = tmp_path / "cache"
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    server = _server({"/a.zip": (_zip_bytes(_members()), '"v1"')})
+    _crawl(cache, server, lookup=StubLookup({24.9: CITY_RECORDS}))
+    assert not (_feed_dir(cache, "f-a") / "stop_times.txt").exists()
+    summary, log = _crawl(
+        cache, server, lookup=StubLookup({24.9: CITY_RECORDS + OTHER_CITY})
+    )
+    assert log["f-a"]["method"] == "download"
+    assert log["f-a"]["stop_times"] == "complete"
+    assert (_feed_dir(cache, "f-a") / "stop_times.txt").exists()
+    # And a skip that still holds keeps the cheap not_modified path.
+    _, log = _crawl(cache, server, lookup=StubLookup({24.9: CITY_RECORDS}))
+    assert log["f-a"]["method"] == "not_modified"
+
+
+def test_a_recrawl_request_under_an_old_id_still_forces_and_clears(tmp_path):
+    # An identity override renames a feed but keeps the old id as an alias;
+    # a request written before the rename must still force and clear.
+    cache = tmp_path / "cache"
+    _publish_resolved(
+        cache, [_feed("f-new", "https://feeds.example/a.zip", aliases=["f-old"])]
+    )
+    server = _server({"/a.zip": (_zip_bytes(_members()), '"v1"')})
+    lookup = StubLookup({24.9: CITY_RECORDS})
+    _crawl(cache, server, lookup=lookup)
+    assert not (_feed_dir(cache, "f-new") / "stop_times.txt").exists()
+    (cache / "recrawl_requests.jsonl").write_text(
+        json.dumps({"feed_id": "f-old"}) + "\n"
+    )
+    summary, log = _crawl(cache, server, lookup=lookup)
+    assert log["f-new"]["stop_times"] == "complete"
+    assert summary["recrawl_cleared"] == 1
+    assert (cache / "recrawl_requests.jsonl").read_text() == ""
+
+
+def test_a_recrawl_request_forces_the_complete_read(tmp_path):
+    cache = tmp_path / "cache"
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    server = _server({"/a.zip": (_zip_bytes(_members()), '"v1"')})
+    lookup = StubLookup({24.9: CITY_RECORDS})
+    _crawl(cache, server, lookup=lookup)
+    assert not (_feed_dir(cache, "f-a") / "stop_times.txt").exists()
+    (cache / "recrawl_requests.jsonl").write_text(json.dumps({"feed_id": "f-a"}) + "\n")
+    summary, log = _crawl(cache, server, lookup=lookup)
+    assert log["f-a"]["stop_times"] == "complete"
+    assert log["f-a"]["stop_times_reason"] == "recrawl requested"
+    assert (_feed_dir(cache, "f-a") / "stop_times.txt").read_bytes() == STOP_TIMES
+    assert summary["recrawl_cleared"] == 1
 
 
 def test_a_small_feed_downloads_whole_and_extracts(tmp_path):
