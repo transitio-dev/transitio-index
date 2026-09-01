@@ -129,7 +129,9 @@ def _write_crawl(cache, feed_id, stops_rows):
     feed_dir = cache / "crawl" / crawl._dir_name(feed_id)
     feed_dir.mkdir(parents=True, exist_ok=True)
     stops_text = "stop_id,stop_lat,stop_lon\n" + "".join(stops_rows)
-    (feed_dir / "stops.txt").write_text(stops_text)
+    # Bytes, not text: the state digest is over exact bytes, and Windows
+    # text mode would rewrite the newlines.
+    (feed_dir / "stops.txt").write_bytes(stops_text.encode())
     (feed_dir / "state.json").write_text(
         json.dumps(
             {
