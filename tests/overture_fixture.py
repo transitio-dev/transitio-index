@@ -92,17 +92,41 @@ AREA_SCHEMA = pa.schema(
         ("geometry", pa.binary()),
         ("sources", pa.list_(SOURCE)),
         ("is_land", pa.bool_()),
+        ("country", pa.string()),
+        (
+            "bbox",
+            pa.struct(
+                [
+                    ("xmin", pa.float64()),
+                    ("xmax", pa.float64()),
+                    ("ymin", pa.float64()),
+                    ("ymax", pa.float64()),
+                ]
+            ),
+        ),
     ]
 )
 
 
-def area(division_id, wkb, sources, *, is_land=True):
-    """One ``division_area`` row: a division's polygon and its licence sources."""
+def area(division_id, wkb, sources, *, is_land=True, country=None):
+    """One ``division_area`` row: a division's polygon and its licence sources.
+
+    The ``bbox`` column mirrors the real release (it is what spatial pushdown
+    filters on); it is derived from the WKB, zeroed when that is malformed.
+    """
+    try:
+        import shapely
+
+        xmin, ymin, xmax, ymax = shapely.from_wkb(wkb).bounds
+    except Exception:
+        xmin = ymin = xmax = ymax = 0.0
     return {
         "division_id": division_id,
         "geometry": wkb,
         "sources": sources,
         "is_land": is_land,
+        "country": country,
+        "bbox": {"xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax},
     }
 
 
