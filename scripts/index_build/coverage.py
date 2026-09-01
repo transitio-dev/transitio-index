@@ -1,6 +1,17 @@
-"""Coverage stage, declared mode: membership edges from declared feed locations.
+"""Coverage stage: membership edges from crawled stops, else declared locations.
 
-Which places does a feed serve? With no crawl artifact the answer comes from
+Which places does a feed serve? For a crawled feed the answer is measured: its
+digest-verified stops resolve through the boundary lookup, and every place
+holding at least ``MIN_STOPS`` stops and ``MIN_STOP_SHARE`` of the feed's stops
+(or half the feed's stops regardless of count) gets an edge, at the plan's
+formula confidence with the counts and thresholds recorded as evidence.
+Ancestor edges come free — a stop inside a city is inside its region and
+country polygons too. Metro edges are propagated from member-city edges,
+because minted metros carry no geometry yet (the merged metros stage's own
+convention); when metro polygons exist, PIP takes over with no schema change.
+Crawled evidence supersedes the declared placements feed by feed.
+
+For every other feed the answer comes from
 what the catalogues declare: the seed stage resolved each feed's declared
 municipality, subdivision or country to a gazetteer place, and this stage turns
 those placements into candidate edges — one ``(place, feed)`` row each, at the
@@ -56,27 +67,42 @@ def _check_lineage(resolve_manifest, seed_manifest, expanded_manifest):
             "seed placements and expanded places come from different "
             "Overture releases; re-run the pipeline in stage order"
         )
+    if expanded_manifest.get("sources") != seed_manifest.get("sources"):
+        raise CoverageError(
+            "expanded places do not descend from the seed placements' "
+            "catalogue snapshot; re-run the pipeline in stage order"
+        )
 
 
-# Flat declared membership confidences: an exact municipality match, or a
-# coarser subdivision/country match. Both sit below the 0.70 review cutoff.
-DECLARED_CONFIDENCE = {"municipality": 0.50, "subdivision": 0.35, "country": 0.35}
+# Flat declared membership confidences, all below the 0.70 review cutoff: an
+# exact municipality match, a coarser subdivision/country or bounding-box
+# match, or a >=4-character geohash.
+DECLARED_CONFIDENCE = {
+    "municipality": 0.50,
+    "subdivision": 0.35,
+    "country": 0.35,
+    "bbox": 0.35,
+    "geohash": 0.25,
+}
 REVIEW_CUTOFF = 0.70
 
+# The crawled admission thresholds: a place needs this many stops AND this
+# share of the feed's stops — or half the feed's stops regardless of count.
+MIN_STOPS = 5
+MIN_STOP_SHARE = 0.02
+FULL_SHARE = 0.5
 
-def _edge(place_id, feed_id, confidence, placement):
+
+def _edge(place_id, feed_id, confidence, evidence, method):
     return {
         "place_id": place_id,
         "feed_id": feed_id,
         "tier": "unknown",
         "confidence": confidence,
         "tier_confidence": 0.0,
-        "method": "inferred",
+        "method": method,
         "rehomed_from": [],
-        "evidence": {
-            "declared_level": placement["level"],
-            "declared_place_id": placement["place_id"],
-        },
+        "evidence": evidence,
         "curation": None,
         "merged_evidence": [],
         "curation_history": [],
@@ -150,7 +176,7 @@ def link_static_feeds(feeds, canonical):
     return linked
 
 
-def declared_edges(feeds, places, placements):
+def declared_edges(feeds, places, placements, *, superseded=frozenset()):
     """Candidate edges for the placements, and what could not be placed.
 
     Returns ``(edges, unknown_place_ids, unmatched_feed_ids)``: one edge per
@@ -164,26 +190,209 @@ def declared_edges(feeds, places, placements):
     by_key = {}
     unknown_places = set()
     unmatched_feeds = set()
+    unknown_levels = set()
     for placement in placements:
         feed_id = canonical.get(placement["feed_id"])
         if feed_id is None:
             unmatched_feeds.add(placement["feed_id"])
             continue
-        if feed_id in linked:
+        if feed_id in linked or feed_id in superseded:
             continue
         if placement["place_id"] not in places:
             unknown_places.add(placement["place_id"])
             continue
-        confidence = DECLARED_CONFIDENCE[placement["level"]]
+        confidence = DECLARED_CONFIDENCE.get(placement["level"])
+        if confidence is None:
+            # A level this stage does not know is reported, never guessed at.
+            unknown_levels.add(str(placement["level"]))
+            continue
+        evidence = {
+            "declared_level": placement["level"],
+            "declared_place_id": placement["place_id"],
+        }
         for place_id in _reach(placement["place_id"], places):
             key = (place_id, feed_id)
             if key not in by_key or by_key[key]["confidence"] < confidence:
-                by_key[key] = _edge(place_id, feed_id, confidence, placement)
+                by_key[key] = _edge(place_id, feed_id, confidence, evidence, "inferred")
     edges = [by_key[key] for key in sorted(by_key)]
-    return edges, sorted(unknown_places), sorted(unmatched_feeds)
+    return (
+        edges,
+        sorted(unknown_places),
+        sorted(unmatched_feeds),
+        sorted(unknown_levels),
+    )
 
 
-def cover(cache_dir):
+def _stop_hull(points):
+    """The convex hull of the stops, honest across the antimeridian.
+
+    The frame is chosen by the largest circular longitude gap: when rotating
+    that gap out of the frame gives a narrower span than the plain reading,
+    the hull is built in the shifted frame and split back at the dateline —
+    a Pacific feed gets a narrow two-part hull, while a feed genuinely
+    spanning most longitudes keeps the plain one.
+    """
+    import shapely
+
+    xs = sorted({x for x, _ in points})
+    width = xs[-1] - xs[0]
+    if width <= 180.0:
+        return shapely.convex_hull(shapely.MultiPoint(points))
+    gaps = [(xs[i + 1] - xs[i], xs[i + 1]) for i in range(len(xs) - 1)]
+    gaps.append((xs[0] + 360.0 - xs[-1], xs[0]))
+    gap, cut = max(gaps)
+    if 360.0 - gap >= width:
+        return shapely.convex_hull(shapely.MultiPoint(points))
+    shifted = [(x + 360.0 if x < cut else x, y) for x, y in points]
+    hull = shapely.convex_hull(shapely.MultiPoint(shifted))
+    east = shapely.intersection(hull, shapely.box(-180.0, -90.0, 180.0, 90.0))
+    west = shapely.transform(
+        shapely.intersection(hull, shapely.box(180.0, -90.0, 540.0, 90.0)),
+        lambda coords: coords - [360.0, 0.0],
+    )
+    return shapely.union(east, west)
+
+
+def _crawled_confidence(stops_in_place, stop_share):
+    """The plan's membership formula: 0.6 at the admission threshold, 1.0 at a
+    tenth of the stops or fifty of them."""
+    return 0.6 + 0.4 * min(1.0, max(stop_share / 0.10, stops_in_place / 50))
+
+
+def crawled_edges(
+    cache_dir,
+    feeds,
+    places,
+    lookup,
+    *,
+    min_stops=MIN_STOPS,
+    min_stop_share=MIN_STOP_SHARE,
+):
+    """Measured edges for the crawled feeds; ``(edges_by_key, report)``.
+
+    Reads each crawled feed's digest-verified stops (the crawl's state.json is
+    the commit point, exactly as expansion reads them), resolves every stop
+    through the boundary lookup, and admits ``(place, feed)`` pairs by the
+    thresholds. A feed whose stops were read supersedes its declared
+    placements even when nothing passes — the crawl saw where it stops. Metro
+    edges are propagated from passing member-city edges at the same
+    confidence.
+    """
+    # Heavy deps (shapely/pyarrow via the gazetteer modules) load only when
+    # crawl artifacts exist; the declared path stays importable without them.
+    import shapely
+
+    from index_build import crawl, expand, overture
+
+    canonical = _canonical_ids(feeds)
+    # Division hits map to places by overture id first (a P402-resolved place
+    # has no wikidata on the division record), by QID otherwise.
+    by_overture = {
+        place.get("overture_id"): place_id
+        for place_id, place in places.items()
+        if place.get("overture_id")
+    }
+    by_key = {}
+    superseded = set()
+    crawl_fields = {}
+    stale = set()
+    mismatches = 0
+    unmatched = set()
+    for feed_dir, state in expand._crawled_feeds(cache_dir):
+        state_id = state.get("feed_id")
+        feed_id = canonical.get(state_id) if isinstance(state_id, str) else None
+        if feed_id is None:
+            unmatched.add(str(state_id))
+            continue
+        read = expand._stop_points(feed_dir, state)
+        if read is None:
+            mismatches += 1
+            crawl_fields[feed_id] = {"crawl_status": "state_mismatch"}
+            continue
+        points, dropped = read
+        superseded.add(feed_id)
+        # The schema's crawl bookkeeping, from the state that verified the
+        # evidence: measured hull, stop count, validators, retrieval time.
+        # A digest-valid file whose rows are all unparsable is still the
+        # crawl's answer: it supersedes, counts its rows, and places nothing.
+        crawl_fields[feed_id] = {
+            "stop_count": len(points) + dropped,
+            "coverage": (shapely.to_wkb(_stop_hull(points)).hex() if points else None),
+            "etag": state.get("etag"),
+            "last_modified": state.get("last_modified"),
+            "last_crawled": state.get("retrieved_at"),
+            "crawl_status": "ok",
+        }
+        if not points:
+            continue
+        lookup.ensure(crawl.cluster_boxes(points))
+        counts = collections.Counter()
+        for x, y in points:
+            hit = set()
+            for record in lookup.divisions_at(x, y):
+                place_id = by_overture.get(record.get("overture_id"))
+                if place_id is None and record.get("wikidata") in places:
+                    place_id = record["wikidata"]
+                if place_id is not None:
+                    hit.add(place_id)
+                    continue
+                qid = record.get("wikidata")
+                if record.get("kind") and qid and overture.QID_PATTERN.match(qid):
+                    # A QID-bearing division the gazetteer does not know can
+                    # only mean places_expanded predates this crawl.
+                    stale.add(qid)
+            counts.update(hit)
+        # Dropped rows stay in the denominator: a stop whose coordinates do
+        # not parse is still one of the feed's stops, and excluding it would
+        # let a mostly-corrupt file inflate a share to false confidence.
+        total = len(points) + dropped
+        passing = {}
+        for place_id, stops_in_place in counts.items():
+            share = stops_in_place / total
+            if share >= FULL_SHARE or (
+                stops_in_place >= min_stops and share >= min_stop_share
+            ):
+                passing[place_id] = (stops_in_place, share)
+        for place_id, (stops_in_place, share) in passing.items():
+            evidence = {
+                "stops_in_place": stops_in_place,
+                "stop_share": share,
+                "min_stops": min_stops,
+                "min_stop_share": min_stop_share,
+                "review_cutoff": REVIEW_CUTOFF,
+            }
+            confidence = _crawled_confidence(stops_in_place, share)
+            targets = [place_id]
+            if places[place_id].get("kind") == "city":
+                # Minted metros have no geometry to test yet; membership
+                # propagates from the member city, like the declared path.
+                targets.extend(
+                    metro_id
+                    for metro_id in places[place_id].get("metro_ids") or []
+                    if metro_id in places
+                )
+            for target in targets:
+                key = (target, feed_id)
+                if key not in by_key or by_key[key]["confidence"] < confidence:
+                    by_key[key] = _edge(target, feed_id, confidence, evidence, "crawl")
+    if stale:
+        raise CoverageError(
+            "crawled stops hit QID-bearing divisions the gazetteer does not "
+            f"know ({', '.join(sorted(stale)[:5])}); places_expanded predates "
+            "the crawl — re-run the expand stage"
+        )
+    report = {
+        "superseded": superseded,
+        "state_mismatches": mismatches,
+        "unmatched_crawl_ids": sorted(unmatched),
+        "crawl_fields": crawl_fields,
+    }
+    return by_key, report
+
+
+def cover(
+    cache_dir, *, lookup=None, min_stops=MIN_STOPS, min_stop_share=MIN_STOP_SHARE
+):
     """Derive declared membership edges; publish the ``coverage`` generation.
 
     Reads the resolved feeds, the expanded places and the seed placements, and
@@ -204,19 +413,74 @@ def cover(cache_dir):
             )
             _check_lineage(resolve_manifest, seed_manifest, expanded_manifest)
             places = {place["place_id"]: place for place in place_rows}
-            edges, unknown_places, unmatched_feeds = declared_edges(
-                feeds, places, placements
-            )
 
-            covered = {edge["feed_id"] for edge in edges}
+            crawled_by_key = {}
+            crawl_report = {
+                "superseded": set(),
+                "state_mismatches": 0,
+                "unmatched_crawl_ids": [],
+                "crawl_fields": {},
+            }
+            opened_lookup = None
+            try:
+                if (cache_dir / "crawl" / "crawl_log.jsonl").is_file():
+                    if lookup is None:
+                        from index_build import boundaries
+
+                        opened_lookup = boundaries.BoundaryLookup(
+                            cache_dir,
+                            release=expanded_manifest.get("overture_release"),
+                        )
+                        lookup = opened_lookup
+                    try:
+                        crawled_by_key, crawl_report = crawled_edges(
+                            cache_dir,
+                            feeds,
+                            places,
+                            lookup,
+                            min_stops=min_stops,
+                            min_stop_share=min_stop_share,
+                        )
+                    except store.StoreError as error:
+                        raise CoverageError(
+                            "the boundary lookup cannot answer the crawled "
+                            "stops; run the expand stage first"
+                        ) from error
+            finally:
+                if opened_lookup is not None:
+                    opened_lookup.close()
+
+            edges, unknown_places, unmatched_feeds, unknown_levels = declared_edges(
+                feeds, places, placements, superseded=crawl_report["superseded"]
+            )
+            merged = dict(crawled_by_key)
+            for edge in edges:
+                merged[(edge["place_id"], edge["feed_id"])] = edge
+            edges = [merged[key] for key in sorted(merged)]
+
+            declared_covered = {
+                edge["feed_id"]
+                for edge in edges
+                if edge["feed_id"] not in crawl_report["superseded"]
+            }
             for feed in feeds:
-                feed["coverage_source"] = (
-                    "declared" if feed["feed_id"] in covered else None
-                )
+                if feed["feed_id"] in crawl_report["superseded"]:
+                    # The schema's crawl fields: measured hull and stop count
+                    # replace whatever the catalogues declared.
+                    feed["coverage_source"] = "crawl"
+                    feed.update(crawl_report["crawl_fields"][feed["feed_id"]])
+                elif feed["feed_id"] in declared_covered:
+                    feed["coverage_source"] = "declared"
+                    feed.update(crawl_report["crawl_fields"].get(feed["feed_id"]) or {})
+                else:
+                    feed["coverage_source"] = None
+            covered = {
+                feed["feed_id"] for feed in feeds if feed["coverage_source"] is not None
+            }
 
             manifest = {
                 "source": "coverage",
-                "mode": "declared",
+                "mode": "crawled" if crawl_report["superseded"] else "declared",
                 "sources": resolve_manifest.get("sources"),
                 "overture_release": expanded_manifest.get("overture_release"),
                 "feeds": len(feeds),
@@ -231,12 +495,16 @@ def cover(cache_dir):
                     for feed in feeds
                     if feed.get("dangling_static_feed_id")
                 ),
+                "feeds_crawl_covered": len(crawl_report["superseded"]),
+                "crawl_state_mismatches": crawl_report["state_mismatches"],
+                "unmatched_crawl_ids": crawl_report["unmatched_crawl_ids"],
                 "edges": len(edges),
                 "edges_by_place_kind": dict(
                     collections.Counter(places[e["place_id"]]["kind"] for e in edges)
                 ),
                 "unknown_place_ids": unknown_places,
                 "unmatched_feed_ids": unmatched_feeds,
+                "unknown_placement_levels": unknown_levels,
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),

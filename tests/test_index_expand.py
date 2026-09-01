@@ -305,6 +305,18 @@ def test_a_corrupt_state_file_skips_only_that_feed(tmp_path):
     assert "Q40840" in places
 
 
+def test_a_stops_member_the_parser_refuses_skips_only_that_feed(tmp_path):
+    # A field over csv's parser limit raises mid-parse; that is one feed's
+    # corruption, never the run's.
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES)
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    _write_crawl(cache, "f-huge", ['"' + "x" * 200000 + '",61.5,23.8\n'])
+    manifest, places, _ = _expand(tmp_path, cache)
+    assert manifest["state_mismatches"] == 1
+    assert "Q40840" in places
+
+
 def test_unparsable_stop_rows_are_skipped(tmp_path):
     cache = tmp_path / "cache"
     _publish_names(cache, SEED_PLACES)

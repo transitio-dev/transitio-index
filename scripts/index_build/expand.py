@@ -14,27 +14,20 @@ unchanged as ``places_expanded.jsonl``, so the declared path keeps running end
 to end.
 """
 
-import csv
 import datetime
 import hashlib
-import io
 import json
-import math
 import os
 import re
 
 import shapely
 
-from index_build import boundaries, geometry, metros, overture, seed, store
+from index_build import boundaries, crawl, geometry, metros, overture, seed, store
 from index_build import names as names_stage
 
 EXPANDED_POINTER = "expanded.json"
 PLACES_ARTIFACT = "places_expanded.jsonl"
 REPORT_ARTIFACT = "expansion_report.jsonl"
-
-# Stop clusters become grid cells of this size, padded into lookup boxes.
-GRID_DEG = 0.2
-PAD_DEG = 0.05
 
 # The only directory shape the crawl stage produces; anything else in the log
 # is refused rather than joined into a path.
@@ -42,53 +35,36 @@ _CRAWL_DIR = re.compile(r"\Aid-[0-9a-f]{64}\Z")
 
 
 def _stop_points(feed_dir, state):
-    """The ``(lon, lat)`` stop coordinates of one crawled feed, or None.
+    """``(points, dropped)`` for one crawled feed's stops, or None.
 
     The bytes are verified against the digest ``state.json`` — the crawl's
     per-feed commit point — recorded for them: a crash mid-crawl can leave a
     member newer or older than the state, and a mismatched file must be
-    skipped, never resolved as evidence.
+    skipped, never resolved as evidence. The file is streamed twice (digest,
+    then parse) so no whole member is buffered, and ANY failure — a symlink,
+    a csv field over the parser limit, memory — answers None: one feed's
+    corrupt member must never abort the run.
     """
     path = feed_dir / "stops.txt"
-    if not path.is_file():
+    digests = state.get("member_sha256")
+    expected = digests.get("stops.txt") if isinstance(digests, dict) else None
+    if not expected:
         return None
     try:
         handle = store.open_nofollow(path)
     except OSError:
         return None
-    with os.fdopen(handle, "rb") as opened:
-        data = opened.read()
-    digests = state.get("member_sha256")
-    expected = digests.get("stops.txt") if isinstance(digests, dict) else None
-    if expected != hashlib.sha256(data).hexdigest():
+    try:
+        with os.fdopen(handle, "rb") as opened:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: opened.read(1024 * 1024), b""):
+                digest.update(chunk)
+            if digest.hexdigest() != expected:
+                return None
+            opened.seek(0)
+            return crawl.stop_coordinates(opened)
+    except Exception:
         return None
-    points = []
-    text = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8-sig", errors="replace")
-    for row in csv.DictReader(text):
-        try:
-            x = float(row.get("stop_lon") or "")
-            y = float(row.get("stop_lat") or "")
-        except ValueError:
-            continue
-        # Range-checked, not just finite: a huge value would overflow the
-        # grid-cell arithmetic, a bogus one would scan meaningless boxes.
-        if -180.0 <= x <= 180.0 and -90.0 <= y <= 90.0:
-            points.append((x, y))
-    return points
-
-
-def _cluster_boxes(points):
-    """Padded grid-cell boxes covering the points, one box per occupied cell."""
-    cells = {(math.floor(x / GRID_DEG), math.floor(y / GRID_DEG)) for x, y in points}
-    return [
-        (
-            cx * GRID_DEG - PAD_DEG,
-            cy * GRID_DEG - PAD_DEG,
-            (cx + 1) * GRID_DEG + PAD_DEG,
-            (cy + 1) * GRID_DEG + PAD_DEG,
-        )
-        for cx, cy in sorted(cells)
-    ]
 
 
 def _crawled_feeds(cache_dir):
@@ -101,10 +77,14 @@ def _crawled_feeds(cache_dir):
     if crawl_root.is_symlink() or not crawl_root.is_dir():
         return []
     log_path = crawl_root / "crawl_log.jsonl"
-    if log_path.is_symlink() or not log_path.is_file():
+    try:
+        handle = store.open_nofollow(log_path)
+    except OSError:
         return []
+    with os.fdopen(handle, "rb") as opened:
+        raw = opened.read()
     found = []
-    for record in store.parse_jsonl(log_path.read_bytes()):
+    for record in store.parse_jsonl(raw):
         if not isinstance(record, dict):
             continue
         name = record.get("directory")
@@ -117,11 +97,11 @@ def _crawled_feeds(cache_dir):
         if feed_dir.is_symlink() or not feed_dir.is_dir():
             continue
         state_path = feed_dir / "state.json"
-        if state_path.is_symlink() or not state_path.is_file():
-            continue
         try:
-            state = json.loads(state_path.read_text())
-        except ValueError:
+            handle = store.open_nofollow(state_path)
+            with os.fdopen(handle, "rb") as opened:
+                state = json.loads(opened.read())
+        except (OSError, ValueError):
             continue
         # One corrupt state skips one feed; it must never abort expansion.
         if not isinstance(state, dict) or not isinstance(state.get("members"), list):
@@ -206,22 +186,24 @@ def _discover(cache_dir, places_by_id, lookup, wikidata, area_dataset, report):
     boxes = []
     usable = []
     for feed_dir, state in crawled:
-        points = _stop_points(feed_dir, state)
-        if points is None:
+        read = _stop_points(feed_dir, state)
+        if read is None:
             state_mismatches += 1
             continue
+        points, _ = read
         stops_read += len(points)
-        boxes.extend(_cluster_boxes(points))
+        boxes.extend(crawl.cluster_boxes(points))
         usable.append((feed_dir, state))
     lookup.ensure(boxes)
 
     divisions = {}
     for feed_dir, state in usable:
-        points = _stop_points(feed_dir, state)
-        if points is None:
+        read = _stop_points(feed_dir, state)
+        if read is None:
             # Changed between the passes: no longer trustworthy evidence.
             state_mismatches += 1
             continue
+        points, _ = read
         for x, y in points:
             for record in lookup.divisions_at(x, y):
                 divisions[record["division_id"]] = record
@@ -326,6 +308,7 @@ def expand(cache_dir, *, lookup=None, wikidata=None, area_dataset=None):
 
             manifest = {
                 "source": "expand",
+                "sources": names_manifest.get("sources"),
                 "mode": mode,
                 "places": len(places_by_id),
                 "overture_release": release,

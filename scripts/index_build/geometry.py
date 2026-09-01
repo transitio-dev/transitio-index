@@ -217,7 +217,7 @@ def attach_geometry(cache_dir, *, dataset=None):
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
         with store.exclusive_writer(directory):
-            places, _ = store.read_jsonl(
+            places, metros_manifest = store.read_jsonl(
                 cache_dir / "gazetteer", "metros.json", "places_seed.jsonl"
             )
             wanted = {p["overture_id"] for p in places if p.get("overture_id")}
@@ -265,11 +265,12 @@ def attach_geometry(cache_dir, *, dataset=None):
             notice = _notice(shipped, overture.OVERTURE_RELEASE)
             manifest = {
                 "source": "geometry",
+                "sources": metros_manifest.get("sources"),
                 "overture_release": overture.OVERTURE_RELEASE,
                 "with_geometry": with_geometry,
                 "omitted_by_licence": omitted,
                 "invalid_geometry": invalid,
-                "sources": sorted("|".join(pair) for pair in shipped),
+                "licence_sources": sorted("|".join(pair) for pair in shipped),
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),
