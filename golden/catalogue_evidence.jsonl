@@ -1,0 +1,20 @@
+{"feed_id": "f-9-amtrak~amtrakcalifornia~amtrakcharteredvehicle", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Amtrak", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-9q8y-sfmta", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-9q9-bart", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Bay Area Rapid Transit (BART)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-dq-mtamaryland~marc", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-dq-mtamaryland~subwaylink", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-dr4-septa~bus", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-dr4-septa~rail", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-dr5-mtanyclirr", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Long Island Rail Road", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-dr5-nj~transit~bus", "spec": "gtfs", "atlas_name": null, "mdb_provider": "New Jersey Transit (NJ Transit)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-dr5-nj~transit~rail", "spec": "gtfs", "atlas_name": null, "mdb_provider": "New Jersey Transit (NJ Transit)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-dr5r-mtabc", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-dr5r-mtanewyorkcitytransit", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-dr5r-nyctsubway", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-dr7-mtanyc~metro~north", "spec": "gtfs", "atlas_name": null, "mdb_provider": "MTA", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-f-viarail~traindecharlevoix", "spec": "gtfs", "atlas_name": null, "mdb_provider": "VIA Rail Canada", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-mdb-3215", "spec": "gtfs", "atlas_name": null, "mdb_provider": "DELFI Germany-wide scheduled timetable data (GTFS)", "sources": ["mdb"]}
+{"feed_id": "f-mdb-865", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Helsingin seudun liikenne (HSL)", "sources": ["mdb"]}
+{"feed_id": "f-transport~for~london", "spec": "gtfs", "atlas_name": "Transport for London feed converted into GTFS by Interline", "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-u-se", "spec": "gtfs", "atlas_name": null, "mdb_provider": "TrafikLab", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-u6xr-finferries~sundqvistinvestmentsoyab~nordiccoastline", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Finferries, Alandstrafiken, Rosita Oy, JS Ferryway Ltd Oy, Kuljetus-Savolainen Oy, Archipelago Lines Oy, Sundqvist Investments Oy Ab, Pörtö Line, Nordic Coast Line, Yksityinen, HSL, Vitharun, Espoon kaupunki, Suomen saaristokuljetus, Norsöline, JT-Line Oy, A&S Ravintolat, Merisataman lauttaliikenne, NJK Blekholmen, Ferra Oy, City Cruisers, Aava Lines Oy, Helsingin Risteilypalvelut/TMSJ Group Oy", "sources": ["atlas", "mdb"]}
