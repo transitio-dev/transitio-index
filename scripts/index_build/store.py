@@ -458,6 +458,18 @@ def unlink(directory, name):
     directory.unlink(name)
 
 
+def open_nofollow(path):
+    """Open ``path`` for binary read, refusing a symlinked final component.
+
+    ``O_NOFOLLOW`` makes the refusal atomic at open where the platform has
+    it; elsewhere (Windows) an lstat check runs first instead.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow and os.path.islink(path):
+        raise OSError(errno.ELOOP, "symlink refused", str(path))
+    return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | nofollow)
+
+
 def create_temporary(directory, readable=False):
     """An exclusively created temporary file; the caller owns the handle.
 

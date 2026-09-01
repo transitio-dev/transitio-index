@@ -16,12 +16,13 @@ memoized polygons; the cloud filter only selects candidates by bounding box.
 """
 
 import json
+import math
 
 import pyarrow.dataset as ds
 import shapely
 from shapely.strtree import STRtree
 
-from index_build import overture, store
+from index_build import geometry, overture, store
 
 DIVISIONS_FILE = "divisions.jsonl"
 COVERED_FILE = "covered.jsonl"
@@ -111,19 +112,60 @@ class BoundaryLookup:
         self.close()
 
     def _load(self):
+        damaged = False
         path = self._dir.path / DIVISIONS_FILE
-        if path.is_file():
+        divisions_present = path.is_file()
+        if divisions_present:
+            # The memo gets the same validation as fresh rows: an entry
+            # written before validation existed, or corrupted on disk, must
+            # not seed the containment index.
             for record in store.parse_jsonl(path.read_bytes()):
-                record["geoms"] = [
-                    shapely.from_wkb(bytes.fromhex(entry))
-                    for entry in record.get("geometries") or []
-                ]
+                if not isinstance(record, dict) or not record.get("division_id"):
+                    damaged = True
+                    continue
+                kept, geoms = [], []
+                for entry in record.get("geometries") or []:
+                    try:
+                        geom = shapely.from_wkb(bytes.fromhex(entry))
+                    except Exception:
+                        damaged = True
+                        continue
+                    if not geometry._valid_polygon(geom):
+                        damaged = True
+                        continue
+                    kept.append(entry)
+                    geoms.append(geom)
+                if not kept:
+                    # A record ensure() wrote always carries geometry; none
+                    # left means damage.
+                    damaged = True
+                record["geometries"] = kept
+                record["geoms"] = geoms
                 self._records[record["division_id"]] = record
         path = self._dir.path / COVERED_FILE
         if path.is_file():
-            self._covered = [
-                tuple(row["box"]) for row in store.parse_jsonl(path.read_bytes())
-            ]
+            for row in store.parse_jsonl(path.read_bytes()):
+                box = row.get("box") if isinstance(row, dict) else None
+                if (
+                    isinstance(box, list)
+                    and len(box) == 4
+                    and all(
+                        isinstance(v, (int, float)) and math.isfinite(v) for v in box
+                    )
+                ):
+                    self._covered.append(tuple(box))
+                else:
+                    damaged = True
+        if self._covered and not divisions_present:
+            # The two files persist together; coverage without a divisions
+            # file is not a valid memo. (Coverage with an EMPTY divisions
+            # file is legitimate: an all-ocean box finds no divisions.)
+            damaged = True
+        if damaged:
+            # Damage must not count as covered: the dropped entries would
+            # become permanent false negatives, so coverage is cleared and
+            # the next ensure() refetches and repairs the memo.
+            self._covered = []
         self._tree = None
 
     def _persist(self):
@@ -180,6 +222,10 @@ class BoundaryLookup:
                         try:
                             geom = shapely.force_2d(shapely.from_wkb(row["geometry"]))
                         except Exception:
+                            continue
+                        if not geometry._valid_polygon(geom):
+                            # Empty, invalid or non-polygon geometry must not
+                            # enter the containment index as division evidence.
                             continue
                         key = shapely.to_wkb(geom).hex()
                         polygons.setdefault(row["division_id"], {})[key] = geom
