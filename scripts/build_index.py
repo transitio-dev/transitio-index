@@ -26,6 +26,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from index_build import (  # noqa: E402
     atlas,
     coverage,
+    crawl,
     crosswalk,
     expand,
     gbfs,
@@ -97,6 +98,10 @@ def run_expand(arguments):
     return [expand.expand(arguments.cache_dir)]
 
 
+def run_crawl(arguments):
+    return [crawl.crawl(arguments.cache_dir)]
+
+
 def run_coverage(arguments):
     return [coverage.cover(arguments.cache_dir)]
 
@@ -110,6 +115,7 @@ STAGES = {
     "crosswalk": run_crosswalk,
     "gazetteer": run_gazetteer,
     "resolve": run_resolve,
+    "crawl": run_crawl,
     "expand": run_expand,
     "coverage": run_coverage,
     "publish": run_publish,
