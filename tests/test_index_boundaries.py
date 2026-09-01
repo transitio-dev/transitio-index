@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -60,6 +61,21 @@ AREAS = [
     # must be ignored despite matching the bbox pushdown.
     fx.area("fi-sea", _wkb(24.0, 59.0, 25.5, 60.3), CC0, is_land=False, country="FI"),
     fx.area("fi-bad", b"not wkb", CC0, country="FI"),
+    # Parseable but not usable as containment evidence: a line and a bowtie.
+    fx.area(
+        "fi-line",
+        shapely.to_wkb(shapely.LineString([(24.9, 60.12), (25.0, 60.18)])),
+        CC0,
+        country="FI",
+    ),
+    fx.area(
+        "fi-bowtie",
+        shapely.to_wkb(
+            shapely.Polygon([(24.9, 60.15), (25.0, 60.2), (25.0, 60.15), (24.9, 60.2)])
+        ),
+        CC0,
+        country="FI",
+    ),
 ]
 
 HEL_BOX = (24.9, 60.15, 25.0, 60.2)
@@ -192,6 +208,33 @@ def test_a_point_outside_everything_finds_nothing(tmp_path):
     with _lookup(tmp_path, cache) as lookup:
         lookup.ensure([(0.0, 0.0, 1.0, 1.0)])
         assert lookup.divisions_at(0.5, 0.5) == []
+
+
+def test_a_stale_memo_entry_is_not_trusted(tmp_path):
+    # A memo written before geometry validation existed (or corrupted on
+    # disk) must be filtered on load, not fed to the containment index.
+    cache = tmp_path / "cache"
+    with _lookup(tmp_path, cache) as lookup:
+        lookup.ensure([HEL_BOX])
+    memo = cache / "boundary_lookup" / "test-release" / "divisions.jsonl"
+    rows = [json.loads(line) for line in memo.read_text().splitlines()]
+    line_hex = shapely.to_wkb(shapely.LineString([(24.9, 60.12), (25.0, 60.18)])).hex()
+    for row in rows:
+        if row["division_id"] == "fi-hel":
+            row["geometries"] = [line_hex, "not hex"]
+    memo.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    reopened = boundaries.BoundaryLookup(cache, release="test-release")
+    try:
+        found = reopened.divisions_at(24.94, 60.17)
+        assert [r["division_id"] for r in found] == ["fi-uusimaa", "fi"]
+    finally:
+        reopened.close()
+    # The corruption cleared coverage, so a lookup WITH datasets refetches
+    # and the record recovers its geometry.
+    with _lookup(tmp_path, cache) as recovered:
+        recovered.ensure([HEL_BOX])
+        found = recovered.divisions_at(24.94, 60.17)
+        assert [r["division_id"] for r in found] == ["fi-hel", "fi-uusimaa", "fi"]
 
 
 def test_the_memo_is_keyed_by_release(tmp_path):

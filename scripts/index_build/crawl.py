@@ -29,6 +29,7 @@ import datetime
 import hashlib
 import json
 import os
+import tempfile
 import zipfile
 import zlib
 
@@ -61,17 +62,24 @@ def _feed_url(feed):
 
 
 def _dir_name(feed_id):
-    """A cache-safe directory name for the feed; hashed when the id is not."""
-    if store.safe_component(feed_id):
-        return feed_id
-    return "id-" + hashlib.sha256(feed_id.encode("utf-8")).hexdigest()[:16]
+    """The digest-keyed cache directory for the feed.
+
+    Paths never key on the id itself: Onestop ids are Unicode, can exceed a
+    filesystem's byte limit while passing a character count, and can collide
+    as filenames under normalisation. ``state.json`` carries the real id. The
+    digest is kept whole — ids are upstream-controlled, and a truncated hash
+    would make chosen collisions feasible.
+    """
+    return "id-" + hashlib.sha256(feed_id.encode("utf-8")).hexdigest()
 
 
 def _read_state(directory):
     try:
-        return json.loads(store.read_text(directory, STATE_FILE))
+        state = json.loads(store.read_text(directory, STATE_FILE))
     except (store.StoreError, ValueError):
         return {}
+    # A corrupt file must read as "no usable state", never abort the crawl.
+    return state if isinstance(state, dict) else {}
 
 
 def _write_state(directory, state):
@@ -88,14 +96,24 @@ def _members_intact(feed_dir, state):
     """
     names = state.get("members") or []
     digests = state.get("member_sha256") or {}
+    # Persisted state never chooses paths: names outside the fixed member set
+    # (or a malformed list) mean a corrupt state, not a valid cache.
+    if not isinstance(names, list) or not all(name in MEMBERS for name in names):
+        return False
     if not names or not isinstance(digests, dict) or set(digests) != set(names):
         return False
     for name in names:
         path = feed_dir.path / name
-        if path.is_symlink() or not path.is_file():
+        if not path.is_file():
+            return False
+        try:
+            # O_NOFOLLOW refuses a symlink atomically at open, where a
+            # check-then-open pair could be raced by a replacement.
+            handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
             return False
         digest = hashlib.sha256()
-        with open(path, "rb") as opened:
+        with os.fdopen(handle, "rb") as opened:
             for chunk in iter(lambda: opened.read(1024 * 1024), b""):
                 digest.update(chunk)
         if digest.hexdigest() != digests[name]:
@@ -109,21 +127,27 @@ def _recrawl_ids(cache_dir):
     if not path.is_file():
         return frozenset()
     records = store.parse_jsonl(path.read_bytes())
-    return frozenset(r["feed_id"] for r in records if r.get("feed_id"))
+    return frozenset(
+        r["feed_id"]
+        for r in records
+        if isinstance(r, dict) and isinstance(r.get("feed_id"), str) and r["feed_id"]
+    )
 
 
 def _range_validator(probe):
     """A validator strong enough to pin range reads, or None.
 
-    A weak ETag (``W/...``) permits byte-different representations, which is
-    exactly what multi-request range reads must exclude (RFC 7233 requires a
-    strong validator in ``If-Range``); Last-Modified stands in when the strong
-    ETag is absent.
+    Only a strong ETag qualifies: a weak ETag (``W/...``) permits
+    byte-different representations, and a Last-Modified timestamp can stay
+    unchanged across several representations within its one-second
+    granularity — either could let multi-request reads assemble members from
+    different snapshots. Last-Modified still serves the conditional-skip
+    paths; it just never pins ranges.
     """
     etag = probe.get("etag")
     if etag and not etag.startswith("W/"):
         return etag
-    return probe.get("last_modified")
+    return None
 
 
 def _prune_members(feed_dir, kept):
@@ -365,11 +389,14 @@ def crawl(cache_dir, *, fetcher=None, range_threshold=fetch.RANGE_THRESHOLD):
     feeds, resolve_manifest = store.read_jsonl(
         cache_dir / "resolve", "feeds_resolved.json", "feeds_resolved.jsonl"
     )
-    recrawl = _recrawl_ids(cache_dir)
     directory = store.open_subdir(cache_dir, "crawl")
     log = []
     try:
         with store.exclusive_writer(directory):
+            # Read under the same lock appenders and the clearing rewrite
+            # hold, so a compliant concurrent writer can neither expose a
+            # partial file nor have a fresh request missed by this run.
+            recrawl = _recrawl_ids(cache_dir)
             for feed in feeds:
                 if not feed.get("crawlable"):
                     continue
@@ -387,6 +414,39 @@ def crawl(cache_dir, *, fetcher=None, range_threshold=fetch.RANGE_THRESHOLD):
                 LOG_FILE,
                 lambda: (json.dumps(record) + "\n" for record in log),
             )
+            cleared = 0
+            if recrawl:
+                # A request is cleared only by the complete read that satisfied
+                # it; everything else survives the run for the next build.
+                fulfilled = {
+                    record["feed_id"]
+                    for record in log
+                    if record["method"] in ("range", "download")
+                    and "stop_times.txt" in record["members"]
+                }
+                cleared = sum(1 for feed_id in recrawl if feed_id in fulfilled)
+                if cleared:
+                    path = cache_dir / "recrawl_requests.jsonl"
+                    # Non-object rows survive untouched: only rows whose
+                    # request was satisfied are removed.
+                    remaining = [
+                        row
+                        for row in store.parse_jsonl(path.read_bytes())
+                        if not isinstance(row, dict)
+                        or row.get("feed_id") not in fulfilled
+                    ]
+                    # A random O_EXCL temporary: a predictable name could be a
+                    # pre-planted symlink. Appenders must hold this crawl lock.
+                    handle, partial = tempfile.mkstemp(dir=cache_dir, suffix=".recrawl")
+                    try:
+                        with os.fdopen(handle, "w") as opened:
+                            opened.write(
+                                "".join(json.dumps(row) + "\n" for row in remaining)
+                            )
+                        os.replace(partial, path)
+                    except BaseException:
+                        os.unlink(partial)
+                        raise
     finally:
         directory.close()
 
@@ -401,5 +461,6 @@ def crawl(cache_dir, *, fetcher=None, range_threshold=fetch.RANGE_THRESHOLD):
         "bytes_fetched": sum(r["bytes_fetched"] for r in log),
         "bytes_saved": sum(r["bytes_saved"] for r in log),
         "recrawl_requested": len(recrawl),
+        "recrawl_cleared": cleared,
         "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }

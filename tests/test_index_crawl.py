@@ -100,6 +100,11 @@ def _fetcher(transport):
     )
 
 
+def _feed_dir(cache, feed_id):
+    """The digest-keyed directory the crawl stage uses for a feed."""
+    return cache / "crawl" / crawl._dir_name(feed_id)
+
+
 def _crawl(cache, transport, *, range_threshold=10**9):
     with _fetcher(transport) as fetcher:
         summary = crawl.crawl(cache, fetcher=fetcher, range_threshold=range_threshold)
@@ -115,7 +120,7 @@ def test_a_small_feed_downloads_whole_and_extracts(tmp_path):
     assert log["f-a"]["method"] == "download"
     assert log["f-a"]["archive_sha256"] == hashlib.sha256(data).hexdigest()
     assert log["f-a"]["members"] == sorted(FULL_MEMBERS)
-    feed_dir = cache / "crawl" / "f-a"
+    feed_dir = _feed_dir(cache, "f-a")
     assert (feed_dir / "stops.txt").read_bytes() == STOPS
     assert (feed_dir / "stop_times.txt").read_bytes() == STOP_TIMES
     assert not (feed_dir / "feed.zip").exists()  # archive removed after extraction
@@ -131,7 +136,7 @@ def test_a_large_feed_reads_members_through_ranges(tmp_path):
     summary, log = _crawl(cache, _server({"/a.zip": (data, '"v1"')}), range_threshold=1)
     assert log["f-a"]["method"] == "range"
     assert log["f-a"]["members"] == sorted(FULL_MEMBERS)
-    assert (cache / "crawl" / "f-a" / "stop_times.txt").read_bytes() == STOP_TIMES
+    assert (_feed_dir(cache, "f-a") / "stop_times.txt").read_bytes() == STOP_TIMES
     assert summary["bytes_fetched"] > 0
 
 
@@ -155,15 +160,14 @@ def test_a_weak_etag_cannot_pin_range_reads(tmp_path):
     assert log["f-a"]["fallback_reason"] == "no validator to pin range reads"
 
 
-def test_a_weak_etag_with_last_modified_still_ranges(tmp_path):
+def test_last_modified_alone_cannot_pin_range_reads(tmp_path):
+    # A timestamp can stay identical across representations within its
+    # one-second granularity, so it never pins multi-request reads.
     cache = tmp_path / "cache"
     data = _zip_bytes()
     stamp = "Mon, 01 Sep 2025 00:00:00 GMT"
-    pins = []
 
     def handler(request):
-        if request.headers.get("If-Range"):
-            pins.append(request.headers["If-Range"])
         headers = {
             "Content-Length": str(len(data)),
             "Accept-Ranges": "bytes",
@@ -172,19 +176,12 @@ def test_a_weak_etag_with_last_modified_still_ranges(tmp_path):
         }
         if request.method == "HEAD":
             return httpx.Response(200, headers=headers)
-        span = request.headers["Range"].split("=", 1)[1]
-        start_text, _, end_text = span.partition("-")
-        start, end = int(start_text), int(end_text) + 1
-        body = data[start:end]
-        headers = dict(headers)
-        headers["Content-Length"] = str(len(body))
-        headers["Content-Range"] = f"bytes {start}-{end - 1}/{len(data)}"
-        return httpx.Response(206, headers=headers, content=body)
+        return httpx.Response(200, headers=headers, content=data)
 
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
     _, log = _crawl(cache, httpx.MockTransport(handler), range_threshold=1)
-    assert log["f-a"]["method"] == "range"
-    assert set(pins) == {stamp}  # pinned by Last-Modified, never the weak ETag
+    assert log["f-a"]["method"] == "download"
+    assert log["f-a"]["fallback_reason"] == "no validator to pin range reads"
 
 
 def test_a_url_change_refetches_despite_matching_validators(tmp_path):
@@ -227,7 +224,7 @@ def test_a_corrupted_cached_member_forces_a_refetch(tmp_path):
     server = _server({"/a.zip": (data, '"v1"')})
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
     _crawl(cache, server)
-    stops = cache / "crawl" / "f-a" / "stops.txt"
+    stops = _feed_dir(cache, "f-a") / "stops.txt"
     stops.write_bytes(b"tampered\n")
     _, log = _crawl(cache, server)
     assert log["f-a"]["method"] == "download"  # digest mismatch, no 304 skip
@@ -240,7 +237,7 @@ def test_a_symlinked_cached_member_forces_a_refetch(tmp_path):
     server = _server({"/a.zip": (data, '"v1"')})
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
     _crawl(cache, server)
-    stops = cache / "crawl" / "f-a" / "stops.txt"
+    stops = _feed_dir(cache, "f-a") / "stops.txt"
     aside = tmp_path / "aside.txt"
     aside.write_bytes(STOPS)  # same content: only the symlink is wrong
     stops.unlink()
@@ -250,7 +247,7 @@ def test_a_symlinked_cached_member_forces_a_refetch(tmp_path):
         pytest.skip("no symlink support here")
     _, log = _crawl(cache, server)
     assert log["f-a"]["method"] == "download"
-    assert not (cache / "crawl" / "f-a" / "stops.txt").is_symlink()
+    assert not (_feed_dir(cache, "f-a") / "stops.txt").is_symlink()
 
 
 def test_an_encrypted_archive_fails_the_feed_not_the_run(tmp_path):
@@ -279,7 +276,7 @@ def test_an_encrypted_archive_fails_the_feed_not_the_run(tmp_path):
     )
     assert log["f-enc"]["method"] == "failed"
     assert log["f-good"]["method"] == "download"
-    assert not (cache / "crawl" / "f-enc" / "feed.zip").exists()
+    assert not (_feed_dir(cache, "f-enc") / "feed.zip").exists()
 
 
 def test_an_oversized_member_fails_without_leaving_the_archive(tmp_path, monkeypatch):
@@ -289,18 +286,18 @@ def test_an_oversized_member_fails_without_leaving_the_archive(tmp_path, monkeyp
     _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(), None)}))
     assert log["f-a"]["method"] == "failed"
     assert "ceiling" in log["f-a"]["fallback_reason"]
-    assert not (cache / "crawl" / "f-a" / "feed.zip").exists()
+    assert not (_feed_dir(cache, "f-a") / "feed.zip").exists()
 
 
 def test_a_member_dropped_upstream_is_pruned_locally(tmp_path):
     cache = tmp_path / "cache"
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
     _crawl(cache, _server({"/a.zip": (_zip_bytes(), '"v1"')}))
-    assert (cache / "crawl" / "f-a" / "stop_times.txt").exists()
+    assert (_feed_dir(cache, "f-a") / "stop_times.txt").exists()
     slimmer = {k: v for k, v in FULL_MEMBERS.items() if k != "stop_times.txt"}
     _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(slimmer), '"v2"')}))
     assert "stop_times.txt" not in log["f-a"]["members"]
-    assert not (cache / "crawl" / "f-a" / "stop_times.txt").exists()
+    assert not (_feed_dir(cache, "f-a") / "stop_times.txt").exists()
 
 
 def test_state_records_per_member_digests_on_both_paths(tmp_path):
@@ -315,7 +312,7 @@ def test_state_records_per_member_digests_on_both_paths(tmp_path):
             cache, _server({"/a.zip": (data, '"v1"')}), range_threshold=threshold
         )
         assert log["f-a"]["method"] == expected_method
-        state = json.loads((cache / "crawl" / "f-a" / "state.json").read_text())
+        state = json.loads((_feed_dir(cache, "f-a") / "state.json").read_text())
         assert state["member_sha256"]["stops.txt"] == hashlib.sha256(STOPS).hexdigest()
 
 
@@ -330,7 +327,7 @@ def test_a_range_hostile_server_falls_back_to_download(tmp_path):
     )
     assert log["f-a"]["method"] == "download"
     assert log["f-a"]["fallback_reason"] == "no range support"
-    assert (cache / "crawl" / "f-a" / "stops.txt").read_bytes() == STOPS
+    assert (_feed_dir(cache, "f-a") / "stops.txt").read_bytes() == STOPS
 
 
 def test_an_unchanged_feed_is_skipped_on_rerun(tmp_path):
@@ -342,7 +339,7 @@ def test_an_unchanged_feed_is_skipped_on_rerun(tmp_path):
     summary, log = _crawl(cache, server)
     assert log["f-a"]["method"] == "not_modified"
     assert log["f-a"]["bytes_fetched"] == 0
-    assert (cache / "crawl" / "f-a" / "stops.txt").read_bytes() == STOPS
+    assert (_feed_dir(cache, "f-a") / "stops.txt").read_bytes() == STOPS
     assert summary["by_method"] == {"not_modified": 1}
 
 
@@ -358,6 +355,12 @@ def test_a_recrawl_request_bypasses_the_skip(tmp_path):
     summary, log = _crawl(cache, server)
     assert log["f-a"]["method"] == "download"  # fetched despite matching ETag
     assert summary["recrawl_requested"] == 1
+    # The complete read fulfilled the request, so it is cleared — and only
+    # then: the next run skips again on validators.
+    assert summary["recrawl_cleared"] == 1
+    assert (cache / "recrawl_requests.jsonl").read_text() == ""
+    summary, log = _crawl(cache, server)
+    assert log["f-a"]["method"] == "not_modified"
 
 
 def test_a_feed_directory_conflict_fails_the_feed_not_the_run(tmp_path):
@@ -373,7 +376,7 @@ def test_a_feed_directory_conflict_fails_the_feed_not_the_run(tmp_path):
         ],
     )
     (cache / "crawl").mkdir(parents=True)
-    (cache / "crawl" / "f-squat").write_text("not a directory")
+    _feed_dir(cache, "f-squat").write_text("not a directory")
     summary, log = _crawl(cache, _server({"/a.zip": (data, None)}))
     assert log["f-squat"]["method"] == "failed"
     assert log["f-good"]["method"] == "download"
@@ -427,7 +430,7 @@ def test_a_feed_without_stop_times_still_crawls(tmp_path):
     _, log = _crawl(cache, _server({"/a.zip": (data, None)}))
     assert log["f-a"]["method"] == "download"
     assert "stop_times.txt" not in log["f-a"]["members"]
-    assert (cache / "crawl" / "f-a" / "stops.txt").exists()
+    assert (_feed_dir(cache, "f-a") / "stops.txt").exists()
 
 
 def test_the_mdb_url_is_the_fallback(tmp_path):
