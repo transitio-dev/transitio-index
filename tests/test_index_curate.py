@@ -20,6 +20,10 @@ from index_build import (  # noqa: E402
 )
 from test_index_classify import (  # noqa: E402
     LOOKUP,
+    ROUTES_A,
+    STOP_TIMES_A,
+    STOPS_A,
+    TRIPS_A,
     _build,
     _candidate,
     _coverage,
@@ -480,6 +484,80 @@ def test_a_selector_on_a_tier_another_entry_creates_hashes_the_route_evidence(tm
     fresh = {**selector, "evidence_hash": row["current_evidence_hash"]}
     _, manifest, _ = _curate(tmp_path / "fresh", [creator, fresh])
     assert manifest["stale_overrides"] == 0
+
+
+def test_a_linked_rt_feed_inherits_its_static_feeds_curated_membership(tmp_path):
+    # f-rt is linked to f-a, f-lone to nothing. The static-side override
+    # (national dropped in Q-city) is applied BEFORE propagation, so the
+    # companion inherits the curated tiers; the RT-side override runs after
+    # it, so a curator can still trim an inherited edge.
+    cache = tmp_path / "cache"
+    feeds = [
+        {"feed_id": "f-a", "spec": "gtfs", "coverage_source": "crawl", "aliases": []},
+        {
+            "feed_id": "f-rt",
+            "spec": "gtfs-rt",
+            "coverage_source": None,
+            "aliases": [],
+            "static_feed_id": "f-a",
+            "static_link_method": "declared",
+        },
+        {
+            "feed_id": "f-lone",
+            "spec": "gtfs-rt",
+            "coverage_source": "declared",
+            "aliases": [],
+            "static_feed_id": None,
+            "static_link_method": "none",
+        },
+    ]
+    _write_crawl(
+        cache,
+        "f-a",
+        {
+            "stops.txt": STOPS_A,
+            "routes.txt": ROUTES_A,
+            "trips.txt": TRIPS_A,
+            "stop_times.txt": STOP_TIMES_A,
+        },
+        "complete",
+    )
+    candidates = [
+        _candidate(place, "f-a")
+        for place in ("Q-city", "Q-reg", "Q-c", "Q-metro", "Q-other")
+    ] + [_candidate("Q-other", "f-lone")]
+    _coverage(cache, feeds, candidates)
+    classify.classify(cache, lookup=LOOKUP)
+    entries = [
+        {"feed": "f-a", "place": "Q-city", "set_tiers": ["local"], **ENTRY},
+        {"feed": "f-rt", "place": "Q-other", "tier": "unknown", "remove_edge": True},
+    ]
+    manifest = curate.curate(cache, overrides_dir=_overrides(tmp_path, entries))
+    edges, _ = store.read_jsonl(
+        cache / "curate", "edges_final.json", "edges_final.jsonl"
+    )
+    rt = {e["place_id"]: e for e in edges if e["feed_id"] == "f-rt"}
+    assert set(rt) == {"Q-city", "Q-reg", "Q-c", "Q-metro"}
+    city = rt["Q-city"]
+    assert city["tier"] == "unknown" and city["tier_confidence"] == 0.0
+    assert city["evidence"] == {
+        "inherited_from": "f-a",
+        "static_link_method": "declared",
+        "inherited_tiers": ["local"],
+    }
+    static_city = next(
+        e for e in edges if e["feed_id"] == "f-a" and e["place_id"] == "Q-city"
+    )
+    assert city["service"] == static_city["service"]
+    assert city["method"] == "inferred" and city["needs_review"] is True
+    assert (
+        city["selector_state"] == "unavailable" and city["fingerprint_kind"] == "none"
+    )
+    assert manifest["rt_feeds_propagated"] == 1 and manifest["rt_edges_inherited"] == 5
+    # The unlinked RT feed keeps its declared coverage, untouched.
+    lone = [e for e in edges if e["feed_id"] == "f-lone"]
+    assert [(e["place_id"], e["tier"]) for e in lone] == [("Q-other", "unknown")]
+    assert lone[0]["evidence"].get("unknown_reason") == "declared"
 
 
 def test_a_whole_feed_claim_needs_route_evidence(tmp_path):
