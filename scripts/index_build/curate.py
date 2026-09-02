@@ -30,6 +30,12 @@ feed was crawled; a curator's selector predicate (``agency_id`` and/or
 — a feed with no route evidence can only get ``unavailable``, ``whole_feed``
 included.
 
+GTFS-RT feeds are not tiered — tier needs route-level evidence — so a
+linked one inherits the place membership of its static feed, as curated,
+as one ``unknown`` edge per place carrying the pair's service level: the
+propagation runs after the static-side overrides and before the RT-side
+ones. An RT feed with no static link keeps its declared coverage.
+
 Stale does not mean ignored. An entry's ``evidence_hash`` records the
 machine evidence of everything the entry targets, hashed once as a set;
 when the current evidence differs the override is still applied, every
@@ -556,6 +562,63 @@ class _Curator:
                     f"{sorted(set(pair) - set(whole))}"
                 )
 
+    # -- GTFS-RT propagation ---------------------------------------------
+
+    def propagate(self, feeds):
+        """GTFS-RT feeds inherit the place membership of their static feed —
+        not its tiers — from the static edges AS CURATED: one ``unknown``
+        edge per place the static feed serves, carrying the pair's service
+        level and naming the link it came along. Run after the static-side
+        overrides and before the RT-side ones, so a curator's change to the
+        static feed reaches its companion and a curator can still correct an
+        inherited edge without this pass overwriting it. Returns how many
+        feeds and edges were propagated."""
+        propagated = 0
+        inherited = 0
+        for feed in feeds:
+            static_id = feed.get("static_feed_id")
+            if feed.get("spec") != "gtfs-rt" or not static_id:
+                continue
+            rt_id = feed["feed_id"]
+            for key in [k for k in self.pairs if k[0] == rt_id]:
+                del self.pairs[key]
+            for (f, place_id), pair in list(self.pairs.items()):
+                if f != static_id or not pair:
+                    continue
+                template = next(iter(pair.values()))
+                edge = {
+                    "place_id": place_id,
+                    "feed_id": rt_id,
+                    "tier": "unknown",
+                    "service": template.get("service"),
+                    "tier_confidence": 0.0,
+                    "method": "inferred",
+                    "rehomed_from": [],
+                    "evidence": {
+                        "inherited_from": static_id,
+                        "static_link_method": feed.get("static_link_method"),
+                        "inherited_tiers": sorted(pair),
+                    },
+                    "curation": None,
+                    "merged_evidence": [],
+                    "curation_history": [],
+                    "classification_fingerprint": None,
+                    "fingerprint_kind": "none",
+                    "selector_state": "unavailable",
+                    "selector": None,
+                    "needs_review": True,
+                }
+                self.pairs[(rt_id, place_id)]["unknown"] = edge
+                # The inherited edge is the machine's state for the RT feed:
+                # what an RT-side override is judged against.
+                self.original[(rt_id, place_id, "unknown")] = copy.deepcopy(edge)
+                self.classified[(rt_id, place_id)]["unknown"] = self.original[
+                    (rt_id, place_id, "unknown")
+                ]
+                inherited += 1
+            propagated += 1
+        return propagated, inherited
+
     def edges(self):
         return sorted(
             (edge for pair in self.pairs.values() for edge in pair.values()),
@@ -619,9 +682,21 @@ def curate(cache_dir, *, overrides_dir=None, strict=False):
             if feed_id is not None:
                 crawled[feed_id] = (feed_dir, state)
         curator = _Curator(edges, feeds, crawled, places, candidates)
+        # Static-side overrides first, then the GTFS-RT propagation along
+        # the inferred static link, then the overrides aimed at RT feeds.
+        rt_ids = {f["feed_id"] for f in feeds if f.get("spec") == "gtfs-rt"}
+        static_entries = [
+            e for e in entries if curator.feed_id(e["feed"]) not in rt_ids
+        ]
+        rt_entries = [e for e in entries if curator.feed_id(e["feed"]) in rt_ids]
         applied = 0
         for phase in PHASES:
-            applied += curator.apply([e for e in entries if e["operation"] == phase])
+            applied += curator.apply(
+                [e for e in static_entries if e["operation"] == phase]
+            )
+        rt_feeds, rt_edges = curator.propagate(feeds)
+        for phase in PHASES:
+            applied += curator.apply([e for e in rt_entries if e["operation"] == phase])
         curator.check_pairs()
         final = curator.edges()
         _write_report(cache_dir, curator.stale)
@@ -646,6 +721,8 @@ def curate(cache_dir, *, overrides_dir=None, strict=False):
             "overrides_applied": applied,
             "stale_overrides": len(curator.stale),
             "strict": strict,
+            "rt_feeds_propagated": rt_feeds,
+            "rt_edges_inherited": rt_edges,
             **dict(curator.counts),
             "edges": len(final),
             "edges_by_tier": dict(by_tier),
