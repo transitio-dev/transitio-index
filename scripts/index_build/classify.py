@@ -20,8 +20,15 @@ knowing a route's tier says nothing about whether the feed serves the place.
 Every tier edge of a ``(place, feed)`` pair carries the same ``service``
 struct: the pair's scheduled stops and serving routes in the place, and its
 stop-events per average calendar day when the calendar was crawled.
-Selectors and fingerprints are the next stage's concern; every edge leaves
-here ``selector_state = "unavailable"``.
+Selectors and fingerprints are decided here, from the same evidence. A
+route-level feed gives each tier edge a ``complete`` selector — exactly the
+route ids that serve the place at that tier — and a ``route_stops``
+fingerprint; a feed that legitimately skipped ``stop_times`` is
+``whole_feed`` with a ``feed_stops`` fingerprint; every edge without route
+evidence stays ``unavailable`` with no fingerprint (``none``): a selector is
+never built from less than complete route coverage. A skipped feed whose
+whole-feed claim no longer holds is requested for a complete recrawl
+through ``recrawl_requests.jsonl``, the one artifact that crosses builds.
 """
 
 import collections
@@ -29,11 +36,14 @@ import contextlib
 import csv
 import datetime
 import heapq
+import json
+import os
+import stat
 import io
 import math
 import statistics
-import types
 
+from transitio.index import fingerprint
 from index_build import coverage, crawl, store
 
 CLASSIFY_POINTER = "edges.json"
@@ -193,16 +203,24 @@ def _reader(opened):
 
 
 def _read_routes(opened):
-    """``{route_id: route_type or None}`` — an unparsable type is a missing
-    signal, never a guessed one."""
+    """``({route_id: {"route_type", "agency_id"}}, route_types)`` — an
+    unparsable type is a missing signal (None), never a guessed one; ids
+    stay verbatim. ``route_types`` lists every row's type, id or not, as the
+    crawl's skip predicate saw them."""
     routes = {}
+    route_types = []
     for row in _reader(opened):
+        value = (row.get("route_type") or "").strip()
+        route_type = int(value) if value.isdigit() else None
+        route_types.append(route_type)
         route_id = row.get("route_id") or ""
         if not route_id:
             continue
-        value = (row.get("route_type") or "").strip()
-        routes[route_id] = int(value) if value.isdigit() else None
-    return routes
+        routes[route_id] = {
+            "route_type": route_type,
+            "agency_id": row.get("agency_id") or "",
+        }
+    return routes, route_types
 
 
 def _read_trips(opened, routes):
@@ -515,12 +533,12 @@ def _members(feed_dir, state, names):
         with crawl.verified_member(feed_dir, state, "stops.txt") as opened:
             if opened is None:
                 return None
-            rows, _ = crawl.stop_rows(opened)
+            rows, parsed["stops_dropped"] = crawl.stop_rows(opened)
         parsed["coords"] = {stop_id: (x, y) for stop_id, x, y in rows if stop_id}
         with crawl.verified_member(feed_dir, state, "routes.txt") as opened:
             if opened is None:
                 return None
-            parsed["routes"] = _read_routes(opened)
+            parsed["routes"], parsed["route_types"] = _read_routes(opened)
         if "trips.txt" in names:
             with crawl.verified_member(feed_dir, state, "trips.txt") as opened:
                 if opened is None:
@@ -570,9 +588,23 @@ def _unknown_edge(candidate, reason, route_min_stops):
     return _edge(candidate, "unknown", 0.0, evidence, True)
 
 
-def _tier_edges(candidate, contributing, route_min_stops, extra=None, service=None):
+def _tier_edges(
+    candidate,
+    contributing,
+    route_min_stops,
+    extra=None,
+    service=None,
+    stamp=None,
+    selector_mode=None,
+):
     """One edge per tier over the contributing ``(route, decision, weight,
-    signals)`` tuples, ``tier_confidence`` the weight-averaged decision."""
+    signals)`` tuples, ``tier_confidence`` the weight-averaged decision.
+
+    ``stamp`` holds the feed's fingerprint fields, identical on every edge.
+    ``selector_mode`` is ``"complete"`` when each tier's selector is exactly
+    its contributing route ids (route-level evidence), ``"whole_feed"`` when
+    every route qualifies; without it the candidate's ``unavailable`` stays.
+    """
     by_tier = collections.defaultdict(list)
     for item in contributing:
         by_tier[item["decision"]["tier"]].append(item)
@@ -612,6 +644,13 @@ def _tier_edges(candidate, contributing, route_min_stops, extra=None, service=No
         edge = _edge(candidate, tier, tier_confidence, evidence, needs_review)
         if service is not None:
             edge["service"] = service
+        edge.update(stamp or {})
+        if selector_mode == "complete":
+            edge["selector_state"] = "complete"
+            edge["selector"] = {"route_id": sorted(item["route_id"] for item in items)}
+        elif selector_mode == "whole_feed":
+            edge["selector_state"] = "whole_feed"
+            edge["selector"] = None
         edges.append(edge)
     return edges
 
@@ -715,14 +754,15 @@ def _classify_feed(
                 0,
                 None,
             )
-        # The crawl's skip rested on single-country, single-city conditions
-        # judged against the boundary memo of ITS time; judge them again
-        # against the current lookup before trusting a whole-feed claim.
-        still_skipped, _ = crawl._skip_stop_times(
-            types.SimpleNamespace(path=feed_dir),
-            state.get("member_sha256") or {},
+        # The crawl's skip rested on single-tier, single-country, single-city
+        # conditions judged against the boundary memo of ITS time; judge the
+        # very data verified above again, against the current lookup, before
+        # trusting a whole-feed claim — never a re-read of the files.
+        still_skipped, _ = crawl.skip_predicate(
+            parsed["route_types"],
+            list(coords.values()),
+            parsed["stops_dropped"],
             lookup,
-            False,
         )
         if not still_skipped:
             return (
@@ -746,7 +786,7 @@ def _classify_feed(
                 "span_km": None,
                 "median_km": None,
             }
-            for route_type in routes.values()
+            for route_type in (info["route_type"] for info in routes.values())
         ]
         edges = []
         service = {
@@ -754,9 +794,23 @@ def _classify_feed(
             "routes": len(routes),
             "departures_per_day": None,
         }
+        stamp = {
+            "classification_fingerprint": fingerprint.compute(
+                "feed_stops", routes, coords
+            ),
+            "fingerprint_kind": "feed_stops",
+        }
         for candidate in candidates.values():
             edges.extend(
-                _tier_edges(candidate, contributing, route_min_stops, None, service)
+                _tier_edges(
+                    candidate,
+                    contributing,
+                    route_min_stops,
+                    None,
+                    service,
+                    stamp,
+                    "whole_feed",
+                )
             )
         return edges, "whole_feed", len(routes), 0, None
 
@@ -774,7 +828,8 @@ def _classify_feed(
 
     # Per-route measurement, then service to each candidate place.
     measured = {}
-    for route_id, route_type in routes.items():
+    for route_id, info in routes.items():
+        route_type = info["route_type"]
         stop_ids = parsed["stops"].get(route_id, set())
         span, median, count = _route_geography(
             stop_ids, parsed["sequences"].get(route_id, []), coords
@@ -789,12 +844,21 @@ def _classify_feed(
             "decision": classify_route(
                 route_type, countries if count else None, span, median
             ),
+            "route_id": route_id,
             "route_type": route_type,
             "span_km": span,
             "median_km": median,
             "stop_count": count,
             "place_stops": place_stops,
         }
+    # The fingerprint describes the feed, not the place: one digest over
+    # every route's served stops and every stop's coordinates, on all edges.
+    stamp = {
+        "classification_fingerprint": fingerprint.compute(
+            "route_stops", routes, coords, parsed["stops"]
+        ),
+        "fingerprint_kind": "route_stops",
+    }
 
     edges = []
     dropped = 0
@@ -827,9 +891,78 @@ def _classify_feed(
                 _service_level(
                     contributing, place_id, place, parsed.get("stop_departures")
                 ),
+                stamp,
+                "complete",
             )
         )
     return edges, "route_stops", len(routes), dropped, parsed.get("join_gaps")
+
+
+def _request_recrawl(cache_dir, feed_ids):
+    """Append the feeds whose whole-feed claim no longer holds to
+    ``recrawl_requests.jsonl`` — the one artifact that crosses builds — so the
+    next crawl reads their complete stop_times past the validator skip.
+    Existing requests are read and appended through ONE descriptor, opened
+    without following a symlink and checked to be a regular file, so nothing
+    can be swapped in between the read and the write; the crawl alone
+    rewrites the file, once a complete read succeeds. Returns how many
+    were newly requested.
+    """
+    if not feed_ids:
+        return 0
+    try:
+        handle = _open_requests(cache_dir / "recrawl_requests.jsonl")
+    except OSError as error:
+        raise ClassifyError(f"recrawl_requests.jsonl: {error}") from error
+    with os.fdopen(handle, "r+b") as opened:
+        if not stat.S_ISREG(os.fstat(opened.fileno()).st_mode):
+            raise ClassifyError("recrawl_requests.jsonl is not a regular file")
+        existing = {
+            r["feed_id"]
+            for r in store.parse_jsonl(opened.read())
+            if isinstance(r, dict) and isinstance(r.get("feed_id"), str)
+        }
+        wanted = [f for f in sorted(set(feed_ids)) if f not in existing]
+        opened.write(
+            "".join(
+                json.dumps({"feed_id": feed_id, "reason": "skip_stale"}) + "\n"
+                for feed_id in wanted
+            ).encode("utf-8")
+        )
+    return len(wanted)
+
+
+def _open_requests(path):
+    """A read/append descriptor that is certainly the regular file at
+    ``path`` and never a symlink's target.
+
+    With ``O_NOFOLLOW`` the refusal is atomic at open. Without it (Windows)
+    the entry's identity is pinned first: ``lstat`` must show a regular
+    file, and ``fstat`` on the opened descriptor must agree on device and
+    inode — a swap between the two shows as a mismatch and fails closed. A
+    missing file is created with ``O_EXCL`` so a race cannot substitute
+    one, and a lost race is judged once more through the pinned path.
+    """
+    flags = os.O_RDWR | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        return os.open(path, flags | os.O_CREAT | nofollow, 0o644)
+    for _ in range(2):
+        try:
+            before = os.lstat(path)
+        except FileNotFoundError:
+            try:
+                return os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                continue
+        if not stat.S_ISREG(before.st_mode):
+            raise ClassifyError("recrawl_requests.jsonl is not a regular file")
+        handle = os.open(path, flags)
+        after = os.fstat(handle)
+        if (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino):
+            return handle
+        os.close(handle)
+    raise ClassifyError("recrawl_requests.jsonl changed while being opened")
 
 
 def _pointer_present(path):
@@ -1054,6 +1187,7 @@ def classify(cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS):
             routes_classified = 0
             edges_dropped = 0
             join_gaps = collections.Counter()
+            stale_skips = []
             for feed_id in sorted(by_feed):
                 feed_candidates = by_feed[feed_id]
                 if sources.get(feed_id) == "crawl" and feed_id in crawled:
@@ -1071,6 +1205,8 @@ def classify(cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS):
                     edges_dropped += dropped
                     for key, value in (gaps or {}).items():
                         join_gaps[key] += value
+                    if status == "skip_stale":
+                        stale_skips.append(feed_id)
                 else:
                     classified = [
                         _unknown_edge(c, "declared", route_min_stops)
@@ -1080,6 +1216,9 @@ def classify(cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS):
                 statuses[status] += 1
                 edges.extend(classified)
             edges.sort(key=lambda e: (e["place_id"], e["feed_id"], e["tier"]))
+            # Under the crawl lock still held: appenders and the crawl's own
+            # rewrite of this file must never interleave.
+            recrawl_requested = _request_recrawl(cache_dir, stale_skips)
 
             by_tier = collections.Counter(e["tier"] for e in edges)
             manifest = {
@@ -1100,6 +1239,13 @@ def classify(cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS):
                 "edges_dropped_no_serving_route": edges_dropped,
                 "join_gaps": dict(join_gaps),
                 "edges_by_tier": dict(by_tier),
+                "edges_by_selector_state": dict(
+                    collections.Counter(e["selector_state"] for e in edges)
+                ),
+                "edges_by_fingerprint_kind": dict(
+                    collections.Counter(e["fingerprint_kind"] for e in edges)
+                ),
+                "recrawl_requested": recrawl_requested,
                 "unknown_share": (by_tier["unknown"] / len(edges)) if edges else 0.0,
                 "needs_review": sum(1 for e in edges if e["needs_review"]),
                 "retrieved_at": datetime.datetime.now(

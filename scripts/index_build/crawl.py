@@ -263,36 +263,32 @@ def cluster_boxes(points):
 
 
 def _fixed_tier(route_type):
-    """Whether the route type settles a tier with no route geography.
+    """The tier a route type settles with no route geography, or None.
 
-    The geography-free rules: tram/subway (rule 3) and the fixed-tier half of
-    rule 2 — coach 200-209, urban rail 400-405, bus 700-716, trolleybus 800s,
-    tram 900s.
+    The geography-free rules, ranges exactly as the classifier's: tram/subway
+    (rule 3) and the fixed-tier half of rule 2 — coach 200-209 national;
+    urban rail 400-405, bus 700-716, trolleybus 800s and tram 900s local.
+    Anything else (717-799 included) is unknown to the classifier too.
     """
-    return (
-        route_type in (0, 1)
-        or 200 <= route_type <= 209
-        or 400 <= route_type <= 405
-        or 700 <= route_type <= 716
-        or 800 <= route_type <= 999
-    )
+    if route_type in (0, 1) or 400 <= route_type <= 405:
+        return "local"
+    if 700 <= route_type <= 716 or 800 <= route_type <= 999:
+        return "local"
+    if 200 <= route_type <= 209:
+        return "national"
+    return None
 
 
 def _skip_stop_times(feed_dir, digests, lookup, force):
     """Whether the complete stop_times read may be skipped; ``(skip, reason)``.
 
-    The plan's predicate, all three required: (a) every route settled by a
-    geography-free tier rule, (b) every stop in a single country, (c) every
-    stop in exactly one distinct city — most-specific city-kind division,
-    against the boundary memo's full pinned geometry. ``reason`` says why the
-    member is read when it is; any doubt or error reads it. Only members the
-    CURRENT fetch wrote (``digests``) count as evidence — a member the new
-    archive dropped must not leave a stale file deciding the skip.
+    Reads the members the CURRENT fetch wrote (``digests``) — a member the
+    new archive dropped must not leave a stale file deciding the skip — and
+    judges them by :func:`skip_predicate`. ``reason`` says why the member is
+    read when it is; any doubt or error reads it.
     """
     if force:
         return False, "recrawl requested"
-    if lookup is None:
-        return False, "no boundary lookup"
     if "routes.txt" not in digests or "stops.txt" not in digests:
         return False, "routes or stops member missing"
     try:
@@ -304,19 +300,51 @@ def _skip_stop_times(feed_dir, digests, lookup, force):
                     io.TextIOWrapper(opened, encoding="utf-8-sig", errors="strict")
                 )
             )
-        if not rows:
-            return False, "no routes"
+        route_types = []
         for row in rows:
             value = (row.get("route_type") or "").strip()
-            if not value.isdigit() or not _fixed_tier(int(value)):
-                return False, "route types need geography"
+            route_types.append(int(value) if value.isdigit() else None)
         with os.fdopen(store.open_nofollow(stops_path), "rb") as opened:
             points, dropped = stop_coordinates(opened)
-        if dropped:
-            # A whole-feed claim cannot rest on the parseable subset.
-            return False, "unparsable stop rows"
-        if not points:
-            return False, "no parseable stops"
+    except Exception as error:
+        # The predicate is an optimisation gate; any failure inside it means
+        # the full read, never a failed feed.
+        return False, f"predicate error: {error}"
+    return skip_predicate(route_types, points, dropped, lookup)
+
+
+def skip_predicate(route_types, points, dropped, lookup):
+    """The plan's skip predicate over parsed evidence; ``(skip, reason)``.
+
+    All three required: (a) every route settled by a geography-free tier
+    rule, and all to the SAME tier — a tram plus a coach would need a
+    per-tier selector, which only the complete read can build — (b) every
+    stop in a single country, (c) every stop in exactly one distinct city —
+    most-specific city-kind division, against the boundary memo's full
+    pinned geometry. ``route_types`` holds one entry per route (None when
+    unparsable), ``points`` the parseable stop coordinates and ``dropped``
+    how many stop rows were not. The crawler judges the members it just
+    wrote; the classify stage judges the same digest-verified data again
+    later, so a whole-feed claim is never re-read from disk.
+    """
+    if lookup is None:
+        return False, "no boundary lookup"
+    if not route_types:
+        return False, "no routes"
+    tiers = set()
+    for route_type in route_types:
+        tier = _fixed_tier(route_type) if route_type is not None else None
+        if tier is None:
+            return False, "route types need geography"
+        tiers.add(tier)
+    if len(tiers) > 1:
+        return False, "route types span tiers"
+    if dropped:
+        # A whole-feed claim cannot rest on the parseable subset.
+        return False, "unparsable stop rows"
+    if not points:
+        return False, "no parseable stops"
+    try:
         lookup.ensure(cluster_boxes(points))
         countries = set()
         cities = set()
@@ -339,11 +367,9 @@ def _skip_stop_times(feed_dir, digests, lookup, force):
             cities.update(stop_cities)
             if len(cities) > 1:
                 return False, "stops span cities"
-        return True, None
     except Exception as error:
-        # The predicate is an optimisation gate; any failure inside it means
-        # the full read, never a failed feed.
         return False, f"predicate error: {error}"
+    return True, None
 
 
 def _cache_reusable(feed_dir, state, url, force, lookup):

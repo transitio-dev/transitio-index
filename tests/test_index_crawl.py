@@ -179,6 +179,20 @@ OTHER_COUNTRY = [
             StubLookup({24.9: CITY_RECORDS}),
             "route types need geography",
         ),
+        # A tram and a coach are both fixed-tier, but two tiers: per-tier
+        # selectors need the complete read.
+        (
+            _members(routes=b"route_id,route_type\nr1,0\nr2,201\n"),
+            StubLookup({24.9: CITY_RECORDS}),
+            "route types span tiers",
+        ),
+        # 750 sits between the bus and trolleybus ranges: unknown to the
+        # classifier, so no whole-feed claim may rest on it.
+        (
+            _members(routes=b"route_id,route_type\nr1,0\nr2,750\n"),
+            StubLookup({24.9: CITY_RECORDS}),
+            "route types need geography",
+        ),
         (_members(), StubLookup({24.9: CITY_RECORDS[1:]}), "a stop matches no city"),
         (_members(), StubLookup({}), "a stop matches no division"),
         (
@@ -584,6 +598,55 @@ def test_a_cache_from_a_smaller_member_set_is_refetched(tmp_path):
     assert log["f-a"]["method"] == "download"
     _, log = _crawl(cache, server)
     assert log["f-a"]["method"] == "not_modified"
+
+
+def test_a_stale_skip_is_corrected_on_the_next_build(tmp_path):
+    # The plan's two-build correction path. Build one: the crawl's memo
+    # shows one city, so stop_times is skipped; classification, seeing two
+    # cities, finds the whole-feed claim stale and requests a recrawl.
+    # Build two: the request bypasses the unchanged validators, the
+    # complete read clears it, and classification builds the selectors.
+    from test_index_classify import _candidate, _coverage, _records
+
+    from index_build import classify
+
+    cache = tmp_path / "cache"
+    members = _members(
+        routes=b"route_id,route_type\ntram,0\n",
+        stops=b"stop_id,stop_lat,stop_lon\ns1,60.1,24.9\ns2,60.1,25.9\n",
+    )
+    members["trips.txt"] = b"trip_id,route_id\nt,tram\n"
+    members["stop_times.txt"] = b"trip_id,stop_id,stop_sequence\nt,s1,1\nt,s2,2\n"
+    server = _server({"/a.zip": (_zip_bytes(members), '"v1"')})
+    crawl_lookup = StubLookup({24.9: _records("Q-city"), 25.9: _records("Q-city")})
+    stage_lookup = StubLookup({24.9: _records("Q-city"), 25.9: _records("Q-other")})
+    feeds = [
+        {"feed_id": "f-a", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    candidates = [_candidate("Q-city", "f-a"), _candidate("Q-other", "f-a")]
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+
+    _, log = _crawl(cache, server, lookup=crawl_lookup)
+    assert log["f-a"]["stop_times"] == "skipped"
+    _coverage(cache, feeds, candidates)
+    manifest = classify.classify(cache, lookup=stage_lookup)
+    assert manifest["feeds_by_status"] == {"skip_stale": 1}
+    assert manifest["recrawl_requested"] == 1
+
+    summary, log = _crawl(cache, server, lookup=crawl_lookup)
+    assert log["f-a"]["method"] == "download"  # past the matching ETag
+    assert log["f-a"]["stop_times"] == "complete"
+    assert summary["recrawl_cleared"] == 1
+    assert (cache / "recrawl_requests.jsonl").read_text() == ""
+    _coverage(cache, feeds, candidates)
+    manifest = classify.classify(cache, lookup=stage_lookup)
+    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    assert manifest["edges_by_selector_state"] == {"complete": 2}
+    assert manifest["recrawl_requested"] == 0
+    assert {e["place_id"]: e["selector"] for e in edges} == {
+        "Q-city": {"route_id": ["tram"]},
+        "Q-other": {"route_id": ["tram"]},
+    }
 
 
 def test_a_recrawl_request_bypasses_the_skip(tmp_path):
