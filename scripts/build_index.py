@@ -23,8 +23,13 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+DEFAULT_GOLDEN = (
+    pathlib.Path(__file__).resolve().parent.parent / "golden" / "feeds.jsonl"
+)
+
 from index_build import (  # noqa: E402
     atlas,
+    classify,
     coverage,
     crawl,
     crosswalk,
@@ -106,8 +111,19 @@ def run_coverage(arguments):
     return [coverage.cover(arguments.cache_dir)]
 
 
+def run_classify(arguments):
+    return [classify.classify(arguments.cache_dir)]
+
+
 def run_publish(arguments):
-    return [publish.publish(arguments.cache_dir)]
+    golden_path = None if arguments.no_golden else arguments.golden
+    if golden_path is not None and not golden_path.is_file():
+        # The gate must never vanish because a file went missing.
+        raise SystemExit(
+            f"golden file {golden_path} is missing; pass --no-golden to publish "
+            "without the golden diff"
+        )
+    return [publish.publish(arguments.cache_dir, golden_path=golden_path)]
 
 
 STAGES = {
@@ -118,6 +134,7 @@ STAGES = {
     "crawl": run_crawl,
     "expand": run_expand,
     "coverage": run_coverage,
+    "classify": run_classify,
     "publish": run_publish,
 }
 
@@ -162,6 +179,18 @@ def parse_args(argv=None):
         type=commit_sha,
         default=atlas.ATLAS_COMMIT,
         help="Atlas commit to pin (default: the commit this build is pinned to)",
+    )
+    parser.add_argument(
+        "--golden",
+        type=pathlib.Path,
+        default=DEFAULT_GOLDEN,
+        help="golden set the publish stage must pass first (default: the "
+        "repository's golden/feeds.jsonl)",
+    )
+    parser.add_argument(
+        "--no-golden",
+        action="store_true",
+        help="publish without the golden diff (an explicit choice, never a default)",
     )
     parser.add_argument(
         "--overrides-dir",

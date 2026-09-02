@@ -295,6 +295,46 @@ def test_a_recrawl_request_forces_the_complete_read(tmp_path):
     assert summary["recrawl_cleared"] == 1
 
 
+def test_malformed_utf8_in_stops_is_a_data_error():
+    with pytest.raises(UnicodeDecodeError):
+        crawl.stop_rows(b"stop_id,stop_lat,stop_lon\n\xff,1.0,2.0\n")
+
+
+def test_reading_locks_the_crawl_root_even_before_any_crawl(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    assert crawl.states_digest(cache) is None
+    with crawl.reading(cache):
+        assert (cache / "crawl").is_dir()
+        assert crawl.states_digest(cache) is None  # a directory, but no log
+        directory = store.open_subdir(cache, "crawl")
+        try:
+            with pytest.raises(store.StoreError):
+                with store.exclusive_writer(directory):
+                    pass
+        finally:
+            directory.close()
+
+
+def test_a_corrupt_log_line_or_state_shape_skips_only_that_feed(tmp_path):
+    cache = tmp_path / "cache"
+    good = cache / "crawl" / crawl._dir_name("f-good")
+    bad = cache / "crawl" / crawl._dir_name("f-bad")
+    for feed_dir, stop_times in ((good, {"state": "complete"}), (bad, "complete")):
+        feed_dir.mkdir(parents=True)
+        (feed_dir / "state.json").write_text(
+            json.dumps({"members": ["stops.txt"], "stop_times": stop_times})
+        )
+    (cache / "crawl" / "crawl_log.jsonl").write_text(
+        "not json\n"
+        + json.dumps({"directory": good.name})
+        + "\n"
+        + json.dumps({"directory": bad.name})
+        + "\n"
+    )
+    assert [d for d, _ in crawl.crawled_feeds(cache)] == [good]
+
+
 def test_a_small_feed_downloads_whole_and_extracts(tmp_path):
     cache = tmp_path / "cache"
     data = _zip_bytes()

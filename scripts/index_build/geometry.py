@@ -266,6 +266,7 @@ def attach_geometry(cache_dir, *, dataset=None):
             manifest = {
                 "source": "geometry",
                 "sources": metros_manifest.get("sources"),
+                "seed_generation": metros_manifest.get("seed_generation"),
                 "overture_release": overture.OVERTURE_RELEASE,
                 "with_geometry": with_geometry,
                 "omitted_by_licence": omitted,

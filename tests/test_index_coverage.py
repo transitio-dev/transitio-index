@@ -16,7 +16,7 @@ def _publish(cache, subdir, pointer, artifact, records, manifest=None):
     directory = store.open_subdir(cache, subdir)
     try:
         with store.exclusive_writer(directory):
-            store.publish(
+            return store.publish(
                 cache / subdir,
                 pointer,
                 {artifact: store.jsonl_chunks(records)},
@@ -98,6 +98,7 @@ def _cover(
     crawls=None,
     lookup=None,
     tamper=None,
+    late_crawl=None,
     **cover_args,
 ):
     cache = tmp_path / "cache"
@@ -109,15 +110,7 @@ def _cover(
         feeds,
         {"source": "resolve", "sources": SOURCES},
     )
-    _publish(
-        cache,
-        "gazetteer",
-        "expanded.json",
-        "places_expanded.jsonl",
-        places,
-        {"source": "expand", "overture_release": RELEASE, "sources": SOURCES},
-    )
-    _publish(
+    seed_manifest = _publish(
         cache,
         "gazetteer",
         "seed.json",
@@ -125,11 +118,42 @@ def _cover(
         placements,
         {"source": "seed", "sources": seed_sources, "overture_release": seed_release},
     )
+    _publish(
+        cache,
+        "gazetteer",
+        "expanded.json",
+        "places_expanded.jsonl",
+        places,
+        {
+            "source": "expand",
+            "overture_release": RELEASE,
+            "sources": SOURCES,
+            "seed_generation": seed_manifest["generation"],
+        },
+    )
     for feed_id, stops_rows in (crawls or {}).items():
         _write_crawl(cache, feed_id, stops_rows)
     if tamper:
         stops = cache / "crawl" / crawl._dir_name(tamper) / "stops.txt"
         stops.write_bytes(stops.read_bytes() + b"sx,1.0,10.0\n")
+    if crawls:
+        # The expanded generation must record the crawl it read.
+        _publish(
+            cache,
+            "gazetteer",
+            "expanded.json",
+            "places_expanded.jsonl",
+            places,
+            {
+                "source": "expand",
+                "overture_release": RELEASE,
+                "sources": SOURCES,
+                "seed_generation": seed_manifest["generation"],
+                "crawl_digest": crawl.states_digest(cache),
+            },
+        )
+    if late_crawl:
+        _write_crawl(cache, late_crawl, _rows(2, 10.0))
     manifest = coverage.cover(cache, lookup=lookup, **cover_args)
     covered, _ = store.read_jsonl(
         cache / "coverage", "coverage.json", "feeds_covered.jsonl"
@@ -188,6 +212,13 @@ LOOKUP = StubLookup(
             {"kind": "country", "wikidata": "Q-c"},
         ],
         20.0: [
+            {"kind": "city", "wikidata": "Q-other"},
+            {"kind": "region", "wikidata": "Q-reg"},
+            {"kind": "country", "wikidata": "Q-c"},
+        ],
+        # A point inside two overlapping member cities.
+        25.0: [
+            {"kind": "city", "wikidata": "Q-city"},
             {"kind": "city", "wikidata": "Q-other"},
             {"kind": "region", "wikidata": "Q-reg"},
             {"kind": "country", "wikidata": "Q-c"},
@@ -319,6 +350,33 @@ def test_all_unparsable_stops_still_supersede_declared(tmp_path):
     assert covered["f-city"]["stop_count"] == 4
     assert covered["f-city"]["coverage"] is None
     assert "f-city" not in edges
+
+
+def test_a_feed_spread_across_metro_members_is_admitted_to_the_metro(tmp_path):
+    # Three stops in the second member fail its thresholds alone; summed
+    # with the first member's six they admit the metro, whose own aggregated
+    # evidence outranks the edge propagated from the passing city.
+    places = [p for p in PLACES if p["place_id"] != "Q-metro"] + [
+        {**_place("Q-metro", "metro"), "member_ids": ["Q-city", "Q-other"]}
+    ]
+    # A stop inside both members counts once for the metro.
+    rows = _rows(6, 10.0) + _rows(3, 20.0) + _rows(1, 25.0) + _rows(90, 30.0)
+    _, _, edges = _cover(
+        tmp_path, places=places, crawls={"f-none": rows}, lookup=LOOKUP
+    )
+    feed = edges["f-none"]
+    assert "Q-city" in feed and "Q-other" not in feed
+    assert feed["Q-metro"]["evidence"]["stops_in_place"] == 10
+
+
+def test_a_crawl_that_changed_after_expansion_is_refused(tmp_path):
+    with pytest.raises(coverage.CoverageError, match="re-run the expand"):
+        _cover(
+            tmp_path,
+            crawls={"f-city": _rows(6, 10.0)},
+            lookup=LOOKUP,
+            late_crawl="f-none",
+        )
 
 
 def test_a_state_mismatched_crawl_falls_back_to_declared(tmp_path):
