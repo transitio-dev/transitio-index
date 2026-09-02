@@ -384,15 +384,25 @@ def _check_names_lineage(cache_dir, expanded_manifest):
             )
 
 
-def _read_coverage(cache_dir, *, locked=False):
-    """The feeds, edges and manifest of the latest edge stage, or
-    ``(None, None, None)``; stale classified edges are a publish error."""
-    from index_build import classify
+def _read_coverage(cache_dir, *, locked=False, overrides_dir=None):
+    """The feeds, edges, manifest and override digest of the latest edge
+    stage, or ``(None, None, None, None)``; stale classified edges are a
+    publish error.
+
+    The override file is an input like any other: curated edges must come
+    from the ``edges.yaml`` on disk now (by digest), and an ``edges.yaml``
+    that no curate generation applied is a stage that has not run yet. The
+    digest returned is the one the edges were checked against — the
+    baseline every later comparison must use.
+    """
+    from index_build import classify, overrides
 
     try:
-        return classify.read_edges(cache_dir, locked=locked)
-    except classify.ClassifyError as error:
+        feeds, edges, manifest = classify.read_edges(cache_dir, locked=locked)
+        current = overrides.applied_digest(manifest, overrides_dir)
+    except (classify.ClassifyError, overrides.OverrideError) as error:
         raise PublishError(str(error)) from error
+    return feeds, edges, manifest, current
 
 
 def _golden_gate(cache_dir, golden_path, edges, manifest):
@@ -414,7 +424,7 @@ def _golden_gate(cache_dir, golden_path, edges, manifest):
     return report
 
 
-def publish(cache_dir, *, golden_path=None):
+def publish(cache_dir, *, golden_path=None, overrides_dir=None):
     """Build ``<cache>/index`` from the crosswalk (and gazetteer). Returns the manifest.
 
     The source versions come from the crosswalk manifest — the ones it actually
@@ -430,19 +440,35 @@ def publish(cache_dir, *, golden_path=None):
     from index_build import crawl
 
     # Every upstream stage's writer lock is held from the reads through the
-    # commit, so no crawl, resolve, expand, coverage or classify run can
-    # republish between the lineage checks, the gate's verdict and
+    # commit, so no crawl, resolve, expand, coverage, classify or curate run
+    # can republish between the lineage checks, the gate's verdict and
     # snapshot.json.
     with contextlib.ExitStack() as stack:
         # Stage locks first, the crawl lock last — the order every stage
         # uses (its own lock, then the crawl's), so no lock-order inversion.
-        for subdir in ("resolve", "gazetteer", "coverage", "classify"):
-            if (cache_dir / subdir).is_dir():
-                held = store.open_subdir(cache_dir, subdir)
-                stack.callback(held.close)
-                stack.enter_context(store.exclusive_writer(held))
+        for subdir in (
+            "crosswalk",
+            "resolve",
+            "gazetteer",
+            "coverage",
+            "classify",
+            "curate",
+        ):
+            # Created when absent, so a stage that has not run yet cannot
+            # slip its first publication in between: the lock exists first.
+            held = store.open_subdir(cache_dir, subdir)
+            stack.callback(held.close)
+            stack.enter_context(store.exclusive_writer(held))
         stack.enter_context(crawl.reading(cache_dir))
-        records, edges, coverage = _read_coverage(cache_dir, locked=True)
+        # The override digest the curated edges were checked against is the
+        # baseline: it is re-read once more right before activation, so an
+        # edit during publication cannot ship through a generation built
+        # before it — and never re-established from a later read.
+        records, edges, coverage, override_digest = _read_coverage(
+            cache_dir, locked=True, overrides_dir=overrides_dir
+        )
+        from index_build import overrides
+
         if records is None:
             records, crosswalk = store.read_jsonl(
                 cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
@@ -487,7 +513,7 @@ def publish(cache_dir, *, golden_path=None):
                     "the edges were derived from a different places generation "
                     "than the one being published; re-run the pipeline in stage order"
                 )
-            if coverage.get("source") != "classify":
+            if coverage.get("source") not in ("classify", "curate"):
                 # Candidate edges carry no tiers; shipping them would publish
                 # every edge as unknown with the tier gate silently off.
                 raise PublishError(
@@ -529,6 +555,10 @@ def publish(cache_dir, *, golden_path=None):
             edges_data = _edges_parquet_bytes(edges, snapshot_id)
             manifest["edges_sha256"] = hashlib.sha256(edges_data).hexdigest()
             manifest["coverage_mode"] = coverage.get("mode")
+            # Curation's third staleness signal: the count travels with the
+            # snapshot, zero when clean and when nothing was curated.
+            manifest["stale_overrides"] = int(coverage.get("stale_overrides") or 0)
+            manifest["overrides_sha256"] = override_digest
             if coverage.get("unknown_share") is not None:
                 # Recorded so the next build's golden diff can measure drift.
                 manifest["unknown_share"] = coverage["unknown_share"]
@@ -542,6 +572,12 @@ def publish(cache_dir, *, golden_path=None):
         directory = store.open_subdir(cache_dir, "index")
         try:
             with store.exclusive_writer(directory):
+                # Before the first file is replaced: an abort here leaves the
+                # previous index whole, never a new table under an old manifest.
+                if overrides.edges_digest(overrides_dir) != override_digest:
+                    raise PublishError(
+                        "edges.yaml changed during publication; re-run the curate stage"
+                    )
                 store.write_bytes(directory, FEEDS_FILE, feeds_data)
                 if places_data is not None:
                     store.write_bytes(directory, PLACES_FILE, places_data)

@@ -104,15 +104,18 @@ def check_catalogue_evidence(golden_path, evidence_path):
     }
 
 
-def _actual(cache_dir):
-    """``{feed_id: [edges]}`` from the latest edge stage — classified edges
-    when a fresh classify generation exists, candidate edges otherwise; a
-    stale classify generation fails the gate rather than being checked."""
-    from index_build import classify
+def _actual(cache_dir, overrides_dir=None):
+    """``{feed_id: [edges]}`` from the latest edge stage — curated edges
+    when a fresh curate generation exists, classified edges when a fresh
+    classify generation does, candidate edges otherwise; a stale generation
+    fails the gate rather than being checked, and so do curated edges whose
+    ``edges.yaml`` has moved on (or an ``edges.yaml`` nobody applied)."""
+    from index_build import classify, overrides
 
     try:
         _, edges, manifest = classify.read_edges(cache_dir)
-    except classify.ClassifyError as error:
+        overrides.applied_digest(manifest, overrides_dir)
+    except (classify.ClassifyError, overrides.OverrideError) as error:
         raise GoldenError(str(error)) from error
     if edges is None:
         raise GoldenError("no edge generation to check against")
@@ -155,12 +158,20 @@ def _is_share(value):
     )
 
 
-def check(cache_dir, golden_path, *, assert_tiers=None, edges=None, manifest=None):
+def check(
+    cache_dir,
+    golden_path,
+    *,
+    assert_tiers=None,
+    edges=None,
+    manifest=None,
+    overrides_dir=None,
+):
     """Diff the build against the golden entries; returns the report.
 
     The report's ``violations`` list one dict per broken expectation; an
     empty list is a pass. Tier and review-state assertions are ON whenever
-    the edges come from a classify generation (``assert_tiers`` overrides
+    the edges come from a classify or curate generation (``assert_tiers`` overrides
     either way): the feed's tier set over EVERY edge it has must equal the
     recorded one and the review state must match — ``needs_review`` when
     any of its edges needs review — so a rule change that moves a golden
@@ -170,7 +181,7 @@ def check(cache_dir, golden_path, *, assert_tiers=None, edges=None, manifest=Non
     """
     entries = load_golden(golden_path)
     if edges is None:
-        actual, manifest = _actual(cache_dir)
+        actual, manifest = _actual(cache_dir, overrides_dir)
     else:
         # The caller's own read: publish passes the very edges it ships, so
         # a concurrent republish cannot make the gate judge another set.
@@ -179,7 +190,7 @@ def check(cache_dir, golden_path, *, assert_tiers=None, edges=None, manifest=Non
             actual.setdefault(edge["feed_id"], []).append(edge)
         manifest = manifest or {}
     if assert_tiers is None:
-        assert_tiers = manifest.get("source") == "classify"
+        assert_tiers = manifest.get("source") in ("classify", "curate")
     violations = []
     for entry in entries:
         feed_id = entry["feed_id"]
@@ -280,11 +291,18 @@ def main(argv=None):
         action="store_true",
         help="check membership only, even against classified edges",
     )
+    parser.add_argument(
+        "--overrides-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("overrides"),
+        help="directory of override YAML files (default: overrides)",
+    )
     args = parser.parse_args(argv)
     report = check(
         args.cache_dir,
         args.golden,
         assert_tiers=False if args.membership_only else None,
+        overrides_dir=args.overrides_dir,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 1

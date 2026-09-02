@@ -33,6 +33,7 @@ from index_build import (  # noqa: E402
     coverage,
     crawl,
     crosswalk,
+    curate,
     expand,
     gbfs,
     geometry,
@@ -115,6 +116,16 @@ def run_classify(arguments):
     return [classify.classify(arguments.cache_dir)]
 
 
+def run_curate(arguments):
+    return [
+        curate.curate(
+            arguments.cache_dir,
+            overrides_dir=arguments.overrides_dir,
+            strict=arguments.strict_overrides,
+        )
+    ]
+
+
 def run_publish(arguments):
     golden_path = None if arguments.no_golden else arguments.golden
     if golden_path is not None and not golden_path.is_file():
@@ -123,7 +134,13 @@ def run_publish(arguments):
             f"golden file {golden_path} is missing; pass --no-golden to publish "
             "without the golden diff"
         )
-    return [publish.publish(arguments.cache_dir, golden_path=golden_path)]
+    return [
+        publish.publish(
+            arguments.cache_dir,
+            golden_path=golden_path,
+            overrides_dir=arguments.overrides_dir,
+        )
+    ]
 
 
 STAGES = {
@@ -135,6 +152,7 @@ STAGES = {
     "expand": run_expand,
     "coverage": run_coverage,
     "classify": run_classify,
+    "curate": run_curate,
     "publish": run_publish,
 }
 
@@ -198,23 +216,45 @@ def parse_args(argv=None):
         default=pathlib.Path("overrides"),
         help="directory of override YAML files (default: overrides)",
     )
+    parser.add_argument(
+        "--strict-overrides",
+        action="store_true",
+        help="fail the curate stage on a stale override instead of flagging it",
+    )
+    parser.add_argument(
+        "--downstream",
+        action="store_true",
+        help="also run every later stage, in build order, so nothing downstream "
+        "of a rerun is left stale",
+    )
     arguments = parser.parse_args(argv)
     if not arguments.sources:
         arguments.sources = list(SOURCES)
     return arguments
 
 
+def stages_from(stage, downstream):
+    """The stages one invocation runs: the named one, and — with
+    ``downstream`` — every later one in build order, which is the order
+    ``STAGES`` lists them in."""
+    order = list(STAGES)
+    return order[order.index(stage) :] if downstream else [stage]
+
+
 def main(argv=None):
     arguments = parse_args(argv)
+    summaries = []
+    stage = arguments.stage
     try:
-        summaries = STAGES[arguments.stage](arguments)
+        for stage in stages_from(arguments.stage, arguments.downstream):
+            summaries.extend(STAGES[stage](arguments))
     except Exception as error:  # noqa: B902
         # Broad on purpose: this is the CLI boundary, where any stage
         # failure should read as one line rather than a traceback. Set
         # TRANSITIO_TRACEBACK to see the original instead.
         if os.environ.get("TRANSITIO_TRACEBACK"):
             raise
-        print(f"{arguments.stage}: {error}", file=sys.stderr)
+        print(f"{stage}: {error}", file=sys.stderr)
         return 1
     for summary in summaries:
         print(json.dumps(summary, indent=2, sort_keys=True))

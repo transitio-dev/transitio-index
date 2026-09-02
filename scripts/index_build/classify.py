@@ -49,6 +49,10 @@ from index_build import coverage, crawl, store
 CLASSIFY_POINTER = "edges.json"
 EDGES_ARTIFACT = "edges.jsonl"
 FEEDS_ARTIFACT = "feeds_classified.jsonl"
+# The curate stage's generation: the final edges, when curation has run.
+CURATE_POINTER = "edges_final.json"
+CURATED_EDGES_ARTIFACT = "edges_final.jsonl"
+CURATED_FEEDS_ARTIFACT = "feeds_curated.jsonl"
 
 REVIEW_CUTOFF = coverage.REVIEW_CUTOFF
 # A route serves a place with this many SCHEDULED stops inside it. One stop is
@@ -1017,21 +1021,48 @@ def _require_service(edges, stage):
             )
 
 
-def read_edges(cache_dir, *, locked=False):
+EDGE_STAGES = ("resolve", "gazetteer", "coverage", "classify", "curate")
+
+
+def read_edges(cache_dir, *, locked=False, final=True):
     """``(feeds, edges, manifest)`` of the latest edge stage, or ``(None,
     None, None)`` with no edge stage at all.
 
-    The classify generation is preferred over the coverage one, and either
-    is refused (:class:`ClassifyError`) unless it descends from the CURRENT
-    resolved feeds, expanded places, crawl (by digest) and — for classify —
-    coverage generation: a rerun of any input that was not followed
-    downstream makes the edges stale, and stale edges are never published
-    or checked as fresh. One pointer resolution serves both artifacts of a generation, so
-    a republish racing this read cannot pair feeds from one generation with
-    edges from another; atomicity against upstream REPUBLISHES between the
-    checks and a commit is the caller's — publish holds every upstream
-    stage's writer lock for its whole duration.
+    The curate generation is preferred over the classify one (unless
+    ``final`` is False, for the curate stage reading its own input), and
+    classify over coverage; each is refused (:class:`ClassifyError`) unless
+    it descends from the CURRENT resolved feeds, expanded places, crawl (by
+    digest) and the generation before it in the chain: a rerun of any input
+    that was not followed downstream makes the edges stale, and stale edges
+    are never published or checked as fresh.
+
+    The whole read is one snapshot: a caller that does not already hold
+    them (``locked``) takes every edge stage's writer lock in the one
+    global order, then the crawl's, for the duration — the same locks
+    publish and curate hold through their commits — so no pointer can move
+    between the lineage checks and the artifacts returned.
     """
+    if locked:
+        return _read_edges(cache_dir, final)
+    with contextlib.ExitStack() as stack:
+        for subdir in EDGE_STAGES:
+            held = store.open_subdir(cache_dir, subdir)
+            stack.callback(held.close)
+            stack.enter_context(store.exclusive_writer(held))
+        stack.enter_context(crawl.reading(cache_dir))
+        return _read_edges(cache_dir, final)
+
+
+def _read_edges(cache_dir, final):
+    """:func:`read_edges` under the caller's locks."""
+    if _pointer_present(cache_dir / "curate" / CURATE_POINTER) and not _pointer_present(
+        cache_dir / "classify" / CLASSIFY_POINTER
+    ):
+        # Curated edges cannot exist without the classified edges they
+        # descend from, whatever else is present.
+        raise ClassifyError(
+            "a curate generation exists without its classify generation"
+        )
     if not _pointer_present(cache_dir / "coverage" / coverage.COVERAGE_POINTER):
         if _pointer_present(cache_dir / "classify" / CLASSIFY_POINTER):
             # Classified edges cannot exist without the coverage they
@@ -1051,13 +1082,7 @@ def read_edges(cache_dir, *, locked=False):
             f"the coverage generation is unreadable: {error}"
         ) from error
     with coverage_generation:
-        if locked:
-            # The caller holds the crawl lock for its whole operation.
-            current_crawl = crawl.states_digest(cache_dir)
-        else:
-            with crawl.reading(cache_dir):
-                current_crawl = crawl.states_digest(cache_dir)
-        if coverage_manifest.get("crawl_digest") != current_crawl:
+        if coverage_manifest.get("crawl_digest") != crawl.states_digest(cache_dir):
             # Membership was measured against a crawl that has since moved;
             # every edge downstream of it is stale.
             raise ClassifyError(
@@ -1114,7 +1139,31 @@ def read_edges(cache_dir, *, locked=False):
         feeds = store.parse_jsonl(generation.read_bytes(FEEDS_ARTIFACT))
         edges = store.parse_jsonl(generation.read_bytes(EDGES_ARTIFACT))
     _require_service(edges, "classified")
-    return feeds, edges, manifest
+    if not final or not _pointer_present(cache_dir / "curate" / CURATE_POINTER):
+        return feeds, edges, manifest
+    try:
+        curated, curate_manifest = store.resolve(cache_dir / "curate", CURATE_POINTER)
+    except (store.StoreError, ValueError) as error:
+        raise ClassifyError(f"the curate generation is unreadable: {error}") from error
+    with curated:
+        _check_descends(
+            curate_manifest,
+            "classify_generation",
+            manifest.get("generation"),
+            "the curated edges",
+            "curate",
+        )
+        _check_descends(
+            curate_manifest,
+            "expanded_generation",
+            current_expanded,
+            "the curated edges",
+            "curate",
+        )
+        feeds = store.parse_jsonl(curated.read_bytes(CURATED_FEEDS_ARTIFACT))
+        edges = store.parse_jsonl(curated.read_bytes(CURATED_EDGES_ARTIFACT))
+    _require_service(edges, "curated")
+    return feeds, edges, curate_manifest
 
 
 def classify(cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS):
