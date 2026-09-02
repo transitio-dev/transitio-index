@@ -1018,7 +1018,7 @@ def test_the_cli_runs_a_stage_and_everything_downstream(monkeypatch):
     }
     monkeypatch.setattr(build_index, "STAGES", fake)
     assert build_index.main(["--stage", "classify", "--downstream"]) == 0
-    assert calls == ["classify", "curate", "publish"]
+    assert calls == ["classify", "curate", "prune", "publish"]
     calls.clear()
     assert build_index.main(["--stage", "curate"]) == 0
     assert calls == ["curate"]

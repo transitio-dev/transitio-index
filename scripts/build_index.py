@@ -41,6 +41,7 @@ from index_build import (  # noqa: E402
     metros,
     names,
     overture,
+    prune,
     publish,
     resolve,
     seed,
@@ -126,6 +127,10 @@ def run_curate(arguments):
     ]
 
 
+def run_prune(arguments):
+    return [prune.prune(arguments.cache_dir)]
+
+
 def run_publish(arguments):
     golden_path = None if arguments.no_golden else arguments.golden
     if golden_path is not None and not golden_path.is_file():
@@ -153,6 +158,7 @@ STAGES = {
     "coverage": run_coverage,
     "classify": run_classify,
     "curate": run_curate,
+    "prune": run_prune,
     "publish": run_publish,
 }
 

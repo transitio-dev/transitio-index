@@ -5,11 +5,12 @@ Writes ``<cache>/index/`` — ``feeds.parquet`` (one row per feed),
 boundary), ``edges.parquet`` (one membership row per place/feed/tier) and
 ``snapshot.json`` (the manifest: a deterministic snapshot id, the schema
 version, the source versions, the counts, and each Parquet's SHA-256). The
-feeds come from the coverage generation when it exists (stamped with
-``coverage_source`` and ``crawlable``, alongside the candidate edges), else from
-the crosswalk; the places from the expanded generation, else the names one.
-Places and edges are optional: an index built before those stages ran is feeds
-only, and the reader treats the missing tables the same way.
+feeds come from the latest edge stage when one exists (curated, classified or
+coverage edges, with the feeds stamped ``coverage_source`` and ``crawlable``),
+else from the crosswalk; the places from the pruned generation for a curated
+build, else the expanded generation, else the names one. Places and edges are
+optional: an index built before those stages ran is feeds only, and the reader
+treats the missing tables the same way.
 
 The flat identity and crosswalk fields are their own columns; the verbatim Atlas,
 MDB and GBFS source rows are kept as JSON-string columns, so nothing is lost and
@@ -108,9 +109,14 @@ def _place_row(record, snapshot_id, service=None):
         "aliases": record.get("aliases") or [],
         # An explicit default set upstream (a curated override) wins; otherwise a
         # place in exactly one metro promotes to it, and choosing among several
-        # is the resolver's metro-default rule, so it stays null.
+        # is the resolver's metro-default rule, so it stays null. A default the
+        # prune stage cleared stays cleared, whatever metro survived.
         "default_metro_id": record.get("default_metro_id")
-        or (metro_ids[0] if len(metro_ids) == 1 else None),
+        or (
+            metro_ids[0]
+            if len(metro_ids) == 1 and not record.get("default_metro_cleared")
+            else None
+        ),
         "resolution_method": record.get("resolution_method"),
         "curated": bool(record.get("curated", False)),
         "parent_id": record.get("parent_id"),
@@ -314,15 +320,54 @@ def _edges_parquet_bytes(edges, snapshot_id):
     return sink.getvalue()
 
 
-def _read_places(cache_dir):
-    """The gazetteer places, the Overture release and the generation read,
-    or ``(None, None, None)``.
+def _read_places(cache_dir, edge_manifest=None):
+    """The gazetteer places, the Overture release and the expanded generation
+    they descend from, or ``(None, None, None)``.
 
-    The expanded generation is preferred (it is what coverage derived edges
-    from), falling back to the names one for a build that has not run the
-    expand stage. The release is taken from the same generation's own manifest,
-    so the places cannot be labelled with a different pointer read separately.
+    The pruned generation is what a curated build ships: it must descend
+    from the current expanded places and from the very curate generation
+    whose edges are being published (``edge_manifest``), and a curated build
+    without one is a stage that has not run. Without curation the expanded
+    generation is used (it is what coverage derived edges from), falling
+    back to the names one for a build that has not run the expand stage.
+    The release is taken from the same generation's own manifest, so the
+    places cannot be labelled with a different pointer read separately.
     """
+    curated = edge_manifest is not None and edge_manifest.get("source") == "curate"
+    pruned = cache_dir / "prune" / "places_pruned.json"
+    if pruned.is_symlink() or pruned.exists():
+        try:
+            places, manifest = store.read_jsonl(
+                cache_dir / "prune", "places_pruned.json", "places_pruned.jsonl"
+            )
+        except (store.StoreError, ValueError) as error:
+            raise PublishError(f"the pruned places are unreadable: {error}") from error
+        if not curated:
+            raise PublishError(
+                "pruned places exist without a curate generation to have pruned "
+                "against; re-run the pipeline in stage order"
+            )
+        if manifest.get("curate_generation") != edge_manifest.get("generation"):
+            raise PublishError(
+                "the pruned places were not derived from the edges being "
+                "published; re-run the prune stage"
+            )
+        expanded = _current_expanded(cache_dir)
+        if manifest.get("expanded_generation") != expanded.get("generation"):
+            raise PublishError(
+                "the pruned places do not descend from the current expanded "
+                "places; re-run the pipeline in stage order"
+            )
+        _check_names_lineage(cache_dir, expanded)
+        return (
+            places,
+            manifest.get("overture_release"),
+            manifest.get("expanded_generation"),
+        )
+    if curated:
+        raise PublishError(
+            "curated edges exist but no pruned places; run the prune stage"
+        )
     if not (cache_dir / "gazetteer").is_dir():
         return None, None, None
     for pointer, artifact in (
@@ -347,6 +392,21 @@ def _read_places(cache_dir):
         return places, manifest.get("overture_release"), manifest.get("generation")
     # No published places generation: the index is feeds only.
     return None, None, None
+
+
+def _current_expanded(cache_dir):
+    """The current expanded generation's manifest; its absence under a
+    pruned generation is corruption, never a feeds-only build."""
+    try:
+        generation, manifest = store.resolve(cache_dir / "gazetteer", "expanded.json")
+    except (store.StoreError, ValueError) as error:
+        raise PublishError(
+            f"the expanded generation the pruned places descend from is "
+            f"unreadable: {error}"
+        ) from error
+    with generation:
+        pass
+    return manifest
 
 
 def _check_names_lineage(cache_dir, expanded_manifest):
@@ -453,6 +513,7 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
             "coverage",
             "classify",
             "curate",
+            "prune",
         ):
             # Created when absent, so a stage that has not run yet cannot
             # slip its first publication in between: the lock exists first.
@@ -493,7 +554,7 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
         # A gazetteer that ran but produced no places is a places index of zero
         # places, distinct from a feeds-only build (no gazetteer at all) — hence
         # ``is not None`` throughout, never a truthiness test that folds the two.
-        places, overture_release, places_generation = _read_places(cache_dir)
+        places, overture_release, places_generation = _read_places(cache_dir, coverage)
         if places is not None and not overture_release:
             # The release folds into the snapshot id; without it a places index would
             # share the feeds-only id for the same feeds.
