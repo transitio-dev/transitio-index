@@ -59,6 +59,7 @@ def merge_names(cache_dir, *, wikidata=None):
             manifest = {
                 "source": "names",
                 "sources": geometry_manifest.get("sources"),
+                "seed_generation": geometry_manifest.get("seed_generation"),
                 "wikidata_api": overture.WIKIDATA_API,
                 # Carried forward so the publish stage reads the pinned release
                 # from the same generation as the places, not a separate pointer.

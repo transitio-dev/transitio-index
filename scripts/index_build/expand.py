@@ -15,10 +15,6 @@ to end.
 """
 
 import datetime
-import hashlib
-import json
-import os
-import re
 
 import shapely
 
@@ -29,86 +25,22 @@ EXPANDED_POINTER = "expanded.json"
 PLACES_ARTIFACT = "places_expanded.jsonl"
 REPORT_ARTIFACT = "expansion_report.jsonl"
 
-# The only directory shape the crawl stage produces; anything else in the log
-# is refused rather than joined into a path.
-_CRAWL_DIR = re.compile(r"\Aid-[0-9a-f]{64}\Z")
-
 
 def _stop_points(feed_dir, state):
     """``(points, dropped)`` for one crawled feed's stops, or None.
 
-    The bytes are verified against the digest ``state.json`` — the crawl's
-    per-feed commit point — recorded for them: a crash mid-crawl can leave a
-    member newer or older than the state, and a mismatched file must be
-    skipped, never resolved as evidence. The file is streamed twice (digest,
-    then parse) so no whole member is buffered, and ANY failure — a symlink,
-    a csv field over the parser limit, memory — answers None: one feed's
-    corrupt member must never abort the run.
+    Read through the digest-verified member; a data failure — a csv field
+    over the parser limit, an undecodable byte, memory — answers None: one
+    feed's corrupt member must never abort the run. A programming defect is
+    not caught, so it cannot masquerade as bad feed data.
     """
-    path = feed_dir / "stops.txt"
-    digests = state.get("member_sha256")
-    expected = digests.get("stops.txt") if isinstance(digests, dict) else None
-    if not expected:
-        return None
     try:
-        handle = store.open_nofollow(path)
-    except OSError:
-        return None
-    try:
-        with os.fdopen(handle, "rb") as opened:
-            digest = hashlib.sha256()
-            for chunk in iter(lambda: opened.read(1024 * 1024), b""):
-                digest.update(chunk)
-            if digest.hexdigest() != expected:
+        with crawl.verified_member(feed_dir, state, "stops.txt") as opened:
+            if opened is None:
                 return None
-            opened.seek(0)
             return crawl.stop_coordinates(opened)
-    except Exception:
+    except crawl.MEMBER_ERRORS:
         return None
-
-
-def _crawled_feeds(cache_dir):
-    """``(feed_dir, state)`` for crawled feeds whose state records stops.
-
-    The per-feed ``state.json`` is the crawl's commit point, so it — not the
-    run-level log alone — decides what may be read as evidence.
-    """
-    crawl_root = cache_dir / "crawl"
-    if crawl_root.is_symlink() or not crawl_root.is_dir():
-        return []
-    log_path = crawl_root / "crawl_log.jsonl"
-    try:
-        handle = store.open_nofollow(log_path)
-    except OSError:
-        return []
-    with os.fdopen(handle, "rb") as opened:
-        raw = opened.read()
-    found = []
-    for record in store.parse_jsonl(raw):
-        if not isinstance(record, dict):
-            continue
-        name = record.get("directory")
-        if not isinstance(name, str) or not _CRAWL_DIR.fullmatch(name):
-            # A corrupted or foreign log line must not traverse the cache.
-            continue
-        feed_dir = crawl_root / name
-        # The whole chain must be real: a symlinked feed directory would let
-        # the final-component checks below inspect files outside the cache.
-        if feed_dir.is_symlink() or not feed_dir.is_dir():
-            continue
-        state_path = feed_dir / "state.json"
-        try:
-            handle = store.open_nofollow(state_path)
-            with os.fdopen(handle, "rb") as opened:
-                state = json.loads(opened.read())
-        except (OSError, ValueError):
-            continue
-        # One corrupt state skips one feed; it must never abort expansion.
-        if not isinstance(state, dict) or not isinstance(state.get("members"), list):
-            continue
-        if "stops.txt" in state["members"]:
-            found.append((feed_dir, state))
-    return found
 
 
 def _attach_boundary(place, rows):
@@ -180,7 +112,7 @@ def _discover(cache_dir, places_by_id, lookup, wikidata, area_dataset, report):
     # Two passes, one feed's stops in memory at a time — never every crawled
     # feed's stops at once: first the lookup boxes, then, with the boxes
     # ensured, the per-point division resolution.
-    crawled = _crawled_feeds(cache_dir)
+    crawled = crawl.crawled_feeds(cache_dir)
     stops_read = 0
     state_mismatches = 0
     boxes = []
@@ -263,6 +195,40 @@ def _discover(cache_dir, places_by_id, lookup, wikidata, area_dataset, report):
     }
 
 
+def _expanded(
+    cache_dir, places_by_id, report, counts, lookup, wikidata, area_dataset, release
+):
+    """Discovery under the crawl lock; ``(crawl_digest, counts, mode)``.
+
+    The digest is taken while the lock is still held, so it describes
+    exactly the states discovery read.
+    """
+    mode = "declared"
+    opened_lookup = None
+    try:
+        if crawl.crawled_feeds(cache_dir):
+            mode = "expanded"
+            if wikidata is None:
+                wikidata = overture.WikidataClient()
+            if area_dataset is None:
+                area_dataset = geometry.division_area_dataset(release)
+            if lookup is None:
+                opened_lookup = boundaries.BoundaryLookup(
+                    cache_dir,
+                    release=release,
+                    area_dataset=area_dataset,
+                    division_dataset=overture.overture_dataset(release),
+                )
+                lookup = opened_lookup
+            counts = _discover(
+                cache_dir, places_by_id, lookup, wikidata, area_dataset, report
+            )
+    finally:
+        if opened_lookup is not None:
+            opened_lookup.close()
+    return crawl.states_digest(cache_dir), counts, mode
+
+
 def expand(cache_dir, *, lookup=None, wikidata=None, area_dataset=None):
     """Publish ``places_expanded``: the seed plus crawl-discovered places.
 
@@ -271,7 +237,6 @@ def expand(cache_dir, *, lookup=None, wikidata=None, area_dataset=None):
     release forward. Returns the generation manifest.
     """
     directory = store.open_subdir(cache_dir, "gazetteer")
-    opened_lookup = None
     try:
         with store.exclusive_writer(directory):
             places, names_manifest = store.read_jsonl(
@@ -287,28 +252,23 @@ def expand(cache_dir, *, lookup=None, wikidata=None, area_dataset=None):
                 "places_added": 0,
                 "metros_added": 0,
             }
-            mode = "declared"
-            if _crawled_feeds(cache_dir):
-                mode = "expanded"
-                if wikidata is None:
-                    wikidata = overture.WikidataClient()
-                if area_dataset is None:
-                    area_dataset = geometry.division_area_dataset(release)
-                if lookup is None:
-                    opened_lookup = boundaries.BoundaryLookup(
-                        cache_dir,
-                        release=release,
-                        area_dataset=area_dataset,
-                        division_dataset=overture.overture_dataset(release),
-                    )
-                    lookup = opened_lookup
-                counts = _discover(
-                    cache_dir, places_by_id, lookup, wikidata, area_dataset, report
+            with crawl.reading(cache_dir):
+                crawl_digest, counts, mode = _expanded(
+                    cache_dir,
+                    places_by_id,
+                    report,
+                    counts,
+                    lookup,
+                    wikidata,
+                    area_dataset,
+                    release,
                 )
-
             manifest = {
                 "source": "expand",
                 "sources": names_manifest.get("sources"),
+                "seed_generation": names_manifest.get("seed_generation"),
+                "names_generation": names_manifest.get("generation"),
+                "crawl_digest": crawl_digest,
                 "mode": mode,
                 "places": len(places_by_id),
                 "overture_release": release,
@@ -329,6 +289,4 @@ def expand(cache_dir, *, lookup=None, wikidata=None, area_dataset=None):
                 held=directory,
             )
     finally:
-        if opened_lookup is not None:
-            opened_lookup.close()
         directory.close()

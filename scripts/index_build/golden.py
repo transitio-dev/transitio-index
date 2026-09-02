@@ -16,11 +16,16 @@ them so the switch is a flag, not a schema change.
 """
 
 import json
+import math
+import os
 
 from index_build import overture, store
 
 REQUIRED_KEYS = ("feed_id", "name", "why", "membership", "tiers", "review_state")
 REVIEW_STATES = ("confident", "needs_review")
+# The index-wide unknown-edge share may not move more than this, in
+# percentage points, between one snapshot and the next.
+UNKNOWN_DRIFT = 0.05
 TIERS = ("local", "regional", "national", "international", "unknown")
 
 
@@ -46,7 +51,9 @@ def load_golden(path):
             raise GoldenError(f"{record['feed_id']}: duplicate entry")
         seen.add(record["feed_id"])
         for key in ("membership", "membership_excludes"):
-            places = record.get(key) or []
+            # Present means a QID list — a falsy non-list (0, false, "") is
+            # malformed, never an empty contract.
+            places = record.get(key, [])
             if not isinstance(places, list) or any(
                 not (isinstance(q, str) and overture.QID_PATTERN.match(q))
                 for q in places
@@ -98,33 +105,116 @@ def check_catalogue_evidence(golden_path, evidence_path):
 
 
 def _actual(cache_dir):
-    """``{feed_id: set of place ids}`` from the build's candidate edges."""
-    edges, _ = store.read_jsonl(
-        cache_dir / "coverage", "coverage.json", "edges_candidate.jsonl"
-    )
+    """``{feed_id: [edges]}`` from the latest edge stage — classified edges
+    when a fresh classify generation exists, candidate edges otherwise; a
+    stale classify generation fails the gate rather than being checked."""
+    from index_build import classify
+
+    try:
+        _, edges, manifest = classify.read_edges(cache_dir)
+    except classify.ClassifyError as error:
+        raise GoldenError(str(error)) from error
+    if edges is None:
+        raise GoldenError("no edge generation to check against")
     actual = {}
     for edge in edges:
-        actual.setdefault(edge["feed_id"], set()).add(edge["place_id"])
-    return actual
+        actual.setdefault(edge["feed_id"], []).append(edge)
+    return actual, manifest
 
 
-def check(cache_dir, golden_path, *, assert_tiers=False):
+def _unknown_drift(cache_dir, manifest):
+    """The change in unknown-edge share against the previous snapshot, or
+    None when either side has no measurement."""
+    current = manifest.get("unknown_share")
+    path = cache_dir / "index" / "snapshot.json"
+    if current is None or not (path.is_symlink() or path.exists()):
+        return None
+    try:
+        with os.fdopen(store.open_nofollow(path), "rb") as opened:
+            snapshot = json.loads(opened.read())
+    except (OSError, ValueError) as error:
+        # A snapshot that is there but unreadable must not silently
+        # disable the drift check.
+        raise GoldenError(f"the previous snapshot is unreadable: {error}") from error
+    if not isinstance(snapshot, dict):
+        raise GoldenError("the previous snapshot is not an object")
+    previous = snapshot.get("unknown_share")
+    if previous is None:
+        return None
+    if not (_is_share(previous) and _is_share(current)):
+        # NaN parses as JSON and compares false to everything.
+        raise GoldenError("unknown_share is not a finite number")
+    return current - previous
+
+
+def _is_share(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def check(cache_dir, golden_path, *, assert_tiers=None, edges=None, manifest=None):
     """Diff the build against the golden entries; returns the report.
 
     The report's ``violations`` list one dict per broken expectation; an
-    empty list is a pass. ``assert_tiers`` stays False until the classifier
-    exists — entries record tiers and review state for that switch.
+    empty list is a pass. Tier and review-state assertions are ON whenever
+    the edges come from a classify generation (``assert_tiers`` overrides
+    either way): the feed's tier set over EVERY edge it has must equal the
+    recorded one and the review state must match — ``needs_review`` when
+    any of its edges needs review — so a rule change that moves a golden
+    feed across the cutoff fails the diff without anyone remembering a
+    flag. ``edges``/``manifest`` let a caller check the edges it already
+    read instead of resolving the latest generation again.
     """
     entries = load_golden(golden_path)
-    actual = _actual(cache_dir)
+    if edges is None:
+        actual, manifest = _actual(cache_dir)
+    else:
+        # The caller's own read: publish passes the very edges it ships, so
+        # a concurrent republish cannot make the gate judge another set.
+        actual = {}
+        for edge in edges:
+            actual.setdefault(edge["feed_id"], []).append(edge)
+        manifest = manifest or {}
+    if assert_tiers is None:
+        assert_tiers = manifest.get("source") == "classify"
     violations = []
     for entry in entries:
         feed_id = entry["feed_id"]
-        places = actual.get(feed_id)
+        edges = actual.get(feed_id) or []
+        places = {edge["place_id"] for edge in edges}
         if not places:
             violations.append({"feed_id": feed_id, "problem": "feed has no edges"})
             continue
         expected = set(entry["membership"])
+        if assert_tiers:
+            relevant = edges
+            tiers = {edge["tier"] for edge in relevant}
+            if tiers != set(entry["tiers"]):
+                violations.append(
+                    {
+                        "feed_id": feed_id,
+                        "problem": "tier set differs",
+                        "expected": sorted(entry["tiers"]),
+                        "actual": sorted(tiers),
+                    }
+                )
+            state = (
+                "needs_review"
+                if any(edge.get("needs_review") for edge in relevant)
+                else "confident"
+            )
+            if state != entry["review_state"]:
+                violations.append(
+                    {
+                        "feed_id": feed_id,
+                        "problem": "review state crossed the cutoff",
+                        "expected": entry["review_state"],
+                        "actual": state,
+                    }
+                )
         if entry.get("membership_exact"):
             if places != expected:
                 violations.append(
@@ -155,7 +245,22 @@ def check(cache_dir, golden_path, *, assert_tiers=False):
                 }
             )
     if assert_tiers:
-        raise NotImplementedError("tier assertions land with the classifier")
+        drift = _unknown_drift(cache_dir, manifest)
+        # Exactly five points is permitted; the tolerance keeps binary
+        # rounding (0.40 - 0.35) from failing it.
+        if (
+            drift is not None
+            and abs(drift) > UNKNOWN_DRIFT
+            and not math.isclose(abs(drift), UNKNOWN_DRIFT)
+        ):
+            violations.append(
+                {
+                    "feed_id": None,
+                    "problem": "unknown share drifted",
+                    "delta": drift,
+                    "limit": UNKNOWN_DRIFT,
+                }
+            )
     return {
         "entries": len(entries),
         "violations": violations,
@@ -170,8 +275,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Run the golden-set diff")
     parser.add_argument("--cache-dir", required=True, type=pathlib.Path)
     parser.add_argument("--golden", required=True, type=pathlib.Path)
+    parser.add_argument(
+        "--membership-only",
+        action="store_true",
+        help="check membership only, even against classified edges",
+    )
     args = parser.parse_args(argv)
-    report = check(args.cache_dir, args.golden)
+    report = check(
+        args.cache_dir,
+        args.golden,
+        assert_tiers=False if args.membership_only else None,
+    )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 1
 

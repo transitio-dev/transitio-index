@@ -18,6 +18,7 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 from index_build import publish  # noqa: E402
+from index_build import classify  # noqa: E402
 
 # Import the read layer directly too, so an old installed transitio shadowing
 # the source (which would lack it) fails loudly rather than skipping the module.
@@ -65,7 +66,7 @@ def _publish_gen(cache, pointer, artifact, records, manifest):
     directory = store.open_subdir(cache, "gazetteer")
     try:
         with store.exclusive_writer(directory):
-            store.publish(
+            return store.publish(
                 cache / "gazetteer",
                 pointer,
                 {artifact: store.jsonl_chunks(records)},
@@ -142,7 +143,7 @@ def _edge(place_id, feed_id, **kw):
         "place_id": place_id,
         "feed_id": feed_id,
         "tier": kw.get("tier", "unknown"),
-        "confidence": kw.get("confidence", 0.5),
+        "service": kw.get("service"),
         "tier_confidence": 0.0,
         "method": "inferred",
         "rehomed_from": [],
@@ -161,7 +162,7 @@ def _edge(place_id, feed_id, **kw):
 def _edges_index(tmp_path, edges, feeds=None, release="2026-08-19.0", places=None):
     """A cache with expanded places and a coverage generation, published."""
     cache = tmp_path / "cache"
-    _publish_gen(
+    expanded = _publish_gen(
         cache,
         "expanded.json",
         "places_expanded.jsonl",
@@ -185,11 +186,13 @@ def _edges_index(tmp_path, edges, feeds=None, release="2026-08-19.0", places=Non
                     "mode": "declared",
                     "sources": SOURCES,
                     "overture_release": "2026-08-19.0",
+                    "expanded_generation": expanded["generation"],
                 },
                 held=directory,
             )
     finally:
         directory.close()
+    classify.classify(cache)
     manifest = publish.publish(cache)
     return cache, manifest
 
@@ -499,6 +502,8 @@ def test_places_without_an_overture_release_are_refused(tmp_path):
 
 
 def test_edges_round_trip_through_the_reader(tmp_path):
+    import pandas
+
     pytest.importorskip("geopandas")
     edges = [_edge("Q1757", "f-a"), _edge("Q-metro", "f-a")]
     cache, manifest = _edges_index(tmp_path, edges)
@@ -509,12 +514,11 @@ def test_edges_round_trip_through_the_reader(tmp_path):
     row = index.edges.set_index("place_id").loc["Q1757"]
     assert row["feed_id"] == "f-a"
     assert row["tier"] == "unknown"
-    assert row["confidence"] == 0.5
+    assert pandas.isna(row["service"])  # a null column reads None or NaN
     assert row["selector_state"] == "unavailable"
     assert bool(row["needs_review"]) is True
     assert json.loads(row["evidence"])["declared_level"] == "municipality"
     # The feeds come from the coverage generation, stamped with their coverage.
-    import pandas
 
     by_id = {r["feed_id"]: r for _, r in index.feeds.iterrows()}
     assert by_id["f-a"]["coverage_source"] == "declared"
@@ -583,8 +587,75 @@ def test_a_duplicate_column_label_is_refused_even_when_correctly_hashed(tmp_path
 def test_the_snapshot_id_reflects_distinct_edges_content(tmp_path):
     pytest.importorskip("geopandas")
     _, a = _edges_index(tmp_path / "a", [_edge("Q1757", "f-a")])
-    _, b = _edges_index(tmp_path / "b", [_edge("Q1757", "f-a", confidence=0.35)])
+    service = {"stops": 1, "routes": 1, "departures_per_day": 2.0}
+    _, b = _edges_index(tmp_path / "b", [_edge("Q1757", "f-a", service=service)])
     assert a["snapshot_id"] != b["snapshot_id"]
+
+
+def test_a_place_sums_the_service_of_the_feeds_serving_it(tmp_path):
+    pytest.importorskip("geopandas")
+    measured = {"stops": 3, "routes": 2, "departures_per_day": 40.0}
+    edges = [
+        _edge("Q1757", "f-a", service=measured),
+        # The pair's second tier repeats the struct: counted once.
+        _edge("Q1757", "f-a", tier="national", service=measured),
+        _edge("Q1757", "f-b", service={"stops": 1, "routes": None}),
+        # A declared-only place: one feed, nothing measured.
+        _edge("Q-metro", "f-b"),
+    ]
+    cache, _ = _edges_index(tmp_path, edges)
+    index = transitio_index.read_index(cache / "index")
+    service = transitio_index.place("Q1757", index=index).service
+    assert (service.feeds, service.stops, service.routes) == (2, 4, 2)
+    assert service.departures_per_day == 40.0
+    declared = transitio_index.place("Q-metro", index=index).service
+    assert (declared.feeds, declared.stops, declared.departures_per_day) == (
+        1,
+        None,
+        None,
+    )
+
+
+def test_a_feeds_only_snapshot_needs_an_explicit_no_golden(tmp_path):
+    cache, _ = _build_index(tmp_path)
+    with pytest.raises(publish.PublishError, match="no-golden"):
+        publish.publish(cache, golden_path=REPO / "golden" / "feeds.jsonl")
+
+
+def test_unclassified_edges_are_refused(tmp_path):
+    cache = tmp_path / "cache"
+    expanded = _publish_gen(
+        cache,
+        "expanded.json",
+        "places_expanded.jsonl",
+        PLACES,
+        {"source": "expand", "overture_release": "2026-08-19.0"},
+    )
+    directory = store.open_subdir(cache, "coverage")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "coverage",
+                "coverage.json",
+                {
+                    "feeds_covered.jsonl": store.jsonl_chunks([_covered_feed("f-a")]),
+                    "edges_candidate.jsonl": store.jsonl_chunks(
+                        [_edge("Q1757", "f-a")]
+                    ),
+                },
+                {
+                    "source": "coverage",
+                    "mode": "declared",
+                    "sources": SOURCES,
+                    "overture_release": "2026-08-19.0",
+                    "expanded_generation": expanded["generation"],
+                },
+                held=directory,
+            )
+    finally:
+        directory.close()
+    with pytest.raises(publish.PublishError, match="unclassified"):
+        publish.publish(cache)
 
 
 def test_coverage_without_a_places_generation_is_refused(tmp_path):

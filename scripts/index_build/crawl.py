@@ -1,9 +1,10 @@
 """Crawl stage: fetch each crawlable feed's GTFS members into the build cache.
 
 For every resolved feed that is crawlable, the stage fetches the members later
-stages read — ``agency.txt``, ``routes.txt``, ``stops.txt``, ``trips.txt`` and
-the complete ``stop_times.txt`` — into ``cache/crawl/<feed dir>/`` alongside a
-``state.json`` provenance record (URL, validators, digests, members, time).
+stages read — ``agency.txt``, ``routes.txt``, ``stops.txt``, ``trips.txt``,
+``calendar.txt``, ``calendar_dates.txt`` and the complete ``stop_times.txt`` —
+into ``cache/crawl/<feed dir>/`` alongside a ``state.json`` provenance record
+(URL, validators, digests, members, the member set asked for, time).
 
 Feeds large enough to pay for it (past the size threshold, on a server that
 honours ranges and offers a strong validator) are read member-by-member through
@@ -28,6 +29,7 @@ no city) reads the member: the safe direction. A recrawl request always reads
 it.
 """
 
+import contextlib
 import csv
 import datetime
 import hashlib
@@ -35,6 +37,7 @@ import io
 import json
 import math
 import os
+import re
 import tempfile
 import zipfile
 import zlib
@@ -46,6 +49,8 @@ MEMBERS = (
     "routes.txt",
     "stops.txt",
     "trips.txt",
+    "calendar.txt",
+    "calendar_dates.txt",
     "stop_times.txt",
 )
 
@@ -55,6 +60,14 @@ CHEAP_MEMBERS = tuple(name for name in MEMBERS if name != STOP_TIMES)
 # Stop clusters become grid cells of this size, padded into lookup boxes.
 GRID_DEG = 0.2
 PAD_DEG = 0.05
+
+# The only directory shape the crawl produces; anything else in the log is
+# refused rather than joined into a path.
+_CRAWL_DIR = re.compile(r"\Aid-[0-9a-f]{64}\Z")
+
+# What a corrupt crawled member can raise while being read as evidence; a
+# programming defect is deliberately NOT in this tuple, so it surfaces.
+MEMBER_ERRORS = (OSError, ValueError, csv.Error, UnicodeError, MemoryError)
 
 LOG_FILE = "crawl_log.jsonl"
 STATE_FILE = "state.json"
@@ -86,18 +99,21 @@ def _dir_name(feed_id):
     return "id-" + hashlib.sha256(feed_id.encode("utf-8")).hexdigest()
 
 
-def stop_coordinates(source):
-    """``(points, dropped)`` parsed from ``stops.txt`` bytes or a binary file.
+def stop_rows(source):
+    """``(rows, dropped)`` parsed from ``stops.txt`` bytes or a binary file.
 
-    ``points`` are the parseable ``(lon, lat)`` pairs; ``dropped`` counts rows
-    refused for a malformed or out-of-range coordinate — range-checked, not
-    just finite, because a huge value would overflow the grid-cell arithmetic.
-    Evidence consumers use the points; the skip predicate refuses any drop.
+    ``rows`` are ``(stop_id, lon, lat)`` for the parseable rows; ``dropped``
+    counts rows refused for a malformed or out-of-range coordinate —
+    range-checked, not just finite, because a huge value would overflow the
+    grid-cell arithmetic. Evidence consumers use the rows; the skip predicate
+    refuses any drop.
     """
-    points = []
+    rows = []
     dropped = 0
     stream = io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source
-    text = io.TextIOWrapper(stream, encoding="utf-8-sig", errors="replace")
+    # Strict: replacing malformed bytes would let distinct invalid ids
+    # collapse into one; a bad byte is a data error the caller handles.
+    text = io.TextIOWrapper(stream, encoding="utf-8-sig", errors="strict")
     for row in csv.DictReader(text):
         try:
             x = float(row.get("stop_lon") or "")
@@ -106,10 +122,130 @@ def stop_coordinates(source):
             dropped += 1
             continue
         if -180.0 <= x <= 180.0 and -90.0 <= y <= 90.0:
-            points.append((x, y))
+            # Ids verbatim: two legal ids differing only by padding must
+            # never collapse into one.
+            rows.append((row.get("stop_id") or "", x, y))
         else:
             dropped += 1
-    return points, dropped
+    return rows, dropped
+
+
+def stop_coordinates(source):
+    """``(points, dropped)``: the ``(lon, lat)`` pairs of :func:`stop_rows`."""
+    rows, dropped = stop_rows(source)
+    return [(x, y) for _, x, y in rows], dropped
+
+
+@contextlib.contextmanager
+def verified_member(feed_dir, state, name):
+    """A crawled member opened for binary reading after digest verification.
+
+    Yields the file positioned at its start, or None when the state records
+    no digest for the member, the file is missing or symlinked, or its bytes
+    do not match — ``state.json`` is the crawl's per-feed commit point, and a
+    member a crash left newer or older than it must never be read as
+    evidence. The digest streams the file, so no whole member is buffered.
+    """
+    digests = state.get("member_sha256")
+    expected = digests.get(name) if isinstance(digests, dict) else None
+    if not expected:
+        yield None
+        return
+    try:
+        handle = store.open_nofollow(feed_dir / name)
+    except OSError:
+        yield None
+        return
+    with os.fdopen(handle, "rb") as opened:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: opened.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != expected:
+            yield None
+            return
+        opened.seek(0)
+        yield opened
+
+
+def states_digest(cache_dir):
+    """A digest over every crawled feed's WHOLE committed state — what a
+    stage read, so a later stage can prove it read the same crawl; None
+    when no crawl has ever committed a log. Every field counts: a state
+    rewritten with the same retrieval time but other members, digests,
+    validators or stop_times mode is a different crawl."""
+    root = cache_dir / "crawl"
+    if root.is_symlink() or not (root / LOG_FILE).exists():
+        return None
+    lines = sorted(
+        json.dumps(state, sort_keys=True, ensure_ascii=False)
+        for _, state in crawled_feeds(cache_dir)
+    )
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+@contextlib.contextmanager
+def reading(cache_dir):
+    """Hold the crawl root's writer lock while crawl artifacts are read as
+    evidence, so a concurrent crawl cannot rewrite states between a stage's
+    reads (or between its reads and the digest it records). The directory
+    is created when absent so the lock exists BEFORE any first crawl could:
+    a crawl that starts while a stage holds it waits for the stage."""
+    if (cache_dir / "crawl").is_symlink():
+        raise store.StoreError("the crawl directory is a symlink")
+    directory = store.open_subdir(cache_dir, "crawl")
+    try:
+        with store.exclusive_writer(directory):
+            yield
+    finally:
+        directory.close()
+
+
+def crawled_feeds(cache_dir):
+    """``(feed_dir, state)`` for crawled feeds whose state records stops.
+
+    The per-feed ``state.json`` is the crawl's commit point, so it — not the
+    run-level log alone — decides what may be read as evidence. Every path
+    component is refused when symlinked, and one corrupt log line or state
+    skips one feed, never the caller's run.
+    """
+    crawl_root = cache_dir / "crawl"
+    if crawl_root.is_symlink() or not crawl_root.is_dir():
+        return []
+    log_path = crawl_root / LOG_FILE
+    try:
+        handle = store.open_nofollow(log_path)
+    except OSError:
+        return []
+    with os.fdopen(handle, "rb") as opened:
+        raw = opened.read()
+    found = []
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            # One corrupt log line skips one feed, never every consumer.
+            continue
+        if not isinstance(record, dict):
+            continue
+        name = record.get("directory")
+        if not isinstance(name, str) or not _CRAWL_DIR.fullmatch(name):
+            continue
+        feed_dir = crawl_root / name
+        if feed_dir.is_symlink() or not feed_dir.is_dir():
+            continue
+        try:
+            handle = store.open_nofollow(feed_dir / STATE_FILE)
+            with os.fdopen(handle, "rb") as opened:
+                state = json.loads(opened.read())
+        except (OSError, ValueError):
+            continue
+        if not _valid_state(state) or not isinstance(state.get("members"), list):
+            continue
+        if "stops.txt" in state["members"]:
+            found.append((feed_dir, state))
+    return found
 
 
 def cluster_boxes(points):
@@ -162,22 +298,19 @@ def _skip_stop_times(feed_dir, digests, lookup, force):
     try:
         routes_path = feed_dir.path / "routes.txt"
         stops_path = feed_dir.path / "stops.txt"
-        rows = list(
-            csv.DictReader(
-                io.TextIOWrapper(
-                    io.BytesIO(routes_path.read_bytes()),
-                    encoding="utf-8-sig",
-                    errors="replace",
+        with os.fdopen(store.open_nofollow(routes_path), "rb") as opened:
+            rows = list(
+                csv.DictReader(
+                    io.TextIOWrapper(opened, encoding="utf-8-sig", errors="strict")
                 )
             )
-        )
         if not rows:
             return False, "no routes"
         for row in rows:
             value = (row.get("route_type") or "").strip()
             if not value.isdigit() or not _fixed_tier(int(value)):
                 return False, "route types need geography"
-        with open(stops_path, "rb") as opened:
+        with os.fdopen(store.open_nofollow(stops_path), "rb") as opened:
             points, dropped = stop_coordinates(opened)
         if dropped:
             # A whole-feed claim cannot rest on the parseable subset.
@@ -223,6 +356,10 @@ def _cache_reusable(feed_dir, state, url, force, lookup):
     """
     if state.get("url") != url or force or not _members_intact(feed_dir, state):
         return False
+    if state.get("members_requested") != sorted(MEMBERS):
+        # A crawl that asked for fewer members (before the calendar files
+        # joined the set) cannot stand in for one that asks for them all.
+        return False
     if (state.get("stop_times") or {}).get("state") == "skipped":
         still_skipped, _ = _skip_stop_times(
             feed_dir, state.get("member_sha256") or {}, lookup, force
@@ -231,13 +368,22 @@ def _cache_reusable(feed_dir, state, url, force, lookup):
     return True
 
 
+def _valid_state(state):
+    """Whether a parsed state has the shape the crawl writes; a corrupt
+    file must read as "no usable state", never abort a run."""
+    if not isinstance(state, dict):
+        return False
+    if "stop_times" in state and not isinstance(state["stop_times"], dict):
+        return False
+    return True
+
+
 def _read_state(directory):
     try:
         state = json.loads(store.read_text(directory, STATE_FILE))
     except (store.StoreError, ValueError):
         return {}
-    # A corrupt file must read as "no usable state", never abort the crawl.
-    return state if isinstance(state, dict) else {}
+    return state if _valid_state(state) else {}
 
 
 def _write_state(directory, state):
@@ -539,6 +685,9 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 "archive_sha256": record.get("archive_sha256"),
                 "member_sha256": digests,
                 "members": sorted(digests),
+                # The member set this crawler asked for: a cache written
+                # for a smaller set is not reusable, optional members or not.
+                "members_requested": sorted(MEMBERS),
                 # Whether the complete stop_times read was withheld by the
                 # predicate, so later stages can tell "skipped" from "absent"
                 # and a recrawl request knows what to restore.

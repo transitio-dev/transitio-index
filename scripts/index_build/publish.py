@@ -19,6 +19,7 @@ defines it.
 """
 
 import collections
+import contextlib
 import datetime
 import hashlib
 import io
@@ -29,7 +30,7 @@ import pyarrow.parquet as pq
 
 from index_build import store
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
@@ -95,9 +96,10 @@ def _row(record, snapshot_id):
     }
 
 
-def _place_row(record, snapshot_id):
+def _place_row(record, snapshot_id, service=None):
     metro_ids = record.get("metro_ids") or []
     return {
+        "service": _json_block(service),
         "place_id": record["place_id"],
         "kind": record["kind"],
         "source_subtype": record.get("source_subtype"),
@@ -188,6 +190,7 @@ _PLACES_SCHEMA = pa.schema(
         ("statistical_area_id", pa.string()),
         ("geonames_id", pa.string()),
         ("geometry_source", pa.string()),
+        ("service", pa.string()),
         ("snapshot", pa.string()),
         ("geometry", pa.binary()),
     ]
@@ -210,7 +213,32 @@ def _geo_metadata():
     ).encode("utf-8")
 
 
-def _places_parquet_bytes(places, snapshot_id):
+def _service_by_place(edges):
+    """Each place's service level summed over the feeds serving it.
+
+    Every tier edge of a (place, feed) pair carries the same struct, so pairs
+    are counted once. Each number sums over the feeds that report it and
+    stays null when none does: a place served only by declared feeds has
+    unknown counts, not zero.
+    """
+    per_pair = {}
+    for edge in edges or []:
+        per_pair.setdefault((edge["place_id"], edge["feed_id"]), edge.get("service"))
+    totals = {}
+    for (place_id, _), service in per_pair.items():
+        service = service or {}
+        total = totals.setdefault(
+            place_id,
+            {"feeds": 0, "stops": None, "routes": None, "departures_per_day": None},
+        )
+        total["feeds"] += 1
+        for field in ("stops", "routes", "departures_per_day"):
+            if service.get(field) is not None:
+                total[field] = (total[field] or 0) + service[field]
+    return totals
+
+
+def _places_parquet_bytes(places, snapshot_id, service_by_place=None):
     """The places as GeoParquet bytes: declared columns plus the WKB boundary.
 
     The schema is declared, not inferred, so an all-null column (``geonames_id``,
@@ -219,7 +247,9 @@ def _places_parquet_bytes(places, snapshot_id):
     """
     rows = []
     for place in places:
-        row = _place_row(place, snapshot_id)
+        row = _place_row(
+            place, snapshot_id, (service_by_place or {}).get(place["place_id"])
+        )
         wkb = place.get("geometry")
         row["geometry"] = bytes.fromhex(wkb) if wkb else None
         rows.append(row)
@@ -235,7 +265,7 @@ _EDGES_SCHEMA = pa.schema(
         ("place_id", pa.string()),
         ("feed_id", pa.string()),
         ("tier", pa.string()),
-        ("confidence", pa.float64()),
+        ("service", pa.string()),
         ("tier_confidence", pa.float64()),
         ("method", pa.string()),
         ("rehomed_from", pa.list_(pa.string())),
@@ -258,7 +288,7 @@ def _edge_row(record, snapshot_id):
         "place_id": record["place_id"],
         "feed_id": record["feed_id"],
         "tier": record["tier"],
-        "confidence": record["confidence"],
+        "service": _json_block(record.get("service")),
         "tier_confidence": record["tier_confidence"],
         "method": record["method"],
         "rehomed_from": record.get("rehomed_from") or [],
@@ -285,7 +315,8 @@ def _edges_parquet_bytes(edges, snapshot_id):
 
 
 def _read_places(cache_dir):
-    """The gazetteer places and the Overture release, or ``(None, None)``.
+    """The gazetteer places, the Overture release and the generation read,
+    or ``(None, None, None)``.
 
     The expanded generation is preferred (it is what coverage derived edges
     from), falling back to the names one for a build that has not run the
@@ -293,41 +324,97 @@ def _read_places(cache_dir):
     so the places cannot be labelled with a different pointer read separately.
     """
     if not (cache_dir / "gazetteer").is_dir():
-        return None, None
+        return None, None, None
     for pointer, artifact in (
         ("expanded.json", "places_expanded.jsonl"),
         ("names.json", "places_seed.jsonl"),
     ):
+        path = cache_dir / "gazetteer" / pointer
+        if not (path.is_symlink() or path.exists()):
+            continue
         try:
             places, manifest = store.read_jsonl(
                 cache_dir / "gazetteer", pointer, artifact
             )
-        except store.StoreError:
-            continue
-        return places, manifest.get("overture_release")
+        except (store.StoreError, ValueError) as error:
+            # A pointer that exists but will not resolve is corruption, and
+            # corruption must never fall back to an older generation.
+            raise PublishError(
+                f"the {pointer} generation is unreadable: {error}"
+            ) from error
+        if pointer == "expanded.json":
+            _check_names_lineage(cache_dir, manifest)
+        return places, manifest.get("overture_release"), manifest.get("generation")
     # No published places generation: the index is feeds only.
-    return None, None
+    return None, None, None
 
 
-def _read_coverage(cache_dir):
-    """The covered feeds, candidate edges and manifest, or ``(None, None, None)``.
+def _check_names_lineage(cache_dir, expanded_manifest):
+    """The expanded places must have been derived from the CURRENT seed and
+    names generations: a gazetteer rerun without a following expand leaves
+    an old expanded/coverage/classify chain that is mutually consistent and
+    still stale."""
+    for pointer, key in (
+        ("seed.json", "seed_generation"),
+        ("names.json", "names_generation"),
+    ):
+        path = cache_dir / "gazetteer" / pointer
+        recorded = expanded_manifest.get(key)
+        if not (path.is_symlink() or path.exists()):
+            if recorded is not None:
+                # The ancestor these places descend from is gone: nothing
+                # can verify them any more.
+                raise PublishError(
+                    f"the {pointer} generation the expanded places descend "
+                    "from no longer exists; re-run the expand stage"
+                )
+            continue
+        try:
+            generation, manifest = store.resolve(cache_dir / "gazetteer", pointer)
+        except (store.StoreError, ValueError) as error:
+            raise PublishError(
+                f"the {pointer} generation is unreadable: {error}"
+            ) from error
+        with generation:
+            pass
+        if recorded != manifest.get("generation"):
+            raise PublishError(
+                f"the expanded places do not descend from the current {pointer} "
+                "generation; re-run the expand stage"
+            )
 
-    One pointer resolution serves both artifacts, so a coverage republish racing
-    this read cannot pair feeds from one generation with edges from another.
-    """
-    if not (cache_dir / "coverage").is_dir():
-        return None, None, None
+
+def _read_coverage(cache_dir, *, locked=False):
+    """The feeds, edges and manifest of the latest edge stage, or
+    ``(None, None, None)``; stale classified edges are a publish error."""
+    from index_build import classify
+
     try:
-        generation, manifest = store.resolve(cache_dir / "coverage", "coverage.json")
-    except store.StoreError:
-        return None, None, None
-    with generation:
-        feeds = store.parse_jsonl(generation.read_bytes("feeds_covered.jsonl"))
-        edges = store.parse_jsonl(generation.read_bytes("edges_candidate.jsonl"))
-    return feeds, edges, manifest
+        return classify.read_edges(cache_dir, locked=locked)
+    except classify.ClassifyError as error:
+        raise PublishError(str(error)) from error
 
 
-def publish(cache_dir):
+def _golden_gate(cache_dir, golden_path, edges, manifest):
+    """The golden diff over the very edges about to ship, run before
+    anything is written: a violation fails the publish loudly rather than
+    shipping a regression."""
+    from index_build import golden
+
+    try:
+        report = golden.check(cache_dir, golden_path, edges=edges, manifest=manifest)
+    except golden.GoldenError as error:
+        raise PublishError(f"golden diff could not run: {error}") from error
+    if not report["passed"]:
+        problems = "; ".join(
+            f"{v.get('feed_id') or 'index'}: {v['problem']}"
+            for v in report["violations"]
+        )
+        raise PublishError(f"golden diff failed: {problems}")
+    return report
+
+
+def publish(cache_dir, *, golden_path=None):
     """Build ``<cache>/index`` from the crosswalk (and gazetteer). Returns the manifest.
 
     The source versions come from the crosswalk manifest — the ones it actually
@@ -340,83 +427,131 @@ def publish(cache_dir):
     """
     # The coverage generation supersedes the crosswalk as the feed source: its
     # feeds carry coverage_source and crawlability, and its edges ship alongside.
-    records, edges, coverage = _read_coverage(cache_dir)
-    if records is None:
-        records, crosswalk = store.read_jsonl(
-            cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
-        )
-        sources = crosswalk.get("sources")
-    else:
-        sources = coverage.get("sources")
-    if not records:
-        raise PublishError("no feeds to publish")
-    if not sources:
-        raise PublishError("the feed manifest records no source versions")
+    from index_build import crawl
 
-    # A gazetteer that ran but produced no places is a places index of zero
-    # places, distinct from a feeds-only build (no gazetteer at all) — hence
-    # ``is not None`` throughout, never a truthiness test that folds the two.
-    places, overture_release = _read_places(cache_dir)
-    if places is not None and not overture_release:
-        # The release folds into the snapshot id; without it a places index would
-        # share the feeds-only id for the same feeds.
-        raise PublishError("gazetteer places carry no overture_release")
-    if edges is not None:
-        if places is None:
-            raise PublishError("coverage edges exist but no places generation does")
-        if coverage.get("overture_release") != overture_release:
-            raise PublishError(
-                "coverage and places come from different Overture releases; "
-                "re-run the pipeline in stage order"
+    # Every upstream stage's writer lock is held from the reads through the
+    # commit, so no crawl, resolve, expand, coverage or classify run can
+    # republish between the lineage checks, the gate's verdict and
+    # snapshot.json.
+    with contextlib.ExitStack() as stack:
+        # Stage locks first, the crawl lock last — the order every stage
+        # uses (its own lock, then the crawl's), so no lock-order inversion.
+        for subdir in ("resolve", "gazetteer", "coverage", "classify"):
+            if (cache_dir / subdir).is_dir():
+                held = store.open_subdir(cache_dir, subdir)
+                stack.callback(held.close)
+                stack.enter_context(store.exclusive_writer(held))
+        stack.enter_context(crawl.reading(cache_dir))
+        records, edges, coverage = _read_coverage(cache_dir, locked=True)
+        if records is None:
+            records, crosswalk = store.read_jsonl(
+                cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
             )
-    digests = []
-    if places is not None:
-        digests.append(_content_digest(places))
-    if edges is not None:
-        # Covered feeds and edges also fold in: the override files shape them.
-        digests.append(_content_digest(records))
-        digests.append(_content_digest(edges))
-    snapshot_id = _snapshot_id(sources, overture_release, digests)
-    feeds_data = _parquet_bytes(records, snapshot_id)
-    counts = _counts(records)
-    manifest = {
-        "schema_version": SCHEMA_VERSION,
-        "snapshot_id": snapshot_id,
-        "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "sources": sources,
-        "counts": counts,
-        "feeds_sha256": hashlib.sha256(feeds_data).hexdigest(),
-    }
+            sources = crosswalk.get("sources")
+        else:
+            sources = coverage.get("sources")
+        if not records:
+            raise PublishError("no feeds to publish")
+        if not sources:
+            raise PublishError("the feed manifest records no source versions")
+        golden_report = None
+        if golden_path is not None:
+            if edges is None:
+                # The gate is mandatory; a feeds-only snapshot must say so.
+                raise PublishError(
+                    "the golden diff needs classified edges; publish a feeds-only "
+                    "snapshot with --no-golden"
+                )
+            golden_report = _golden_gate(cache_dir, golden_path, edges, coverage)
 
-    places_data = None
-    if places is not None:
-        places_data = _places_parquet_bytes(places, snapshot_id)
-        manifest["places_sha256"] = hashlib.sha256(places_data).hexdigest()
-        manifest["overture_release"] = overture_release
-        counts["places"] = len(places)
-        counts["places_by_kind"] = dict(collections.Counter(p["kind"] for p in places))
+        # A gazetteer that ran but produced no places is a places index of zero
+        # places, distinct from a feeds-only build (no gazetteer at all) — hence
+        # ``is not None`` throughout, never a truthiness test that folds the two.
+        places, overture_release, places_generation = _read_places(cache_dir)
+        if places is not None and not overture_release:
+            # The release folds into the snapshot id; without it a places index would
+            # share the feeds-only id for the same feeds.
+            raise PublishError("gazetteer places carry no overture_release")
+        if edges is not None:
+            if places is None:
+                raise PublishError("coverage edges exist but no places generation does")
+            if coverage.get("overture_release") != overture_release:
+                raise PublishError(
+                    "coverage and places come from different Overture releases; "
+                    "re-run the pipeline in stage order"
+                )
+            # The exact generation, not just the release: the edges must
+            # reference the places generation this snapshot ships.
+            if coverage.get("expanded_generation") != places_generation:
+                raise PublishError(
+                    "the edges were derived from a different places generation "
+                    "than the one being published; re-run the pipeline in stage order"
+                )
+            if coverage.get("source") != "classify":
+                # Candidate edges carry no tiers; shipping them would publish
+                # every edge as unknown with the tier gate silently off.
+                raise PublishError(
+                    "the edges are unclassified; run the classify stage before publishing"
+                )
+        digests = []
+        if places is not None:
+            digests.append(_content_digest(places))
+        if edges is not None:
+            # Covered feeds and edges also fold in: the override files shape them.
+            digests.append(_content_digest(records))
+            digests.append(_content_digest(edges))
+        snapshot_id = _snapshot_id(sources, overture_release, digests)
+        feeds_data = _parquet_bytes(records, snapshot_id)
+        counts = _counts(records)
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "snapshot_id": snapshot_id,
+            "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "sources": sources,
+            "counts": counts,
+            "feeds_sha256": hashlib.sha256(feeds_data).hexdigest(),
+        }
 
-    edges_data = None
-    if edges is not None:
-        edges_data = _edges_parquet_bytes(edges, snapshot_id)
-        manifest["edges_sha256"] = hashlib.sha256(edges_data).hexdigest()
-        manifest["coverage_mode"] = coverage.get("mode")
-        counts["edges"] = len(edges)
-        counts["edges_by_tier"] = dict(collections.Counter(e["tier"] for e in edges))
-
-    directory = store.open_subdir(cache_dir, "index")
-    try:
-        with store.exclusive_writer(directory):
-            store.write_bytes(directory, FEEDS_FILE, feeds_data)
-            if places_data is not None:
-                store.write_bytes(directory, PLACES_FILE, places_data)
-            if edges_data is not None:
-                store.write_bytes(directory, EDGES_FILE, edges_data)
-            store.write_file(
-                directory,
-                SNAPSHOT_FILE,
-                lambda: [json.dumps(manifest, indent=2, sort_keys=True)],
+        places_data = None
+        if places is not None:
+            places_data = _places_parquet_bytes(
+                places, snapshot_id, _service_by_place(edges)
             )
-    finally:
-        directory.close()
+            manifest["places_sha256"] = hashlib.sha256(places_data).hexdigest()
+            manifest["overture_release"] = overture_release
+            counts["places"] = len(places)
+            counts["places_by_kind"] = dict(
+                collections.Counter(p["kind"] for p in places)
+            )
+
+        edges_data = None
+        if edges is not None:
+            edges_data = _edges_parquet_bytes(edges, snapshot_id)
+            manifest["edges_sha256"] = hashlib.sha256(edges_data).hexdigest()
+            manifest["coverage_mode"] = coverage.get("mode")
+            if coverage.get("unknown_share") is not None:
+                # Recorded so the next build's golden diff can measure drift.
+                manifest["unknown_share"] = coverage["unknown_share"]
+            if golden_report is not None:
+                manifest["golden_entries"] = golden_report["entries"]
+            counts["edges"] = len(edges)
+            counts["edges_by_tier"] = dict(
+                collections.Counter(e["tier"] for e in edges)
+            )
+
+        directory = store.open_subdir(cache_dir, "index")
+        try:
+            with store.exclusive_writer(directory):
+                store.write_bytes(directory, FEEDS_FILE, feeds_data)
+                if places_data is not None:
+                    store.write_bytes(directory, PLACES_FILE, places_data)
+                if edges_data is not None:
+                    store.write_bytes(directory, EDGES_FILE, edges_data)
+                store.write_file(
+                    directory,
+                    SNAPSHOT_FILE,
+                    lambda: [json.dumps(manifest, indent=2, sort_keys=True)],
+                )
+        finally:
+            directory.close()
     return manifest
