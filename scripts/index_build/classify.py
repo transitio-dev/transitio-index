@@ -15,13 +15,17 @@ every candidate place at its geography-free tier.
 ``unknown`` is an explicit tier, never a null: a route missing a signal a rule
 needs, a feed without route evidence, and every declared-only feed yield
 ``tier = "unknown"`` with ``tier_confidence = 0.0`` and ``needs_review``, while
-membership ``confidence`` keeps whatever the coverage evidence earned — not
+the edge keeps its membership and the coverage stage's service level — not
 knowing a route's tier says nothing about whether the feed serves the place.
+Every tier edge of a ``(place, feed)`` pair carries the same ``service``
+struct: the pair's scheduled stops and serving routes in the place, and its
+stop-events per average calendar day when the calendar was crawled.
 Selectors and fingerprints are the next stage's concern; every edge leaves
 here ``selector_state = "unavailable"``.
 """
 
 import collections
+import contextlib
 import csv
 import datetime
 import heapq
@@ -37,10 +41,11 @@ EDGES_ARTIFACT = "edges.jsonl"
 FEEDS_ARTIFACT = "feeds_classified.jsonl"
 
 REVIEW_CUTOFF = coverage.REVIEW_CUTOFF
-# A route serves a place with this many stops inside it, or with exactly one
-# stop that is at least this share of its stops (short feeders and shuttles).
-ROUTE_MIN_STOPS = 2
-SINGLE_STOP_SHARE = 0.25
+# A route serves a place with this many SCHEDULED stops inside it. One stop is
+# service: an intercity train has one station per municipality and serves
+# every one of them; a neighbourhood route's single stop serves the people
+# around it.
+ROUTE_MIN_STOPS = 1
 # A route decided within this fraction of a threshold has its confidence
 # multiplied by the penalty.
 MARGIN = 0.20
@@ -154,13 +159,8 @@ def classify_route(route_type, countries, span_km, median_km):
 
 def route_serves(stops_in_place, route_stops, *, route_min_stops=ROUTE_MIN_STOPS):
     """Whether a route with ``route_stops`` stops serves a place holding
-    ``stops_in_place`` of them; one incidental stop on a long route is not
-    service."""
-    if stops_in_place >= route_min_stops:
-        return True
-    return (
-        stops_in_place == 1 and route_stops > 0 and 1 >= SINGLE_STOP_SHARE * route_stops
-    )
+    ``stops_in_place`` of its scheduled stops."""
+    return route_stops > 0 and stops_in_place >= route_min_stops
 
 
 class _LaterFirst:
@@ -206,9 +206,11 @@ def _read_routes(opened):
 
 
 def _read_trips(opened, routes):
-    """``({trip_id: route_id}, orphans)`` for trips of known routes, ids
-    verbatim; ``orphans`` counts trips naming a route the feed lacks."""
+    """``({trip_id: route_id}, {trip_id: service_id}, orphans)`` for trips of
+    known routes, ids verbatim; ``orphans`` counts trips naming a route the
+    feed lacks."""
     trips = {}
+    services = {}
     orphans = 0
     for row in _reader(opened):
         trip_id = row.get("trip_id") or ""
@@ -217,12 +219,111 @@ def _read_trips(opened, routes):
             continue
         if route_id in routes:
             trips[trip_id] = route_id
+            services[trip_id] = row.get("service_id") or ""
         else:
             orphans += 1
-    return trips, orphans
+    return trips, services, orphans
 
 
-def _read_stop_times(opened, trip_routes):
+def _read_calendar(calendar, calendar_dates):
+    """``(active_days, span_days)``: per service id, the number of dates it
+    runs over the feed's calendar span, and that span in days.
+
+    Weekday flags apply over each service's own date range; ``calendar_dates``
+    adds (type 1) or removes (type 2) single dates. The span is the whole
+    calendar's extent, so a service running only on Sundays counts one day
+    in seven. ``calendar`` may be None (a feed with only exceptions). Days
+    are counted arithmetically — a legal row may span year 1 to 9999, and
+    walking it date by date would be millions of steps per service.
+    """
+    windows = {}
+    if calendar is not None:
+        for row in _reader(calendar):
+            service_id = row.get("service_id") or ""
+            start = _date(row.get("start_date"))
+            end = _date(row.get("end_date"))
+            if not service_id or start is None or end is None or end < start:
+                continue
+            flags = [
+                (row.get(day) or "").strip() == "1"
+                for day in (
+                    "monday",
+                    "tuesday",
+                    "wednesday",
+                    "thursday",
+                    "friday",
+                    "saturday",
+                    "sunday",
+                )
+            ]
+            windows[service_id] = (start, end, flags)
+    added = collections.defaultdict(set)
+    removed = collections.defaultdict(set)
+    if calendar_dates is not None:
+        for row in _reader(calendar_dates):
+            service_id = row.get("service_id") or ""
+            date = _date(row.get("date"))
+            kind = (row.get("exception_type") or "").strip()
+            if not service_id or date is None:
+                continue
+            if kind == "1":
+                added[service_id].add(date)
+            elif kind == "2":
+                removed[service_id].add(date)
+    dates = [w[0] for w in windows.values()] + [w[1] for w in windows.values()]
+    for exceptions in added.values():
+        dates.extend(exceptions)
+    if not dates:
+        return {}, 0
+    first, last = min(dates), max(dates)
+    span_days = (last - first).days + 1
+    active_days = {}
+    for service_id in set(windows) | set(added):
+        window = windows.get(service_id)
+        extra = added.get(service_id, set())
+        count = _window_days(window) if window else 0
+        # An exception counts only where it changes the answer: adding a
+        # date the window already runs, or removing one it never ran, is
+        # a no-op — and a removal wins over an addition of the same date.
+        count += sum(1 for date in extra if not _in_window(window, date))
+        count -= sum(
+            1
+            for date in removed.get(service_id, set())
+            if date in extra or _in_window(window, date)
+        )
+        active_days[service_id] = count
+    return active_days, span_days
+
+
+def _window_days(window):
+    """How many dates in ``(start, end, flags)`` fall on a flagged weekday."""
+    start, end, flags = window
+    days = (end - start).days + 1
+    weeks, rest = divmod(days, 7)
+    count = weeks * sum(flags)
+    for offset in range(rest):
+        count += flags[(start.weekday() + offset) % 7]
+    return count
+
+
+def _in_window(window, date):
+    if window is None:
+        return False
+    start, end, flags = window
+    return start <= date <= end and flags[date.weekday()]
+
+
+def _date(value):
+    value = (value or "").strip()
+    if len(value) != 8 or not value.isdigit():
+        return None
+    try:
+        return datetime.date(int(value[:4]), int(value[4:6]), int(value[6:]))
+    except ValueError:
+        return None
+
+
+def _read_stop_times(opened, trip_routes, trip_services, weights=None):
     """Per route, its distinct stop ids and its longest DISTINCT stop
     patterns, in two streamed passes — the file is never held whole.
 
@@ -237,9 +338,15 @@ def _read_stop_times(opened, trip_routes):
     identical patterns then collapse BEFORE the sample is cut. Two
     different patterns of the very same length can still compete for that
     length's slots — a bounded approximation, never unbounded memory.
+
+    ``weights`` maps a service id to its share of calendar days; with it,
+    every scheduled stop-event adds that share to its stop's departures per
+    day as the row streams by, one float per stop — the fourth result, or
+    None without a calendar.
     """
     stops = collections.defaultdict(set)
     trip_rows = collections.Counter()
+    departures = collections.Counter()
     dangling = 0
     for row in _reader(opened):
         trip_id = row.get("trip_id") or ""
@@ -252,8 +359,16 @@ def _read_stop_times(opened, trip_routes):
             continue
         if not stop_id:
             continue
-        stops[route_id].add(stop_id)
         trip_rows[trip_id] += 1
+        if (row.get("pickup_type") or "").strip() == "1" and (
+            row.get("drop_off_type") or ""
+        ).strip() == "1":
+            # Neither boarding nor alighting: traversal, not service. The
+            # row still shapes the trip's pattern (legs), never its stops.
+            continue
+        stops[route_id].add(stop_id)
+        if weights is not None:
+            departures[stop_id] += weights.get(trip_services.get(trip_id, ""), 0.0)
     # Candidates are bounded PER DISTINCT TRIP LENGTH: for each route and
     # each stop count, a small heap keeps the PATTERN_SAMPLE smallest trip
     # ids, and the PATTERN_SAMPLE largest lengths are then taken — so
@@ -299,7 +414,12 @@ def _read_stop_times(opened, trip_routes):
         route_id: sorted(found, key=lambda s: (-len(s), s))[:PATTERN_SAMPLE]
         for route_id, found in patterns.items()
     }
-    return stops, sequences, dangling
+    return (
+        stops,
+        sequences,
+        dangling,
+        (dict(departures) if weights is not None else None),
+    )
 
 
 def _span_km(points):
@@ -337,20 +457,59 @@ def _route_geography(stop_ids, sequences, coords):
     if span is None:
         # Unmeasurable geometry: every geography-dependent rule must skip.
         return None, None, len(points)
+    if any(s not in coords for sequence in sequences for s in sequence):
+        # A pattern stop without coordinates — a traversal-only stop sits in
+        # the patterns but not the scheduled set — would leave the legs a
+        # subset presented as complete: no median.
+        return span, None, len(points)
     legs = [
         haversine_km(coords[a], coords[b])
         for sequence in sequences
         for a, b in zip(sequence, sequence[1:])
-        if a in coords and b in coords
     ]
     median = statistics.median(legs) if legs else None
     return span, median, len(points)
+
+
+def _calendar_weights(feed_dir, state):
+    """``{service_id: share of calendar days it runs}`` from the crawled
+    calendar members, streamed under their digests; None when the feed has
+    neither file, so no departure count can be measured.
+
+    A calendar member the state records but that fails verification is a
+    state mismatch, raised like any other unverifiable member.
+    """
+    recorded = state.get("member_sha256") or {}
+    names = [n for n in ("calendar.txt", "calendar_dates.txt") if n in recorded]
+    if not names:
+        return None
+    with contextlib.ExitStack() as stack:
+        opened = {}
+        for name in names:
+            member = stack.enter_context(crawl.verified_member(feed_dir, state, name))
+            if member is None:
+                raise ValueError(f"{name}: not the member the state recorded")
+            opened[name] = member
+        active_days, span_days = _read_calendar(
+            opened.get("calendar.txt"), opened.get("calendar_dates.txt")
+        )
+    if not span_days:
+        return None
+    return {service: days / span_days for service, days in active_days.items()}
 
 
 def _members(feed_dir, state, names):
     """The digest-verified members parsed, or None on an unverifiable or
     unparsable member — one feed's problem, never the run's. Only data
     errors are caught; a programming defect surfaces."""
+    if state.get("members_requested") != sorted(crawl.MEMBERS):
+        # A cache the crawler asked fewer members of (before the calendar
+        # files joined the set) cannot say whether the feed has them:
+        # classifying it would pass off "never fetched" as "not there".
+        raise ClassifyError(
+            f"{state.get('feed_id')}: the crawl state predates the current "
+            "member set; re-run the crawl stage"
+        )
     parsed = {}
     try:
         with crawl.verified_member(feed_dir, state, "stops.txt") as opened:
@@ -366,13 +525,21 @@ def _members(feed_dir, state, names):
             with crawl.verified_member(feed_dir, state, "trips.txt") as opened:
                 if opened is None:
                     return None
-                trip_routes, orphans = _read_trips(opened, parsed["routes"])
+                trip_routes, trip_services, orphans = _read_trips(
+                    opened, parsed["routes"]
+                )
+            # The calendar comes first so each stop-event is weighted as it
+            # streams by: one float per stop, never an event table.
+            weights = _calendar_weights(feed_dir, state)
             with crawl.verified_member(feed_dir, state, "stop_times.txt") as opened:
                 if opened is None:
                     return None
-                parsed["stops"], parsed["sequences"], dangling = _read_stop_times(
-                    opened, trip_routes
-                )
+                (
+                    parsed["stops"],
+                    parsed["sequences"],
+                    dangling,
+                    parsed["stop_departures"],
+                ) = _read_stop_times(opened, trip_routes, trip_services, weights)
             parsed["join_gaps"] = {
                 "orphan_trips": orphans,
                 "dangling_stop_times": dangling,
@@ -403,7 +570,7 @@ def _unknown_edge(candidate, reason, route_min_stops):
     return _edge(candidate, "unknown", 0.0, evidence, True)
 
 
-def _tier_edges(candidate, contributing, route_min_stops, extra=None):
+def _tier_edges(candidate, contributing, route_min_stops, extra=None, service=None):
     """One edge per tier over the contributing ``(route, decision, weight,
     signals)`` tuples, ``tier_confidence`` the weight-averaged decision."""
     by_tier = collections.defaultdict(list)
@@ -439,12 +606,40 @@ def _tier_edges(candidate, contributing, route_min_stops, extra=None):
         )
         needs_review = (
             tier == "unknown"
-            or candidate["confidence"] < REVIEW_CUTOFF
             or tier_confidence < REVIEW_CUTOFF
             or any(item["decision"]["margin"] for item in items)
         )
-        edges.append(_edge(candidate, tier, tier_confidence, evidence, needs_review))
+        edge = _edge(candidate, tier, tier_confidence, evidence, needs_review)
+        if service is not None:
+            edge["service"] = service
+        edges.append(edge)
     return edges
+
+
+def _place_stop_ids(route, place_id, place):
+    """The route's scheduled stops inside the place. A metro adds the union
+    over its member cities to whatever its own polygon (if it has one)
+    placed — a minted member-union metro has no geometry of its own."""
+    inside = set(route["place_stops"].get(place_id, ()))
+    if place.get("kind") == "metro":
+        for member in place.get("member_ids") or []:
+            inside.update(route["place_stops"].get(member, ()))
+    return inside
+
+
+def _service_level(contributing, place_id, place, stop_departures):
+    """The feed's service level in the place over its serving routes."""
+    stops = set()
+    for route in contributing:
+        stops |= _place_stop_ids(route, place_id, place)
+    departures = None
+    if stop_departures is not None:
+        departures = sum(stop_departures.get(stop_id, 0.0) for stop_id in stops)
+    return {
+        "stops": len(stops),
+        "routes": len(contributing),
+        "departures_per_day": departures,
+    }
 
 
 def _stops_inside(route, place_id, place):
@@ -455,12 +650,7 @@ def _stops_inside(route, place_id, place):
     overlapping members counts once — taken BEFORE the service rule, so a
     route split across two members still serves the metro.
     """
-    if place.get("kind") == "metro":
-        inside = set()
-        for member in place.get("member_ids") or []:
-            inside.update(route["place_stops"].get(member, ()))
-        return len(inside)
-    return len(route["place_stops"].get(place_id, ()))
+    return len(_place_stop_ids(route, place_id, place))
 
 
 def _classify_feed(
@@ -559,8 +749,15 @@ def _classify_feed(
             for route_type in routes.values()
         ]
         edges = []
+        service = {
+            "stops": len(coords),
+            "routes": len(routes),
+            "departures_per_day": None,
+        }
         for candidate in candidates.values():
-            edges.extend(_tier_edges(candidate, contributing, route_min_stops))
+            edges.extend(
+                _tier_edges(candidate, contributing, route_min_stops, None, service)
+            )
         return edges, "whole_feed", len(routes), 0, None
 
     if mode != "complete":
@@ -616,9 +813,9 @@ def _classify_feed(
                     {**route, "weight": inside / max(route["stop_count"], 1)}
                 )
         if not contributing:
-            # Coverage admitted the feed, but no single route serves the
-            # place by the route rule: per the plan, no edge — counted, so
-            # the omission is loud in the manifest.
+            # Coverage admitted the feed on a stop no route schedules (an
+            # unused stop, a parent station): no edge — counted, so the
+            # omission is loud in the manifest.
             dropped += 1
             continue
         edges.extend(
@@ -627,6 +824,9 @@ def _classify_feed(
                 contributing,
                 route_min_stops,
                 {"join_gaps": parsed.get("join_gaps")},
+                _service_level(
+                    contributing, place_id, place, parsed.get("stop_departures")
+                ),
             )
         )
     return edges, "route_stops", len(routes), dropped, parsed.get("join_gaps")
@@ -670,6 +870,18 @@ def _check_descends(manifest, recorded_key, current, what, rerun):
         raise ClassifyError(
             f"{what} predates the current inputs; re-run the {rerun} stage"
         )
+
+
+def _require_service(edges, stage):
+    """Refuse edges from before the service level: a record without the
+    ``service`` key, or still carrying the retired ``confidence``, was
+    written by an older stage and would publish as no service at all."""
+    for edge in edges:
+        if "service" not in edge or "confidence" in edge:
+            raise ClassifyError(
+                f"the {stage} edges predate the service level; "
+                "re-run the coverage and classify stages"
+            )
 
 
 def read_edges(cache_dir, *, locked=False):
@@ -748,6 +960,7 @@ def read_edges(cache_dir, *, locked=False):
             edges = store.parse_jsonl(
                 coverage_generation.read_bytes(coverage.EDGES_ARTIFACT)
             )
+            _require_service(edges, "coverage")
             return feeds, edges, coverage_manifest
     generation, manifest = classified
     with generation:
@@ -767,6 +980,7 @@ def read_edges(cache_dir, *, locked=False):
         )
         feeds = store.parse_jsonl(generation.read_bytes(FEEDS_ARTIFACT))
         edges = store.parse_jsonl(generation.read_bytes(EDGES_ARTIFACT))
+    _require_service(edges, "classified")
     return feeds, edges, manifest
 
 
@@ -793,6 +1007,7 @@ def classify(cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS):
                 candidates = store.parse_jsonl(
                     generation.read_bytes(coverage.EDGES_ARTIFACT)
                 )
+                _require_service(candidates, "coverage")
             place_rows, expanded_manifest = store.read_jsonl(
                 cache_dir / "gazetteer", "expanded.json", "places_expanded.jsonl"
             )

@@ -99,6 +99,7 @@ def _edge(feed_id, place_id, tier="unknown", needs_review=True):
         "place_id": place_id,
         "tier": tier,
         "needs_review": needs_review,
+        "service": None,
     }
 
 

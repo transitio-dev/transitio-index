@@ -1,9 +1,10 @@
 """Crawl stage: fetch each crawlable feed's GTFS members into the build cache.
 
 For every resolved feed that is crawlable, the stage fetches the members later
-stages read — ``agency.txt``, ``routes.txt``, ``stops.txt``, ``trips.txt`` and
-the complete ``stop_times.txt`` — into ``cache/crawl/<feed dir>/`` alongside a
-``state.json`` provenance record (URL, validators, digests, members, time).
+stages read — ``agency.txt``, ``routes.txt``, ``stops.txt``, ``trips.txt``,
+``calendar.txt``, ``calendar_dates.txt`` and the complete ``stop_times.txt`` —
+into ``cache/crawl/<feed dir>/`` alongside a ``state.json`` provenance record
+(URL, validators, digests, members, the member set asked for, time).
 
 Feeds large enough to pay for it (past the size threshold, on a server that
 honours ranges and offers a strong validator) are read member-by-member through
@@ -48,6 +49,8 @@ MEMBERS = (
     "routes.txt",
     "stops.txt",
     "trips.txt",
+    "calendar.txt",
+    "calendar_dates.txt",
     "stop_times.txt",
 )
 
@@ -352,6 +355,10 @@ def _cache_reusable(feed_dir, state, url, force, lookup):
     — a skip that no longer holds must refetch, not be reused via 304.
     """
     if state.get("url") != url or force or not _members_intact(feed_dir, state):
+        return False
+    if state.get("members_requested") != sorted(MEMBERS):
+        # A crawl that asked for fewer members (before the calendar files
+        # joined the set) cannot stand in for one that asks for them all.
         return False
     if (state.get("stop_times") or {}).get("state") == "skipped":
         still_skipped, _ = _skip_stop_times(
@@ -678,6 +685,9 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 "archive_sha256": record.get("archive_sha256"),
                 "member_sha256": digests,
                 "members": sorted(digests),
+                # The member set this crawler asked for: a cache written
+                # for a smaller set is not reusable, optional members or not.
+                "members_requested": sorted(MEMBERS),
                 # Whether the complete stop_times read was withheld by the
                 # predicate, so later stages can tell "skipped" from "absent"
                 # and a recrawl request knows what to restore.

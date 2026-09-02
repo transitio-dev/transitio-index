@@ -143,7 +143,7 @@ def _edge(place_id, feed_id, **kw):
         "place_id": place_id,
         "feed_id": feed_id,
         "tier": kw.get("tier", "unknown"),
-        "confidence": kw.get("confidence", 0.5),
+        "service": kw.get("service"),
         "tier_confidence": 0.0,
         "method": "inferred",
         "rehomed_from": [],
@@ -512,7 +512,7 @@ def test_edges_round_trip_through_the_reader(tmp_path):
     row = index.edges.set_index("place_id").loc["Q1757"]
     assert row["feed_id"] == "f-a"
     assert row["tier"] == "unknown"
-    assert row["confidence"] == 0.5
+    assert row["service"] != row["service"]  # null: nothing measured
     assert row["selector_state"] == "unavailable"
     assert bool(row["needs_review"]) is True
     assert json.loads(row["evidence"])["declared_level"] == "municipality"
@@ -586,8 +586,33 @@ def test_a_duplicate_column_label_is_refused_even_when_correctly_hashed(tmp_path
 def test_the_snapshot_id_reflects_distinct_edges_content(tmp_path):
     pytest.importorskip("geopandas")
     _, a = _edges_index(tmp_path / "a", [_edge("Q1757", "f-a")])
-    _, b = _edges_index(tmp_path / "b", [_edge("Q1757", "f-a", confidence=0.35)])
+    service = {"stops": 1, "routes": 1, "departures_per_day": 2.0}
+    _, b = _edges_index(tmp_path / "b", [_edge("Q1757", "f-a", service=service)])
     assert a["snapshot_id"] != b["snapshot_id"]
+
+
+def test_a_place_sums_the_service_of_the_feeds_serving_it(tmp_path):
+    pytest.importorskip("geopandas")
+    measured = {"stops": 3, "routes": 2, "departures_per_day": 40.0}
+    edges = [
+        _edge("Q1757", "f-a", service=measured),
+        # The pair's second tier repeats the struct: counted once.
+        _edge("Q1757", "f-a", tier="national", service=measured),
+        _edge("Q1757", "f-b", service={"stops": 1, "routes": None}),
+        # A declared-only place: one feed, nothing measured.
+        _edge("Q-metro", "f-b"),
+    ]
+    cache, _ = _edges_index(tmp_path, edges)
+    index = transitio_index.read_index(cache / "index")
+    service = transitio_index.place("Q1757", index=index).service
+    assert (service.feeds, service.stops, service.routes) == (2, 4, 2)
+    assert service.departures_per_day == 40.0
+    declared = transitio_index.place("Q-metro", index=index).service
+    assert (declared.feeds, declared.stops, declared.departures_per_day) == (
+        1,
+        None,
+        None,
+    )
 
 
 def test_a_feeds_only_snapshot_needs_an_explicit_no_golden(tmp_path):

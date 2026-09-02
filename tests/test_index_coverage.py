@@ -223,6 +223,11 @@ LOOKUP = StubLookup(
             {"kind": "region", "wikidata": "Q-reg"},
             {"kind": "country", "wikidata": "Q-c"},
         ],
+        # A point the metro's own polygon AND a member city place.
+        45.0: [
+            {"kind": "city", "wikidata": "Q-city"},
+            {"kind": "metro", "wikidata": "Q-metro"},
+        ],
     }
 )
 
@@ -231,9 +236,9 @@ def _rows(count, lon):
     return [f"s{lon}-{i},1.0,{lon}\n" for i in range(count)]
 
 
-def test_crawled_stops_supersede_declared_and_pin_the_cutoff(tmp_path):
-    # 245 of 250 stops in Q-city (confidence 1.0), 5 in Q-other — exactly the
-    # admission threshold, so its confidence 0.68 sits below the 0.70 cutoff.
+def test_crawled_stops_supersede_declared_and_carry_the_counts(tmp_path):
+    # 245 of 250 stops in Q-city, 5 in Q-other: both are members — a fact —
+    # and each edge carries its counts as the service level's first term.
     manifest, covered, edges = _cover(
         tmp_path,
         crawls={"f-city": _rows(245, 10.0) + _rows(5, 20.0)},
@@ -247,57 +252,43 @@ def test_crawled_stops_supersede_declared_and_pin_the_cutoff(tmp_path):
     city = edges["f-city"]
     assert city["Q-city"]["method"] == "crawl"
     assert set(city) == {"Q-city", "Q-other", "Q-reg", "Q-c", "Q-metro", "Q-csa"}
-    assert city["Q-city"]["confidence"] == 1.0
-    assert city["Q-city"]["needs_review"] is False
-    assert city["Q-other"]["confidence"] == pytest.approx(0.68)
-    assert city["Q-other"]["needs_review"] is True
+    # Unclassified, so every edge is flagged for tier review.
+    assert city["Q-city"]["needs_review"] is True
     assert city["Q-other"]["evidence"] == {
         "stops_in_place": 5,
         "stop_share": pytest.approx(0.02),
-        "min_stops": 5,
-        "min_stop_share": 0.02,
-        "review_cutoff": 0.70,
     }
-    # The metros propagate from the member city at its confidence, and no
+    assert city["Q-city"]["service"] == {
+        "stops": 245,
+        "routes": None,
+        "departures_per_day": None,
+    }
+    # The metros propagate from the member city with its counts, and no
     # declared evidence survives on a superseded feed.
-    assert city["Q-metro"]["confidence"] == 1.0
+    assert city["Q-metro"]["service"]["stops"] == 245
     assert "declared_level" not in city["Q-city"]["evidence"]
 
 
-def test_a_tiny_feed_passes_on_share_and_a_sparse_place_fails(tmp_path):
-    # Two of three stops in Q-other: below min_stops but at two-thirds share,
-    # the override admits it; the one Q-city stop fails both rules.
+def test_a_single_stop_inside_a_place_admits_the_feed(tmp_path):
+    # Two of three stops in Q-other, one in Q-city: one stop is membership
+    # (an intercity train has one station per municipality).
     _, _, edges = _cover(
         tmp_path,
         crawls={"f-none": _rows(2, 20.0) + _rows(1, 10.0)},
         lookup=LOOKUP,
     )
     tiny = edges["f-none"]
-    assert "Q-city" not in tiny
-    assert tiny["Q-other"]["confidence"] == 1.0
-    assert set(tiny) == {"Q-other", "Q-reg", "Q-c"}
-
-
-def test_the_admission_thresholds_are_configurable(tmp_path):
-    _, _, edges = _cover(
-        tmp_path,
-        crawls={"f-city": _rows(245, 10.0) + _rows(5, 20.0)},
-        lookup=LOOKUP,
-        min_stops=6,
-    )
-    # With min_stops raised past the five Q-other stops, only the share
-    # override could admit it, and 0.02 is far below half.
-    assert "Q-other" not in edges["f-city"]
-    assert edges["f-city"]["Q-city"]["evidence"]["min_stops"] == 6
+    assert set(tiny) == {"Q-city", "Q-other", "Q-reg", "Q-c", "Q-metro", "Q-csa"}
+    assert tiny["Q-city"]["service"]["stops"] == 1
+    assert tiny["Q-other"]["evidence"]["stop_share"] == pytest.approx(2 / 3)
 
 
 def test_dropped_rows_stay_in_the_share_denominator(tmp_path):
     # Five good stops among 245 unparsable rows must not read as 100% share:
-    # the share is 5/250, exactly the threshold, and confidence 0.68.
+    # the share is 5/250.
     rows = _rows(5, 20.0) + ["s-bad%d,not-a-lat,20.0\n" % i for i in range(245)]
     _, covered, edges = _cover(tmp_path, crawls={"f-none": rows}, lookup=LOOKUP)
     edge = edges["f-none"]["Q-other"]
-    assert edge["confidence"] == pytest.approx(0.68)
     assert edge["evidence"]["stop_share"] == pytest.approx(0.02)
     assert covered["f-none"]["stop_count"] == 250
 
@@ -352,10 +343,9 @@ def test_all_unparsable_stops_still_supersede_declared(tmp_path):
     assert "f-city" not in edges
 
 
-def test_a_feed_spread_across_metro_members_is_admitted_to_the_metro(tmp_path):
-    # Three stops in the second member fail its thresholds alone; summed
-    # with the first member's six they admit the metro, whose own aggregated
-    # evidence outranks the edge propagated from the passing city.
+def test_a_metro_counts_the_stops_of_all_its_members(tmp_path):
+    # Six stops in one member, three in the other: the metro's own
+    # aggregated evidence outranks the edge propagated from either city.
     places = [p for p in PLACES if p["place_id"] != "Q-metro"] + [
         {**_place("Q-metro", "metro"), "member_ids": ["Q-city", "Q-other"]}
     ]
@@ -365,8 +355,20 @@ def test_a_feed_spread_across_metro_members_is_admitted_to_the_metro(tmp_path):
         tmp_path, places=places, crawls={"f-none": rows}, lookup=LOOKUP
     )
     feed = edges["f-none"]
-    assert "Q-city" in feed and "Q-other" not in feed
+    assert feed["Q-city"]["service"]["stops"] == 7
+    assert feed["Q-other"]["service"]["stops"] == 4
     assert feed["Q-metro"]["evidence"]["stops_in_place"] == 10
+    assert feed["Q-metro"]["service"]["stops"] == 10
+
+
+def test_a_stop_placed_by_the_metro_polygon_and_a_member_counts_once(tmp_path):
+    places = [p for p in PLACES if p["place_id"] != "Q-metro"] + [
+        {**_place("Q-metro", "metro"), "member_ids": ["Q-city"]}
+    ]
+    _, _, edges = _cover(
+        tmp_path, places=places, crawls={"f-none": _rows(3, 45.0)}, lookup=LOOKUP
+    )
+    assert edges["f-none"]["Q-metro"]["service"]["stops"] == 3
 
 
 def test_a_crawl_that_changed_after_expansion_is_refused(tmp_path):
@@ -388,7 +390,7 @@ def test_a_state_mismatched_crawl_falls_back_to_declared(tmp_path):
     )
     assert manifest["crawl_state_mismatches"] == 1
     assert covered["f-city"]["coverage_source"] == "declared"
-    assert edges["f-city"]["Q-city"]["confidence"] == 0.50
+    assert edges["f-city"]["Q-city"]["method"] == "inferred"
 
 
 def test_an_unknown_qid_division_means_a_stale_gazetteer(tmp_path):
@@ -417,9 +419,9 @@ def test_a_city_placement_reaches_its_ancestors_and_every_metro(tmp_path):
     _, _, edges = _cover(tmp_path)
     city = edges["f-city"]
     assert set(city) == {"Q-city", "Q-reg", "Q-c", "Q-metro", "Q-csa"}
-    # Same flat confidence everywhere, and every declared edge is unclassified.
+    # Nothing measured, and every declared edge is unclassified.
     for edge in city.values():
-        assert edge["confidence"] == 0.50
+        assert edge["service"] is None
         assert edge["tier"] == "unknown"
         assert edge["tier_confidence"] == 0.0
         assert edge["selector_state"] == "unavailable"
@@ -433,7 +435,7 @@ def test_a_subdivision_placement_is_coarser_and_reaches_no_metro(tmp_path):
     _, _, edges = _cover(tmp_path)
     region = edges["f-reg"]
     assert set(region) == {"Q-reg", "Q-c"}
-    assert region["Q-reg"]["confidence"] == 0.35
+    assert region["Q-reg"]["evidence"]["declared_level"] == "subdivision"
 
 
 def test_a_linked_gtfs_rt_feed_gets_no_direct_edges(tmp_path):

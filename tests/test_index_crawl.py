@@ -566,6 +566,26 @@ def test_an_unchanged_feed_is_skipped_on_rerun(tmp_path):
     assert summary["by_method"] == {"not_modified": 1}
 
 
+def test_a_cache_from_a_smaller_member_set_is_refetched(tmp_path):
+    # A state written before the calendar files joined the member set has
+    # no way to say whether the feed lacks them or was never asked: one
+    # refetch settles it, after which validators skip again.
+    cache = tmp_path / "cache"
+    data = _zip_bytes()
+    server = _server({"/a.zip": (data, '"v1"')})
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    _crawl(cache, server)
+    state_path = _feed_dir(cache, "f-a") / "state.json"
+    state = json.loads(state_path.read_text())
+    assert state["members_requested"] == sorted(crawl.MEMBERS)
+    del state["members_requested"]
+    state_path.write_text(json.dumps(state))
+    _, log = _crawl(cache, server)
+    assert log["f-a"]["method"] == "download"
+    _, log = _crawl(cache, server)
+    assert log["f-a"]["method"] == "not_modified"
+
+
 def test_a_recrawl_request_bypasses_the_skip(tmp_path):
     cache = tmp_path / "cache"
     data = _zip_bytes()

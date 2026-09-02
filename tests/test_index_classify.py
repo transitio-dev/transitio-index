@@ -94,7 +94,7 @@ def test_a_historical_skip_is_rejudged_against_the_current_lookup(tmp_path):
         },
         "skipped",
     )
-    _coverage(cache, feeds, [_candidate("Q-city", "f-k", 1.0)])
+    _coverage(cache, feeds, [_candidate("Q-city", "f-k")])
     manifest = classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     assert [(e["tier"], e["evidence"]["unknown_reason"]) for e in edges] == [
@@ -187,7 +187,7 @@ def test_shorter_patterns_survive_many_longer_duplicates():
     rows += b"branch,a,1\nbranch,d,2\n"
     trips = {f"t{i:02d}": "r" for i in range(64)}
     trips["branch"] = "r"
-    _, sequences, _ = classify._read_stop_times(io.BytesIO(rows), trips)
+    _, sequences, _, _ = classify._read_stop_times(io.BytesIO(rows), trips, {})
     assert sequences["r"] == [("a", "b", "c"), ("a", "d")]
 
 
@@ -195,7 +195,7 @@ def test_a_blank_stop_id_row_leaves_no_legs():
     import io
 
     rows = b"trip_id,stop_id,stop_sequence\nt,a,1\nt,,2\nt,c,3\n"
-    stops, sequences, _ = classify._read_stop_times(io.BytesIO(rows), {"t": "r"})
+    stops, sequences, _, _ = classify._read_stop_times(io.BytesIO(rows), {"t": "r"}, {})
     assert stops["r"] == {"a", "c"}
     assert sequences == {}
 
@@ -211,7 +211,7 @@ def test_pattern_sampling_keeps_distinct_patterns():
     rows += b"branch,a,1\nbranch,d,2\n"
     trips = {f"t{i}": "r" for i in range(9)}
     trips["branch"] = "r"
-    stops, sequences, _ = classify._read_stop_times(io.BytesIO(rows), trips)
+    stops, sequences, _, _ = classify._read_stop_times(io.BytesIO(rows), trips, {})
     assert stops["r"] == {"a", "b", "c", "d"}
     assert sequences["r"] == [("a", "b", "c"), ("a", "d")]
 
@@ -246,7 +246,7 @@ def test_ids_are_joined_verbatim():
 
 @pytest.mark.parametrize(
     ("inside", "total", "serves"),
-    [(2, 50, True), (1, 4, True), (1, 5, False), (0, 3, False), (1, 0, False)],
+    [(2, 50, True), (1, 50, True), (0, 3, False), (1, 0, False)],
 )
 def test_when_a_route_serves_a_place(inside, total, serves):
     assert classify.route_serves(inside, total) is serves
@@ -311,6 +311,8 @@ LOOKUP = StubLookup(
         10.02: _records("Q-city"),
         10.3: _records("Q-city"),
         20.0: _records("Q-other"),
+        # A point only the metro's own polygon places.
+        40.0: [{"kind": "metro", "wikidata": "Q-metro", "country": "AA"}],
         # A point inside two overlapping member cities.
         25.0: [
             {
@@ -353,6 +355,7 @@ def _write_crawl(cache, feed_id, members, stop_times_state):
                 "feed_id": feed_id,
                 "members": sorted(members),
                 "member_sha256": digests,
+                "members_requested": sorted(crawl.MEMBERS),
                 "stop_times": {"state": stop_times_state, "reason": None},
             }
         )
@@ -366,9 +369,13 @@ def _write_crawl(cache, feed_id, members, stop_times_state):
     )
 
 
-def _candidate(place_id, feed_id, confidence):
+def _candidate(place_id, feed_id, stops=3):
     return coverage._edge(
-        place_id, feed_id, confidence, {"stops_in_place": 3, "stop_share": 1.0}, "crawl"
+        place_id,
+        feed_id,
+        {"stops_in_place": stops, "stop_share": 1.0},
+        "crawl",
+        {"stops": stops, "routes": None, "departures_per_day": None},
     )
 
 
@@ -433,15 +440,15 @@ def _build(tmp_path):
         },
     ]
     candidates = [
-        _candidate("Q-city", "f-a", 1.0),
-        _candidate("Q-reg", "f-a", 1.0),
-        _candidate("Q-c", "f-a", 1.0),
-        _candidate("Q-metro", "f-a", 1.0),
-        _candidate("Q-other", "f-a", 0.68),
-        _candidate("Q-other", "f-skip", 1.0),
-        _candidate("Q-reg", "f-skip", 1.0),
-        _candidate("Q-city", "f-none", 1.0),
-        _candidate("Q-other", "f-declared", 0.5),
+        _candidate("Q-city", "f-a"),
+        _candidate("Q-reg", "f-a"),
+        _candidate("Q-c", "f-a"),
+        _candidate("Q-metro", "f-a"),
+        _candidate("Q-other", "f-a"),
+        _candidate("Q-other", "f-skip"),
+        _candidate("Q-reg", "f-skip"),
+        _candidate("Q-city", "f-none"),
+        _candidate("Q-other", "f-declared"),
     ]
     _write_crawl(
         cache,
@@ -490,7 +497,7 @@ def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
     assert local["needs_review"] is False
     assert local["evidence"]["matched_route_types"] == [0]
     assert local["evidence"]["serving_routes"] == 1
-    assert local["evidence"]["route_min_stops"] == 2
+    assert local["evidence"]["route_min_stops"] == 1
     national = a[("Q-city", "national")]
     assert national["tier_confidence"] == pytest.approx(0.60)
     assert national["needs_review"] is True
@@ -498,14 +505,19 @@ def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
     # Legs come from every sampled pattern, each sorted by sequence: the
     # short t0 (one 33 km leg) and the out-of-order t2 (33 km and 1078 km).
     assert national["evidence"]["median_interstop_km"] == pytest.approx(33.4, rel=0.01)
-    # One incidental-but-large stop share: the bus's single stop in Q-other is
-    # a third of its stops, so it serves; the tram never reaches it.
+    # The bus's single stop in Q-other is service; the tram never reaches it.
     assert set(k[1] for k in a if k[0] == "Q-other") == {"national"}
     # The geometry-less metro follows its member city.
     assert set(k[1] for k in a if k[0] == "Q-metro") == {"local", "national"}
     assert a[("Q-metro", "local")]["tier_confidence"] == pytest.approx(0.90)
-    # Membership confidence is carried, never recomputed.
-    assert a[("Q-other", "national")]["confidence"] == 0.68
+    # The service level is per (place, feed): one route, one stop, and no
+    # departures without a calendar; every tier edge of the pair shares it.
+    assert a[("Q-other", "national")]["service"] == {
+        "stops": 1,
+        "routes": 1,
+        "departures_per_day": None,
+    }
+    assert a[("Q-city", "local")]["service"] == a[("Q-city", "national")]["service"]
     assert manifest["feeds_by_status"] == {
         "route_stops": 1,
         "whole_feed": 1,
@@ -523,14 +535,16 @@ def test_a_skipped_feed_is_whole_feed_at_its_fixed_tier(tmp_path):
         assert edge["tier_confidence"] == pytest.approx(0.90)
         assert edge["needs_review"] is False
         assert edge["evidence"]["spread_km"] is None
+        # Whole feed: every stop and route, no timetable to count.
+        assert edge["service"] == {"stops": 2, "routes": 1, "departures_per_day": None}
 
 
-def test_unknown_is_explicit_and_keeps_membership_confidence(tmp_path):
+def test_unknown_is_explicit_and_keeps_the_coverage_service(tmp_path):
     _, manifest, edges = _build(tmp_path)
     none = edges["f-none"][("Q-city", "unknown")]
     assert none["tier_confidence"] == 0.0
     assert none["needs_review"] is True
-    assert none["confidence"] == 1.0
+    assert none["service"] == {"stops": 3, "routes": None, "departures_per_day": None}
     assert none["evidence"]["unknown_reason"] == "no_route_evidence"
     declared = edges["f-declared"][("Q-other", "unknown")]
     assert declared["evidence"]["unknown_reason"] == "declared"
@@ -572,7 +586,7 @@ def test_a_skipped_feed_without_parseable_routes_is_unknown(tmp_path):
         },
         "skipped",
     )
-    _coverage(cache, feeds, [_candidate("Q-other", "f-s", 1.0)])
+    _coverage(cache, feeds, [_candidate("Q-other", "f-s")])
     classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     assert [(e["place_id"], e["tier"]) for e in edges] == [("Q-other", "unknown")]
@@ -601,7 +615,7 @@ def test_a_crawl_that_changed_after_coverage_is_refused(tmp_path):
     feeds = [
         {"feed_id": "f-m", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
     ]
-    _coverage(cache, feeds, [_candidate("Q-other", "f-m", 1.0)])
+    _coverage(cache, feeds, [_candidate("Q-other", "f-m")])
     _write_crawl(
         cache,
         "f-m",
@@ -640,7 +654,7 @@ def test_tier_confidence_is_weighted_by_stop_share(tmp_path):
         },
         "complete",
     )
-    _coverage(cache, feeds, [_candidate("Q-city", "f-w", 1.0)])
+    _coverage(cache, feeds, [_candidate("Q-city", "f-w")])
     classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     (edge,) = edges
@@ -668,7 +682,7 @@ def test_join_gaps_are_counted_not_silent(tmp_path):
         },
         "complete",
     )
-    _coverage(cache, feeds, [_candidate("Q-city", "f-g", 1.0)])
+    _coverage(cache, feeds, [_candidate("Q-city", "f-g")])
     manifest = classify.classify(cache, lookup=LOOKUP)
     assert manifest["join_gaps"] == {"orphan_trips": 1, "dangling_stop_times": 1}
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
@@ -709,7 +723,7 @@ def test_a_trip_without_stop_sequences_gives_no_legs(tmp_path):
         },
         "complete",
     )
-    _coverage(cache, feeds, [_candidate("Q-city", "f-q", 1.0)])
+    _coverage(cache, feeds, [_candidate("Q-city", "f-q")])
     classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     assert [(e["place_id"], e["tier"]) for e in edges] == [("Q-city", "unknown")]
@@ -717,8 +731,7 @@ def test_a_trip_without_stop_sequences_gives_no_legs(tmp_path):
 
 def test_a_stop_in_two_members_counts_once_for_the_metro(tmp_path):
     # One stop inside two overlapping member cities is one stop inside the
-    # metro: with four unplaced stops it is a fifth of the route, not the
-    # two stops the service rule needs.
+    # metro — service, but a single stop of it.
     cache = tmp_path / "cache"
     places = PLACES[:-1] + [
         _place("Q-metro", "metro", member_ids=["Q-city", "Q-other"])
@@ -743,14 +756,26 @@ def test_a_stop_in_two_members_counts_once_for_the_metro(tmp_path):
         },
         "complete",
     )
-    _coverage(cache, feeds, [_candidate("Q-metro", "f-d", 1.0)], places=places)
+    _coverage(cache, feeds, [_candidate("Q-metro", "f-d")], places=places)
     manifest = classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
-    assert edges == []
-    assert manifest["edges_dropped_no_serving_route"] == 1
+    (edge,) = edges
+    assert (edge["place_id"], edge["tier"]) == ("Q-metro", "local")
+    assert edge["service"] == {"stops": 1, "routes": 1, "departures_per_day": None}
+    assert manifest["edges_dropped_no_serving_route"] == 0
 
 
-def test_a_route_with_an_unlocated_stop_has_no_geometry(tmp_path):
+@pytest.mark.parametrize(
+    "stop_times",
+    [
+        b"trip_id,stop_id,stop_sequence\nt,s1,1\nt,s2,2\nt,ghost,3\n",
+        # The unlocated stop is traversal-only: outside the scheduled set,
+        # but in the pattern, so the legs would be incomplete.
+        b"trip_id,stop_id,stop_sequence,pickup_type,drop_off_type\n"
+        b"t,s1,1,,\nt,s2,2,,\nt,ghost,3,1,1\n",
+    ],
+)
+def test_a_route_with_an_unlocated_stop_has_no_geometry(tmp_path, stop_times):
     # One stop id without coordinates: the service denominator still counts
     # it, but span and median are missing signals, so the bus is unknown.
     cache = tmp_path / "cache"
@@ -764,13 +789,11 @@ def test_a_route_with_an_unlocated_stop_has_no_geometry(tmp_path):
             "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
             "routes.txt": b"route_id,route_type\nbus,3\n",
             "trips.txt": b"trip_id,route_id\nt,bus\n",
-            "stop_times.txt": (
-                b"trip_id,stop_id,stop_sequence\nt,s1,1\nt,s2,2\nt,ghost,3\n"
-            ),
+            "stop_times.txt": stop_times,
         },
         "complete",
     )
-    _coverage(cache, feeds, [_candidate("Q-city", "f-u", 1.0)])
+    _coverage(cache, feeds, [_candidate("Q-city", "f-u")])
     classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     assert [(e["place_id"], e["tier"]) for e in edges] == [("Q-city", "unknown")]
@@ -790,10 +813,10 @@ def test_a_corrupt_classify_generation_is_refused(tmp_path):
         classify.read_edges(cache)
 
 
-def test_metro_service_sums_over_members_and_unserved_places_are_dropped(tmp_path):
-    # A five-stop tram with one stop in each member city serves neither city
-    # by the route rule but does serve the metro; the city candidate no
-    # route serves is dropped, and the drop is counted.
+def test_a_traversal_only_stop_is_no_service_and_the_metro_sums_members(tmp_path):
+    # The tram's Q-other stop allows neither boarding nor alighting: the
+    # feed is admitted there on stops.txt alone, no route serves it, so the
+    # candidate is dropped and counted; the metro sums its served members.
     cache = tmp_path / "cache"
     places = PLACES[:-1] + [
         _place("Q-metro", "metro", member_ids=["Q-city", "Q-other"])
@@ -812,8 +835,8 @@ def test_metro_service_sums_over_members_and_unserved_places_are_dropped(tmp_pat
             "routes.txt": b"route_id,route_type\ntram,0\n",
             "trips.txt": b"trip_id,route_id\nt,tram\n",
             "stop_times.txt": (
-                b"trip_id,stop_id,stop_sequence\n"
-                b"t,s1,1\nt,b3,2\nt,o1,3\nt,o2,4\nt,o3,5\n"
+                b"trip_id,stop_id,stop_sequence,pickup_type,drop_off_type\n"
+                b"t,s1,1,0,0\nt,b3,2,1,1\nt,o1,3,,\nt,o2,4,,\nt,o3,5,,\n"
             ),
         },
         "complete",
@@ -821,13 +844,166 @@ def test_metro_service_sums_over_members_and_unserved_places_are_dropped(tmp_pat
     _coverage(
         cache,
         feeds,
-        [_candidate("Q-city", "f-t", 1.0), _candidate("Q-metro", "f-t", 1.0)],
+        [
+            _candidate("Q-city", "f-t"),
+            _candidate("Q-metro", "f-t"),
+            _candidate("Q-other", "f-t"),
+        ],
         places=places,
     )
     manifest = classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
-    assert [(e["place_id"], e["tier"]) for e in edges] == [("Q-metro", "local")]
+    by_place = {e["place_id"]: e for e in edges}
+    assert [(e["place_id"], e["tier"]) for e in edges] == [
+        ("Q-city", "local"),
+        ("Q-metro", "local"),
+    ]
+    assert by_place["Q-metro"]["service"]["stops"] == 1
     assert manifest["edges_dropped_no_serving_route"] == 1
+
+
+def test_calendar_days_are_counted_not_walked():
+    import io
+
+    calendar = io.BytesIO(
+        b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        b"start_date,end_date\n"
+        b"all,1,1,1,1,1,1,1,00010101,99991231\n"
+        b"wk,1,1,1,1,1,0,0,20260901,20260914\n"
+    )
+    dates = io.BytesIO(
+        b"service_id,date,exception_type\n"
+        b"wk,20260907,2\n"  # a Monday: -1
+        b"wk,20260905,2\n"  # a Saturday it never ran: no-op
+        b"wk,20260901,1\n"  # a Tuesday it already runs: no-op
+        b"wk,20260919,1\n"  # a date outside its window: +1
+        b"wk,20260920,1\n"
+        b"wk,20260920,2\n"  # added and removed: the removal wins
+        b"lone,20260903,1\n"  # a service with exceptions only
+    )
+    active_days, span_days = classify._read_calendar(calendar, dates)
+    assert span_days == 3652059
+    assert active_days == {"all": 3652059, "wk": 10, "lone": 1}
+
+
+def test_a_crawl_state_from_a_smaller_member_set_is_refused(tmp_path):
+    # A cache the crawler never asked for calendar files cannot say whether
+    # the feed has one: classifying it would publish null departures as if
+    # measured, so it is refused until the crawl runs again.
+    cache = tmp_path / "cache"
+    feeds = [
+        {"feed_id": "f-a", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    _write_crawl(
+        cache,
+        "f-a",
+        {
+            "stops.txt": STOPS_A,
+            "routes.txt": ROUTES_A,
+            "trips.txt": TRIPS_A,
+            "stop_times.txt": STOP_TIMES_A,
+        },
+        "complete",
+    )
+    state_path = cache / "crawl" / crawl._dir_name("f-a") / "state.json"
+    state = json.loads(state_path.read_text())
+    del state["members_requested"]
+    state_path.write_text(json.dumps(state))
+    _coverage(cache, feeds, [_candidate("Q-city", "f-a")])
+    with pytest.raises(classify.ClassifyError, match="re-run the crawl"):
+        classify.classify(cache, lookup=LOOKUP)
+
+
+def test_edges_without_the_service_key_are_refused(tmp_path):
+    # Artifacts written before the service level (they carried a membership
+    # confidence instead) must not publish as "no service everywhere".
+    cache = tmp_path / "cache"
+    feeds = [
+        {
+            "feed_id": "f-old",
+            "spec": "gtfs",
+            "coverage_source": "declared",
+            "aliases": [],
+        }
+    ]
+    legacy = {k: v for k, v in _candidate("Q-other", "f-old").items() if k != "service"}
+    _coverage(cache, feeds, [{**legacy, "confidence": 0.5}])
+    with pytest.raises(classify.ClassifyError, match="predate the service level"):
+        classify.classify(cache, lookup=LOOKUP)
+    with pytest.raises(classify.ClassifyError, match="predate the service level"):
+        classify.read_edges(cache)
+
+
+def test_a_metro_polygon_places_stops_alongside_its_members(tmp_path):
+    # An official metro has its own boundary: a stop only that polygon
+    # places joins the member cities' stops in the metro's service.
+    cache = tmp_path / "cache"
+    places = PLACES[:-1] + [_place("Q-metro", "metro", member_ids=["Q-city"])]
+    feeds = [
+        {"feed_id": "f-m", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    _write_crawl(
+        cache,
+        "f-m",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\nm1,1.0,40.0\n",
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": b"trip_id,route_id\nt,tram\n",
+            "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt,s1,1\nt,m1,2\n",
+        },
+        "complete",
+    )
+    _coverage(
+        cache,
+        feeds,
+        [_candidate("Q-city", "f-m"), _candidate("Q-metro", "f-m")],
+        places=places,
+    )
+    classify.classify(cache, lookup=LOOKUP)
+    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    stops = {e["place_id"]: e["service"]["stops"] for e in edges}
+    assert stops == {"Q-city": 1, "Q-metro": 2}
+
+
+def test_departures_per_day_are_weighted_by_the_calendar(tmp_path):
+    # Two weeks: a weekday service minus one removed day (9 dates) and a
+    # Sunday service plus one added date (3 dates); each trip visits both
+    # stops once, so the place sees 2 * (9 + 3) / 14 stop-events a day.
+    cache = tmp_path / "cache"
+    feeds = [
+        {"feed_id": "f-cal", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    _write_crawl(
+        cache,
+        "f-cal",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": b"trip_id,route_id,service_id\nt1,tram,wk\nt2,tram,sun\n",
+            "calendar.txt": (
+                b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+                b"sunday,start_date,end_date\n"
+                b"wk,1,1,1,1,1,0,0,20260901,20260914\n"
+                b"sun,0,0,0,0,0,0,1,20260901,20260914\n"
+            ),
+            "calendar_dates.txt": (
+                b"service_id,date,exception_type\nwk,20260907,2\nsun,20260901,1\n"
+            ),
+            "stop_times.txt": (
+                b"trip_id,stop_id,stop_sequence\nt1,s1,1\nt1,s2,2\nt2,s1,1\nt2,s2,2\n"
+            ),
+        },
+        "complete",
+    )
+    _coverage(cache, feeds, [_candidate("Q-city", "f-cal", 2)])
+    classify.classify(cache, lookup=LOOKUP)
+    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    (edge,) = edges
+    assert edge["service"] == {
+        "stops": 2,
+        "routes": 1,
+        "departures_per_day": pytest.approx(24 / 14),
+    }
 
 
 def test_publish_refuses_edges_from_another_places_generation(tmp_path):

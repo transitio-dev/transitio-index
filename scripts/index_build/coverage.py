@@ -2,9 +2,10 @@
 
 Which places does a feed serve? For a crawled feed the answer is measured: its
 digest-verified stops resolve through the boundary lookup, and every place
-holding at least ``MIN_STOPS`` stops and ``MIN_STOP_SHARE`` of the feed's stops
-(or half the feed's stops regardless of count) gets an edge, at the plan's
-formula confidence with the counts and thresholds recorded as evidence.
+holding ANY of them gets an edge — membership is a fact, not a score; the
+classify stage keeps the pair only where a route has a scheduled stop, and
+carries the service level (stops, routes, departures per day) that tells a
+big city from a small one.
 Ancestor edges come free — a stop inside a city is inside its region and
 country polygons too. Metro edges are propagated from member-city edges,
 because minted metros carry no geometry yet (the merged metros stage's own
@@ -14,17 +15,16 @@ Crawled evidence supersedes the declared placements feed by feed.
 For every other feed the answer comes from
 what the catalogues declare: the seed stage resolved each feed's declared
 municipality, subdivision or country to a gazetteer place, and this stage turns
-those placements into candidate edges — one ``(place, feed)`` row each, at the
-plan's flat declared confidences (always below the review cutoff), with
-``tier = "unknown"`` and no selector, since nothing measured which routes or
-stops are involved.
+those placements into candidate edges — one ``(place, feed)`` row each, with
+``tier = "unknown"``, no service level and no selector, since nothing measured
+which routes or stops are involved.
 
 Declared edges propagate explicitly. A crawled feed would reach its city's
 ancestors and metros for free, since its stops fall inside every enclosing
 polygon; a declared feed has no geometry to test, so an edge to a city also
 yields edges to the city's administrative ancestors and to every metro in its
-``metro_ids``, at the same confidence. Without that a declared-only feed would be
-invisible to the bare-name query, which promotes to the default metro.
+``metro_ids``. Without that a declared-only feed would be invisible to the
+bare-name query, which promotes to the default metro.
 
 A GTFS-RT feed linked to a static feed gets no edges here: it inherits the static
 feed's membership in the edge-override stage, after curation, so a curated change
@@ -81,31 +81,20 @@ def _check_lineage(resolve_manifest, seed_manifest, expanded_manifest):
         )
 
 
-# Flat declared membership confidences, all below the 0.70 review cutoff: an
-# exact municipality match, a coarser subdivision/country or bounding-box
-# match, or a >=4-character geohash.
-DECLARED_CONFIDENCE = {
-    "municipality": 0.50,
-    "subdivision": 0.35,
-    "country": 0.35,
-    "bbox": 0.35,
-    "geohash": 0.25,
-}
+# The declared placement levels this stage knows: an exact municipality
+# match, a coarser subdivision/country or bounding-box match, or a
+# >=4-character geohash. Anything else is reported, never guessed at.
+DECLARED_LEVELS = ("municipality", "subdivision", "country", "bbox", "geohash")
+# The tier-confidence cutoff below which a classified edge needs review.
 REVIEW_CUTOFF = 0.70
 
-# The crawled admission thresholds: a place needs this many stops AND this
-# share of the feed's stops — or half the feed's stops regardless of count.
-MIN_STOPS = 5
-MIN_STOP_SHARE = 0.02
-FULL_SHARE = 0.5
 
-
-def _edge(place_id, feed_id, confidence, evidence, method):
+def _edge(place_id, feed_id, evidence, method, service=None):
     return {
         "place_id": place_id,
         "feed_id": feed_id,
         "tier": "unknown",
-        "confidence": confidence,
+        "service": service,
         "tier_confidence": 0.0,
         "method": method,
         "rehomed_from": [],
@@ -117,7 +106,8 @@ def _edge(place_id, feed_id, confidence, evidence, method):
         "fingerprint_kind": "none",
         "selector_state": "unavailable",
         "selector": None,
-        "needs_review": confidence < REVIEW_CUTOFF,
+        # Tier unknown until classified: the tier review flag is on.
+        "needs_review": True,
     }
 
 
@@ -187,7 +177,7 @@ def declared_edges(feeds, places, placements, *, superseded=frozenset()):
     """Candidate edges for the placements, and what could not be placed.
 
     Returns ``(edges, unknown_place_ids, unmatched_feed_ids)``: one edge per
-    reached ``(place, feed)`` pair, keeping the higher confidence when a feed
+    reached ``(place, feed)`` pair, the first placement winning when a feed
     reaches a place twice; the placement place ids absent from the expanded
     places; and the placement feed ids that match no resolved feed. A linked
     GTFS-RT feed's placements are skipped — it inherits later.
@@ -208,8 +198,7 @@ def declared_edges(feeds, places, placements, *, superseded=frozenset()):
         if placement["place_id"] not in places:
             unknown_places.add(placement["place_id"])
             continue
-        confidence = DECLARED_CONFIDENCE.get(placement["level"])
-        if confidence is None:
+        if placement["level"] not in DECLARED_LEVELS:
             # A level this stage does not know is reported, never guessed at.
             unknown_levels.add(str(placement["level"]))
             continue
@@ -219,8 +208,8 @@ def declared_edges(feeds, places, placements, *, superseded=frozenset()):
         }
         for place_id in _reach(placement["place_id"], places):
             key = (place_id, feed_id)
-            if key not in by_key or by_key[key]["confidence"] < confidence:
-                by_key[key] = _edge(place_id, feed_id, confidence, evidence, "inferred")
+            if key not in by_key:
+                by_key[key] = _edge(place_id, feed_id, evidence, "inferred")
     edges = [by_key[key] for key in sorted(by_key)]
     return (
         edges,
@@ -307,30 +296,17 @@ def stop_places(lookup, x, y, places, by_overture):
     return hit, countries, stale
 
 
-def _crawled_confidence(stops_in_place, stop_share):
-    """The plan's membership formula: 0.6 at the admission threshold, 1.0 at a
-    tenth of the stops or fifty of them."""
-    return 0.6 + 0.4 * min(1.0, max(stop_share / 0.10, stops_in_place / 50))
-
-
-def crawled_edges(
-    cache_dir,
-    feeds,
-    places,
-    lookup,
-    *,
-    min_stops=MIN_STOPS,
-    min_stop_share=MIN_STOP_SHARE,
-):
+def crawled_edges(cache_dir, feeds, places, lookup):
     """Measured edges for the crawled feeds; ``(edges_by_key, report)``.
 
     Reads each crawled feed's digest-verified stops (the crawl's state.json is
     the commit point, exactly as expansion reads them), resolves every stop
-    through the boundary lookup, and admits ``(place, feed)`` pairs by the
-    thresholds. A feed whose stops were read supersedes its declared
-    placements even when nothing passes — the crawl saw where it stops. Metro
-    edges are propagated from passing member-city edges at the same
-    confidence.
+    through the boundary lookup, and admits every ``(place, feed)`` pair with
+    a stop inside, the count being the service level's first term. A feed
+    whose stops were read supersedes its declared placements even when no
+    stop lands anywhere — the crawl saw where it stops. Metro edges are
+    propagated from member-city edges; a metro's own aggregated evidence
+    outranks them.
     """
     # Heavy deps (shapely/pyarrow via the gazetteer modules) load only when
     # crawl artifacts exist; the declared path stays importable without them.
@@ -385,30 +361,28 @@ def crawled_edges(
         for x, y in points:
             hit, _, stale_here = stop_places(lookup, x, y, places, by_overture)
             stale.update(stale_here)
-            counts.update(hit)
-            for metro_id, members in metro_members.items():
-                if hit & members:
-                    counts[metro_id] += 1
+            # A metro counts a stop once, whether its own polygon, a member
+            # city, or both placed it there.
+            counts.update(
+                hit | {m for m, members in metro_members.items() if hit & members}
+            )
         # Dropped rows stay in the denominator: a stop whose coordinates do
         # not parse is still one of the feed's stops, and excluding it would
         # let a mostly-corrupt file inflate a share to false confidence.
+        # Membership is a fact: any stop inside a place admits the feed to
+        # it. The classify stage keeps the pair only when a route has a
+        # SCHEDULED stop there, which stops.txt alone cannot tell.
         total = len(points) + dropped
-        passing = {}
         for place_id, stops_in_place in counts.items():
-            share = stops_in_place / total
-            if share >= FULL_SHARE or (
-                stops_in_place >= min_stops and share >= min_stop_share
-            ):
-                passing[place_id] = (stops_in_place, share)
-        for place_id, (stops_in_place, share) in passing.items():
             evidence = {
                 "stops_in_place": stops_in_place,
-                "stop_share": share,
-                "min_stops": min_stops,
-                "min_stop_share": min_stop_share,
-                "review_cutoff": REVIEW_CUTOFF,
+                "stop_share": stops_in_place / total,
             }
-            confidence = _crawled_confidence(stops_in_place, share)
+            service = {
+                "stops": stops_in_place,
+                "routes": None,
+                "departures_per_day": None,
+            }
             targets = [place_id]
             if places[place_id].get("kind") == "city":
                 # Minted metros have no geometry to test yet; membership
@@ -420,22 +394,21 @@ def crawled_edges(
                 )
             for target in targets:
                 key = (target, feed_id)
-                current = by_key.get(key)
-                # A place's own evidence outranks propagation at equal
-                # confidence, so a metro reports its aggregated stops.
+                # A place's own evidence outranks a propagated edge, so a
+                # metro reports its aggregated stops, never one member's.
                 own = target == place_id
-                if (
-                    current is None
-                    or current["confidence"] < confidence
-                    or (own and current["confidence"] <= confidence)
-                ):
-                    by_key[key] = _edge(target, feed_id, confidence, evidence, "crawl")
+                if own or not by_key.get(key, {}).get("_own"):
+                    edge = _edge(target, feed_id, evidence, "crawl", service)
+                    edge["_own"] = own
+                    by_key[key] = edge
     if stale:
         raise CoverageError(
             "crawled stops hit QID-bearing divisions the gazetteer does not "
             f"know ({', '.join(sorted(stale)[:5])}); places_expanded predates "
             "the crawl — re-run the expand stage"
         )
+    for edge in by_key.values():
+        edge.pop("_own", None)
     report = {
         "superseded": superseded,
         "state_mismatches": mismatches,
@@ -445,9 +418,7 @@ def crawled_edges(
     return by_key, report
 
 
-def cover(
-    cache_dir, *, lookup=None, min_stops=MIN_STOPS, min_stop_share=MIN_STOP_SHARE
-):
+def cover(cache_dir, *, lookup=None):
     """Derive declared membership edges; publish the ``coverage`` generation.
 
     Reads the resolved feeds, the expanded places and the seed placements, and
@@ -506,8 +477,6 @@ def cover(
                             feeds,
                             places,
                             lookup,
-                            min_stops=min_stops,
-                            min_stop_share=min_stop_share,
                         )
                     except store.StoreError as error:
                         raise CoverageError(

@@ -30,7 +30,7 @@ import pyarrow.parquet as pq
 
 from index_build import store
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
@@ -96,9 +96,10 @@ def _row(record, snapshot_id):
     }
 
 
-def _place_row(record, snapshot_id):
+def _place_row(record, snapshot_id, service=None):
     metro_ids = record.get("metro_ids") or []
     return {
+        "service": _json_block(service),
         "place_id": record["place_id"],
         "kind": record["kind"],
         "source_subtype": record.get("source_subtype"),
@@ -189,6 +190,7 @@ _PLACES_SCHEMA = pa.schema(
         ("statistical_area_id", pa.string()),
         ("geonames_id", pa.string()),
         ("geometry_source", pa.string()),
+        ("service", pa.string()),
         ("snapshot", pa.string()),
         ("geometry", pa.binary()),
     ]
@@ -211,7 +213,32 @@ def _geo_metadata():
     ).encode("utf-8")
 
 
-def _places_parquet_bytes(places, snapshot_id):
+def _service_by_place(edges):
+    """Each place's service level summed over the feeds serving it.
+
+    Every tier edge of a (place, feed) pair carries the same struct, so pairs
+    are counted once. Each number sums over the feeds that report it and
+    stays null when none does: a place served only by declared feeds has
+    unknown counts, not zero.
+    """
+    per_pair = {}
+    for edge in edges or []:
+        per_pair.setdefault((edge["place_id"], edge["feed_id"]), edge.get("service"))
+    totals = {}
+    for (place_id, _), service in per_pair.items():
+        service = service or {}
+        total = totals.setdefault(
+            place_id,
+            {"feeds": 0, "stops": None, "routes": None, "departures_per_day": None},
+        )
+        total["feeds"] += 1
+        for field in ("stops", "routes", "departures_per_day"):
+            if service.get(field) is not None:
+                total[field] = (total[field] or 0) + service[field]
+    return totals
+
+
+def _places_parquet_bytes(places, snapshot_id, service_by_place=None):
     """The places as GeoParquet bytes: declared columns plus the WKB boundary.
 
     The schema is declared, not inferred, so an all-null column (``geonames_id``,
@@ -220,7 +247,9 @@ def _places_parquet_bytes(places, snapshot_id):
     """
     rows = []
     for place in places:
-        row = _place_row(place, snapshot_id)
+        row = _place_row(
+            place, snapshot_id, (service_by_place or {}).get(place["place_id"])
+        )
         wkb = place.get("geometry")
         row["geometry"] = bytes.fromhex(wkb) if wkb else None
         rows.append(row)
@@ -236,7 +265,7 @@ _EDGES_SCHEMA = pa.schema(
         ("place_id", pa.string()),
         ("feed_id", pa.string()),
         ("tier", pa.string()),
-        ("confidence", pa.float64()),
+        ("service", pa.string()),
         ("tier_confidence", pa.float64()),
         ("method", pa.string()),
         ("rehomed_from", pa.list_(pa.string())),
@@ -259,7 +288,7 @@ def _edge_row(record, snapshot_id):
         "place_id": record["place_id"],
         "feed_id": record["feed_id"],
         "tier": record["tier"],
-        "confidence": record["confidence"],
+        "service": _json_block(record.get("service")),
         "tier_confidence": record["tier_confidence"],
         "method": record["method"],
         "rehomed_from": record.get("rehomed_from") or [],
@@ -485,7 +514,9 @@ def publish(cache_dir, *, golden_path=None):
 
         places_data = None
         if places is not None:
-            places_data = _places_parquet_bytes(places, snapshot_id)
+            places_data = _places_parquet_bytes(
+                places, snapshot_id, _service_by_place(edges)
+            )
             manifest["places_sha256"] = hashlib.sha256(places_data).hexdigest()
             manifest["overture_release"] = overture_release
             counts["places"] = len(places)
