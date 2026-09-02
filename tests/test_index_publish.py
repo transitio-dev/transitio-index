@@ -502,6 +502,8 @@ def test_places_without_an_overture_release_are_refused(tmp_path):
 
 
 def test_edges_round_trip_through_the_reader(tmp_path):
+    import pandas
+
     pytest.importorskip("geopandas")
     edges = [_edge("Q1757", "f-a"), _edge("Q-metro", "f-a")]
     cache, manifest = _edges_index(tmp_path, edges)
@@ -512,12 +514,11 @@ def test_edges_round_trip_through_the_reader(tmp_path):
     row = index.edges.set_index("place_id").loc["Q1757"]
     assert row["feed_id"] == "f-a"
     assert row["tier"] == "unknown"
-    assert row["service"] != row["service"]  # null: nothing measured
+    assert pandas.isna(row["service"])  # a null column reads None or NaN
     assert row["selector_state"] == "unavailable"
     assert bool(row["needs_review"]) is True
     assert json.loads(row["evidence"])["declared_level"] == "municipality"
     # The feeds come from the coverage generation, stamped with their coverage.
-    import pandas
 
     by_id = {r["feed_id"]: r for _, r in index.feeds.iterrows()}
     assert by_id["f-a"]["coverage_source"] == "declared"
