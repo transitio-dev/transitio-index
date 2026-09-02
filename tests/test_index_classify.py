@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -95,12 +96,38 @@ def test_a_historical_skip_is_rejudged_against_the_current_lookup(tmp_path):
         "skipped",
     )
     _coverage(cache, feeds, [_candidate("Q-city", "f-k")])
+    # An unrelated request from an earlier build must survive the append.
+    requests = cache / "recrawl_requests.jsonl"
+    requests.write_text(json.dumps({"feed_id": "f-else"}) + "\n")
     manifest = classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     assert [(e["tier"], e["evidence"]["unknown_reason"]) for e in edges] == [
         ("unknown", "skip_stale")
     ]
+    assert edges[0]["selector_state"] == "unavailable"
     assert manifest["feeds_by_status"] == {"skip_stale": 1}
+    # The back-edge: the feed is asked for a complete read next crawl, once.
+    assert manifest["recrawl_requested"] == 1
+    assert [
+        json.loads(line)["feed_id"] for line in requests.read_text().splitlines()
+    ] == [
+        "f-else",
+        "f-k",
+    ]
+    assert classify.classify(cache, lookup=LOOKUP)["recrawl_requested"] == 0
+    assert len(requests.read_text().splitlines()) == 2
+    # The request file is appended through a no-follow descriptor: a
+    # symlink planted in its place is refused, never written through.
+    aside = tmp_path / "aside.jsonl"
+    aside.write_text("")
+    requests.unlink()
+    try:
+        requests.symlink_to(aside)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(classify.ClassifyError, match="recrawl_requests.jsonl"):
+        classify.classify(cache, lookup=LOOKUP)
+    assert aside.read_text() == ""
 
 
 def test_expanded_places_must_descend_from_the_current_seed(tmp_path):
@@ -240,8 +267,15 @@ def test_the_cli_refuses_to_lose_the_golden_gate(tmp_path):
 def test_ids_are_joined_verbatim():
     import io
 
-    routes = classify._read_routes(io.BytesIO(b"route_id,route_type\na ,3\na,0\n"))
-    assert routes == {"a ": 3, "a": 0}
+    routes, route_types = classify._read_routes(
+        io.BytesIO(b"route_id,agency_id,route_type\na ,x,3\na,,0\n,,7\n")
+    )
+    assert routes == {
+        "a ": {"route_type": 3, "agency_id": "x"},
+        "a": {"route_type": 0, "agency_id": ""},
+    }
+    # The id-less row still counts for the skip predicate's tier check.
+    assert route_types == [3, 0, 7]
 
 
 @pytest.mark.parametrize(
@@ -518,6 +552,23 @@ def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
         "departures_per_day": None,
     }
     assert a[("Q-city", "local")]["service"] == a[("Q-city", "national")]["service"]
+    # Each tier's selector is exactly its serving routes; the fingerprint
+    # describes the feed, so every edge of it carries the same digest.
+    assert local["selector_state"] == "complete"
+    assert local["selector"] == {"route_id": ["tram"]}
+    assert national["selector"] == {"route_id": ["bus"]}
+    assert a[("Q-other", "national")]["selector"] == {"route_id": ["bus"]}
+    assert {e["fingerprint_kind"] for e in a.values()} == {"route_stops"}
+    assert len({e["classification_fingerprint"] for e in a.values()}) == 1
+    # f-a's nine tier edges (five places, two tiers, Q-other national only)
+    # are complete; f-skip's two are whole-feed; f-none and f-declared stay
+    # unavailable.
+    assert manifest["edges_by_selector_state"] == {
+        "complete": 9,
+        "whole_feed": 2,
+        "unavailable": 2,
+    }
+    assert manifest["recrawl_requested"] == 0
     assert manifest["feeds_by_status"] == {
         "route_stops": 1,
         "whole_feed": 1,
@@ -537,6 +588,9 @@ def test_a_skipped_feed_is_whole_feed_at_its_fixed_tier(tmp_path):
         assert edge["evidence"]["spread_km"] is None
         # Whole feed: every stop and route, no timetable to count.
         assert edge["service"] == {"stops": 2, "routes": 1, "departures_per_day": None}
+        assert edge["selector_state"] == "whole_feed" and edge["selector"] is None
+        assert edge["fingerprint_kind"] == "feed_stops"
+        assert len(edge["classification_fingerprint"]) == 64
 
 
 def test_unknown_is_explicit_and_keeps_the_coverage_service(tmp_path):
@@ -545,6 +599,10 @@ def test_unknown_is_explicit_and_keeps_the_coverage_service(tmp_path):
     assert none["tier_confidence"] == 0.0
     assert none["needs_review"] is True
     assert none["service"] == {"stops": 3, "routes": None, "departures_per_day": None}
+    # No route evidence: never a selector, never a fingerprint.
+    assert none["selector_state"] == "unavailable"
+    assert none["fingerprint_kind"] == "none"
+    assert none["classification_fingerprint"] is None
     assert none["evidence"]["unknown_reason"] == "no_route_evidence"
     declared = edges["f-declared"][("Q-other", "unknown")]
     assert declared["evidence"]["unknown_reason"] == "declared"
@@ -912,6 +970,28 @@ def test_a_crawl_state_from_a_smaller_member_set_is_refused(tmp_path):
     _coverage(cache, feeds, [_candidate("Q-city", "f-a")])
     with pytest.raises(classify.ClassifyError, match="re-run the crawl"):
         classify.classify(cache, lookup=LOOKUP)
+
+
+def test_the_request_file_is_pinned_without_o_nofollow(tmp_path, monkeypatch):
+    # The fallback for platforms without O_NOFOLLOW: a symlink is refused
+    # by identity, a missing file is created, and an append deduplicates.
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    assert classify._request_recrawl(cache, ["f-a", "f-a"]) == 1
+    assert classify._request_recrawl(cache, ["f-a", "f-b"]) == 1
+    lines = (cache / "recrawl_requests.jsonl").read_text().splitlines()
+    assert [json.loads(line)["feed_id"] for line in lines] == ["f-a", "f-b"]
+    aside = tmp_path / "aside.jsonl"
+    aside.write_text("")
+    (cache / "recrawl_requests.jsonl").unlink()
+    try:
+        (cache / "recrawl_requests.jsonl").symlink_to(aside)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(classify.ClassifyError, match="not a regular file"):
+        classify._request_recrawl(cache, ["f-c"])
+    assert aside.read_text() == ""
 
 
 def test_edges_without_the_service_key_are_refused(tmp_path):
