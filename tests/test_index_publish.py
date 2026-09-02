@@ -19,6 +19,7 @@ import shapely  # noqa: E402
 
 from index_build import publish  # noqa: E402
 from index_build import classify  # noqa: E402
+from index_build import overrides  # noqa: E402
 
 # Import the read layer directly too, so an old installed transitio shadowing
 # the source (which would lack it) fails loudly rather than skipping the module.
@@ -508,6 +509,8 @@ def test_edges_round_trip_through_the_reader(tmp_path):
     edges = [_edge("Q1757", "f-a"), _edge("Q-metro", "f-a")]
     cache, manifest = _edges_index(tmp_path, edges)
     index = transitio_index.read_index(cache / "index")
+    assert manifest["stale_overrides"] == 0
+    assert manifest["overrides_sha256"] is None
 
     assert index.edges is not None
     assert len(index.edges) == 2
@@ -582,6 +585,20 @@ def test_a_duplicate_column_label_is_refused_even_when_correctly_hashed(tmp_path
     snap_path.write_text(json.dumps(snapshot))
     with pytest.raises(IncompatibleIndexError, match="not a readable edges table"):
         transitio_index.read_index(cache / "index")
+
+
+def test_an_override_file_edited_during_publication_aborts_it(tmp_path, monkeypatch):
+    # The digest is read when the edges are, and again right before the
+    # snapshot is written: a file edited in between aborts the activation.
+    pytest.importorskip("geopandas")
+    cache, _ = _edges_index(tmp_path, [_edge("Q1757", "f-a")])
+    # Read when the edges are, then once more at activation: two reads.
+    digests = iter([None, "edited"])
+    monkeypatch.setattr(overrides, "edges_digest", lambda overrides_dir: next(digests))
+    with pytest.raises(publish.PublishError, match="during publication"):
+        publish.publish(cache)
+    # The abort came before any file was replaced: the previous index reads.
+    assert len(transitio_index.read_index(cache / "index").edges) == 1
 
 
 def test_the_snapshot_id_reflects_distinct_edges_content(tmp_path):

@@ -612,7 +612,7 @@ def test_unknown_is_explicit_and_keeps_the_coverage_service(tmp_path):
 
 def test_publish_reads_the_classified_edges(tmp_path):
     cache, _, _ = _build(tmp_path)
-    feeds, edges, manifest = publish._read_coverage(cache)
+    feeds, edges, manifest, _ = publish._read_coverage(cache)
     assert manifest["source"] == "classify"
     assert {e["tier"] for e in edges} >= {"local", "national", "unknown"}
     assert len(feeds) == 4
