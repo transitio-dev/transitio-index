@@ -7,10 +7,10 @@ boundary), ``edges.parquet`` (one membership row per place/feed/tier) and
 version, the source versions, the counts, and each Parquet's SHA-256). The
 feeds come from the latest edge stage when one exists (curated, classified or
 coverage edges, with the feeds stamped ``coverage_source`` and ``crawlable``),
-else from the crosswalk; the places from the pruned generation for a curated
-build, else the expanded generation, else the names one. Places and edges are
-optional: an index built before those stages ran is feeds only, and the reader
-treats the missing tables the same way.
+else from the resolved feeds, else from the crosswalk; the places from the
+pruned generation for a curated build, else the expanded generation, else the
+names one. Places and edges are optional: an index built before those stages
+ran is feeds only, and the reader treats the missing tables the same way.
 
 The flat identity and crosswalk fields are their own columns; the verbatim Atlas,
 MDB and GBFS source rows are kept as JSON-string columns, so nothing is lost and
@@ -31,7 +31,7 @@ import pyarrow.parquet as pq
 
 from index_build import store
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
@@ -62,6 +62,13 @@ _SCHEMA = pa.schema(
         ("crawlable", pa.bool_()),
         ("uncrawlable_reason", pa.string()),
         ("coverage_source", pa.string()),
+        # The crawl's evidence and bookkeeping (schema_version 3).
+        ("coverage", pa.binary()),
+        ("stop_count", pa.int64()),
+        ("etag", pa.string()),
+        ("last_modified", pa.string()),
+        ("last_crawled", pa.string()),
+        ("crawl_status", pa.string()),
         ("snapshot", pa.string()),
     ]
 )
@@ -93,8 +100,19 @@ def _row(record, snapshot_id):
         "crawlable": record.get("crawlable"),
         "uncrawlable_reason": record.get("uncrawlable_reason"),
         "coverage_source": record.get("coverage_source"),
+        "coverage": _wkb(record.get("coverage")),
+        "stop_count": record.get("stop_count"),
+        "etag": record.get("etag"),
+        "last_modified": record.get("last_modified"),
+        "last_crawled": record.get("last_crawled"),
+        "crawl_status": record.get("crawl_status"),
         "snapshot": snapshot_id,
     }
+
+
+def _wkb(value):
+    """A hex-encoded WKB column value as bytes, None passing through."""
+    return None if value is None else bytes.fromhex(value)
 
 
 def _place_row(record, snapshot_id, service=None):
@@ -395,8 +413,8 @@ def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
             _check_lineage(
                 cache_dir,
                 manifest,
-                (("seed.json", "seed_generation"),),
-                "names",
+                (("gazetteer", "seed.json", "seed_generation"),),
+                "names places",
                 "gazetteer",
             )
         _check_places_overrides(manifest, overrides_dir)
@@ -424,12 +442,18 @@ def _no_places(overrides_dir):
 
 
 def _check_places_overrides(expanded_manifest, overrides_dir):
-    """The places.yaml on disk must be the one the gazetteer applied."""
+    """The places.yaml on disk must be the one the gazetteer applied; a
+    generation written before override tracking cannot say which one."""
     from index_build import overrides
 
+    if "places_overrides_sha256" not in expanded_manifest:
+        raise PublishError(
+            "the places generation predates override tracking; re-run the "
+            "gazetteer stage"
+        )
     try:
         overrides.expect_digest(
-            expanded_manifest.get("places_overrides_sha256"),
+            expanded_manifest["places_overrides_sha256"],
             overrides.places_digest(overrides_dir),
             "places.yaml",
             "gazetteer",
@@ -461,29 +485,91 @@ def _check_names_lineage(cache_dir, expanded_manifest):
     _check_lineage(
         cache_dir,
         expanded_manifest,
-        (("seed.json", "seed_generation"), ("names.json", "names_generation")),
-        "expanded",
+        (
+            ("gazetteer", "seed.json", "seed_generation"),
+            ("gazetteer", "names.json", "names_generation"),
+        ),
+        "expanded places",
         "expand",
     )
 
 
+def _read_resolved(cache_dir, overrides_dir, *, check_file=True):
+    """The resolved feeds and their manifest, or ``(None, None)`` without a
+    resolve generation. They must descend from the current crosswalk (a
+    re-run crosswalk without a following resolve leaves a feed chain that
+    is mutually consistent and still stale) and, when they are what ships
+    (``check_file``), from the ``feeds.yaml`` on disk now — a coverage
+    generation checks the file itself, and a ``set_coverage`` edit must not
+    send the resolve stage back. A ``feeds.yaml`` that no resolve generation
+    applied is a stage that has not run yet."""
+    from index_build import overrides
+
+    pointer = cache_dir / "resolve" / "feeds_resolved.json"
+    if not (pointer.is_symlink() or pointer.exists()):
+        if overrides.feeds_digest(overrides_dir) is not None:
+            raise PublishError(
+                "feeds.yaml exists but no resolve generation applied it; run the "
+                "resolve stage"
+            )
+        return None, None
+    try:
+        feeds, manifest = store.read_jsonl(
+            cache_dir / "resolve", pointer.name, "feeds_resolved.jsonl"
+        )
+    except (store.StoreError, ValueError) as error:
+        raise PublishError(f"the resolve generation is unreadable: {error}") from error
+    if manifest.get("crosswalk_generation") is None:
+        # A resolve generation from before the crosswalk was recorded
+        # cannot demonstrate descent at all.
+        raise PublishError(
+            "the resolved feeds record no crosswalk generation; re-run the "
+            "resolve stage"
+        )
+    _check_lineage(
+        cache_dir,
+        manifest,
+        (("crosswalk", "feeds.json", "crosswalk_generation"),),
+        "resolved feeds",
+        "resolve",
+    )
+    if "feeds_overrides_sha256" not in manifest:
+        # Written before override tracking: it cannot say which feeds.yaml
+        # shaped it, and an absent file must not read as "none applied".
+        raise PublishError(
+            "the resolve generation predates override tracking; re-run the "
+            "resolve stage"
+        )
+    if check_file:
+        try:
+            overrides.expect_digest(
+                manifest["feeds_overrides_sha256"],
+                overrides.feeds_digest(overrides_dir),
+                "feeds.yaml",
+                "resolve",
+            )
+        except overrides.OverrideError as error:
+            raise PublishError(str(error)) from error
+    return feeds, manifest
+
+
 def _check_lineage(cache_dir, manifest, ancestors, what, rerun):
-    """The ``what`` places must descend from the current ``ancestors``
-    generations (pointer, manifest key), else ``rerun`` is the stage to run."""
-    for pointer, key in ancestors:
-        path = cache_dir / "gazetteer" / pointer
+    """The ``what`` must descend from the current ``ancestors`` generations
+    (subdirectory, pointer, manifest key), else ``rerun`` is the stage to run."""
+    for subdir, pointer, key in ancestors:
+        path = cache_dir / subdir / pointer
         recorded = manifest.get(key)
         if not (path.is_symlink() or path.exists()):
             if recorded is not None:
-                # The ancestor these places descend from is gone: nothing
-                # can verify them any more.
+                # The ancestor these descend from is gone: nothing can
+                # verify them any more.
                 raise PublishError(
-                    f"the {pointer} generation the {what} places descend "
-                    f"from no longer exists; re-run the {rerun} stage"
+                    f"the {pointer} generation the {what} descend from no "
+                    f"longer exists; re-run the {rerun} stage"
                 )
             continue
         try:
-            generation, current = store.resolve(cache_dir / "gazetteer", pointer)
+            generation, current = store.resolve(cache_dir / subdir, pointer)
         except (store.StoreError, ValueError) as error:
             raise PublishError(
                 f"the {pointer} generation is unreadable: {error}"
@@ -492,7 +578,7 @@ def _check_lineage(cache_dir, manifest, ancestors, what, rerun):
             pass
         if recorded != current.get("generation"):
             raise PublishError(
-                f"the {what} places do not descend from the current {pointer} "
+                f"the {what} do not descend from the current {pointer} "
                 f"generation; re-run the {rerun} stage"
             )
 
@@ -513,15 +599,23 @@ def _read_coverage(cache_dir, *, locked=False, overrides_dir=None):
     try:
         feeds, edges, manifest = classify.read_edges(cache_dir, locked=locked)
         current = overrides.applied_digest(manifest, overrides_dir)
-        if manifest is not None:
+    except (classify.ClassifyError, overrides.OverrideError) as error:
+        raise PublishError(str(error)) from error
+    if manifest is not None:
+        if "feeds_overrides_sha256" not in manifest:
+            raise PublishError(
+                "the edge generation predates override tracking; re-run the "
+                "coverage stage"
+            )
+        try:
             overrides.expect_digest(
-                manifest.get("feeds_overrides_sha256"),
+                manifest["feeds_overrides_sha256"],
                 overrides.feeds_digest(overrides_dir),
                 "feeds.yaml",
                 "coverage",
             )
-    except (classify.ClassifyError, overrides.OverrideError) as error:
-        raise PublishError(str(error)) from error
+        except overrides.OverrideError as error:
+            raise PublishError(str(error)) from error
     return feeds, edges, manifest, current
 
 
@@ -558,6 +652,8 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
     # The coverage generation supersedes the crosswalk as the feed source: its
     # feeds carry coverage_source and crawlability, and its edges ship alongside.
     from index_build import crawl
+    from transitio import __version__ as built_with
+    from transitio.index import DISCOVERY_SEMANTICS_VERSION, MIN_READER_VERSIONS
 
     # Every upstream stage's writer lock is held from the reads through the
     # commit, so no crawl, resolve, expand, coverage, classify or curate run
@@ -590,13 +686,20 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
         )
         from index_build import overrides
 
-        if records is None:
+        # Without coverage the resolved feeds ship (identity and crawlability
+        # applied), and only without those the crosswalk's.
+        resolved, resolve_manifest = _read_resolved(
+            cache_dir, overrides_dir, check_file=records is None
+        )
+        if records is not None:
+            sources = coverage.get("sources")
+        elif resolved is not None:
+            records, sources = resolved, resolve_manifest.get("sources")
+        else:
             records, crosswalk = store.read_jsonl(
                 cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
             )
             sources = crosswalk.get("sources")
-        else:
-            sources = coverage.get("sources")
         if not records:
             raise PublishError("no feeds to publish")
         if not sources:
@@ -645,15 +748,23 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
         digests = []
         if places is not None:
             digests.append(_content_digest(places))
-        if edges is not None:
-            # Covered feeds and edges also fold in: the override files shape them.
+        if resolved is not None or edges is not None:
+            # Resolved and covered feeds fold in, and edges: the override
+            # files shape them, and no source version pins those.
             digests.append(_content_digest(records))
+        if edges is not None:
             digests.append(_content_digest(edges))
         snapshot_id = _snapshot_id(sources, overture_release, digests)
         feeds_data = _parquet_bytes(records, snapshot_id)
         counts = _counts(records)
         manifest = {
             "schema_version": SCHEMA_VERSION,
+            # The snapshot pins the data; the discovery semantics and the
+            # build's version are recorded so a reproduction can say whether
+            # it is exact, and a reader below the schema's floor refuses it.
+            "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
+            "min_reader_version": MIN_READER_VERSIONS[SCHEMA_VERSION],
+            "built_with": built_with,
             "snapshot_id": snapshot_id,
             "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "sources": sources,
@@ -709,15 +820,17 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
         # first file is replaced: an override file edited during publication
         # must not activate a snapshot built from its predecessor.
         checks = [("edges.yaml", override_digest, overrides.edges_digest, "curate")]
-        if coverage is not None:
-            checks.append(
-                (
-                    "feeds.yaml",
-                    coverage.get("feeds_overrides_sha256"),
-                    overrides.feeds_digest,
-                    "resolve",
-                )
+        # feeds.yaml is rechecked even for a crosswalk-only index (recorded
+        # None): a file created during publication must not ship unapplied.
+        feed_source = coverage if coverage is not None else resolve_manifest
+        checks.append(
+            (
+                "feeds.yaml",
+                (feed_source or {}).get("feeds_overrides_sha256"),
+                overrides.feeds_digest,
+                "coverage" if coverage is not None else "resolve",
             )
+        )
         checks.append(
             (
                 "places.yaml",
@@ -739,10 +852,15 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
                             f"{rerun} stage"
                         )
                 store.write_bytes(directory, FEEDS_FILE, feeds_data)
-                if places_data is not None:
-                    store.write_bytes(directory, PLACES_FILE, places_data)
-                if edges_data is not None:
-                    store.write_bytes(directory, EDGES_FILE, edges_data)
+                # A table this build lacks must not linger from an earlier one.
+                for name, data in (
+                    (PLACES_FILE, places_data),
+                    (EDGES_FILE, edges_data),
+                ):
+                    if data is not None:
+                        store.write_bytes(directory, name, data)
+                    else:
+                        store.unlink(directory, name)
                 store.write_file(
                     directory,
                     SNAPSHOT_FILE,

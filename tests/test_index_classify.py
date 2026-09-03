@@ -146,6 +146,7 @@ def test_expanded_places_must_descend_from_the_current_seed(tmp_path):
         {"places_expanded.jsonl": PLACES},
         {
             "source": "expand",
+            "places_overrides_sha256": None,
             "sources": SOURCES,
             "overture_release": RELEASE,
             "seed_generation": seed["generation"],
@@ -170,7 +171,12 @@ def test_a_vanished_names_generation_is_refused_by_publish(tmp_path):
         "gazetteer",
         "names.json",
         {"places_seed.jsonl": PLACES},
-        {"source": "names", "sources": SOURCES, "overture_release": RELEASE},
+        {
+            "source": "names",
+            "places_overrides_sha256": None,
+            "sources": SOURCES,
+            "overture_release": RELEASE,
+        },
     )
     _publish(
         cache,
@@ -179,6 +185,7 @@ def test_a_vanished_names_generation_is_refused_by_publish(tmp_path):
         {"places_expanded.jsonl": PLACES},
         {
             "source": "expand",
+            "places_overrides_sha256": None,
             "sources": SOURCES,
             "overture_release": RELEASE,
             "names_generation": names["generation"],
@@ -197,7 +204,12 @@ def test_expanded_places_must_descend_from_the_current_names(tmp_path):
         "gazetteer",
         "names.json",
         {"places_seed.jsonl": PLACES},
-        {"source": "names", "sources": SOURCES, "overture_release": RELEASE},
+        {
+            "source": "names",
+            "places_overrides_sha256": None,
+            "sources": SOURCES,
+            "overture_release": RELEASE,
+        },
     )
     with pytest.raises(publish.PublishError, match="re-run the expand"):
         publish._read_places(cache)
@@ -433,7 +445,12 @@ def _coverage(cache, feeds, candidates, *, places=PLACES):
         "gazetteer",
         "expanded.json",
         {"places_expanded.jsonl": places},
-        {"source": "expand", "sources": SOURCES, "overture_release": RELEASE},
+        {
+            "source": "expand",
+            "places_overrides_sha256": None,
+            "sources": SOURCES,
+            "overture_release": RELEASE,
+        },
     )
     return _publish(
         cache,
@@ -660,7 +677,12 @@ def test_mixed_lineage_is_refused(tmp_path):
         "gazetteer",
         "expanded.json",
         {"places_expanded.jsonl": PLACES},
-        {"source": "expand", "sources": SOURCES, "overture_release": RELEASE},
+        {
+            "source": "expand",
+            "places_overrides_sha256": None,
+            "sources": SOURCES,
+            "overture_release": RELEASE,
+        },
     )
     with pytest.raises(classify.ClassifyError, match="stage order"):
         classify.classify(cache, lookup=LOOKUP)
@@ -1093,7 +1115,12 @@ def test_publish_refuses_edges_from_another_places_generation(tmp_path):
         "gazetteer",
         "expanded.json",
         {"places_expanded.jsonl": PLACES},
-        {"source": "expand", "sources": SOURCES, "overture_release": RELEASE},
+        {
+            "source": "expand",
+            "places_overrides_sha256": None,
+            "sources": SOURCES,
+            "overture_release": RELEASE,
+        },
     )
     with pytest.raises(publish.PublishError, match="re-run"):
         publish.publish(cache)
