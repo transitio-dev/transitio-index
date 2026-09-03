@@ -985,3 +985,53 @@ def test_places_generations_before_override_tracking_are_refused(tmp_path, point
     _publish_gen(cache, pointer, artifact, PLACES, {"source": "gazetteer"})
     with pytest.raises(publish.PublishError, match="predates override tracking"):
         publish._read_places(cache)
+
+
+def test_the_snapshot_records_every_generation_it_descends_from(tmp_path):
+    cache, _ = _build_index(tmp_path)
+    _, crosswalk = store.read_jsonl(cache / "crosswalk", "feeds.json", "feeds.jsonl")
+    raw = {}
+    for name in publish.RAW_POINTERS:
+        if (cache / "raw" / name).exists():
+            handle, manifest = store.resolve(cache / "raw", name)
+            with handle:
+                raw[f"raw/{name}"] = manifest["generation"]
+    assert raw  # the ingests this build ran
+    edges = {
+        "source": "curate",
+        "generation": "e",
+        "classify_generation": "c",
+        "coverage_generation": "v",
+        "resolve_generation": "r",
+    }
+    places = {
+        "source": "expand",
+        "generation": "x",
+        "seed_generation": "s",
+        "names_generation": "n",
+        "pruned_generation": "p",
+    }
+    generations, leaves = publish._generations(
+        cache, edges, {"generation": "r2"}, places
+    )
+    assert leaves == {
+        "feeds": "curate/edges_final.json",
+        "edges": "curate/edges_final.json",
+        "places": "prune/places_pruned.json",
+    }
+    assert generations == {
+        **raw,
+        "crosswalk/feeds.json": crosswalk["generation"],
+        "resolve/feeds_resolved.json": "r2",
+        "gazetteer/expanded.json": "x",
+        "gazetteer/seed.json": "s",
+        "gazetteer/names.json": "n",
+        "prune/places_pruned.json": "p",
+        "curate/edges_final.json": "e",
+        "classify/edges.json": "c",
+        "coverage/coverage.json": "v",
+    }
+    assert publish._generations(cache, None, None, None) == (
+        {**raw, "crosswalk/feeds.json": crosswalk["generation"]},
+        {"feeds": "crosswalk/feeds.json"},
+    )
