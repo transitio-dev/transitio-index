@@ -96,6 +96,10 @@ class FakeGitHub:
     def handle(self, request):
         authed = "Authorization" in request.headers
         path = request.url.path
+        if path.startswith("/repos/old/r/"):
+            # A transferred repository: GitHub answers with its new home.
+            location = f"{API}/repos/o/r/" + path[len("/repos/old/r/") :]
+            return httpx.Response(301, headers={"Location": location})
         # The token reaches the API and upload hosts only: never the object
         # store the asset redirects lead to.
         assert authed == (request.url.host != "objects.example") or (
@@ -536,3 +540,30 @@ def test_an_ingest_re_run_after_the_build_is_not_released(tmp_path):
     atlas.ingest(cache, archive=archive, commit="b" * 40)
     with pytest.raises(publisher.PublishIndexError, match="raw/atlas.json"):
         publisher.pack(index_dir, cache_dir=cache)
+
+
+def test_a_moved_repository_is_followed_when_reading_and_reported_when_writing(
+    tmp_path,
+):
+    fake = FakeGitHub()
+    fake.seed(
+        "index-0000000000000001",
+        {"manifest.json": _manifest_bytes(snapshot_id="0000000000000001")},
+    )
+    with httpx.Client(base_url=API, transport=fake.transport()) as anonymous:
+        listing = contract.list_releases(anonymous, "old/r")
+        _, manifest, _ = contract.newest_compatible(
+            listing, lambda asset: contract.read_manifest(anonymous, asset)
+        )
+    assert manifest["snapshot_id"] == "0000000000000001"
+    with pytest.raises(publisher.PublishIndexError, match="has moved to"):
+        publisher.publish_index(
+            _index(tmp_path),
+            cache_dir=tmp_path / "cache",
+            repository="old/r",
+            token="secret",
+            api_url=API,
+            out_dir=tmp_path / "out",
+            transport=fake.transport(),
+        )
+    assert [r["tag_name"] for r in fake.releases.values()] == ["index-0000000000000001"]

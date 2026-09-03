@@ -44,10 +44,6 @@ STAGE_LOCKS = (
     "curate",
     "prune",
 )
-# GitHub caps release assets at 2 GiB; an index is a few MB, a manifest a
-# few hundred bytes.
-_MAX_ASSET_BYTES = 2 * 1024 * 1024 * 1024
-_MAX_MANIFEST_BYTES = 1024 * 1024
 USER_AGENT = "transitio-publish-index"
 
 
@@ -283,43 +279,22 @@ def _client(api_url, token, transport=None):
 
 
 def _check(response, what):
+    if response.status_code in (301, 302, 307, 308):
+        raise PublishIndexError(
+            f"{what}: the repository has moved to "
+            f"{response.headers.get('Location', 'another location')}; use its new "
+            "name"
+        )
     if response.status_code // 100 != 2:
         raise PublishIndexError(f"{what}: HTTP {response.status_code}")
     return response
 
 
-def _download(client, url, what, limit=_MAX_ASSET_BYTES):
-    """An asset's bytes, streamed up to ``limit``, following GitHub's
-    redirect to its object store (the client drops the token across hosts)."""
-    chunks = []
-    size = 0
+def _download(client, url, what, limit=contract.MAX_ASSET_BYTES):
     try:
-        with client.stream(
-            "GET",
-            url,
-            headers={"Accept": "application/octet-stream"},
-            follow_redirects=True,
-        ) as response:
-            _check(response, what)
-            for chunk in response.iter_bytes():
-                size += len(chunk)
-                if size > limit:
-                    raise PublishIndexError(f"{what}: larger than {limit} bytes")
-                chunks.append(chunk)
-    except httpx.HTTPError as error:
-        raise PublishIndexError(f"{what}: {error}") from error
-    return b"".join(chunks)
-
-
-def _read_manifest(client, asset):
-    """A release manifest read as a client would, or None when unreadable."""
-    try:
-        data = _download(
-            client, asset["browser_download_url"], "manifest", _MAX_MANIFEST_BYTES
-        )
-        return json.loads(data.decode("utf-8"))
-    except (PublishIndexError, KeyError, ValueError):
-        return None
+        return contract.download(client, url, what, limit)
+    except contract.ReleaseError as error:
+        raise PublishIndexError(str(error)) from error
 
 
 def _release_state(client, repo, release_id):
@@ -357,7 +332,7 @@ def publish_index(
     repo = f"/repos/{repository}"
     with _client(api_url, token, transport) as client:
         try:
-            existing = client.get(f"{repo}/releases/tags/{tag}")
+            existing = client.get(f"{repo}/releases/tags/{tag}", follow_redirects=True)
         except httpx.HTTPError as error:
             raise PublishIndexError(f"listing the release: {error}") from error
         if existing.status_code == 200:
@@ -432,12 +407,9 @@ def publish_index(
     # must be the one just published. From here on the release is public.
     try:
         with _client(api_url, None, transport) as anonymous:
-            listing = _check(
-                anonymous.get(f"{repo}/releases", params={"per_page": 100}),
-                "listing the releases",
-            ).json()
+            listing = contract.list_releases(anonymous, repository)
             release, found, skipped = contract.newest_compatible(
-                listing, lambda asset: _read_manifest(anonymous, asset)
+                listing, lambda asset: contract.read_manifest(anonymous, asset)
             )
     except Exception as error:  # noqa: B902 - the release is public: say so
         raise PublishIndexError(
