@@ -209,12 +209,14 @@ def _publish(cache, subdir, pointer, artifact, records):
         directory.close()
 
 
-def _seed(tmp_path, feeds=FEEDS):
+def _seed(tmp_path, feeds=FEEDS, overrides_dir=None):
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
     _publish(cache, "crosswalk", "feeds.json", "feeds.jsonl", feeds)
     overture.resolve(cache, dataset=dataset, wikidata=fx.StubWikidata())
-    manifest = seed.resolve_seed(cache, dataset=dataset, wikidata=fx.StubWikidata())
+    manifest = seed.resolve_seed(
+        cache, dataset=dataset, wikidata=fx.StubWikidata(), overrides_dir=overrides_dir
+    )
     places, _ = store.read_jsonl(cache / "gazetteer", "seed.json", "places_seed.jsonl")
     report, _ = store.read_jsonl(cache / "gazetteer", "seed.json", "seed_report.jsonl")
     return manifest, {p["place_id"]: p for p in places}, report
@@ -362,3 +364,160 @@ def test_a_locality_wins_over_a_localadmin_of_one_qid_in_either_order():
         seed._merge_place(places, first)
         seed._merge_place(places, second)
         assert places["Q1"]["source_subtype"] == "locality"
+
+
+def test_add_place_upserts_curated_places(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    entries = [
+        {
+            "place": "Q9000",
+            "add_place": {
+                "kind": "metro",
+                "name": "Greater Helsinki",
+                "member_ids": ["Q1757"],
+            },
+            "reason": "curated",
+        },
+        {
+            "place": "Q9001",
+            "add_place": {
+                "kind": "city",
+                "name": "Sipoo",
+                "parent_id": "Q1508",
+                "country_code": "FI",
+                "boundary": "POLYGON((25.2 60.3, 25.5 60.3, 25.5 60.5, 25.2 60.3))",
+            },
+        },
+    ]
+    manifest, places, _ = _seed(
+        tmp_path, overrides_dir=write_overrides(tmp_path, places=entries)
+    )
+    metro, city = places["Q9000"], places["Q9001"]
+    assert metro["curated"] is True and metro["member_ids"] == ["Q1757"]
+    assert "Q9000" in places["Q1757"]["metro_ids"]
+    assert city["parent_id"] == "Q1508" and city["boundary_wkt"].startswith("POLYGON")
+    assert city["resolution_method"] == "curated" and city["names"]["en"] == "Sipoo"
+    assert manifest["overrides_applied"] == 2 and manifest["stale_overrides"] == 0
+    # A parent the seed never had is a build error, never a dangling id.
+    orphan = [
+        {
+            "place": "Q9002",
+            "add_place": {
+                "kind": "city",
+                "name": "X",
+                "parent_id": "Q404",
+                "boundary": "POINT(0 0)",
+            },
+        }
+    ]
+    with pytest.raises(overrides.OverrideError, match="not a seeded place"):
+        _seed(
+            tmp_path / "orphan",
+            overrides_dir=write_overrides(tmp_path / "orphan", places=orphan),
+        )
+
+
+def test_resolve_place_assigns_a_qid_to_an_unresolved_candidate(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    # "Nowheresville" is an Overture locality without a QID, so f-nowhere is
+    # reported unplaced; the curator names its QID by the candidate's
+    # Overture id, and the feed lands there as a curated resolution.
+    entries = [{"place": "Q99999", "source_ref": "us-noqid", "resolve_place": True}]
+    manifest, places, report = _seed(
+        tmp_path, overrides_dir=write_overrides(tmp_path, places=entries)
+    )
+    assert places["Q99999"]["resolution_method"] == "curated"
+    assert places["Q99999"]["curated"] is True
+    assert places["Q99999"]["parent_id"] == "Q1204"
+    assert "f-nowhere" not in {r["feed_id"] for r in report}
+    placements, _ = store.read_jsonl(
+        tmp_path / "cache" / "gazetteer", "seed.json", "feed_places.jsonl"
+    )
+    assert {p["feed_id"]: p["place_id"] for p in placements}["f-nowhere"] == "Q99999"
+    assert manifest["overrides_applied"] == 1
+
+
+def test_add_place_on_an_existing_place_rewrites_its_provenance(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    entries = [
+        {
+            "place": "Q1757",
+            "add_place": {
+                "kind": "city",
+                "name": "Helsinki (curated)",
+                "parent_id": "Q1508",
+            },
+        },
+        {"place": "Q77777", "source_ref": "no-such-candidate", "resolve_place": True},
+    ]
+    with pytest.raises(overrides.OverrideError, match="no candidate"):
+        _seed(tmp_path, overrides_dir=write_overrides(tmp_path, places=entries))
+    # A seeded place keeps its kind, boundary and members; a new one needs
+    # a boundary or a member list.
+    wkt = "POLYGON((24.9 60.1, 25.1 60.1, 25.1 60.3, 24.9 60.1))"
+    refused = [
+        ("Q1757", {**entries[0]["add_place"], "boundary": wkt}, "use set_boundary"),
+        ("Q1757", {**entries[0]["add_place"], "kind": "metro"}, "cannot change"),
+        ("Q900002", {"kind": "country", "name": "Nowhere"}, "needs a boundary"),
+    ]
+    for place, spec, message in refused:
+        base = tmp_path / message.split()[-1]
+        with pytest.raises(overrides.OverrideError, match=message):
+            _seed(
+                base,
+                overrides_dir=write_overrides(
+                    base, places=[{"place": place, "add_place": spec}]
+                ),
+            )
+    loop = [
+        {**entries[0], "add_place": {**entries[0]["add_place"], "parent_id": "Q1757"}}
+    ]
+    with pytest.raises(overrides.OverrideError, match="loops"):
+        _seed(
+            tmp_path / "loop",
+            overrides_dir=write_overrides(tmp_path / "loop", places=loop),
+        )
+    manifest, places, _ = _seed(
+        tmp_path / "ok",
+        overrides_dir=write_overrides(tmp_path / "ok", places=entries[:1]),
+    )
+    helsinki = places["Q1757"]
+    assert helsinki["curated"] is True and helsinki["resolution_method"] == "curated"
+    assert helsinki["name"] == "Helsinki (curated)"
+    assert helsinki["overture_id"] == "fi-helsinki"
+    assert manifest["places_overrides_sha256"] == overrides.places_digest(
+        tmp_path / "ok" / "overrides"
+    )
+
+    # A metro is a member relation, never an administrative parent.
+    metro_parent = [
+        {
+            "place": "Q900003",
+            "add_place": {"kind": "metro", "name": "M", "member_ids": ["Q1757"]},
+        },
+        {
+            "place": "Q1757",
+            "add_place": {**entries[0]["add_place"], "parent_id": "Q900003"},
+        },
+    ]
+    with pytest.raises(overrides.OverrideError, match="is a metro"):
+        _seed(
+            tmp_path / "metro",
+            overrides_dir=write_overrides(tmp_path / "metro", places=metro_parent),
+        )
+
+
+def test_resolve_place_to_a_qid_of_another_kind_is_a_collision(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    # Q1204 is Illinois, a region: the locality cannot become it.
+    entries = [{"place": "Q1204", "source_ref": "us-noqid", "resolve_place": True}]
+    with pytest.raises(overture.GazetteerError, match="is both the region"):
+        _seed(tmp_path, overrides_dir=write_overrides(tmp_path, places=entries))

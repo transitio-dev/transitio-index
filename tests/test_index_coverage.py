@@ -9,7 +9,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 import hashlib  # noqa: E402
 import json  # noqa: E402
 
-from index_build import coverage, crawl, store  # noqa: E402
+from index_build import coverage, crawl, overrides, store  # noqa: E402
 
 
 def _publish(cache, subdir, pointer, artifact, records, manifest=None):
@@ -88,6 +88,9 @@ SOURCES = {"atlas": {"commit": "abc"}}
 RELEASE = "2026-08-19.0"
 
 
+_RESOLVED = object()  # the resolve digest computed from the overrides dir
+
+
 def _cover(
     tmp_path,
     feeds=FEEDS,
@@ -102,13 +105,21 @@ def _cover(
     **cover_args,
 ):
     cache = tmp_path / "cache"
+    resolve_digest = cover_args.pop("resolve_digest", _RESOLVED)
+    if resolve_digest is _RESOLVED:
+        entries, _ = overrides.load_feed_overrides(cover_args.get("overrides_dir"))
+        resolve_digest = overrides.phase_digest(entries, overrides.RESOLVE_OPERATIONS)
     _publish(
         cache,
         "resolve",
         "feeds_resolved.json",
         "feeds_resolved.jsonl",
         feeds,
-        {"source": "resolve", "sources": SOURCES},
+        {
+            "source": "resolve",
+            "sources": SOURCES,
+            "feeds_resolve_sha256": resolve_digest,
+        },
     )
     seed_manifest = _publish(
         cache,
@@ -522,3 +533,131 @@ def test_a_parent_cycle_cannot_loop_the_reach():
         "B": _place("B", "region", parent_id="A"),
     }
     assert coverage._reach("A", places) == ["A", "B"]
+
+
+def test_set_coverage_replaces_a_feeds_declared_placement(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    entries = [
+        {
+            "feed": "f-city",
+            "set_coverage": {"level": "subdivision", "place_id": "Q-reg"},
+        }
+    ]
+    manifest, _, edges = _cover(
+        tmp_path, overrides_dir=write_overrides(tmp_path, feeds=entries)
+    )
+    assert set(edges["f-city"]) == {"Q-reg", "Q-c"}
+    assert edges["f-city"]["Q-reg"]["evidence"]["declared_level"] == "subdivision"
+    assert manifest["overrides_applied"] == 1 and manifest["stale_overrides"] == 0
+    with pytest.raises(overrides.OverrideError, match="not an expanded place"):
+        _cover(
+            tmp_path / "bad",
+            overrides_dir=write_overrides(
+                tmp_path / "bad",
+                feeds=[
+                    {
+                        "feed": "f-city",
+                        "set_coverage": {"level": "municipality", "place_id": "Q404"},
+                    }
+                ],
+            ),
+        )
+    linked = [{"feed": "f-rt-linked", "set_coverage": entries[0]["set_coverage"]}]
+    with pytest.raises(overrides.OverrideError, match="linked GTFS-RT"):
+        _cover(
+            tmp_path / "rt",
+            overrides_dir=write_overrides(tmp_path / "rt", feeds=linked),
+        )
+
+    # One feed reached twice, by its id and by its alias.
+    twice = [{**linked[0], "feed": ref} for ref in ("f-new", "f-old")]
+    with pytest.raises(overrides.OverrideError, match="also given as"):
+        _cover(
+            tmp_path / "twice",
+            overrides_dir=write_overrides(tmp_path / "twice", feeds=twice),
+        )
+
+
+def test_a_stale_set_coverage_is_applied_reported_and_fails_strict(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    entries = [
+        {
+            "feed": "f-city",
+            "set_coverage": {"level": "subdivision", "place_id": "Q-reg"},
+            "evidence_hash": "0" * 64,
+        }
+    ]
+    manifest, _, edges = _cover(
+        tmp_path, overrides_dir=write_overrides(tmp_path, feeds=entries)
+    )
+    assert set(edges["f-city"]) == {"Q-reg", "Q-c"}
+    assert manifest["stale_overrides"] == 1
+    report, _ = store.read_jsonl(
+        tmp_path / "cache" / "coverage", "coverage.json", "override_report.jsonl"
+    )
+    assert report[0]["current_evidence_hash"] == overrides.canonical_digest(
+        {"placements": [["municipality", "Q-city"]], "crawl": None, "crawled": {}}
+    )
+    with pytest.raises(overrides.OverrideError, match="stale override"):
+        _cover(
+            tmp_path / "strict",
+            overrides_dir=write_overrides(tmp_path / "strict", feeds=entries),
+            strict=True,
+        )
+    # feeds.yaml edited after the resolve stage applied it: refused.
+    with pytest.raises(overrides.OverrideError, match="re-run the resolve"):
+        _cover(
+            tmp_path / "moved",
+            overrides_dir=write_overrides(tmp_path / "moved", feeds=entries),
+            resolve_digest="stale",
+        )
+    # Only set_coverage entries: the resolve stage need not run again.
+    manifest, _, _ = _cover(
+        tmp_path / "later",
+        overrides_dir=write_overrides(tmp_path / "later", feeds=entries),
+        resolve_digest=None,
+    )
+    assert manifest["overrides_applied"] == 1
+
+
+def test_set_coverage_wins_over_a_feeds_crawl(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    crawls = {"f-city": _rows(245, 10.0) + _rows(5, 20.0)}
+    entries = [
+        {
+            "feed": "f-city",
+            "set_coverage": {"level": "subdivision", "place_id": "Q-reg"},
+            "evidence_hash": "0" * 64,
+        }
+    ]
+    _, plain, measured = _cover(tmp_path / "plain", crawls=crawls, lookup=LOOKUP)
+    manifest, covered, edges = _cover(
+        tmp_path,
+        crawls=crawls,
+        lookup=LOOKUP,
+        overrides_dir=write_overrides(tmp_path, feeds=entries),
+    )
+    # The curated placement is the coverage; the measured fields stay.
+    assert set(edges["f-city"]) == {"Q-reg", "Q-c"}
+    assert covered["f-city"]["coverage_source"] == "declared"
+    assert covered["f-city"]["stop_count"] == 250
+    assert manifest["mode"] == "declared" and manifest["feeds_crawl_covered"] == 0
+    # Judged against what the crawl measured, not the seed placement alone.
+    report, _ = store.read_jsonl(
+        tmp_path / "cache" / "coverage", "coverage.json", "override_report.jsonl"
+    )
+    assert report[0]["current_evidence_hash"] == overrides.canonical_digest(
+        {
+            "placements": [["municipality", "Q-city"]],
+            "crawl": {
+                key: plain["f-city"].get(key)
+                for key in ("crawl_status", "coverage", "stop_count")
+            },
+            "crawled": {p: e["evidence"] for p, e in measured["f-city"].items()},
+        }
+    )

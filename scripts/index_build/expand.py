@@ -18,7 +18,16 @@ import datetime
 
 import shapely
 
-from index_build import boundaries, crawl, geometry, metros, overture, seed, store
+from index_build import (
+    boundaries,
+    crawl,
+    geometry,
+    metros,
+    overrides,
+    overture,
+    seed,
+    store,
+)
 from index_build import names as names_stage
 
 EXPANDED_POINTER = "expanded.json"
@@ -97,6 +106,14 @@ def _attach_metros(places_by_id, new_cities, wikidata, report):
                 metro = metros._metro_place(record)
                 places_by_id[metro["place_id"]] = metro
                 added.append(metro["place_id"])
+            elif metro.get("kind") != "metro":
+                raise overture.GazetteerError(
+                    f"metro {record['qid']!r} is already seeded as the "
+                    f"{metro['kind']} {metro.get('name')!r}"
+                )
+            if metro.get("members_curated"):
+                # A curator's member list is authoritative: never added to.
+                continue
             metro.setdefault("member_ids", [])
             if city_qid not in metro["member_ids"]:
                 metro["member_ids"].append(city_qid)
@@ -158,8 +175,15 @@ def _discover(cache_dir, places_by_id, lookup, wikidata, area_dataset, report):
 
     discovered = {}
     for record in skeleton.values():
-        if record["qid"] not in places_by_id:
-            seed._add_place(discovered, skeleton, record)
+        seed._add_place(discovered, skeleton, record)
+    for qid, place in discovered.items():
+        existing = places_by_id.get(qid)
+        if existing is not None and existing.get("kind") != place.get("kind"):
+            raise overture.GazetteerError(
+                f"{qid!r} is both the seeded {existing['kind']} "
+                f"{existing.get('name')!r} and the crawled {place['kind']} "
+                f"{place.get('name')!r}"
+            )
     new_ids = [qid for qid in discovered if qid not in places_by_id]
     # Boundaries come from a complete, id-filtered area read, so a multi-part
     # place ships whole even when its stops touched only one component.
@@ -229,7 +253,9 @@ def _expanded(
     return crawl.states_digest(cache_dir), counts, mode
 
 
-def expand(cache_dir, *, lookup=None, wikidata=None, area_dataset=None):
+def expand(
+    cache_dir, *, lookup=None, wikidata=None, area_dataset=None, overrides_dir=None
+):
     """Publish ``places_expanded``: the seed plus crawl-discovered places.
 
     Reads the enriched seed places, discovers what the crawled stops reach
@@ -243,6 +269,12 @@ def expand(cache_dir, *, lookup=None, wikidata=None, area_dataset=None):
                 cache_dir / "gazetteer", "names.json", "places_seed.jsonl"
             )
             release = names_manifest.get("overture_release")
+            overrides.expect_digest(
+                names_manifest.get("places_overrides_sha256"),
+                overrides.places_digest(overrides_dir),
+                "places.yaml",
+                "gazetteer",
+            )
             places_by_id = {place["place_id"]: place for place in places}
             report = []
             counts = {
@@ -268,6 +300,10 @@ def expand(cache_dir, *, lookup=None, wikidata=None, area_dataset=None):
                 "sources": names_manifest.get("sources"),
                 "seed_generation": names_manifest.get("seed_generation"),
                 "names_generation": names_manifest.get("generation"),
+                "places_overrides_sha256": names_manifest.get(
+                    "places_overrides_sha256"
+                ),
+                "stale_place_overrides": names_manifest.get("stale_place_overrides"),
                 "crawl_digest": crawl_digest,
                 "mode": mode,
                 "places": len(places_by_id),

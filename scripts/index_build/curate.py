@@ -51,7 +51,6 @@ import collections
 import contextlib
 import copy
 import datetime
-import hashlib
 import json
 
 from transitio.index import fingerprint
@@ -101,9 +100,7 @@ def evidence_hash(edges, targets=(), feed_id=None, route_evidence=None):
         "evidence": rows,
         "route_evidence": list(route_evidence) if route_evidence else None,
     }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    return overrides.canonical_digest(payload)
 
 
 def _canonical(value):
@@ -659,6 +656,12 @@ def curate(cache_dir, *, overrides_dir=None, strict=False):
                 "the classified edges were not derived from the current "
                 "expanded places; re-run the pipeline in stage order"
             )
+        overrides.expect_digest(
+            classified.get("feeds_overrides_sha256"),
+            overrides.feeds_digest(overrides_dir),
+            "feeds.yaml",
+            "coverage",
+        )
         places = {place["place_id"]: place for place in place_rows}
         # The coverage candidates the classified edges descend from: the
         # pairs coverage measured, whether or not a route served them.
@@ -712,6 +715,8 @@ def curate(cache_dir, *, overrides_dir=None, strict=False):
             "overture_release": classified.get("overture_release"),
             "classify_generation": classified.get("generation"),
             "coverage_generation": classified.get("coverage_generation"),
+            "feeds_overrides_sha256": classified.get("feeds_overrides_sha256"),
+            "stale_feed_overrides": classified.get("stale_feed_overrides"),
             "expanded_generation": classified.get("expanded_generation"),
             # The digest of the very bytes the entries were parsed from:
             # publish refuses these edges once the file has been edited.

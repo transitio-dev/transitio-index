@@ -97,7 +97,9 @@ AREAS = [
 ]
 
 
-def _publish(cache, records):
+def _publish(cache, records, overrides_dir=None):
+    from index_build import overrides
+
     directory = store.open_subdir(cache, "gazetteer")
     try:
         with store.exclusive_writer(directory):
@@ -105,18 +107,23 @@ def _publish(cache, records):
                 cache / "gazetteer",
                 "metros.json",
                 {"places_seed.jsonl": store.jsonl_chunks(records)},
-                {"source": "metros"},
+                {
+                    "source": "metros",
+                    "places_overrides_sha256": overrides.places_digest(overrides_dir),
+                },
                 held=directory,
             )
     finally:
         directory.close()
 
 
-def _run(tmp_path):
+def _run(tmp_path, overrides_dir=None):
     cache = tmp_path / "cache"
-    _publish(cache, PLACES)
+    _publish(cache, PLACES, overrides_dir)
     dataset = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
-    manifest = geometry.attach_geometry(cache, dataset=dataset)
+    manifest = geometry.attach_geometry(
+        cache, dataset=dataset, overrides_dir=overrides_dir
+    )
     places, _ = store.read_jsonl(
         cache / "gazetteer", "geometry.json", "places_seed.jsonl"
     )
@@ -231,3 +238,73 @@ def test_only_the_land_area_is_used(tmp_path):
     shipped = shapely.from_wkb(bytes.fromhex(places["Q1757"]["geometry"]))
     land = shapely.box(24.9, 60.1, 25.1, 60.3)
     assert shipped.difference(land).area == pytest.approx(0.0, abs=1e-9)
+
+
+def test_set_boundary_attaches_a_curated_polygon(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    wkt = "POLYGON((24.5 60.0, 25.5 60.0, 25.5 60.6, 24.5 60.6, 24.5 60.0))"
+    manifest, places, _ = _run(
+        tmp_path,
+        overrides_dir=write_overrides(
+            tmp_path, places=[{"place": "Q_METRO", "set_boundary": wkt}]
+        ),
+    )
+    metro = places["Q_METRO"]
+    assert metro["geometry_source"] == "curated"
+    assert shapely.from_wkb(bytes.fromhex(metro["geometry"])).area > 0
+    assert manifest["curated_geometry"] == 1 and manifest["stale_overrides"] == 0
+    with pytest.raises(overrides.OverrideError, match="valid"):
+        _run(
+            tmp_path / "bad",
+            overrides_dir=write_overrides(
+                tmp_path / "bad",
+                places=[
+                    {"place": "Q_METRO", "set_boundary": "POLYGON((0 0, 1 1, 0 0))"}
+                ],
+            ),
+        )
+    projected = (
+        "POLYGON((2700000 8400000, 2800000 8400000, 2800000 8500000, 2700000 8400000))"
+    )
+    with pytest.raises(overrides.OverrideError, match="WGS84"):
+        _run(
+            tmp_path / "far",
+            overrides_dir=write_overrides(
+                tmp_path / "far",
+                places=[{"place": "Q_METRO", "set_boundary": projected}],
+            ),
+        )
+
+
+def test_a_curated_places_boundary_is_attached_without_a_second_judgement(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    wkt = "POLYGON((24.5 60.0, 25.5 60.0, 25.5 60.6, 24.5 60.6, 24.5 60.0))"
+    fixed = "POLYGON((24.6 60.1, 25.4 60.1, 25.4 60.5, 24.6 60.5, 24.6 60.1))"
+    entries = [
+        {
+            "place": "Q900001",
+            "add_place": {"kind": "country", "name": "New", "boundary": wkt},
+            "evidence_hash": "0" * 64,
+        },
+        {"place": "Q900001", "set_boundary": fixed},
+    ]
+    directory = write_overrides(tmp_path, places=entries)
+    cache = tmp_path / "cache"
+    seeded = PLACES + [
+        {**_place("Q900001", "country"), "curated": True, "boundary_wkt": wkt}
+    ]
+    _publish(cache, seeded, directory)
+    dataset = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
+    manifest = geometry.attach_geometry(cache, dataset=dataset, overrides_dir=directory)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    new = next(p for p in places if p["place_id"] == "Q900001")
+    assert new["geometry_source"] == "curated" and "boundary_wkt" not in new
+    # The explicit set_boundary correction wins over the add_place boundary.
+    assert new["geometry"] == shapely.to_wkb(shapely.from_wkt(fixed)).hex()
+    assert manifest["curated_geometry"] == 2 and manifest["stale_overrides"] == 0

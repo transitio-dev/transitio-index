@@ -43,7 +43,9 @@ LABELS = {
 }
 
 
-def _run(tmp_path):
+def _run(tmp_path, overrides_dir=None, strict=False):
+    from index_build import overrides
+
     cache = tmp_path / "cache"
     directory = store.open_subdir(cache, "gazetteer")
     try:
@@ -52,12 +54,20 @@ def _run(tmp_path):
                 cache / "gazetteer",
                 "geometry.json",
                 {"places_seed.jsonl": store.jsonl_chunks(PLACES)},
-                {"source": "geometry"},
+                {
+                    "source": "geometry",
+                    "places_overrides_sha256": overrides.places_digest(overrides_dir),
+                },
                 held=directory,
             )
     finally:
         directory.close()
-    manifest = names.merge_names(cache, wikidata=fx.StubWikidata(labels=LABELS))
+    manifest = names.merge_names(
+        cache,
+        wikidata=fx.StubWikidata(labels=LABELS),
+        overrides_dir=overrides_dir,
+        strict=strict,
+    )
     places, _ = store.read_jsonl(cache / "gazetteer", "names.json", "places_seed.jsonl")
     return manifest, {p["place_id"]: p for p in places}
 
@@ -123,3 +133,36 @@ def test_labels_and_aliases_parses_wbgetentities(monkeypatch):
             "aliases": ["City of New York", "NYC"],
         }
     }
+
+
+def test_set_aliases_adds_the_curators_names(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    entries = [{"place": "Q2000", "set_aliases": ["Nowheresville", "Nowhere"]}]
+    manifest, places = _run(
+        tmp_path, overrides_dir=write_overrides(tmp_path, places=entries)
+    )
+    # The place's own name never doubles as an alias.
+    assert places["Q2000"]["aliases"] == ["Nowheresville"]
+    assert manifest["overrides_applied"] == 1
+
+
+def test_a_stale_alias_override_fails_strict_after_publishing_its_report(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    entries = [
+        {"place": "Q2000", "set_aliases": ["Nowheresville"], "evidence_hash": "0" * 64}
+    ]
+    manifest, places = _run(
+        tmp_path, overrides_dir=write_overrides(tmp_path, places=entries)
+    )
+    assert manifest["stale_overrides"] == 1
+    assert places["Q2000"]["aliases"] == ["Nowheresville"]
+    with pytest.raises(overrides.OverrideError, match="stale override"):
+        _run(
+            tmp_path / "strict",
+            overrides_dir=write_overrides(tmp_path / "strict", places=entries),
+            strict=True,
+        )

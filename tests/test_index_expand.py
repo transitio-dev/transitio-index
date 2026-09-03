@@ -12,7 +12,7 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
-from index_build import boundaries, crawl, expand, store  # noqa: E402
+from index_build import boundaries, crawl, expand, overture, store  # noqa: E402
 
 # A source the geometry allowlist accepts, and one it does not.
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
@@ -328,3 +328,26 @@ def test_unparsable_stop_rows_are_skipped(tmp_path):
     manifest, places, _ = _expand(tmp_path, cache)
     assert manifest["stops_read"] == 1
     assert "Q40840" in places
+
+
+def test_places_yaml_edited_after_the_gazetteer_refuses_to_expand(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    cache = tmp_path / "cache"
+    _publish_names(cache, [])
+    directory = write_overrides(
+        tmp_path, places=[{"place": "Q1", "set_aliases": ["x"]}]
+    )
+    with pytest.raises(overrides.OverrideError, match="re-run the gazetteer"):
+        expand.expand(cache, overrides_dir=directory)
+
+
+def test_a_crawled_city_whose_qid_is_a_curated_metro_is_a_collision(tmp_path):
+    cache = tmp_path / "cache"
+    taken = {**SEED_PLACES[0], "place_id": "Q40840", "kind": "metro", "curated": True}
+    _publish_names(cache, SEED_PLACES + [taken])
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    with pytest.raises(overture.GazetteerError, match="is both the seeded metro"):
+        _expand(tmp_path, cache)

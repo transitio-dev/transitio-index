@@ -320,9 +320,9 @@ def _edges_parquet_bytes(edges, snapshot_id):
     return sink.getvalue()
 
 
-def _read_places(cache_dir, edge_manifest=None):
-    """The gazetteer places, the Overture release and the expanded generation
-    they descend from, or ``(None, None, None)``.
+def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
+    """The gazetteer places, the Overture release, the expanded generation
+    they descend from and that generation's manifest, or four Nones.
 
     The pruned generation is what a curated build ships: it must descend
     from the current expanded places and from the very curate generation
@@ -359,17 +359,19 @@ def _read_places(cache_dir, edge_manifest=None):
                 "places; re-run the pipeline in stage order"
             )
         _check_names_lineage(cache_dir, expanded)
+        _check_places_overrides(expanded, overrides_dir)
         return (
             places,
             manifest.get("overture_release"),
             manifest.get("expanded_generation"),
+            expanded,
         )
     if curated:
         raise PublishError(
             "curated edges exist but no pruned places; run the prune stage"
         )
     if not (cache_dir / "gazetteer").is_dir():
-        return None, None, None
+        return _no_places(overrides_dir)
     for pointer, artifact in (
         ("expanded.json", "places_expanded.jsonl"),
         ("names.json", "places_seed.jsonl"),
@@ -389,9 +391,51 @@ def _read_places(cache_dir, edge_manifest=None):
             ) from error
         if pointer == "expanded.json":
             _check_names_lineage(cache_dir, manifest)
-        return places, manifest.get("overture_release"), manifest.get("generation")
+        else:
+            _check_lineage(
+                cache_dir,
+                manifest,
+                (("seed.json", "seed_generation"),),
+                "names",
+                "gazetteer",
+            )
+        _check_places_overrides(manifest, overrides_dir)
+        return (
+            places,
+            manifest.get("overture_release"),
+            manifest.get("generation"),
+            manifest,
+        )
     # No published places generation: the index is feeds only.
-    return None, None, None
+    return _no_places(overrides_dir)
+
+
+def _no_places(overrides_dir):
+    """A feeds-only index; a places.yaml that no gazetteer generation
+    applied is a stage that has not run yet."""
+    from index_build import overrides
+
+    if overrides.places_digest(overrides_dir) is not None:
+        raise PublishError(
+            "places.yaml exists but no gazetteer generation applied it; run the "
+            "gazetteer stage"
+        )
+    return None, None, None, None
+
+
+def _check_places_overrides(expanded_manifest, overrides_dir):
+    """The places.yaml on disk must be the one the gazetteer applied."""
+    from index_build import overrides
+
+    try:
+        overrides.expect_digest(
+            expanded_manifest.get("places_overrides_sha256"),
+            overrides.places_digest(overrides_dir),
+            "places.yaml",
+            "gazetteer",
+        )
+    except overrides.OverrideError as error:
+        raise PublishError(str(error)) from error
 
 
 def _current_expanded(cache_dir):
@@ -414,33 +458,42 @@ def _check_names_lineage(cache_dir, expanded_manifest):
     names generations: a gazetteer rerun without a following expand leaves
     an old expanded/coverage/classify chain that is mutually consistent and
     still stale."""
-    for pointer, key in (
-        ("seed.json", "seed_generation"),
-        ("names.json", "names_generation"),
-    ):
+    _check_lineage(
+        cache_dir,
+        expanded_manifest,
+        (("seed.json", "seed_generation"), ("names.json", "names_generation")),
+        "expanded",
+        "expand",
+    )
+
+
+def _check_lineage(cache_dir, manifest, ancestors, what, rerun):
+    """The ``what`` places must descend from the current ``ancestors``
+    generations (pointer, manifest key), else ``rerun`` is the stage to run."""
+    for pointer, key in ancestors:
         path = cache_dir / "gazetteer" / pointer
-        recorded = expanded_manifest.get(key)
+        recorded = manifest.get(key)
         if not (path.is_symlink() or path.exists()):
             if recorded is not None:
                 # The ancestor these places descend from is gone: nothing
                 # can verify them any more.
                 raise PublishError(
-                    f"the {pointer} generation the expanded places descend "
-                    "from no longer exists; re-run the expand stage"
+                    f"the {pointer} generation the {what} places descend "
+                    f"from no longer exists; re-run the {rerun} stage"
                 )
             continue
         try:
-            generation, manifest = store.resolve(cache_dir / "gazetteer", pointer)
+            generation, current = store.resolve(cache_dir / "gazetteer", pointer)
         except (store.StoreError, ValueError) as error:
             raise PublishError(
                 f"the {pointer} generation is unreadable: {error}"
             ) from error
         with generation:
             pass
-        if recorded != manifest.get("generation"):
+        if recorded != current.get("generation"):
             raise PublishError(
-                f"the expanded places do not descend from the current {pointer} "
-                "generation; re-run the expand stage"
+                f"the {what} places do not descend from the current {pointer} "
+                f"generation; re-run the {rerun} stage"
             )
 
 
@@ -460,6 +513,13 @@ def _read_coverage(cache_dir, *, locked=False, overrides_dir=None):
     try:
         feeds, edges, manifest = classify.read_edges(cache_dir, locked=locked)
         current = overrides.applied_digest(manifest, overrides_dir)
+        if manifest is not None:
+            overrides.expect_digest(
+                manifest.get("feeds_overrides_sha256"),
+                overrides.feeds_digest(overrides_dir),
+                "feeds.yaml",
+                "coverage",
+            )
     except (classify.ClassifyError, overrides.OverrideError) as error:
         raise PublishError(str(error)) from error
     return feeds, edges, manifest, current
@@ -554,7 +614,9 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
         # A gazetteer that ran but produced no places is a places index of zero
         # places, distinct from a feeds-only build (no gazetteer at all) — hence
         # ``is not None`` throughout, never a truthiness test that folds the two.
-        places, overture_release, places_generation = _read_places(cache_dir, coverage)
+        places, overture_release, places_generation, places_manifest = _read_places(
+            cache_dir, coverage, overrides_dir
+        )
         if places is not None and not overture_release:
             # The release folds into the snapshot id; without it a places index would
             # share the feeds-only id for the same feeds.
@@ -616,9 +678,6 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
             edges_data = _edges_parquet_bytes(edges, snapshot_id)
             manifest["edges_sha256"] = hashlib.sha256(edges_data).hexdigest()
             manifest["coverage_mode"] = coverage.get("mode")
-            # Curation's third staleness signal: the count travels with the
-            # snapshot, zero when clean and when nothing was curated.
-            manifest["stale_overrides"] = int(coverage.get("stale_overrides") or 0)
             manifest["overrides_sha256"] = override_digest
             if coverage.get("unknown_share") is not None:
                 # Recorded so the next build's golden diff can measure drift.
@@ -630,15 +689,55 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
                 collections.Counter(e["tier"] for e in edges)
             )
 
+        # Curation's third staleness signal: every override file's stale
+        # count travels with the snapshot, zero when clean and when nothing
+        # was curated. Edge staleness is the curate stage's own count.
+        stale = {
+            "stale_place_overrides": (places_manifest or {}).get(
+                "stale_place_overrides"
+            ),
+            "stale_feed_overrides": (coverage or {}).get("stale_feed_overrides"),
+            "stale_edge_overrides": (
+                coverage.get("stale_overrides")
+                if coverage is not None and coverage.get("source") == "curate"
+                else 0
+            ),
+        }
+        stale = {key: int(value or 0) for key, value in stale.items()}
+        manifest.update(stale, stale_overrides=sum(stale.values()))
+        # The digests the inputs were checked against, re-read before the
+        # first file is replaced: an override file edited during publication
+        # must not activate a snapshot built from its predecessor.
+        checks = [("edges.yaml", override_digest, overrides.edges_digest, "curate")]
+        if coverage is not None:
+            checks.append(
+                (
+                    "feeds.yaml",
+                    coverage.get("feeds_overrides_sha256"),
+                    overrides.feeds_digest,
+                    "resolve",
+                )
+            )
+        checks.append(
+            (
+                "places.yaml",
+                (places_manifest or {}).get("places_overrides_sha256"),
+                overrides.places_digest,
+                "gazetteer",
+            )
+        )
+
         directory = store.open_subdir(cache_dir, "index")
         try:
             with store.exclusive_writer(directory):
-                # Before the first file is replaced: an abort here leaves the
-                # previous index whole, never a new table under an old manifest.
-                if overrides.edges_digest(overrides_dir) != override_digest:
-                    raise PublishError(
-                        "edges.yaml changed during publication; re-run the curate stage"
-                    )
+                # An abort here leaves the previous index whole, never a new
+                # table under an old manifest.
+                for what, recorded, current, rerun in checks:
+                    if current(overrides_dir) != recorded:
+                        raise PublishError(
+                            f"{what} changed during publication; re-run the "
+                            f"{rerun} stage"
+                        )
                 store.write_bytes(directory, FEEDS_FILE, feeds_data)
                 if places_data is not None:
                     store.write_bytes(directory, PLACES_FILE, places_data)

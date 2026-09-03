@@ -1104,3 +1104,17 @@ def test_a_corrupt_expanded_generation_is_refused_by_publish(tmp_path):
     (cache / "gazetteer" / "expanded.json").write_text("not a pointer")
     with pytest.raises(publish.PublishError, match="unreadable"):
         publish._read_places(cache)
+
+
+def test_feeds_yaml_edited_after_the_resolve_stage_refuses_to_classify(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    cache = tmp_path / "cache"
+    _coverage(cache, [], [])
+    directory = write_overrides(
+        tmp_path, feeds=[{"feed": "f", "mark_uncrawlable": True}]
+    )
+    with pytest.raises(overrides.OverrideError, match="re-run the coverage"):
+        classify.classify(cache, lookup=LOOKUP, overrides_dir=directory)

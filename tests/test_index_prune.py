@@ -128,7 +128,7 @@ def test_the_stage_prunes_against_the_curated_edges_and_publish_ships_the_result
     assert {p["place_id"] for p in places} == {"Q-city", "Q-reg", "Q-c", "Q-metro"}
     assert manifest["dropped_city"] == 2 and manifest["kept"] == 4
     _, _, edge_manifest, _ = publish._read_coverage(cache)
-    shipped, release, generation = publish._read_places(cache, edge_manifest)
+    shipped, release, generation, _ = publish._read_places(cache, edge_manifest)
     assert {p["place_id"] for p in shipped} == {"Q-city", "Q-reg", "Q-c", "Q-metro"}
     assert generation == edge_manifest["expanded_generation"] and release
     # A re-curation leaves the pruned places behind.

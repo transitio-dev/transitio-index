@@ -18,7 +18,7 @@ import math
 import pyarrow.dataset as ds
 import shapely
 
-from index_build import overture, store
+from index_build import overrides, overture, store
 
 DIVISION_AREA_PATH = "release/{release}/theme=divisions/type=division_area"
 AREA_PROJECT = ["division_id", "geometry", "sources", "is_land"]
@@ -204,7 +204,32 @@ def _inventory_rows(inventory, shipped_count):
     return rows
 
 
-def attach_geometry(cache_dir, *, dataset=None):
+def _curated_geometry(place, wkt):
+    """A curator-supplied boundary: WKT parsed, validated and simplified like
+    any other, shipped with ``geometry_source = "curated"`` — the curator, not
+    a licence audit, vouches for it."""
+    try:
+        geom = shapely.from_wkt(wkt)
+    except Exception as error:  # noqa: B902 - shapely raises its own hierarchy
+        raise overrides.OverrideError(
+            f"place {place['place_id']!r}: boundary is not valid WKT: {error}"
+        ) from None
+    geom = shapely.force_2d(geom)
+    simplified = _simplify(geom)
+    if not _valid_polygon(geom) or not _valid_polygon(simplified):
+        raise overrides.OverrideError(
+            f"place {place['place_id']!r}: boundary is not a valid polygon"
+        )
+    minx, miny, maxx, maxy = geom.bounds
+    if not (-180 <= minx <= maxx <= 180 and -90 <= miny <= maxy <= 90):
+        raise overrides.OverrideError(
+            f"place {place['place_id']!r}: boundary is not in WGS84 degrees"
+        )
+    place["geometry"] = shapely.to_wkb(simplified).hex()
+    place["geometry_source"] = "curated"
+
+
+def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False):
     """Attach simplified geometry to the seeded places and write the NOTICE.
 
     Resolves each seeded place's ``division_area`` polygon(s) and ships the
@@ -261,6 +286,42 @@ def attach_geometry(cache_dir, *, dataset=None):
                     for source in row["sources"]:
                         shipped.add(_source_key(source))
 
+            place_overrides, places_digest = overrides.load_place_overrides(
+                overrides_dir
+            )
+            overrides.expect_digest(
+                metros_manifest.get("places_overrides_sha256"),
+                places_digest,
+                "places.yaml",
+                "gazetteer",
+            )
+            override_report = []
+            by_id = {p["place_id"]: p for p in places}
+            curated = 0
+            for place in places:
+                # A curated place's own boundary, judged already by the seed
+                # stage that upserted it: attached here, not judged again.
+                if place.get("boundary_wkt"):
+                    _curated_geometry(place, place.pop("boundary_wkt"))
+                    curated += 1
+            for entry in overrides.by_operation(place_overrides, "set_boundary"):
+                place = by_id.get(entry["place"])
+                if place is None:
+                    raise overrides.OverrideError(
+                        f"place {entry['place']!r}: set_boundary needs a seeded place"
+                    )
+                # Judged against the geometry the place has now.
+                overrides.judge(
+                    entry,
+                    {
+                        "geometry_source": place.get("geometry_source"),
+                        "geometry": place.get("geometry"),
+                    },
+                    override_report,
+                    "geometry",
+                )
+                _curated_geometry(place, entry["set_boundary"])
+                curated += 1
             inventory_rows = _inventory_rows(inventory, with_geometry)
             notice = _notice(shipped, overture.OVERTURE_RELEASE)
             manifest = {
@@ -271,21 +332,31 @@ def attach_geometry(cache_dir, *, dataset=None):
                 "with_geometry": with_geometry,
                 "omitted_by_licence": omitted,
                 "invalid_geometry": invalid,
+                "curated_geometry": curated,
+                "places_overrides_sha256": places_digest,
+                "stale_overrides": len(override_report),
+                "stale_place_overrides": (
+                    metros_manifest.get("stale_place_overrides") or 0
+                )
+                + len(override_report),
                 "licence_sources": sorted("|".join(pair) for pair in shipped),
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),
             }
-            return store.publish(
+            published = store.publish(
                 cache_dir / "gazetteer",
                 "geometry.json",
                 {
                     "places_seed.jsonl": store.jsonl_chunks(places),
                     "licence_inventory.jsonl": store.jsonl_chunks(inventory_rows),
+                    "override_report.jsonl": store.jsonl_chunks(override_report),
                     "NOTICE": lambda: [notice],
                 },
                 manifest,
                 held=directory,
             )
+            overrides.strict_check(strict, override_report, "geometry")
+            return published
     finally:
         directory.close()

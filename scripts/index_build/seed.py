@@ -21,7 +21,7 @@ import unicodedata
 
 import pyarrow.dataset as ds
 
-from index_build import overture, store
+from index_build import overrides, overture, store
 
 # The Overture subtypes that stand in for a city, most specific first: a name
 # resolving to both prefers the locality (decision in the plan's subtype table).
@@ -224,6 +224,7 @@ def _place(record, *, parent_id):
         "country_code": record["country"],
         "overture_id": record["overture_id"],
         "osm_relation_id": relations[0] if relations else None,
+        "curated": bool(record.get("curated")),
         "metro_ids": [],
         "member_ids": [],
     }
@@ -257,8 +258,19 @@ def _subtype_rank(place):
 
 
 def _merge_place(places, place):
-    """Keep, per QID, the higher-precedence record regardless of feed order."""
+    """Keep, per QID, the higher-precedence record regardless of feed order.
+    A curated QID that already names a place of another kind is a collision,
+    never a replacement."""
     existing = places.get(place["place_id"])
+    if (
+        existing is not None
+        and (place.get("curated") or existing.get("curated"))
+        and existing.get("kind") != place.get("kind")
+    ):
+        raise overture.GazetteerError(
+            f"{place['place_id']!r} is both the {existing['kind']} "
+            f"{existing.get('name')!r} and the {place['kind']} {place.get('name')!r}"
+        )
     if existing is None or _subtype_rank(place) < _subtype_rank(existing):
         places[place["place_id"]] = place
 
@@ -271,7 +283,147 @@ def _add_place(places, skeleton, division):
     _merge_place(places, _place(division, parent_id=parent_id))
 
 
-def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
+def _resolve_place_overrides(candidates, entries, report):
+    """A curator's QID for an Overture candidate the skeleton could not
+    resolve (keyed by its Overture id): assigned as ``curated``. Judged
+    against the candidate as it stands."""
+    by_ref = {e["source_ref"]: e for e in entries}
+    applied = 0
+    consumed = set()
+    for record in candidates:
+        entry = by_ref.get(record.get("overture_id"))
+        if entry is None:
+            continue
+        consumed.add(entry["source_ref"])
+        overrides.judge(
+            entry,
+            {
+                key: record.get(key)
+                for key in (
+                    "overture_id",
+                    "qid",
+                    "resolution_method",
+                    "kind",
+                    "source_subtype",
+                    "name",
+                    "names",
+                    "country",
+                )
+            },
+            report,
+            "seed",
+        )
+        record["qid"] = entry["place"]
+        record["resolution_method"] = "curated"
+        record["curated"] = True
+        applied += 1
+    missing = sorted(set(by_ref) - consumed)
+    if missing:
+        # A candidate that vanished from the skeleton cannot take the QID:
+        # the override no longer names anything, which is a build error.
+        raise overrides.OverrideError(
+            f"resolve_place: no candidate with Overture id {missing[0]!r}"
+        )
+    return applied
+
+
+def _add_place_overrides(places, entries, report):
+    """Curated places upserted into the seed: a real QID, a kind, a name,
+    and either a boundary (attached by the geometry stage) or a member list
+    (a metro's cities, linked reciprocally). ``curated`` exempts them from
+    pruning. Judged against the row that exists, if any."""
+    for entry in entries:
+        spec = entry["add_place"]
+        place_id = entry["place"]
+        overrides.judge(entry, places.get(place_id), report, "seed")
+        existing = places.get(place_id)
+        if existing is None and not ("boundary" in spec or "member_ids" in spec):
+            raise overrides.OverrideError(
+                f"place {place_id!r}: add_place needs a boundary or member_ids"
+            )
+        if existing is not None:
+            # The kind shapes every derived field; the boundary and the
+            # member list have their own operations.
+            if existing.get("kind") != spec["kind"]:
+                raise overrides.OverrideError(
+                    f"place {place_id!r}: add_place cannot change a seeded place's "
+                    "kind"
+                )
+            for field, operation in (
+                ("boundary", "set_boundary"),
+                ("member_ids", "set_place_members"),
+            ):
+                if field in spec:
+                    raise overrides.OverrideError(
+                        f"place {place_id!r}: add_place cannot replace a seeded "
+                        f"place's {field}; use {operation}"
+                    )
+        row = existing or {
+            "place_id": place_id,
+            "kind": spec["kind"],
+            "source_subtype": None,
+            "names": {},
+            "resolution_method": "curated",
+            "country_code": None,
+            "overture_id": None,
+            "osm_relation_id": None,
+            "metro_ids": [],
+            "member_ids": [],
+        }
+        row.update(
+            {
+                "kind": spec["kind"],
+                "name": spec["name"],
+                "parent_id": spec.get("parent_id"),
+                "resolution_method": "curated",
+                "curated": True,
+            }
+        )
+        row["names"] = {**(row.get("names") or {}), "en": spec["name"]}
+        if "country_code" in spec:
+            row["country_code"] = spec["country_code"]
+        if "boundary" in spec:
+            row["boundary_wkt"] = spec["boundary"]
+        if "member_ids" in spec:
+            row["member_ids"] = sorted(set(spec["member_ids"]))
+            row["members_curated"] = True
+        places[place_id] = row
+    for entry in entries:
+        spec = entry["add_place"]
+        parent = spec.get("parent_id")
+        if parent and parent not in places:
+            raise overrides.OverrideError(
+                f"place {entry['place']!r}: parent {parent!r} is not a seeded place"
+            )
+        if parent and places[parent].get("kind") == "metro":
+            raise overrides.OverrideError(
+                f"place {entry['place']!r}: parent {parent!r} is a metro, not an "
+                "administrative place"
+            )
+        for member in spec.get("member_ids", []):
+            city = places.get(member)
+            if city is None or city.get("kind") != "city":
+                raise overrides.OverrideError(
+                    f"place {entry['place']!r}: member {member!r} is not a seeded city"
+                )
+            if entry["place"] not in city.setdefault("metro_ids", []):
+                city["metro_ids"].append(entry["place"])
+                city["metro_ids"].sort()
+    for entry in entries:
+        seen = set()
+        place_id = entry["place"]
+        while place_id is not None:
+            if place_id in seen:
+                raise overrides.OverrideError(
+                    f"place {entry['place']!r}: its parent chain loops"
+                )
+            seen.add(place_id)
+            place_id = (places.get(place_id) or {}).get("parent_id")
+
+
+def resolve_seed(
+    cache_dir, *, dataset=None, wikidata=None, overrides_dir=None, strict=False
+):
     """Build ``places_seed.jsonl`` from the feeds' declared locations.
 
     Reads the crosswalk feeds and the skeleton stage's resolved divisions,
@@ -304,6 +456,13 @@ def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
         dataset = overture.overture_dataset()
     candidates = read_city_candidates(dataset, countries, wanted)
     _resolve_candidates(candidates, wikidata)
+    place_overrides, places_digest = overrides.load_place_overrides(overrides_dir)
+    override_report = []
+    resolved_by_hand = _resolve_place_overrides(
+        candidates,
+        overrides.by_operation(place_overrides, "resolve_place"),
+        override_report,
+    )
     city_index = _index(candidates)
 
     places = {}
@@ -356,9 +515,17 @@ def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
             }
         )
         _add_place(places, skeleton, division)
+    added = overrides.by_operation(place_overrides, "add_place")
+    _add_place_overrides(places, added, override_report)
 
     manifest = {
         "source": "seed",
+        # The exact places.yaml applied: every later gazetteer stage must read
+        # the same bytes, and publish checks the file against it.
+        "places_overrides_sha256": places_digest,
+        "overrides_applied": resolved_by_hand + len(added),
+        "stale_overrides": len(override_report),
+        "stale_place_overrides": len(override_report),
         "overture_release": overture.OVERTURE_RELEASE,
         # The catalogue versions the placements were derived from, carried
         # forward so coverage can refuse a mixed-lineage input set.
@@ -372,16 +539,19 @@ def resolve_seed(cache_dir, *, dataset=None, wikidata=None):
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
         with store.exclusive_writer(directory):
-            return store.publish(
+            published = store.publish(
                 cache_dir / "gazetteer",
                 "seed.json",
                 {
                     "places_seed.jsonl": store.jsonl_chunks(list(places.values())),
                     "feed_places.jsonl": store.jsonl_chunks(placements),
                     "seed_report.jsonl": store.jsonl_chunks(report),
+                    "override_report.jsonl": store.jsonl_chunks(override_report),
                 },
                 manifest,
                 held=directory,
             )
+            overrides.strict_check(strict, override_report, "seed")
+            return published
     finally:
         directory.close()
