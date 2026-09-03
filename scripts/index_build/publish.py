@@ -378,6 +378,8 @@ def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
             )
         _check_names_lineage(cache_dir, expanded)
         _check_places_overrides(expanded, overrides_dir)
+        # The pruned generation is part of the lineage the snapshot records.
+        expanded = {**expanded, "pruned_generation": manifest.get("generation")}
         return (
             places,
             manifest.get("overture_release"),
@@ -426,6 +428,61 @@ def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
         )
     # No published places generation: the index is feeds only.
     return _no_places(overrides_dir)
+
+
+# The catalogue ingests' pointers.
+RAW_POINTERS = ("atlas.json", "mdb.json", "gbfs.json")
+# The edge pointer each edge stage publishes.
+EDGE_POINTERS = {
+    "curate": ("curate", "edges_final.json"),
+    "classify": ("classify", "edges.json"),
+    "coverage": ("coverage", "coverage.json"),
+}
+
+
+def _generations(cache_dir, edges, resolved, places):
+    """Every generation the index descends from, leaves and their ancestors,
+    as ``({"subdir/pointer": generation}, {table: leaf pointer})``: the
+    crosswalk from its pointer (held locked), the rest from the manifests
+    that recorded them. A re-run of any one of them makes the index stale."""
+    from index_build import classify
+
+    found = {}
+    leaves = {}
+    # The ingest and crosswalk pointers as they stand now, held locked.
+    for name in RAW_POINTERS:
+        found[f"raw/{name}"] = classify._current_generation(cache_dir, "raw", name)
+    found["crosswalk/feeds.json"] = classify._current_generation(
+        cache_dir, "crosswalk", "feeds.json"
+    )
+    leaves["feeds"] = "crosswalk/feeds.json"
+    if resolved is not None:
+        found["resolve/feeds_resolved.json"] = resolved.get("generation")
+        leaves["feeds"] = "resolve/feeds_resolved.json"
+    elif edges is not None:
+        found["resolve/feeds_resolved.json"] = edges.get("resolve_generation")
+    if places is not None:
+        pointer = "expanded.json" if places.get("source") == "expand" else "names.json"
+        found[f"gazetteer/{pointer}"] = places.get("generation")
+        leaves["places"] = f"gazetteer/{pointer}"
+        found["gazetteer/seed.json"] = places.get("seed_generation")
+        if pointer == "expanded.json":
+            found["gazetteer/names.json"] = places.get("names_generation")
+        if places.get("pruned_generation") is not None:
+            found["prune/places_pruned.json"] = places["pruned_generation"]
+            leaves["places"] = "prune/places_pruned.json"
+    if edges is not None and edges.get("source") in EDGE_POINTERS:
+        subdir, pointer = EDGE_POINTERS[edges["source"]]
+        found[f"{subdir}/{pointer}"] = edges.get("generation")
+        leaves["edges"] = leaves["feeds"] = f"{subdir}/{pointer}"
+        found["classify/edges.json"] = edges.get("classify_generation")
+        found["coverage/coverage.json"] = edges.get("coverage_generation")
+        if edges.get("source") == "classify":
+            found["classify/edges.json"] = edges.get("generation")
+        if edges.get("source") == "coverage":
+            found["coverage/coverage.json"] = edges.get("generation")
+    found = {key: value for key, value in found.items() if value is not None}
+    return found, leaves
 
 
 def _no_places(overrides_dir):
@@ -663,6 +720,7 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
         # Stage locks first, the crawl lock last — the order every stage
         # uses (its own lock, then the crawl's), so no lock-order inversion.
         for subdir in (
+            "raw",
             "crosswalk",
             "resolve",
             "gazetteer",
@@ -720,6 +778,9 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
         places, overture_release, places_generation, places_manifest = _read_places(
             cache_dir, coverage, overrides_dir
         )
+        generations, leaves = _generations(
+            cache_dir, coverage, resolve_manifest, places_manifest
+        )
         if places is not None and not overture_release:
             # The release folds into the snapshot id; without it a places index would
             # share the feeds-only id for the same feeds.
@@ -770,6 +831,19 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
             "sources": sources,
             "counts": counts,
             "feeds_sha256": hashlib.sha256(feeds_data).hexdigest(),
+            # The stage generations this index was built from, by pointer,
+            # the leaf that produced each table, and the override files
+            # applied, so a release can check they are all still current.
+            "generations": generations,
+            "leaves": leaves,
+            "feeds_overrides_sha256": (
+                coverage if coverage is not None else resolve_manifest or {}
+            ).get("feeds_overrides_sha256"),
+            "places_overrides_sha256": (places_manifest or {}).get(
+                "places_overrides_sha256"
+            ),
+            # The crawl the edges and expanded places were measured against.
+            "crawl_digest": crawl.states_digest(cache_dir),
         }
 
         places_data = None
