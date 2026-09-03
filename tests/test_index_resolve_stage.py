@@ -67,6 +67,9 @@ def test_no_overrides_pass_feeds_through_as_crawlable(tmp_path):
     assert feeds["f-a"]["crawlable"] is True
     assert feeds["f-a"]["uncrawlable_reason"] is None
     assert manifest["overridden_feeds"] == 0
+    assert manifest["crosswalk_generation"] == (
+        store.resolve(cache / "crosswalk", "feeds.json")[1]["generation"]
+    )
     assert manifest["uncrawlable"] == 0
 
 

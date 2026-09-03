@@ -173,6 +173,7 @@ def _edges_index(
         PLACES if places is None else places,
         {
             "source": "expand",
+            "places_overrides_sha256": None,
             "overture_release": release,
             "stale_place_overrides": stale[0],
         },
@@ -191,6 +192,7 @@ def _edges_index(
                 },
                 {
                     "source": "coverage",
+                    "feeds_overrides_sha256": None,
                     "mode": "declared",
                     "sources": SOURCES,
                     "overture_release": "2026-08-19.0",
@@ -252,7 +254,11 @@ def _build_index(tmp_path, archive=None, places=None, release="2026-08-19.0"):
             "names.json",
             "places_seed.jsonl",
             places,
-            {"source": "names", "overture_release": release},
+            {
+                "source": "names",
+                "places_overrides_sha256": None,
+                "overture_release": release,
+            },
         )
     manifest = publish.publish(cache)
     return cache, manifest
@@ -441,11 +447,16 @@ def test_places_round_trip_through_the_reader(tmp_path):
 def test_a_feeds_only_index_has_no_places(tmp_path, monkeypatch):
     from test_index_place_overrides import write_overrides
 
+    # Tables left by an earlier build must not linger under a new manifest.
+    (tmp_path / "cache" / "index").mkdir(parents=True)
+    for stale in ("places.parquet", "edges.parquet"):
+        (tmp_path / "cache" / "index" / stale).write_bytes(b"stale")
     cache, manifest = _build_index(tmp_path)  # no gazetteer
     assert "places_sha256" not in manifest
     index = transitio_index.read_index(cache / "index")
-    assert index.places is None
+    assert index.places is None and index.edges is None
     assert not (cache / "index" / "places.parquet").exists()
+    assert not (cache / "index" / "edges.parquet").exists()
     # A places.yaml that no gazetteer generation applied is a missing stage.
     directory = write_overrides(
         tmp_path, places=[{"place": "Q1", "set_aliases": ["x"]}]
@@ -465,6 +476,20 @@ def test_a_feeds_only_index_has_no_places(tmp_path, monkeypatch):
     monkeypatch.setattr(publish, "_no_places", read_then_write)
     with pytest.raises(publish.PublishError, match="changed during publication"):
         publish.publish(cache, overrides_dir=late)
+    # The same for a feeds.yaml created after the crosswalk-only read.
+    monkeypatch.undo()
+    late_feeds = tmp_path / "late_feeds" / "overrides"
+    late_feeds.mkdir(parents=True)
+
+    def read_then_write_feeds(cache_dir, overrides_dir, *, check_file=True):
+        write_overrides(
+            tmp_path / "late_feeds", feeds=[{"feed": "f", "mark_uncrawlable": True}]
+        )
+        return None, None
+
+    monkeypatch.setattr(publish, "_read_resolved", read_then_write_feeds)
+    with pytest.raises(publish.PublishError, match="feeds.yaml changed during"):
+        publish.publish(cache, overrides_dir=late_feeds)
 
 
 def test_the_reader_refuses_a_places_parquet_that_does_not_match(tmp_path):
@@ -675,8 +700,41 @@ def test_unclassified_edges_are_refused(tmp_path):
         "expanded.json",
         "places_expanded.jsonl",
         PLACES,
-        {"source": "expand", "overture_release": "2026-08-19.0"},
+        {
+            "source": "expand",
+            "places_overrides_sha256": None,
+            "overture_release": "2026-08-19.0",
+        },
     )
+    directory = store.open_subdir(cache, "coverage")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "coverage",
+                "coverage.json",
+                {
+                    "feeds_covered.jsonl": store.jsonl_chunks([_covered_feed("f-a")]),
+                    "edges_candidate.jsonl": store.jsonl_chunks(
+                        [_edge("Q1757", "f-a")]
+                    ),
+                },
+                {
+                    "source": "coverage",
+                    "feeds_overrides_sha256": None,
+                    "mode": "declared",
+                    "sources": SOURCES,
+                    "overture_release": "2026-08-19.0",
+                    "expanded_generation": expanded["generation"],
+                },
+                held=directory,
+            )
+    finally:
+        directory.close()
+    with pytest.raises(publish.PublishError, match="unclassified"):
+        publish.publish(cache)
+
+
+def _publish_coverage(cache, manifest):
     directory = store.open_subdir(cache, "coverage")
     try:
         with store.exclusive_writer(directory):
@@ -693,37 +751,27 @@ def test_unclassified_edges_are_refused(tmp_path):
                     "source": "coverage",
                     "mode": "declared",
                     "sources": SOURCES,
-                    "overture_release": "2026-08-19.0",
-                    "expanded_generation": expanded["generation"],
+                    "feeds_overrides_sha256": None,
+                    **manifest,
                 },
                 held=directory,
             )
     finally:
         directory.close()
-    with pytest.raises(publish.PublishError, match="unclassified"):
-        publish.publish(cache)
 
 
 def test_coverage_without_a_places_generation_is_refused(tmp_path):
     cache = tmp_path / "cache"
-    directory = store.open_subdir(cache, "coverage")
-    try:
-        with store.exclusive_writer(directory):
-            store.publish(
-                cache / "coverage",
-                "coverage.json",
-                {
-                    "feeds_covered.jsonl": store.jsonl_chunks([_covered_feed("f-a")]),
-                    "edges_candidate.jsonl": store.jsonl_chunks(
-                        [_edge("Q1757", "f-a")]
-                    ),
-                },
-                {"source": "coverage", "mode": "declared", "sources": SOURCES},
-                held=directory,
-            )
-    finally:
-        directory.close()
+    _publish_coverage(cache, {})
     with pytest.raises(publish.PublishError, match="no places generation"):
+        publish.publish(cache)
+
+
+def test_coverage_not_from_the_current_resolve_generation_is_refused(tmp_path):
+    # The resolve generation it recorded is gone: nothing can verify it.
+    cache = tmp_path / "cache"
+    _publish_coverage(cache, {"resolve_generation": "old"})
+    with pytest.raises(publish.PublishError, match="re-run the coverage stage"):
         publish.publish(cache)
 
 
@@ -753,9 +801,187 @@ def test_a_names_generation_from_an_older_seed_is_refused(tmp_path):
         PLACES,
         {
             "source": "names",
+            "places_overrides_sha256": None,
             "overture_release": "2026-08-19.0",
             "seed_generation": "old",
         },
     )
     with pytest.raises(publish.PublishError, match="current seed.json"):
+        publish._read_places(cache)
+
+
+def test_crawl_evidence_and_provenance_round_trip(tmp_path):
+    import transitio
+
+    pytest.importorskip("geopandas")
+    hull = "0101000000" + "00" * 16  # a WKB point
+    crawled = {
+        **_covered_feed("f-a", coverage_source="crawl"),
+        "coverage": hull,
+        "stop_count": 250,
+        "crawl_status": "ok",
+        "last_crawled": "2026-09-01T00:00:00+00:00",
+    }
+    cache, manifest = _edges_index(tmp_path, [_edge("Q1757", "f-a")], feeds=[crawled])
+    assert manifest["schema_version"] == 3
+    assert (
+        manifest["discovery_semantics_version"]
+        == transitio_index.DISCOVERY_SEMANTICS_VERSION
+    )
+    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS[3]
+    assert manifest["built_with"] == transitio.__version__
+    index = transitio_index.read_index(cache / "index")
+    row = index.feeds.set_index("feed_id").loc["f-a"]
+    assert row["coverage"] == bytes.fromhex(hull) and row["stop_count"] == 250
+    assert row["crawl_status"] == "ok"
+    feed = transitio_index.place("Q1757", index=index).feeds()[0]
+    assert feed.stop_count == 250 and feed.coverage == bytes.fromhex(hull)
+    assert feed.provenance == {
+        "snapshot": manifest["snapshot_id"],
+        "discovery_semantics_version": transitio_index.DISCOVERY_SEMANTICS_VERSION,
+        "transitio_version": transitio.__version__,
+    }
+    # The tabular export carries the coverage hull as its geometry.
+    frame = transitio_index.place("Q1757", index=index).feeds().to_geodataframe()
+    assert frame.geometry.iloc[0].wkb == bytes.fromhex(hull)
+
+
+def _publish_resolved(cache, feeds, manifest):
+    directory = store.open_subdir(cache, "resolve")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "resolve",
+                "feeds_resolved.json",
+                {"feeds_resolved.jsonl": store.jsonl_chunks(feeds)},
+                {"source": "resolve", **manifest},
+                held=directory,
+            )
+    finally:
+        directory.close()
+
+
+@pytest.mark.parametrize(
+    "lineage", [{"crosswalk_generation": "old"}, {}], ids=["older", "unrecorded"]
+)
+def test_resolved_feeds_not_from_the_current_crosswalk_are_refused(tmp_path, lineage):
+    cache, _ = _build_index(tmp_path)
+    _publish_resolved(cache, [], lineage)
+    with pytest.raises(publish.PublishError, match="re-run the resolve stage"):
+        publish.publish(cache)
+
+
+def test_a_feeds_only_snapshot_ships_the_resolved_feeds(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    cache, before = _build_index(tmp_path)
+    feeds, crosswalk = store.read_jsonl(
+        cache / "crosswalk", "feeds.json", "feeds.jsonl"
+    )
+    feeds[0].update(crawlable=False, uncrawlable_reason="auth")
+    lineage = {
+        "crosswalk_generation": crosswalk["generation"],
+        "sources": crosswalk["sources"],
+        "feeds_overrides_sha256": None,
+    }
+    _publish_resolved(cache, feeds, lineage)
+    manifest = publish.publish(cache)
+    index = transitio_index.read_index(cache / "index")
+    row = index.feeds.set_index("feed_id").loc[feeds[0]["feed_id"]]
+    assert not row["crawlable"]
+    assert manifest["snapshot_id"] != before["snapshot_id"]
+    # A feeds.yaml the resolve generation did not apply: refused, before
+    # and at activation; one nobody applied is a stage that has not run.
+    directory = write_overrides(
+        tmp_path, feeds=[{"feed": "f", "mark_uncrawlable": True}]
+    )
+    with pytest.raises(publish.PublishError, match="re-run the resolve"):
+        publish.publish(cache, overrides_dir=directory)
+    _publish_resolved(cache, feeds, {**lineage, "feeds_overrides_sha256": "x"})
+    with pytest.raises(publish.PublishError, match="re-run the resolve"):
+        publish.publish(cache, overrides_dir=directory)
+    # With a coverage generation shipping instead, the file is coverage's to
+    # check: a set_coverage edit does not send the resolve stage back.
+    _, manifest = publish._read_resolved(cache, directory, check_file=False)
+    assert manifest["feeds_overrides_sha256"] == "x"
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    _build_index(bare)
+    with pytest.raises(publish.PublishError, match="run the resolve stage"):
+        publish.publish(bare / "cache", overrides_dir=directory)
+
+
+def test_reader_versions_order_pre_releases_below_finals():
+    key = transitio_index._version_key
+    assert key("1.0.0rc1") < key("1.0.0") < key("1.0.0.post1") < key("1.0.1")
+    assert key("1.0.0-dev") < key("1.0") == key("1.0.0")
+    assert key("1.0.0.dev1") < key("1.0.0a1") < key("1.0.0b1") < key("1.0.0rc1")
+    assert key("1.x") is None and key("") is None
+    # Bounded: an untrusted manifest cannot feed int() an unbounded digit run.
+    assert key("1" * 400) is None and key("1.0.0rc" + "9" * 40) is None
+    # Schema 3 arrived after the 0.10.0 release, which reads schema 2 only.
+    assert key(transitio_index.MIN_READER_VERSIONS[3]) > key("0.10.0")
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"min_reader_version": "0.1.0"}, "discovery_semantics"),
+        (
+            {"discovery_semantics_version": 1, "min_reader_version": ""},
+            "min_reader_version",
+        ),
+        (
+            {"discovery_semantics_version": 1, "min_reader_version": "1.x"},
+            "min_reader_version",
+        ),
+        (
+            {"discovery_semantics_version": 1, "min_reader_version": "9" * 400},
+            "min_reader_version",
+        ),
+        (
+            {"discovery_semantics_version": 1, "min_reader_version": "999.0.0"},
+            "needs transitio >= 999.0.0",
+        ),
+    ],
+)
+def test_the_reader_requires_the_schema_3_manifest_fields(tmp_path, fields, message):
+    manifest = {"schema_version": 3, "snapshot_id": "x", "feeds_sha256": "0" * 64}
+    (tmp_path / "snapshot.json").write_text(
+        json.dumps({**manifest, **fields}), encoding="utf-8"
+    )
+    with pytest.raises(IncompatibleIndexError, match=message):
+        transitio_index.read_index(tmp_path)
+
+
+def test_generations_before_override_tracking_are_refused(tmp_path, monkeypatch):
+    cache, _ = _build_index(tmp_path)
+    _, crosswalk = store.read_jsonl(cache / "crosswalk", "feeds.json", "feeds.jsonl")
+    _publish_resolved(cache, [], {"crosswalk_generation": crosswalk["generation"]})
+    with pytest.raises(publish.PublishError, match="predates override tracking"):
+        publish.publish(cache)
+    monkeypatch.setattr(
+        classify, "read_edges", lambda *a, **k: ([], [], {"source": "classify"})
+    )
+    with pytest.raises(publish.PublishError, match="predates override tracking"):
+        publish._read_coverage(cache)
+
+
+def test_an_unplaceable_reader_version_fails_closed(tmp_path, monkeypatch):
+    import transitio
+
+    cache, _ = _build_index(tmp_path)
+    monkeypatch.setattr(transitio, "__version__", "not-a-version", raising=False)
+    with pytest.raises(IncompatibleIndexError, match="cannot be compared"):
+        transitio_index.read_index(cache / "index")
+
+
+@pytest.mark.parametrize("pointer", ["expanded.json", "names.json"])
+def test_places_generations_before_override_tracking_are_refused(tmp_path, pointer):
+    cache = tmp_path / "cache"
+    artifact = (
+        "places_expanded.jsonl" if pointer == "expanded.json" else "places_seed.jsonl"
+    )
+    _publish_gen(cache, pointer, artifact, PLACES, {"source": "gazetteer"})
+    with pytest.raises(publish.PublishError, match="predates override tracking"):
         publish._read_places(cache)

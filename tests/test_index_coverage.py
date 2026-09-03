@@ -137,6 +137,7 @@ def _cover(
         places,
         {
             "source": "expand",
+            "places_overrides_sha256": None,
             "overture_release": RELEASE,
             "sources": SOURCES,
             "seed_generation": seed_manifest["generation"],
@@ -157,6 +158,7 @@ def _cover(
             places,
             {
                 "source": "expand",
+                "places_overrides_sha256": None,
                 "overture_release": RELEASE,
                 "sources": SOURCES,
                 "seed_generation": seed_manifest["generation"],

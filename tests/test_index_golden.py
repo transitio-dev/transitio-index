@@ -40,7 +40,7 @@ def _write_cache(
             "gazetteer",
             "expanded.json",
             {"places_expanded.jsonl": []},
-            {"source": "expand"},
+            {"source": "expand", "places_overrides_sha256": None},
         )
     coverage_manifest = _generation(
         cache,

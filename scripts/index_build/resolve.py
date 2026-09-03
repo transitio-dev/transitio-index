@@ -113,6 +113,9 @@ def resolve(cache_dir, *, overrides_dir=None):
                 # The catalogue versions the feeds were built from, carried
                 # forward so later stages label their output with the same ones.
                 "sources": crosswalk_manifest.get("sources"),
+                # The exact crosswalk generation resolved from: publish
+                # refuses these feeds once the crosswalk has moved on.
+                "crosswalk_generation": crosswalk_manifest.get("generation"),
                 "feeds": len(feeds),
                 "overridden_feeds": len(matched),
                 "uncrawlable": sum(1 for feed in feeds if not feed["crawlable"]),
