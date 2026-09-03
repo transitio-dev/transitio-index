@@ -75,7 +75,7 @@ def resolve(cache_dir, *, overrides_dir=None):
     with a ``crawlable`` flag (and any ``uncrawlable_reason``), and republishes
     them. One writer lock spans the read and the publish. Returns the manifest.
     """
-    feed_overrides = overrides.load_feed_overrides(overrides_dir)
+    feed_overrides, feeds_digest = overrides.load_feed_overrides(overrides_dir)
     directory = store.open_subdir(cache_dir, "resolve")
     try:
         with store.exclusive_writer(directory):
@@ -117,6 +117,13 @@ def resolve(cache_dir, *, overrides_dir=None):
                 "overridden_feeds": len(matched),
                 "uncrawlable": sum(1 for feed in feeds if not feed["crawlable"]),
                 "unmatched_overrides": sorted(set(feed_overrides) - matched),
+                # The exact feeds.yaml applied, and its identity and
+                # crawlability operations alone: coverage must see the same
+                # ones, while a set_coverage edit does not send this stage back.
+                "feeds_overrides_sha256": feeds_digest,
+                "feeds_resolve_sha256": overrides.phase_digest(
+                    feed_overrides, overrides.RESOLVE_OPERATIONS
+                ),
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),

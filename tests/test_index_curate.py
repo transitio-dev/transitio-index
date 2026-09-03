@@ -1173,3 +1173,16 @@ def test_an_override_file_is_read_once_and_never_through_a_symlink(
         overrides.load_edge_overrides(directory)
     with pytest.raises(overrides.OverrideError):
         overrides.edges_digest(directory)
+
+
+def test_feeds_yaml_edited_after_the_resolve_stage_refuses_to_curate(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    cache, _, _ = _build(tmp_path)
+    directory = write_overrides(
+        tmp_path, feeds=[{"feed": "f", "mark_uncrawlable": True}]
+    )
+    with pytest.raises(overrides.OverrideError, match="re-run the coverage"):
+        curate.curate(cache, overrides_dir=directory)

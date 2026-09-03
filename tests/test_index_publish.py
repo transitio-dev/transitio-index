@@ -160,15 +160,22 @@ def _edge(place_id, feed_id, **kw):
     }
 
 
-def _edges_index(tmp_path, edges, feeds=None, release="2026-08-19.0", places=None):
-    """A cache with expanded places and a coverage generation, published."""
+def _edges_index(
+    tmp_path, edges, feeds=None, release="2026-08-19.0", places=None, stale=(0, 0)
+):
+    """A cache with expanded places and a coverage generation, published;
+    ``stale`` is the (place, feed) override staleness those record."""
     cache = tmp_path / "cache"
     expanded = _publish_gen(
         cache,
         "expanded.json",
         "places_expanded.jsonl",
         PLACES if places is None else places,
-        {"source": "expand", "overture_release": release},
+        {
+            "source": "expand",
+            "overture_release": release,
+            "stale_place_overrides": stale[0],
+        },
     )
     if feeds is None:
         feeds = [_covered_feed("f-a"), _covered_feed("f-b", coverage_source=None)]
@@ -188,6 +195,7 @@ def _edges_index(tmp_path, edges, feeds=None, release="2026-08-19.0", places=Non
                     "sources": SOURCES,
                     "overture_release": "2026-08-19.0",
                     "expanded_generation": expanded["generation"],
+                    "stale_feed_overrides": stale[1],
                 },
                 held=directory,
             )
@@ -430,12 +438,33 @@ def test_places_round_trip_through_the_reader(tmp_path):
     assert manifest["counts"]["places_by_kind"] == {"city": 1, "metro": 1}
 
 
-def test_a_feeds_only_index_has_no_places(tmp_path):
+def test_a_feeds_only_index_has_no_places(tmp_path, monkeypatch):
+    from test_index_place_overrides import write_overrides
+
     cache, manifest = _build_index(tmp_path)  # no gazetteer
     assert "places_sha256" not in manifest
     index = transitio_index.read_index(cache / "index")
     assert index.places is None
     assert not (cache / "index" / "places.parquet").exists()
+    # A places.yaml that no gazetteer generation applied is a missing stage.
+    directory = write_overrides(
+        tmp_path, places=[{"place": "Q1", "set_aliases": ["x"]}]
+    )
+    with pytest.raises(publish.PublishError, match="run the gazetteer stage"):
+        publish.publish(cache, overrides_dir=directory)
+    # Created after the feeds-only read: refused at activation.
+    late = tmp_path / "late" / "overrides"
+    late.mkdir(parents=True)
+
+    def read_then_write(overrides_dir):
+        write_overrides(
+            tmp_path / "late", places=[{"place": "Q1", "set_aliases": ["x"]}]
+        )
+        return None, None, None, None
+
+    monkeypatch.setattr(publish, "_no_places", read_then_write)
+    with pytest.raises(publish.PublishError, match="changed during publication"):
+        publish.publish(cache, overrides_dir=late)
 
 
 def test_the_reader_refuses_a_places_parquet_that_does_not_match(tmp_path):
@@ -701,3 +730,32 @@ def test_coverage_without_a_places_generation_is_refused(tmp_path):
 def test_mismatched_coverage_and_places_releases_are_refused(tmp_path):
     with pytest.raises(publish.PublishError, match="different Overture releases"):
         _edges_index(tmp_path, [_edge("Q1757", "f-a")], release="2026-07-01.0")
+
+
+def test_the_snapshot_sums_every_override_files_staleness(tmp_path):
+    pytest.importorskip("geopandas")
+    _, manifest = _edges_index(tmp_path, [_edge("Q1757", "f-a")], stale=(1, 2))
+    assert manifest["stale_overrides"] == 3
+    assert (
+        manifest["stale_place_overrides"],
+        manifest["stale_feed_overrides"],
+        manifest["stale_edge_overrides"],
+    ) == (1, 2, 0)
+
+
+def test_a_names_generation_from_an_older_seed_is_refused(tmp_path):
+    cache = tmp_path / "cache"
+    _publish_gen(cache, "seed.json", "feed_places.jsonl", [], {"source": "seed"})
+    _publish_gen(
+        cache,
+        "names.json",
+        "places_seed.jsonl",
+        PLACES,
+        {
+            "source": "names",
+            "overture_release": "2026-08-19.0",
+            "seed_generation": "old",
+        },
+    )
+    with pytest.raises(publish.PublishError, match="current seed.json"):
+        publish._read_places(cache)

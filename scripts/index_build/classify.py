@@ -44,7 +44,7 @@ import math
 import statistics
 
 from transitio.index import fingerprint
-from index_build import coverage, crawl, store
+from index_build import coverage, crawl, overrides, store
 
 CLASSIFY_POINTER = "edges.json"
 EDGES_ARTIFACT = "edges.jsonl"
@@ -1166,7 +1166,9 @@ def _read_edges(cache_dir, final):
     return feeds, edges, curate_manifest
 
 
-def classify(cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS):
+def classify(
+    cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS, overrides_dir=None
+):
     """Classify the candidate edges; publish the ``classify`` generation.
 
     Reads the coverage generation (feeds and candidate edges from one pointer
@@ -1190,6 +1192,12 @@ def classify(cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS):
                     generation.read_bytes(coverage.EDGES_ARTIFACT)
                 )
                 _require_service(candidates, "coverage")
+            overrides.expect_digest(
+                coverage_manifest.get("feeds_overrides_sha256"),
+                overrides.feeds_digest(overrides_dir),
+                "feeds.yaml",
+                "coverage",
+            )
             place_rows, expanded_manifest = store.read_jsonl(
                 cache_dir / "gazetteer", "expanded.json", "places_expanded.jsonl"
             )
@@ -1278,6 +1286,10 @@ def classify(cache_dir, *, lookup=None, route_min_stops=ROUTE_MIN_STOPS):
                 # The exact generations classified from, so a later consumer
                 # can refuse these edges once either input has moved on.
                 "coverage_generation": coverage_manifest.get("generation"),
+                "feeds_overrides_sha256": coverage_manifest.get(
+                    "feeds_overrides_sha256"
+                ),
+                "stale_feed_overrides": coverage_manifest.get("stale_feed_overrides"),
                 "expanded_generation": expanded_manifest.get("generation"),
                 "feeds": len(feeds),
                 "feeds_by_status": dict(statuses),

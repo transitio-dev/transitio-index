@@ -88,12 +88,16 @@ def run_crosswalk(arguments):
 
 
 def run_gazetteer(arguments):
+    options = {
+        "overrides_dir": arguments.overrides_dir,
+        "strict": arguments.strict_overrides,
+    }
     return [
         overture.resolve(arguments.cache_dir),
-        seed.resolve_seed(arguments.cache_dir),
-        metros.attach_metros(arguments.cache_dir),
-        geometry.attach_geometry(arguments.cache_dir),
-        names.merge_names(arguments.cache_dir),
+        seed.resolve_seed(arguments.cache_dir, **options),
+        metros.attach_metros(arguments.cache_dir, **options),
+        geometry.attach_geometry(arguments.cache_dir, **options),
+        names.merge_names(arguments.cache_dir, **options),
     ]
 
 
@@ -102,7 +106,7 @@ def run_resolve(arguments):
 
 
 def run_expand(arguments):
-    return [expand.expand(arguments.cache_dir)]
+    return [expand.expand(arguments.cache_dir, overrides_dir=arguments.overrides_dir)]
 
 
 def run_crawl(arguments):
@@ -110,11 +114,19 @@ def run_crawl(arguments):
 
 
 def run_coverage(arguments):
-    return [coverage.cover(arguments.cache_dir)]
+    return [
+        coverage.cover(
+            arguments.cache_dir,
+            overrides_dir=arguments.overrides_dir,
+            strict=arguments.strict_overrides,
+        )
+    ]
 
 
 def run_classify(arguments):
-    return [classify.classify(arguments.cache_dir)]
+    return [
+        classify.classify(arguments.cache_dir, overrides_dir=arguments.overrides_dir)
+    ]
 
 
 def run_curate(arguments):
@@ -225,7 +237,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--strict-overrides",
         action="store_true",
-        help="fail the curate stage on a stale override instead of flagging it",
+        help="fail the gazetteer, coverage and curate stages on a stale override "
+        "instead of flagging it",
     )
     parser.add_argument(
         "--downstream",

@@ -8,6 +8,7 @@ stages. Place overrides are added with the stage that applies them.
 """
 
 import hashlib
+import json
 import os
 import pathlib
 
@@ -17,6 +18,9 @@ import re
 
 FEEDS_FILE = "feeds.yaml"
 EDGES_FILE = "edges.yaml"
+PLACES_FILE = "places.yaml"
+PLACE_KINDS = ("country", "region", "city", "metro")
+COVERAGE_LEVELS = ("municipality", "subdivision", "country", "bbox", "geohash")
 TIERS = ("local", "regional", "national", "international", "unknown")
 
 # The identity fields ``set_identity`` may correct — ``feed_id`` included, since
@@ -49,6 +53,8 @@ _STATIC_LINK_METHODS = frozenset({"declared", "same_file", "same_host", "none"})
 # The operations a feed entry may carry. ``set_coverage`` is applied by the
 # coverage stage, not the resolve stage, but is a valid key here.
 _OPERATIONS = frozenset({"set_identity", "mark_uncrawlable", "set_coverage"})
+# The operations the resolve stage applies; set_coverage enters at coverage.
+RESOLVE_OPERATIONS = frozenset({"set_identity", "mark_uncrawlable"})
 _METADATA = frozenset({"feed", "reason", "author", "date", "evidence_hash"})
 
 
@@ -142,28 +148,43 @@ def _validate_operations(path, ref, entry):
             raise OverrideError(
                 f"{path}: feed {ref!r} mark_uncrawlable must be true or a mapping"
             )
-    if "set_coverage" in entry and not isinstance(entry["set_coverage"], dict):
-        raise OverrideError(f"{path}: feed {ref!r} set_coverage must be a mapping")
+    if "set_coverage" in entry:
+        spec = entry["set_coverage"]
+        if not isinstance(spec, dict) or set(spec) != {"level", "place_id"}:
+            raise OverrideError(
+                f"{path}: feed {ref!r} set_coverage must be a mapping of level and "
+                "place_id"
+            )
+        if spec["level"] not in COVERAGE_LEVELS:
+            raise OverrideError(
+                f"{path}: feed {ref!r} set_coverage level must be one of "
+                f"{list(COVERAGE_LEVELS)}"
+            )
+        if not isinstance(spec["place_id"], str) or not spec["place_id"]:
+            raise OverrideError(
+                f"{path}: feed {ref!r} set_coverage place_id must be a place id"
+            )
 
 
 def load_feed_overrides(overrides_dir):
-    """The ``feeds.yaml`` entries keyed by feed reference, or ``{}`` when absent.
+    """The ``feeds.yaml`` entries keyed by feed reference and the digest of
+    the bytes they came from: ``({}, None)`` when absent.
 
-    Returns a mapping ``feed_ref -> entry``. A duplicate reference, an entry with
-    no ``feed`` key or no operation, an unknown operation, or a malformed
+    Returns ``(feed_ref -> entry, digest)``. A duplicate reference, an entry
+    with no ``feed`` key or no operation, an unknown operation, or a malformed
     operation value is a build error rather than a silent skip.
     """
     if overrides_dir is None:
-        return {}
+        return {}, None
     path = pathlib.Path(overrides_dir) / FEEDS_FILE
-    data, _ = read_override(overrides_dir, FEEDS_FILE)
+    data, digest = read_override(overrides_dir, FEEDS_FILE)
     if data is None:
-        return {}
+        return {}, None
     import yaml
 
     raw = yaml.load(data.decode("utf-8"), Loader=_strict_loader())
     if raw is None:
-        return {}
+        return {}, digest
     if not isinstance(raw, list):
         raise OverrideError(f"{path}: expected a list of override entries")
     entries = raw
@@ -183,7 +204,7 @@ def load_feed_overrides(overrides_dir):
             )
         _validate_operations(path, ref, entry)
         by_feed[ref] = entry
-    return by_feed
+    return by_feed, digest
 
 
 def read_override(overrides_dir, name):
@@ -400,3 +421,232 @@ def load_edge_overrides(overrides_dir):
         seen.add(key)
         entries.append({**entry, "operation": operation})
     return entries, digest
+
+
+# ---- places.yaml ----
+
+_PLACE_OPERATIONS = frozenset(
+    {"add_place", "set_place_members", "set_boundary", "set_aliases", "resolve_place"}
+)
+_PLACE_METADATA = frozenset(
+    {"place", "source_ref", "reason", "author", "date", "evidence_hash"}
+)
+_ADD_PLACE_FIELDS = frozenset(
+    {"kind", "name", "parent_id", "boundary", "member_ids", "country_code"}
+)
+
+
+def _qid(value):
+    return isinstance(value, str) and bool(re.match(r"\AQ[1-9][0-9]*\Z", value))
+
+
+def _qid_list(value):
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(v, str) and v for v in value)
+    )
+
+
+def _validate_place_entry(path, entry):
+    where = f"place {entry.get('place') or entry.get('source_ref')!r}"
+    unknown = set(entry) - _PLACE_OPERATIONS - _PLACE_METADATA
+    if unknown:
+        raise OverrideError(f"{path}: {where} has unknown keys {sorted(unknown)}")
+    operations = sorted(set(entry) & _PLACE_OPERATIONS)
+    if len(operations) != 1:
+        raise OverrideError(f"{path}: {where} needs exactly one operation")
+    (operation,) = operations
+    if not isinstance(entry.get("place"), str) or not entry["place"]:
+        raise OverrideError(f"{path}: {where} needs a 'place' id")
+    if operation in ("add_place", "resolve_place") and not _qid(entry["place"]):
+        raise OverrideError(f"{path}: {where} {operation} needs a real QID as 'place'")
+    if operation == "resolve_place":
+        if not isinstance(entry.get("source_ref"), str) or not entry["source_ref"]:
+            raise OverrideError(f"{path}: {where} resolve_place needs a source_ref")
+        if entry["resolve_place"] is not True:
+            raise OverrideError(f"{path}: {where} resolve_place must be true")
+    elif "source_ref" in entry:
+        raise OverrideError(f"{path}: {where} only resolve_place takes a source_ref")
+    spec = entry[operation]
+    if operation == "add_place":
+        if not isinstance(spec, dict):
+            raise OverrideError(f"{path}: {where} add_place must be a mapping")
+        unknown = set(spec) - _ADD_PLACE_FIELDS
+        if unknown:
+            raise OverrideError(
+                f"{path}: {where} add_place has unknown keys {sorted(unknown)}"
+            )
+        if spec.get("kind") not in PLACE_KINDS or not (
+            isinstance(spec.get("name"), str) and spec["name"].strip()
+        ):
+            raise OverrideError(f"{path}: {where} add_place needs a kind and a name")
+        code = spec.get("country_code")
+        if "country_code" in spec and not (
+            isinstance(code, str) and re.fullmatch(r"[A-Z]{2}", code)
+        ):
+            raise OverrideError(
+                f"{path}: {where} add_place country_code must be a two-letter "
+                "upper-case ISO code"
+            )
+        if spec["kind"] in ("city", "region") and not (
+            isinstance(spec.get("parent_id"), str) and spec["parent_id"]
+        ):
+            raise OverrideError(
+                f"{path}: {where} add_place: a {spec['kind']} needs a parent_id"
+            )
+        if "boundary" in spec and "member_ids" in spec:
+            raise OverrideError(
+                f"{path}: {where} add_place takes a boundary or a member list, not both"
+            )
+        if "boundary" in spec and not isinstance(spec["boundary"], str):
+            raise OverrideError(f"{path}: {where} add_place boundary must be WKT")
+        if "member_ids" in spec and (
+            spec["kind"] != "metro" or not _qid_list(spec["member_ids"])
+        ):
+            raise OverrideError(
+                f"{path}: {where} add_place member_ids belong to a metro, as a QID list"
+            )
+    elif operation == "set_place_members":
+        if not _qid_list(spec):
+            raise OverrideError(
+                f"{path}: {where} set_place_members must be a non-empty QID list"
+            )
+    elif operation == "set_boundary":
+        if not isinstance(spec, str) or not spec:
+            raise OverrideError(f"{path}: {where} set_boundary must be WKT")
+    elif operation == "set_aliases":
+        if (
+            not isinstance(spec, list)
+            or not spec
+            or any(not isinstance(a, str) or not a for a in spec)
+        ):
+            raise OverrideError(
+                f"{path}: {where} set_aliases must be a non-empty list of strings"
+            )
+    if "evidence_hash" in entry and not isinstance(entry["evidence_hash"], str):
+        raise OverrideError(f"{path}: {where} evidence_hash must be a string")
+    return operation
+
+
+def load_place_overrides(overrides_dir):
+    """``(entries, sha256)``: the ``places.yaml`` entries in file order, each
+    with an ``operation`` key, and the digest of the bytes they were parsed
+    from — ``([], None)`` when there is no file. Every entry names the
+    ``place`` QID it concerns; ``resolve_place`` also names the ``source_ref``
+    (the unresolved candidate's Overture id) it assigns that QID to."""
+    if overrides_dir is None:
+        return [], None
+    path = pathlib.Path(overrides_dir) / PLACES_FILE
+    data, digest = read_override(overrides_dir, PLACES_FILE)
+    if data is None:
+        return [], None
+    import yaml
+
+    raw = yaml.load(data.decode("utf-8"), Loader=_strict_loader())
+    if raw is None:
+        return [], digest
+    if not isinstance(raw, list):
+        raise OverrideError(f"{path}: expected a list of override entries")
+    entries = []
+    seen = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise OverrideError(f"{path}: every entry must be a mapping")
+        operation = _validate_place_entry(path, entry)
+        # resolve_place is keyed by the candidate it resolves: two entries
+        # naming one candidate would race for its QID.
+        key = (
+            (entry["source_ref"], operation)
+            if operation == "resolve_place"
+            else (entry["place"], operation)
+        )
+        if key in seen:
+            raise OverrideError(f"{path}: duplicate {operation} for {key[0]!r}")
+        seen.add(key)
+        entries.append({**entry, "operation": operation})
+    return entries, digest
+
+
+def by_operation(entries, operation):
+    return [entry for entry in entries if entry["operation"] == operation]
+
+
+def canonical_digest(payload):
+    """The SHA-256 of a payload's canonical JSON — the one way every stage
+    hashes the evidence a curator recorded against."""
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def judge(entry, evidence, report, scope):
+    """Whether an entry is stale against ``evidence`` (the derived data the
+    curator looked at, hashed canonically); a mismatch is applied anyway and
+    reported with the current hash to record. An entry without an
+    ``evidence_hash`` is never stale."""
+    recorded = entry.get("evidence_hash")
+    if recorded is None:
+        return False
+    current = canonical_digest(evidence)
+    if current == recorded:
+        return False
+    report.append(
+        {
+            "scope": scope,
+            "place": entry.get("place"),
+            "feed": entry.get("feed"),
+            "source_ref": entry.get("source_ref"),
+            "operation": entry["operation"],
+            "recorded_evidence_hash": recorded,
+            "current_evidence_hash": current,
+        }
+    )
+    return True
+
+
+def phase_digest(by_feed, operations):
+    """The digest of the feed entries' given operations alone, None when no
+    entry carries one: an edit to another phase's operations does not send
+    this phase's stage back."""
+    subset = {}
+    for ref, entry in by_feed.items():
+        ops = {op: entry[op] for op in sorted(operations) if op in entry}
+        if ops:
+            subset[ref] = ops
+    return canonical_digest(subset) if subset else None
+
+
+def feeds_digest(overrides_dir):
+    """The SHA-256 of the current ``feeds.yaml`` bytes, or None without one."""
+    return (
+        None if overrides_dir is None else read_override(overrides_dir, FEEDS_FILE)[1]
+    )
+
+
+def places_digest(overrides_dir):
+    """The SHA-256 of the current ``places.yaml`` bytes, or None without one."""
+    return (
+        None if overrides_dir is None else read_override(overrides_dir, PLACES_FILE)[1]
+    )
+
+
+def expect_digest(recorded, current, what, rerun):
+    """An override file read by a later stage must be the one an earlier
+    stage applied: a mixed snapshot never ships. ``recorded`` is what the
+    earlier manifest carries (None when it predates the file)."""
+    if recorded != current:
+        raise OverrideError(
+            f"{what} changed since the {rerun} stage applied it; re-run the "
+            f"{rerun} stage"
+        )
+
+
+def strict_check(strict, report, stage):
+    """``--strict-overrides``: a stale override fails the stage once its
+    report is preserved in the generation just published."""
+    if strict and report:
+        raise OverrideError(
+            f"{len(report)} stale override(s) in the {stage} stage; see its "
+            "override_report.jsonl"
+        )

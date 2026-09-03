@@ -36,7 +36,7 @@ this feed by feed once the crawl exists.
 import collections
 import datetime
 
-from index_build import store
+from index_build import overrides, store
 
 COVERAGE_POINTER = "coverage.json"
 FEEDS_ARTIFACT = "feeds_covered.jsonl"
@@ -418,7 +418,89 @@ def crawled_edges(cache_dir, feeds, places, lookup):
     return by_key, report
 
 
-def cover(cache_dir, *, lookup=None):
+def _set_coverage(
+    feeds, placements, places, feed_overrides, report, crawled, crawl_fields
+):
+    """A curator's declared placement for a feed replaces the seed's: one
+    placement at the given level and place, which must be an expanded place.
+    Judged against the coverage the feed has now: its placements, its
+    crawl's status and measured fields, and the evidence of every edge the
+    crawl measured (``crawled`` is the measured edges by key). Returns the
+    count applied and the canonical ids of the feeds curated."""
+    refs = _canonical_ids(feeds)
+    # Seed placements carry pre-resolution ids: canonicalise them too, so a
+    # renamed feed's old placement is the one replaced, never a second one.
+    for placement in placements:
+        placement["feed_id"] = refs.get(placement["feed_id"], placement["feed_id"])
+    linked = link_static_feeds(feeds, refs)
+    applied = 0
+    curated = set()
+    targets = {}
+    for ref, entry in feed_overrides.items():
+        if "set_coverage" not in entry:
+            continue
+        feed_id = refs.get(ref)
+        if feed_id is None:
+            raise overrides.OverrideError(f"feed {ref!r}: set_coverage names no feed")
+        if feed_id in targets:
+            # Two references to one feed (an alias and its id): neither wins.
+            raise overrides.OverrideError(
+                f"feed {ref!r}: set_coverage for {feed_id!r} is also given as "
+                f"{targets[feed_id]!r}"
+            )
+        targets[feed_id] = ref
+    for ref, entry in feed_overrides.items():
+        spec = entry.get("set_coverage")
+        if spec is None:
+            continue
+        feed_id = refs[ref]
+        if feed_id in linked:
+            raise overrides.OverrideError(
+                f"feed {ref!r}: set_coverage cannot place a linked GTFS-RT feed; "
+                "it inherits its static feed's coverage"
+            )
+        if spec["place_id"] not in places:
+            raise overrides.OverrideError(
+                f"feed {ref!r}: set_coverage place {spec['place_id']!r} is not an "
+                "expanded place"
+            )
+        fields = crawl_fields.get(feed_id)
+        current = {
+            "placements": sorted(
+                (p["level"], p["place_id"])
+                for p in placements
+                if p["feed_id"] == feed_id
+            ),
+            "crawl": (
+                None
+                if fields is None
+                else {
+                    key: fields.get(key)
+                    for key in ("crawl_status", "coverage", "stop_count")
+                }
+            ),
+            "crawled": {
+                place: edge.get("evidence")
+                for (place, feed), edge in crawled.items()
+                if feed == feed_id
+            },
+        }
+        overrides.judge(
+            {**entry, "feed": ref, "operation": "set_coverage"},
+            current,
+            report,
+            "coverage",
+        )
+        placements[:] = [p for p in placements if p["feed_id"] != feed_id]
+        placements.append(
+            {"feed_id": feed_id, "place_id": spec["place_id"], "level": spec["level"]}
+        )
+        curated.add(feed_id)
+        applied += 1
+    return applied, curated
+
+
+def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False):
     """Derive declared membership edges; publish the ``coverage`` generation.
 
     Reads the resolved feeds, the expanded places and the seed placements, and
@@ -441,6 +523,14 @@ def cover(cache_dir, *, lookup=None):
             from index_build import crawl
 
             places = {place["place_id"]: place for place in place_rows}
+            override_report = []
+            feed_overrides, feeds_digest = overrides.load_feed_overrides(overrides_dir)
+            overrides.expect_digest(
+                resolve_manifest.get("feeds_resolve_sha256"),
+                overrides.phase_digest(feed_overrides, overrides.RESOLVE_OPERATIONS),
+                "feeds.yaml (identity and crawlability)",
+                "resolve",
+            )
 
             crawled_by_key = {}
             crawl_report = {
@@ -488,21 +578,35 @@ def cover(cache_dir, *, lookup=None):
                 if opened_lookup is not None:
                     opened_lookup.close()
 
-            edges, unknown_places, unmatched_feeds, unknown_levels = declared_edges(
-                feeds, places, placements, superseded=crawl_report["superseded"]
+            # A curator's placement is the feed's coverage even when it was
+            # crawled: its measured edges yield, its crawl fields stay.
+            coverage_overrides, curated = _set_coverage(
+                feeds,
+                placements,
+                places,
+                feed_overrides,
+                override_report,
+                crawled_by_key,
+                crawl_report["crawl_fields"],
             )
-            merged = dict(crawled_by_key)
+            superseded = crawl_report["superseded"] - curated
+            edges, unknown_places, unmatched_feeds, unknown_levels = declared_edges(
+                feeds, places, placements, superseded=superseded
+            )
+            merged = {
+                key: edge
+                for key, edge in crawled_by_key.items()
+                if edge["feed_id"] not in curated
+            }
             for edge in edges:
                 merged[(edge["place_id"], edge["feed_id"])] = edge
             edges = [merged[key] for key in sorted(merged)]
 
             declared_covered = {
-                edge["feed_id"]
-                for edge in edges
-                if edge["feed_id"] not in crawl_report["superseded"]
+                edge["feed_id"] for edge in edges if edge["feed_id"] not in superseded
             }
             for feed in feeds:
-                if feed["feed_id"] in crawl_report["superseded"]:
+                if feed["feed_id"] in superseded:
                     # The schema's crawl fields: measured hull and stop count
                     # replace whatever the catalogues declared.
                     feed["coverage_source"] = "crawl"
@@ -518,7 +622,7 @@ def cover(cache_dir, *, lookup=None):
 
             manifest = {
                 "source": "coverage",
-                "mode": "crawled" if crawl_report["superseded"] else "declared",
+                "mode": "crawled" if superseded else "declared",
                 # The exact input generations, so later stages can prove
                 # their inputs are the ones these edges were derived from.
                 "resolve_generation": resolve_manifest.get("generation"),
@@ -528,6 +632,10 @@ def cover(cache_dir, *, lookup=None):
                 "overture_release": expanded_manifest.get("overture_release"),
                 "feeds": len(feeds),
                 "feeds_covered": len(covered),
+                "feeds_overrides_sha256": feeds_digest,
+                "overrides_applied": coverage_overrides,
+                "stale_overrides": len(override_report),
+                "stale_feed_overrides": len(override_report),
                 "linked_rt_feeds": sum(
                     1
                     for feed in feeds
@@ -538,7 +646,7 @@ def cover(cache_dir, *, lookup=None):
                     for feed in feeds
                     if feed.get("dangling_static_feed_id")
                 ),
-                "feeds_crawl_covered": len(crawl_report["superseded"]),
+                "feeds_crawl_covered": len(superseded),
                 "crawl_state_mismatches": crawl_report["state_mismatches"],
                 "unmatched_crawl_ids": crawl_report["unmatched_crawl_ids"],
                 "edges": len(edges),
@@ -552,15 +660,18 @@ def cover(cache_dir, *, lookup=None):
                     datetime.timezone.utc
                 ).isoformat(),
             }
-            return store.publish(
+            published = store.publish(
                 cache_dir / "coverage",
                 COVERAGE_POINTER,
                 {
                     FEEDS_ARTIFACT: store.jsonl_chunks(feeds),
                     EDGES_ARTIFACT: store.jsonl_chunks(edges),
+                    "override_report.jsonl": store.jsonl_chunks(override_report),
                 },
                 manifest,
                 held=directory,
             )
+            overrides.strict_check(strict, override_report, "coverage")
+            return published
     finally:
         directory.close()

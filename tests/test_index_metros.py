@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 pytest.importorskip("pyarrow")
 import overture_fixture as fx  # noqa: E402
 
-from index_build import metros, overture, seed, store  # noqa: E402
+from index_build import expand, metros, overture, seed, store  # noqa: E402
 
 ROWS = [
     fx.division("us", "US", "country", wikidata="Q30", name="United States"),
@@ -120,13 +120,17 @@ def _publish(cache, subdir, pointer, artifact, records):
         directory.close()
 
 
-def _run(tmp_path, metro_map):
+def _run(tmp_path, metro_map, overrides_dir=None):
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
     _publish(cache, "crosswalk", "feeds.json", "feeds.jsonl", FEEDS)
     overture.resolve(cache, dataset=dataset, wikidata=fx.StubWikidata())
-    seed.resolve_seed(cache, dataset=dataset, wikidata=fx.StubWikidata())
-    manifest = metros.attach_metros(cache, wikidata=fx.StubWikidata(metros=metro_map))
+    seed.resolve_seed(
+        cache, dataset=dataset, wikidata=fx.StubWikidata(), overrides_dir=overrides_dir
+    )
+    manifest = metros.attach_metros(
+        cache, wikidata=fx.StubWikidata(metros=metro_map), overrides_dir=overrides_dir
+    )
     places, _ = store.read_jsonl(
         cache / "gazetteer", "metros.json", "places_seed.jsonl"
     )
@@ -218,3 +222,91 @@ def test_statistical_metros_parses_and_skips_malformed(monkeypatch):
             {"qid": "Q1755545", "name": "Los Angeles metropolitan area", "cbsa": None}
         ],
     }
+
+
+def test_set_place_members_replaces_a_metros_members_reciprocally(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    both = {"Q1297": [CHICAGO_METRO], "Q28515": [CHICAGO_METRO]}
+    entries = [
+        {"place": "Q1754965", "set_place_members": ["Q1297"], "evidence_hash": "0" * 64}
+    ]
+    manifest, places = _run(
+        tmp_path, both, overrides_dir=write_overrides(tmp_path, places=entries)
+    )
+    assert manifest["places_overrides_sha256"] == overrides.places_digest(
+        tmp_path / "overrides"
+    )
+    assert places["Q1754965"]["member_ids"] == ["Q1297"]
+    assert "Q1754965" in places["Q1297"]["metro_ids"]
+    assert "Q1754965" not in places["Q28515"]["metro_ids"]
+    # Recorded against evidence that moved: applied, reported, counted.
+    assert manifest["overrides_applied"] == 1 and manifest["stale_overrides"] == 1
+    report, _ = store.read_jsonl(
+        tmp_path / "cache" / "gazetteer", "metros.json", "override_report.jsonl"
+    )
+    assert report[0]["current_evidence_hash"] == overrides.canonical_digest(
+        ["Q1297", "Q28515"]
+    )
+    with pytest.raises(overrides.OverrideError, match="needs a seeded metro"):
+        _run(
+            tmp_path / "bad",
+            both,
+            overrides_dir=write_overrides(
+                tmp_path / "bad",
+                places=[{"place": "Q1297", "set_place_members": ["Q28515"]}],
+            ),
+        )
+
+
+def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from index_build import overrides
+
+    entries = [
+        {
+            "place": "Q1754965",
+            "add_place": {
+                "kind": "metro",
+                "name": "Chicagoland",
+                "member_ids": ["Q1297"],
+            },
+        }
+    ]
+    directory = write_overrides(tmp_path, places=entries)
+    manifest, places = _run(
+        tmp_path, {"Q28515": [CHICAGO_METRO]}, overrides_dir=directory
+    )
+    metro = places["Q1754965"]
+    assert metro["curated"] is True and metro["name"] == "Chicagoland"
+    # The curator's member list is authoritative: the statistical member
+    # joins neither here nor when the expand stage discovers it.
+    assert metro["member_ids"] == ["Q1297"]
+    assert "Q1754965" not in places["Q28515"]["metro_ids"]
+    wikidata = fx.StubWikidata(metros={"Q28515": [CHICAGO_METRO]})
+    assert expand._attach_metros(places, ["Q28515"], wikidata, []) == []
+    assert metro["member_ids"] == ["Q1297"]
+    assert manifest["places"] == len(places)
+    # places.yaml edited between the seed and metros stages: refused.
+    (directory / "places.yaml").write_text("[]\n")
+    with pytest.raises(overrides.OverrideError, match="re-run the gazetteer"):
+        metros.attach_metros(
+            tmp_path / "cache",
+            wikidata=fx.StubWikidata(metros={}),
+            overrides_dir=directory,
+        )
+
+
+def test_a_metro_qid_already_seeded_as_a_city_fails_the_build(tmp_path):
+    collided = {"Q28515": [{**CHICAGO_METRO, "qid": "Q1297"}]}
+    with pytest.raises(overture.GazetteerError, match="already seeded"):
+        _run(tmp_path, collided)
+    places = {
+        qid: {"place_id": qid, "kind": "city", "country_code": "US", "metro_ids": []}
+        for qid in ("Q28515", "Q1297")
+    }
+    with pytest.raises(overture.GazetteerError, match="already seeded"):
+        expand._attach_metros(places, ["Q28515"], fx.StubWikidata(metros=collided), [])
