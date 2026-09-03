@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import sys
@@ -913,7 +914,8 @@ def test_a_feeds_only_snapshot_ships_the_resolved_feeds(tmp_path):
 
 def test_reader_versions_order_pre_releases_below_finals():
     key = transitio_index._version_key
-    assert key("1.0.0rc1") < key("1.0.0") < key("1.0.0.post1") < key("1.0.1")
+    assert key("1.0.0rc1") < key("1.0.0") < key("1.0.0.post0") < key("1.0.0.post1")
+    assert key("1.0.0.post1") < key("1.0.1")
     assert key("1.0.0-dev") < key("1.0") == key("1.0.0")
     assert key("1.0.0.dev1") < key("1.0.0a1") < key("1.0.0b1") < key("1.0.0rc1")
     assert key("1.x") is None and key("") is None
@@ -1035,3 +1037,48 @@ def test_the_snapshot_records_every_generation_it_descends_from(tmp_path):
         {**raw, "crosswalk/feeds.json": crosswalk["generation"]},
         {"feeds": "crosswalk/feeds.json"},
     )
+
+
+def test_a_null_snapshot_column_value_is_refused(tmp_path):
+    import pandas
+
+    cache, _ = _build_index(tmp_path)
+    index_dir = cache / "index"
+    frame = pandas.read_parquet(index_dir / "feeds.parquet")
+    frame.loc[frame.index[0], "snapshot"] = None
+    frame.to_parquet(index_dir / "feeds.parquet", index=False)
+    manifest = json.loads((index_dir / "snapshot.json").read_text())
+    manifest["feeds_sha256"] = hashlib.sha256(
+        (index_dir / "feeds.parquet").read_bytes()
+    ).hexdigest()
+    (index_dir / "snapshot.json").write_text(json.dumps(manifest))
+    with pytest.raises(IncompatibleIndexError, match="snapshot other than"):
+        transitio_index.read_index(index_dir)
+
+
+def test_a_duplicated_column_is_refused(tmp_path):
+    import pyarrow.parquet as pq
+
+    cache, _ = _build_index(tmp_path)
+    index_dir = cache / "index"
+    table = pq.read_table(index_dir / "feeds.parquet")
+    pq.write_table(
+        table.append_column("snapshot", table["snapshot"]), index_dir / "feeds.parquet"
+    )
+    manifest = json.loads((index_dir / "snapshot.json").read_text())
+    manifest["feeds_sha256"] = hashlib.sha256(
+        (index_dir / "feeds.parquet").read_bytes()
+    ).hexdigest()
+    (index_dir / "snapshot.json").write_text(json.dumps(manifest))
+    # Refused as a controlled error, by the Parquet reader or the column check.
+    with pytest.raises(
+        IncompatibleIndexError, match="not a readable feeds table|duplicate columns"
+    ):
+        transitio_index.read_index(index_dir)
+
+
+def test_a_table_declaring_more_than_the_reader_loads_is_refused(tmp_path, monkeypatch):
+    cache, _ = _build_index(tmp_path)
+    monkeypatch.setattr(transitio_index, "_MAX_TABLE_ROWS", 1)
+    with pytest.raises(IncompatibleIndexError, match="declares more than"):
+        transitio_index.read_index(cache / "index")
