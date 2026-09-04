@@ -295,15 +295,17 @@ def test_duplicate_evidence_rows_are_refused(tmp_path):
 
 def test_the_committed_golden_file_is_valid():
     entries = golden.load_golden(REPO / "golden" / "feeds.jsonl")
-    assert len(entries) == 20
+    assert len(entries) == 101
     by_id = {e["feed_id"]: e for e in entries}
     assert by_id["f-dr5r-nyctsubway"]["membership"] == ["Q60", "Q683705"]
-    # The seed spans the plan's required shapes.
+    # The set spans the plan's required shapes, seed and expansion.
     whys = " ".join(e["why"] for e in entries)
     for marker in (
         "MTA-style split",
         "national aggregate",
         "auth-gated",
         "long-distance",
+        "operator split by mode",
+        "bike share",
     ):
         assert marker in whys

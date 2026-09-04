@@ -1,8 +1,41 @@
+{"feed_id": "f-66jc-transantiago~metrodesantiago", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Red Metropolitana de Movilidad", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-6gy-sptrans", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
 {"feed_id": "f-9-amtrak~amtrakcalifornia~amtrakcharteredvehicle", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Amtrak", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-9g3-semovi", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Pumabús, Corredores Concesionados, Sistema de Transporte Colectivo Metro, Metrobús, Servicio de Tren Ligero, Ferrocarriles Suburbanos, Trolebús, Red de Transporte de Pasajeros, Cablebus", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-9q5-metro~losangeles", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Los Angeles County Metropolitan Transportation Authority (LA Metro)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-9q5-metro~losangeles~rail", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Los Angeles County Metropolitan Transportation Authority (LA Metro)", "sources": ["atlas", "mdb"]}
 {"feed_id": "f-9q8y-sfmta", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
 {"feed_id": "f-9q9-bart", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Bay Area Rapid Transit (BART)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-9q9-caltrain", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Caltrain", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-9q9-vta", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Santa Clara Valley Transportation Authority (VTA)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-9vg-dallasarearapidtransit", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Dallas Area Rapid Transit (DART)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-9vk-metropolitantransitauthorityofharriscounty", "spec": "gtfs", "atlas_name": null, "mdb_provider": "METRO Houston", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-9xj-rtd", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Regional Transportation District (RTD)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-bicing~barcelona~gbfs", "spec": "gbfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-bixi~montréal~montreal~gbfs", "spec": "gbfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-bus~dft~gov~uk", "spec": "gtfs", "atlas_name": "United Kingdom Department for Transport Bus Open Data Service", "mdb_provider": "BODS UK aggregate feed", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-c0-bcferries~bc~ca", "spec": "gtfs", "atlas_name": null, "mdb_provider": "BC Ferries", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-c20-trimet", "spec": "gtfs", "atlas_name": null, "mdb_provider": "TriMet, Portland Streetcar", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-c23-metrokingcounty", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Sound Transit, Metro Transit, City of Seattle - King County Metro", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-c23-soundtransit", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Sound Transit", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-c28-nstranslinkca", "spec": "gtfs", "atlas_name": null, "mdb_provider": "TransLink Vancouver", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-c28-washingtonstateferries", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Washington State Ferries", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-c3nf-calgarytransit", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Calgary Transit", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-carris~pt", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Carris", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-citi~bike~new~york~ny~gbfs", "spec": "gbfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-d2g6-transmilenio~troncal~transmilenio~alimentadores~transmile", "spec": "gtfs", "atlas_name": null, "mdb_provider": "SIMUR Bogota", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-delhi~bus", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Delhi Transport Corporation", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-dhw-miamidadetransit", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Miami-Dade Transit", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-divvy~chicago~il~gbfs", "spec": "gbfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-docomo~bike~share~service~tokyo~gbfs", "spec": "gbfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-dp3-cta", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Chicago Transit Authority (CTA)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-dp3-metra", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Metra", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-dpz8-ttc~surface", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Toronto Transit Commission (TTC)", "sources": ["atlas", "mdb"]}
 {"feed_id": "f-dq-mtamaryland~marc", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
 {"feed_id": "f-dq-mtamaryland~subwaylink", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-dqc-virginiarailwayexpress", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Virginia Railway Express", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-dqc-wmata~bus", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Washington Metropolitan Area Transit Authority (WMATA)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-dqc-wmata~rail", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Washington Metropolitan Area Transit Authority (WMATA)", "sources": ["atlas", "mdb"]}
 {"feed_id": "f-dr4-septa~bus", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
 {"feed_id": "f-dr4-septa~rail", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
 {"feed_id": "f-dr5-mtanyclirr", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Long Island Rail Road", "sources": ["atlas", "mdb"]}
@@ -12,9 +45,57 @@
 {"feed_id": "f-dr5r-mtanewyorkcitytransit", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
 {"feed_id": "f-dr5r-nyctsubway", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
 {"feed_id": "f-dr7-mtanyc~metro~north", "spec": "gtfs", "atlas_name": null, "mdb_provider": "MTA", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-drt-mbta", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Massachusetts Bay Transportation Authority (MBTA)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-ecobici~mexico~city~gbfs", "spec": "gbfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-eyce-fertagus", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Fertagus", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-ez-renfeoperadora", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Renfe", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-ezjm-empresamunicipaldetransportes", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Empresa Municipal de Transportes de Madrid (EMT Madrid)", "sources": ["atlas", "mdb"]}
 {"feed_id": "f-f-viarail~traindecharlevoix", "spec": "gtfs", "atlas_name": null, "mdb_provider": "VIA Rail Canada", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-f25d-exo~reseaudetransportmetropolitain", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Exo", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-f25d-socitdetransportdemontral", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Société de transport de Montréal (STM)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-flamingo~wellington~gbfs", "spec": "gbfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-gc6-locallinkcarlowkilkenny~locallinkcork~locallinkkildare~loc", "spec": "gtfs", "atlas_name": null, "mdb_provider": "TFI Local Link Mayo, TFI Local Link Kerry, TFI Local Link Cork, TFI Local Link Galway, TFI Local Link Longford Westmeath Roscommon, TFI Local Link Cavan Monaghan, TFI Local Link Tipperary, TFI Local Link Waterford, TFI Local Link Louth Meath Fingal, TFI Local Link Carlow Kilkenny Wicklow, TFI Local Link Limerick Clare, TFI Local Link Donegal Sligo Leitrim, TFI Local Link Wexford, TFI Local Link Kildare South Dublin, TFI Local Link Laois Offaly", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-gcw-greater~manchester", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Transport for Greater Manchester Arriva in the North West, Atlantic Travel, Bestway Travel, Belle Vue Coaches, Blackburn Private Hire, The Burnley Bus Company, Bullocks Coaches, Cumfy Bus, D&G Bus, Don Fraser Coaches Ltd, Finch Coaches, First Halifax, Calder Valley & Huddersfield, First in Greater Manchester, Little Gem, Go North West, Diamond Bus North West, Harris Travel, Hattons Transport, Hiltons Travel, High Peak, Huyton Travel, Holmeswood Coaches, Link Network, The Blackburn Bus Company, Maghull Coaches, Metrolink, Olympia Travel UK Ltd, Preston Bus, Nexus Move, Rosso, Tyrers, Stagecoach Merseyside and South Lancashire, Stagecoach in Greater Manchester, Selwyn's Travel, South Pennine C.T., Stotts, Travel Assist, Team Pennine, Viking Coaches, Vision Bus, Warrington's Own Buses", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-ge2kx-straeto", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Strætó BS, Reykjanesbær, Akureyri", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-germany~long~distance~rail", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Long-distance rail transport in Germany", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-hong~kong~en", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Hong Kong Government Transport Department", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-lime~brussels~gbfs", "spec": "gbfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
 {"feed_id": "f-mdb-3215", "spec": "gtfs", "atlas_name": null, "mdb_provider": "DELFI Germany-wide scheduled timetable data (GTFS)", "sources": ["mdb"]}
+{"feed_id": "f-mdb-782", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Verkehrsverbund Berlin-Brandenburg (VBB)", "sources": ["mdb"]}
 {"feed_id": "f-mdb-865", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Helsingin seudun liikenne (HSL)", "sources": ["mdb"]}
+{"feed_id": "f-mdb-tdg-80921", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Île-de-France Mobilités", "sources": ["mdb"]}
+{"feed_id": "f-oncf~morocco~rail", "spec": "gtfs", "atlas_name": null, "mdb_provider": "ONCF (Office National des Chemins de Fer)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-r1-ptv", "spec": "gtfs", "atlas_name": "Public Transport Victoria operational branch 1 - Regional Train", "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-r1f-adelaidemetrocomau", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Adelaide Metro", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-r6-nswtrainlink~sydneytrains~buswayswesternsydney~interlinebus", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-r7h-translink", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Translink South East Queensland (Translink SEQ)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-rapid~bus~kl", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Prasarana Malaysia", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-rapid~rail~kl", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Prasarana Malaysia", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-rbs-gowellington~tranzitcoachlines~paraparaumutaxisltd~kapitic", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Metlink", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-rck-gowest~sealinkgroup~atairporter~atmetro~thepartybuscompany", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Auckland Transport", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-rejseplanen~dk~gtfs", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Rejseplanen", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-sp3e-tmb", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Transports Metropolitans de Barcelona (TMB)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-spn-trenitalia", "spec": "gtfs", "atlas_name": null, "mdb_provider": "TRENITALIA", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-sr-atac~romatpl~trenitalia", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Roma Servizi per la Mobilità", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-toeibus~gtfs~jp", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Tokyo Metropolitan Bureau of Transportation - Toei Bus", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-tokyometro~data~tokyometro~train~gtfs~jp", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
 {"feed_id": "f-transport~for~london", "spec": "gtfs", "atlas_name": "Transport for London feed converted into GTFS by Interline", "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-u-flixbus", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-u-nl", "spec": "gtfs", "atlas_name": null, "mdb_provider": "OVapi", "sources": ["atlas", "mdb"]}
 {"feed_id": "f-u-se", "spec": "gtfs", "atlas_name": null, "mdb_provider": "TrafikLab", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-u0-switzerland", "spec": "gtfs", "atlas_name": "SBB/SKI+ Switzerland Mobility Open Data Feed", "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-u1-hamburgerverkehrsverbundhvv~hamburgerverkehrsverbundhvv~ham", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Hamburger Verkehrsverbund GmbH (HVV)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-u151-stib", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-u281z9-mvv", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Münchner Verkehrs- und Tarifverbund GmbH (MVV)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-u2ed-wienerlinien~wlb", "spec": "gtfs", "atlas_name": null, "mdb_provider": null, "sources": ["atlas"]}
+{"feed_id": "f-u2f-dpp", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Prazska integrovana doprava (PID)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-u2m-bkk", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Budapesti Közlekedési Központ (BKK)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-u3q-warszawski~transport~publiczny", "spec": "gtfs", "atlas_name": "Warszawa GTFS", "mdb_provider": "Warszawski Transport Publiczny (ZTM Warszawa)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-u4-ruter~flybussen~stfoldkollektivtrafikk~hedmarktrafikk~oppla", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Entur", "sources": ["atlas", "mdb"]}
 {"feed_id": "f-u6xr-finferries~sundqvistinvestmentsoyab~nordiccoastline", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Finferries, Alandstrafiken, Rosita Oy, JS Ferryway Ltd Oy, Kuljetus-Savolainen Oy, Archipelago Lines Oy, Sundqvist Investments Oy Ab, Pörtö Line, Nordic Coast Line, Yksityinen, HSL, Vitharun, Espoon kaupunki, Suomen saaristokuljetus, Norsöline, JT-Line Oy, A&S Ravintolat, Merisataman lauttaliikenne, NJK Blekholmen, Ferra Oy, City Cruisers, Aava Lines Oy, Helsingin Risteilypalvelut/TMSJ Group Oy", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-ud-tallinn", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Tallinna Linn", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-ud1h-rīgassatiksme", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Rīgas Satiksme", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-udb-tampereenjoukkoliikenne", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Tampereen joukkoliikenne (JOLI)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-vr~fi", "spec": "gtfs", "atlas_name": "Finnish passenger rail (Digitraffic)", "mdb_provider": "Porvoon Museorautatie, Pieksämäen Höyryveturiyhdistys ry", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-w21z-lta", "spec": "gtfs", "atlas_name": null, "mdb_provider": "SMRT, SBS Transit (SBST), Land Transport Authority (LTA), Go Ahead Singapore (GAS), Tower Transit (TTS)", "sources": ["atlas", "mdb"]}
+{"feed_id": "f-wdw-manila", "spec": "gtfs", "atlas_name": null, "mdb_provider": "Manila Light Rail Transit Authority, LTFRB, Manila Metro Rail Transit Corporation, MARINA, Philippine National Railways, The Fort Bus", "sources": ["atlas", "mdb"]}
