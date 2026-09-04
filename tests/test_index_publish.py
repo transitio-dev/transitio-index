@@ -757,7 +757,7 @@ def test_unclassified_edges_are_refused(tmp_path):
         publish.publish(cache)
 
 
-def _publish_coverage(cache, manifest):
+def _publish_coverage(cache, manifest, feeds=None):
     directory = store.open_subdir(cache, "coverage")
     try:
         with store.exclusive_writer(directory):
@@ -765,7 +765,9 @@ def _publish_coverage(cache, manifest):
                 cache / "coverage",
                 "coverage.json",
                 {
-                    "feeds_covered.jsonl": store.jsonl_chunks([_covered_feed("f-a")]),
+                    "feeds_covered.jsonl": store.jsonl_chunks(
+                        [_covered_feed("f-a")] if feeds is None else feeds
+                    ),
                     "edges_candidate.jsonl": store.jsonl_chunks(
                         [_edge("Q1757", "f-a")]
                     ),
@@ -846,12 +848,12 @@ def test_crawl_evidence_and_provenance_round_trip(tmp_path):
         "last_crawled": "2026-09-01T00:00:00+00:00",
     }
     cache, manifest = _edges_index(tmp_path, [_edge("Q1757", "f-a")], feeds=[crawled])
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     assert (
         manifest["discovery_semantics_version"]
         == transitio_index.DISCOVERY_SEMANTICS_VERSION
     )
-    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS[3]
+    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS[4]
     assert manifest["built_with"] == transitio.__version__
     index = transitio_index.read_index(cache / "index")
     row = index.feeds.set_index("feed_id").loc["f-a"]
@@ -944,7 +946,7 @@ def test_reader_versions_order_pre_releases_below_finals():
     # Bounded: an untrusted manifest cannot feed int() an unbounded digit run.
     assert key("1" * 400) is None and key("1.0.0rc" + "9" * 40) is None
     # Schema 3 arrived after the 0.10.0 release, which reads schema 2 only.
-    assert key(transitio_index.MIN_READER_VERSIONS[3]) > key("0.10.0")
+    assert key(transitio_index.MIN_READER_VERSIONS[4]) > key("0.10.0")
 
 
 @pytest.mark.parametrize(
@@ -969,8 +971,8 @@ def test_reader_versions_order_pre_releases_below_finals():
         ),
     ],
 )
-def test_the_reader_requires_the_schema_3_manifest_fields(tmp_path, fields, message):
-    manifest = {"schema_version": 3, "snapshot_id": "x", "feeds_sha256": "0" * 64}
+def test_the_reader_requires_the_schema_4_manifest_fields(tmp_path, fields, message):
+    manifest = {"schema_version": 4, "snapshot_id": "x", "feeds_sha256": "0" * 64}
     (tmp_path / "snapshot.json").write_text(
         json.dumps({**manifest, **fields}), encoding="utf-8"
     )

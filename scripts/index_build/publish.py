@@ -31,7 +31,7 @@ import pyarrow.parquet as pq
 
 from index_build import store
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
@@ -70,6 +70,9 @@ _SCHEMA = pa.schema(
         ("last_modified", pa.string()),
         ("last_crawled", pa.string()),
         ("crawl_status", pa.string()),
+        # Whether the feed's licence permits redistributing derived data;
+        # null when unknown. Set by the license stage.
+        ("redistribution_allowed", pa.bool_()),
         ("snapshot", pa.string()),
     ]
 )
@@ -107,6 +110,7 @@ def _row(record, snapshot_id):
         "last_modified": record.get("last_modified"),
         "last_crawled": record.get("last_crawled"),
         "crawl_status": record.get("crawl_status"),
+        "redistribution_allowed": record.get("redistribution_allowed"),
         "snapshot": snapshot_id,
     }
 
@@ -767,6 +771,11 @@ def _read_licensed(cache_dir, inputs):
     except (store.StoreError, ValueError) as error:
         raise PublishError(f"the license generation is unreadable: {error}") from error
     with generation:
+        if manifest.get("policy") != licensing.POLICY_VERSION:
+            raise PublishError(
+                "the licensed artifacts were built under an older licensing policy; "
+                "re-run the license stage"
+            )
         if manifest.get("generations") != inputs["generations"]:
             raise PublishError(
                 "the licensed artifacts do not descend from the current inputs; "
@@ -904,9 +913,10 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
         digests = []
         if places is not None:
             digests.append(_content_digest(places))
-        if resolved is not None or edges is not None:
-            # Resolved and covered feeds fold in, and edges: the override
-            # files shape them, and no source version pins those.
+        if resolved is not None or edges is not None or licensed is not None:
+            # Resolved, covered and licensed feeds fold in, and edges: the
+            # override files and the licensing policy shape them, and no
+            # source version pins those.
             digests.append(_content_digest(records))
         if edges is not None:
             digests.append(_content_digest(edges))

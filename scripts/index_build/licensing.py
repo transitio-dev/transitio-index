@@ -6,9 +6,15 @@ the current build, through the same lineage-checked readers — records every
 contributing source in ``licence_inventory.jsonl`` (the geometry audit's rows
 and the feeds' own licence blocks), writes the ``NOTICE`` that ships with the
 index, and publishes the three tables as ``feeds_licensed.jsonl``,
-``places_licensed.jsonl`` and ``edges_licensed.jsonl``. This slice passes the
-tables through unchanged; the sanitisation the stage owes (prohibited hulls,
-geometry substitution, dropped places and rehomed edges) follows.
+``places_licensed.jsonl`` and ``edges_licensed.jsonl``.
+
+The feeds are sanitised on the way: a feed's coverage hull is derived from
+its contents, so it ships only where the feed's licence permits
+redistribution — declared as such, or a known-permissive licence — and is
+nulled where redistribution is explicitly disallowed; a feed whose licence
+is unknown keeps its hull, a recorded judgement the ``redistribution_allowed``
+column lets a stricter user overrule. Places and edges still pass through
+unchanged; geometry substitution, dropped places and rehomed edges follow.
 """
 
 import collections
@@ -25,8 +31,77 @@ INVENTORY_ARTIFACT = "licence_inventory.jsonl"
 NOTICE_ARTIFACT = "NOTICE"
 
 
+# SPDX identifiers whose terms permit redistributing derived data (with
+# attribution or share-alike conditions the NOTICE carries); a feed under
+# one of these ships its hull even when the record says nothing explicit.
+# SPDX identifiers compare case-insensitively.
+KNOWN_PERMISSIVE = frozenset(
+    identifier.lower()
+    for identifier in (
+        "CC0-1.0",
+        "CC-BY-3.0",
+        "CC-BY-4.0",
+        "CC-BY-SA-3.0",
+        "CC-BY-SA-4.0",
+        "ODbL-1.0",
+        "ODC-By-1.0",
+        "PDDL-1.0",
+        "OGL-UK-3.0",
+        "MIT",
+        "Apache-2.0",
+    )
+)
+
+# The sanitisation rules a licensed generation was built under; publication
+# refuses a generation from an older policy rather than shipping it.
+POLICY_VERSION = 1
+
+
 class LicenseError(RuntimeError):
-    """The licence inventory could not be built."""
+    """The licence inventory could not be built, or sanitisation failed."""
+
+
+def redistribution_allowed(record):
+    """Whether the feed's licence permits redistributing data derived from
+    it: the record's own declaration when it makes one, else True for a
+    known-permissive licence, else None (unknown)."""
+    block = (record.get("atlas") or {}).get("license") or {}
+    declared = block.get("redistribution_allowed")
+    if isinstance(declared, bool):
+        return declared
+    if isinstance(declared, str) and declared.strip().lower() in ("yes", "no"):
+        return declared.strip().lower() == "yes"
+    spdx = block.get("spdx_identifier") or block.get("spdx_id")
+    if isinstance(spdx, str) and spdx.strip().lower() in KNOWN_PERMISSIVE:
+        return True
+    return None
+
+
+def _sanitise_feeds(records):
+    """Stamp ``redistribution_allowed`` on every feed and null the coverage
+    hull of each feed whose licence disallows redistribution; returns the
+    number of hulls nulled."""
+    nulled = 0
+    for record in records:
+        allowed = redistribution_allowed(record)
+        record["redistribution_allowed"] = allowed
+        if allowed is False and record.get("coverage") is not None:
+            record["coverage"] = None
+            nulled += 1
+    return nulled
+
+
+def _assert_sanitised(records):
+    """The post-condition: nothing prohibited survived into the artifacts."""
+    leaked = [
+        r["feed_id"]
+        for r in records
+        if r.get("redistribution_allowed") is False and r.get("coverage") is not None
+    ]
+    if leaked:
+        raise LicenseError(
+            f"prohibited coverage hulls survived sanitisation: {sorted(leaked)[:5]}"
+        )
 
 
 def _geometry_audit(cache_dir):
@@ -54,6 +129,7 @@ def _feed_rows(records):
     row of their own, so the inventory says how much is unknown."""
     counts = collections.Counter()
     redistribution = collections.defaultdict(collections.Counter)
+    judgements = collections.defaultdict(collections.Counter)
     for record in records:
         block = (record.get("atlas") or {}).get("license") or {}
         # The Atlas declaration is taken whole; the Mobility Database's
@@ -72,6 +148,9 @@ def _feed_rows(records):
         counts[key] += 1
         value = block.get("redistribution_allowed")
         redistribution[key]["unknown" if value is None else str(value).lower()] += 1
+        # The effective judgement the stage applied, beside the raw declaration.
+        judged = record.get("redistribution_allowed")
+        judgements[key]["unknown" if judged is None else str(judged).lower()] += 1
     rows = []
     for key, count in sorted(
         counts.items(), key=lambda item: tuple(str(part) for part in item[0])
@@ -87,6 +166,7 @@ def _feed_rows(records):
                 "allowed": None,
                 "feeds": count,
                 "redistribution_allowed": dict(sorted(redistribution[key].items())),
+                "judgement": dict(sorted(judgements[key].items())),
                 "attribution_text": text,
                 "attribution_instructions": instructions,
             }
@@ -182,7 +262,10 @@ def license_index(cache_dir, *, overrides_dir=None):
                 "a places build has no geometry audit to license; run the gazetteer "
                 "stage"
             )
-        feed_rows = _feed_rows(inputs["records"])
+        records = inputs["records"]
+        hulls_nulled = _sanitise_feeds(records)
+        _assert_sanitised(records)
+        feed_rows = _feed_rows(records)
         inventory = audit_rows + _catalogue_rows(inputs["sources"]) + feed_rows
         notice = _notice(geometry_notice, inputs["sources"], feed_rows)
         artifacts = {
@@ -197,6 +280,7 @@ def license_index(cache_dir, *, overrides_dir=None):
         manifest = {
             "source": "license",
             "licensed": True,
+            "policy": POLICY_VERSION,
             "sources": inputs["sources"],
             "overture_release": inputs["overture_release"],
             # What was read, so publication can prove the licensed tables
@@ -209,7 +293,13 @@ def license_index(cache_dir, *, overrides_dir=None):
                 "places": inputs["places_manifest"],
                 "override_digest": inputs["override_digest"],
             },
-            "feeds": len(inputs["records"]),
+            "feeds": len(records),
+            "hulls_nulled": hulls_nulled,
+            "redistribution_allowed": dict(
+                collections.Counter(
+                    str(r["redistribution_allowed"]).lower() for r in records
+                )
+            ),
             "places": None if inputs["places"] is None else len(inputs["places"]),
             "edges": None if inputs["edges"] is None else len(inputs["edges"]),
             "inventory": len(inventory),
