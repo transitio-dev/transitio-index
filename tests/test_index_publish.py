@@ -757,7 +757,7 @@ def test_unclassified_edges_are_refused(tmp_path):
         publish.publish(cache)
 
 
-def _publish_coverage(cache, manifest, feeds=None):
+def _publish_coverage(cache, manifest, feeds=None, edges=None):
     directory = store.open_subdir(cache, "coverage")
     try:
         with store.exclusive_writer(directory):
@@ -769,7 +769,7 @@ def _publish_coverage(cache, manifest, feeds=None):
                         [_covered_feed("f-a")] if feeds is None else feeds
                     ),
                     "edges_candidate.jsonl": store.jsonl_chunks(
-                        [_edge("Q1757", "f-a")]
+                        [_edge("Q1757", "f-a")] if edges is None else edges
                     ),
                 },
                 {

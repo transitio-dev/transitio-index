@@ -14,6 +14,7 @@ from test_index_publish import (  # noqa: E402
     PLACES,
     _build_index,
     _covered_feed,
+    _edge,
     _publish_audit,
     _publish_coverage,
     _publish_gen,
@@ -26,7 +27,7 @@ LICENSED = {
 }
 
 
-def _cache(tmp_path, feeds=None):
+def _cache(tmp_path, feeds=None, edges=None):
     """A crosswalk, an expanded generation with a geometry audit behind it,
     classified coverage edges: what the license stage reads."""
     pytest.importorskip("geopandas")
@@ -51,6 +52,7 @@ def _cache(tmp_path, feeds=None):
             "expanded_generation": expanded["generation"],
         },
         feeds,
+        edges,
     )
     classify.classify(cache)
     return cache
@@ -305,6 +307,68 @@ def test_prohibited_hulls_are_nulled_and_the_judgement_ships(tmp_path):
         if f.feed_id == "f-a"
     )
     assert feed.redistribution_allowed is False and feed.coverage is None
+
+
+@pytest.mark.parametrize(
+    "block, derived",
+    [
+        ({"spdx_identifier": "CC-BY-4.0"}, True),  # redistributable: contributes
+        ({}, False),  # unknown: ships, but builds no boundary
+    ],
+)
+def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
+    tmp_path, block, derived
+):
+    shapely = pytest.importorskip("shapely")
+    near = shapely.to_wkb(shapely.box(24.9, 60.1, 25.1, 60.3)).hex()
+    far = shapely.to_wkb(shapely.box(27.6, 62.8, 27.8, 63.0)).hex()
+    feeds = [
+        {**_covered_feed("f-a"), "coverage": near, "atlas": {"license": block}},
+        {
+            **_covered_feed("f-p"),
+            "coverage": far,
+            "atlas": {"license": {"redistribution_allowed": "no"}},
+        },
+    ]
+    edges = [_edge("Q1757", "f-a"), _edge("Q-metro", "f-a"), _edge("Q-metro", "f-p")]
+    cache = _cache(tmp_path, feeds, edges)
+    manifest = licensing.license_index(cache)
+    places, _ = store.read_jsonl(
+        cache / "license", "licensed.json", "places_licensed.jsonl"
+    )
+    by_id = {p["place_id"]: p for p in places}
+    # A place with a boundary of its own keeps it.
+    assert by_id["Q1757"]["geometry_source"] == "overture"
+    metro = by_id["Q-metro"]
+    if not derived:
+        assert metro["geometry"] is None and metro["geometry_source"] is None
+        assert manifest["geometry_derived"] == 0
+        assert manifest["places_without_geometry"] == 1
+        return
+    assert manifest["geometry_derived"] == 1
+    assert manifest["places_without_geometry"] == 0
+    assert metro["geometry_source"] == "derived_from_feeds"
+    boundary = shapely.from_wkb(bytes.fromhex(metro["geometry"]))
+    # The union of the redistributable hull, widened; the withheld hull is
+    # not in it.
+    assert boundary.covers(shapely.from_wkb(bytes.fromhex(near)))
+    assert boundary.disjoint(shapely.from_wkb(bytes.fromhex(far)))
+    publish.publish(cache)
+    index = transitio_index.read_index(cache / "index")
+    rows = index.places.set_index("place_id")
+    assert rows.loc["Q-metro", "geometry_source"] == "derived_from_feeds"
+    assert rows.loc["Q-metro", "geometry"].equals(boundary)
+
+
+def test_a_derived_boundary_stays_inside_the_wgs84_domain():
+    shapely = pytest.importorskip("shapely")
+    hull = shapely.to_wkb(shapely.box(179.99, 60.0, 180.0, 60.1)).hex()
+    places = [{"place_id": "P", "geometry": None, "geometry_source": None}]
+    edges = [{"place_id": "P", "feed_id": "f"}]
+    feeds = [{"feed_id": "f", "coverage": hull, "redistribution_allowed": True}]
+    assert licensing._derive_geometry(places, edges, feeds) == (1, 0)
+    bounds = shapely.from_wkb(bytes.fromhex(places[0]["geometry"])).bounds
+    assert bounds[2] == 180.0 and bounds[0] > 179.9
 
 
 def test_the_post_condition_catches_a_surviving_prohibited_hull():

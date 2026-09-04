@@ -13,8 +13,14 @@ its contents, so it ships only where the feed's licence permits
 redistribution — declared as such, or a known-permissive licence — and is
 nulled where redistribution is explicitly disallowed; a feed whose licence
 is unknown keeps its hull, a recorded judgement the ``redistribution_allowed``
-column lets a stricter user overrule. Places and edges still pass through
-unchanged; geometry substitution, dropped places and rehomed edges follow.
+column lets a stricter user overrule.
+
+A place without a boundary of its own — its sources outside the geometry
+allowlist, or a metro — is given the buffered union of the redistributable
+coverage hulls of the feeds with an edge to it, labelled
+``geometry_source = "derived_from_feeds"``, so every place that can have an
+AOI has one materialised. Places still without a geometry are counted;
+dropping them and rehoming their edges follow.
 """
 
 import collections
@@ -54,7 +60,12 @@ KNOWN_PERMISSIVE = frozenset(
 
 # The sanitisation rules a licensed generation was built under; publication
 # refuses a generation from an older policy rather than shipping it.
-POLICY_VERSION = 1
+POLICY_VERSION = 2
+
+DERIVED_SOURCE = "derived_from_feeds"
+# A derived boundary is the hulls' union widened a little, so an AOI cut
+# from it reaches past the outermost stops.
+DERIVED_BUFFER_DEG = 0.01
 
 
 class LicenseError(RuntimeError):
@@ -102,6 +113,52 @@ def _assert_sanitised(records):
         raise LicenseError(
             f"prohibited coverage hulls survived sanitisation: {sorted(leaked)[:5]}"
         )
+
+
+def _derive_geometry(places, edges, records):
+    """Give each place without a boundary the buffered union of the
+    redistributable coverage hulls of the feeds with an edge to it. Only a
+    hull judged redistributable contributes: a place's boundary built from
+    a withheld hull would ship what the policy withholds. Returns how many
+    boundaries were derived and how many places still have none."""
+    import shapely
+
+    from index_build import geometry
+
+    hulls = {
+        r["feed_id"]: r["coverage"]
+        for r in records
+        if r.get("coverage") is not None and r.get("redistribution_allowed") is True
+    }
+    by_place = collections.defaultdict(set)
+    for edge in edges or ():
+        if edge["feed_id"] in hulls:
+            by_place[edge["place_id"]].add(hulls[edge["feed_id"]])
+    derived = missing = 0
+    for place in places:
+        if place.get("geometry") is not None:
+            continue
+        shapes = [
+            shapely.from_wkb(bytes.fromhex(hull))
+            for hull in sorted(by_place.get(place["place_id"], ()))
+        ]
+        union = None
+        if shapes:
+            # Buffered in degrees, then clipped to the WGS84 domain like the
+            # hulls themselves, so a boundary at the dateline stays in range.
+            union = geometry._simplify(
+                shapely.intersection(
+                    shapely.unary_union(shapes).buffer(DERIVED_BUFFER_DEG),
+                    shapely.box(-180.0, -90.0, 180.0, 90.0),
+                )
+            )
+        if not geometry._valid_polygon(union):
+            missing += 1
+            continue
+        place["geometry"] = shapely.to_wkb(union).hex()
+        place["geometry_source"] = DERIVED_SOURCE
+        derived += 1
+    return derived, missing
 
 
 def _geometry_audit(cache_dir):
@@ -265,6 +322,11 @@ def license_index(cache_dir, *, overrides_dir=None):
         records = inputs["records"]
         hulls_nulled = _sanitise_feeds(records)
         _assert_sanitised(records)
+        derived = missing = None
+        if inputs["places"] is not None:
+            derived, missing = _derive_geometry(
+                inputs["places"], inputs["edges"], records
+            )
         feed_rows = _feed_rows(records)
         inventory = audit_rows + _catalogue_rows(inputs["sources"]) + feed_rows
         notice = _notice(geometry_notice, inputs["sources"], feed_rows)
@@ -301,6 +363,8 @@ def license_index(cache_dir, *, overrides_dir=None):
                 )
             ),
             "places": None if inputs["places"] is None else len(inputs["places"]),
+            "geometry_derived": derived,
+            "places_without_geometry": missing,
             "edges": None if inputs["edges"] is None else len(inputs["edges"]),
             "inventory": len(inventory),
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
