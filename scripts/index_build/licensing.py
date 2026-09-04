@@ -19,8 +19,12 @@ A place without a boundary of its own — its sources outside the geometry
 allowlist, or a metro — is given the buffered union of the redistributable
 coverage hulls of the feeds with an edge to it, labelled
 ``geometry_source = "derived_from_feeds"``, so every place that can have an
-AOI has one materialised. Places still without a geometry are counted;
-dropping them and rehoming their edges follow.
+AOI has one materialised. A place still without one is not published: its
+edges are rehomed to the nearest published administrative ancestor, else the
+published country of its ``country_code``, merging with an edge already there
+column by column; a feed left with no edge at all is listed in the manifest's
+``feeds_without_edges``. The pruning closure is re-applied afterwards and
+every foreign key checked, so nothing published dangles.
 """
 
 import collections
@@ -60,7 +64,11 @@ KNOWN_PERMISSIVE = frozenset(
 
 # The sanitisation rules a licensed generation was built under; publication
 # refuses a generation from an older policy rather than shipping it.
-POLICY_VERSION = 2
+POLICY_VERSION = 3
+
+# How an edge was derived, strongest provenance first; a merge keeps the
+# stronger.
+METHOD_STRENGTH = ("human", "agent", "crawl", "inferred")
 
 DERIVED_SOURCE = "derived_from_feeds"
 # A derived boundary is the hulls' union widened a little, so an AOI cut
@@ -159,6 +167,162 @@ def _derive_geometry(places, edges, records):
         place["geometry_source"] = DERIVED_SOURCE
         derived += 1
     return derived, missing
+
+
+def _merge_edges(kept, other):
+    """Fold ``other``, rehomed onto the place, feed and tier ``kept``
+    already covers, into ``kept``: the higher tier confidence, review if
+    either needs it, the weakest selector state (``whole_feed`` absorbs
+    ``complete``; route ids union only between two complete selectors),
+    the displaced evidence and curation appended to the history columns,
+    the stronger method, and every origin."""
+    kept["tier_confidence"] = max(
+        kept.get("tier_confidence") or 0.0, other.get("tier_confidence") or 0.0
+    )
+    kept["needs_review"] = bool(kept.get("needs_review")) or bool(
+        other.get("needs_review")
+    )
+    states = {kept.get("selector_state"), other.get("selector_state")}
+    if "unavailable" in states:
+        kept["selector_state"], kept["selector"] = "unavailable", None
+    elif "whole_feed" in states:
+        kept["selector_state"], kept["selector"] = "whole_feed", None
+    else:
+        route_ids = set((kept.get("selector") or {}).get("route_id") or [])
+        route_ids |= set((other.get("selector") or {}).get("route_id") or [])
+        kept["selector"] = {"route_id": sorted(route_ids)}
+    kept["merged_evidence"] = (
+        list(kept.get("merged_evidence") or [])
+        + [other.get("evidence")]
+        + list(other.get("merged_evidence") or [])
+    )
+    if other.get("curation") is not None:
+        if kept.get("curation") is None:
+            kept["curation"] = other["curation"]
+        else:
+            kept["curation_history"] = list(kept.get("curation_history") or []) + [
+                other["curation"]
+            ]
+            if other["curation"].get("stale"):
+                kept["curation"]["stale"] = True
+    kept["curation_history"] = list(kept.get("curation_history") or []) + list(
+        other.get("curation_history") or []
+    )
+    strength = {method: rank for rank, method in enumerate(METHOD_STRENGTH)}
+    if strength.get(other.get("method"), len(METHOD_STRENGTH)) < strength.get(
+        kept.get("method"), len(METHOD_STRENGTH)
+    ):
+        kept["method"] = other["method"]
+    kept["rehomed_from"] = list(kept.get("rehomed_from") or []) + list(
+        other.get("rehomed_from") or []
+    )
+
+
+def _rehome(places, edges):
+    """Drop every place without a geometry and re-point its edges along
+    the target chain: the nearest published administrative ancestor, else
+    the published country of the place's ``country_code``; an edge with no
+    target is dropped and its feed listed when no edge of it survives. The
+    pruning closure is re-applied to the survivors. Returns the published
+    places, their edges and a report."""
+    from index_build import prune
+
+    by_id = {place["place_id"]: place for place in places}
+    published = {
+        pid for pid, place in by_id.items() if place.get("geometry") is not None
+    }
+    countries = {}
+    for pid in sorted(published):
+        place = by_id[pid]
+        if place.get("kind") == "country" and place.get("country_code"):
+            countries.setdefault(place["country_code"], pid)
+    # An edge already on a target survives a rehomed one, whatever the order.
+    kept = {}
+    moving = []
+    for edge in edges:
+        if edge["place_id"] in published:
+            kept[(edge["place_id"], edge["feed_id"], edge.get("tier"))] = edge
+        else:
+            moving.append(edge)
+    report = collections.Counter(edges_rehomed=0, edges_merged=0, edges_dropped=0)
+    lost = set()
+    for edge in moving:
+        origin = by_id.get(edge["place_id"])
+        if origin is None:
+            # Not an unpublished place but a dangling reference from upstream.
+            raise LicenseError(
+                f"edge {edge['feed_id']} names an unknown place {edge['place_id']}"
+            )
+        target = prune._surviving_ancestor(origin, by_id, published) or countries.get(
+            origin.get("country_code")
+        )
+        if target is None:
+            lost.add(edge["feed_id"])
+            report["edges_dropped"] += 1
+            continue
+        edge["rehomed_from"] = list(edge.get("rehomed_from") or []) + [edge["place_id"]]
+        edge["place_id"] = target
+        report["edges_rehomed"] += 1
+        key = (target, edge["feed_id"], edge.get("tier"))
+        if key in kept:
+            _merge_edges(kept[key], edge)
+            report["edges_merged"] += 1
+        else:
+            kept[key] = edge
+    survivors = list(kept.values())
+    with_edges = {edge["feed_id"] for edge in survivors}
+    # A published place under an unpublished parent moves up to its nearest
+    # published ancestor here, where the whole chain is still in view; the
+    # closure below sees only the published places.
+    reparented = 0
+    for pid in sorted(published):
+        place = by_id[pid]
+        if place.get("parent_id") and place["parent_id"] not in published:
+            place["parent_id"] = prune._surviving_ancestor(place, by_id, published)
+            reparented += 1
+    published_places, closure = prune.prune_places(
+        [by_id[pid] for pid in sorted(published)], survivors
+    )
+    report = dict(report)
+    # Everything that left: the unshippable places and what the closure took.
+    report["places_dropped"] = len(by_id) - len(published_places)
+    report["places_reparented"] = reparented
+    report["feeds_without_edges"] = sorted(lost - with_edges)
+    report["closure"] = closure
+    return published_places, survivors, report
+
+
+def _assert_integrity(places, edges, records):
+    """The post-condition: every published place has a geometry, every
+    edge names a published place and feed, and every place reference
+    resolves."""
+    ids = {place["place_id"] for place in places}
+    feeds = {record["feed_id"] for record in records}
+    problems = []
+    for place in places:
+        pid = place["place_id"]
+        if place.get("geometry") is None:
+            problems.append(f"{pid} has no geometry")
+        for key in ("parent_id", "default_metro_id"):
+            if place.get(key) and place[key] not in ids:
+                problems.append(f"{pid}.{key} -> {place[key]}")
+        for key in ("metro_ids", "member_ids"):
+            for other in place.get(key) or []:
+                if other not in ids:
+                    problems.append(f"{pid}.{key} -> {other}")
+    for edge in edges:
+        if edge["place_id"] not in ids:
+            problems.append(f"edge {edge['feed_id']} -> place {edge['place_id']}")
+        if edge["feed_id"] not in feeds:
+            problems.append(f"edge {edge['place_id']} -> feed {edge['feed_id']}")
+    for record in records:
+        static = record.get("static_feed_id")
+        if static and static not in feeds:
+            problems.append(f"{record['feed_id']}.static_feed_id -> {static}")
+    if problems:
+        raise LicenseError(
+            f"referential integrity failed after licensing: {problems[:5]}"
+        )
 
 
 def _geometry_audit(cache_dir):
@@ -323,10 +487,20 @@ def license_index(cache_dir, *, overrides_dir=None):
         hulls_nulled = _sanitise_feeds(records)
         _assert_sanitised(records)
         derived = missing = None
-        if inputs["places"] is not None:
-            derived, missing = _derive_geometry(
-                inputs["places"], inputs["edges"], records
-            )
+        places, edges, rehoming = inputs["places"], inputs["edges"], None
+        if places is not None:
+            derived, missing = _derive_geometry(places, edges, records)
+        if edges is not None and places is None:
+            raise LicenseError("the build has edges but no places to publish")
+        if places is not None and edges is not None:
+            places, edges, rehoming = _rehome(places, edges)
+        # The feed references are checked in every build; the place and
+        # edge ones once the invariant has been applied.
+        _assert_integrity(
+            places if rehoming is not None else [],
+            edges if rehoming is not None else [],
+            records,
+        )
         feed_rows = _feed_rows(records)
         inventory = audit_rows + _catalogue_rows(inputs["sources"]) + feed_rows
         notice = _notice(geometry_notice, inputs["sources"], feed_rows)
@@ -335,10 +509,10 @@ def license_index(cache_dir, *, overrides_dir=None):
             INVENTORY_ARTIFACT: store.jsonl_chunks(inventory),
             NOTICE_ARTIFACT: lambda: [notice],
         }
-        if inputs["places"] is not None:
-            artifacts[PLACES_ARTIFACT] = store.jsonl_chunks(inputs["places"])
-        if inputs["edges"] is not None:
-            artifacts[EDGES_ARTIFACT] = store.jsonl_chunks(inputs["edges"])
+        if places is not None:
+            artifacts[PLACES_ARTIFACT] = store.jsonl_chunks(places)
+        if edges is not None:
+            artifacts[EDGES_ARTIFACT] = store.jsonl_chunks(edges)
         manifest = {
             "source": "license",
             "licensed": True,
@@ -362,10 +536,11 @@ def license_index(cache_dir, *, overrides_dir=None):
                     str(r["redistribution_allowed"]).lower() for r in records
                 )
             ),
-            "places": None if inputs["places"] is None else len(inputs["places"]),
+            "places": None if places is None else len(places),
             "geometry_derived": derived,
             "places_without_geometry": missing,
-            "edges": None if inputs["edges"] is None else len(inputs["edges"]),
+            "rehoming": rehoming,
+            "edges": None if edges is None else len(edges),
             "inventory": len(inventory),
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }

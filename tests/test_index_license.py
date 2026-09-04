@@ -9,12 +9,13 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 import transitio.index as transitio_index  # noqa: E402
-from index_build import classify, licensing, publish, store  # noqa: E402
+from index_build import classify, licensing, prune, publish, store  # noqa: E402
 from test_index_publish import (  # noqa: E402
     PLACES,
     _build_index,
     _covered_feed,
     _edge,
+    _place,
     _publish_audit,
     _publish_coverage,
     _publish_gen,
@@ -27,7 +28,7 @@ LICENSED = {
 }
 
 
-def _cache(tmp_path, feeds=None, edges=None):
+def _cache(tmp_path, feeds=None, edges=None, places=None):
     """A crosswalk, an expanded generation with a geometry audit behind it,
     classified coverage edges: what the license stage reads."""
     pytest.importorskip("geopandas")
@@ -37,7 +38,7 @@ def _cache(tmp_path, feeds=None, edges=None):
         cache,
         "expanded.json",
         "places_expanded.jsonl",
-        PLACES,
+        PLACES if places is None else places,
         {
             "source": "expand",
             "overture_release": "2026-08-19.0",
@@ -79,7 +80,18 @@ def test_the_stage_licenses_what_publication_reads_and_publication_ships_it(tmp_
         {**r, "redistribution_allowed": licensing.redistribution_allowed(r)}
         for r in before["records"]
     ]
-    assert (edges, places) == (before["edges"], before["places"])
+    assert edges == before["edges"]
+    # The metro, with no boundary and none to derive, is not published; the
+    # city's closure follows.
+    (city,) = [p for p in before["places"] if p["place_id"] == "Q1757"]
+    assert places == [
+        {
+            **city,
+            "metro_ids": [],
+            "default_metro_id": None,
+            "default_metro_cleared": True,
+        }
+    ]
     inventory, _ = store.read_jsonl(
         cache / "license", "licensed.json", "licence_inventory.jsonl"
     )
@@ -339,12 +351,14 @@ def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
     by_id = {p["place_id"]: p for p in places}
     # A place with a boundary of its own keeps it.
     assert by_id["Q1757"]["geometry_source"] == "overture"
-    metro = by_id["Q-metro"]
     if not derived:
-        assert metro["geometry"] is None and metro["geometry_source"] is None
+        # No boundary could be built, so the metro is not published.
+        assert "Q-metro" not in by_id
         assert manifest["geometry_derived"] == 0
         assert manifest["places_without_geometry"] == 1
+        assert manifest["rehoming"]["places_dropped"] == 1
         return
+    metro = by_id["Q-metro"]
     assert manifest["geometry_derived"] == 1
     assert manifest["places_without_geometry"] == 0
     assert metro["geometry_source"] == "derived_from_feeds"
@@ -358,6 +372,122 @@ def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
     rows = index.places.set_index("place_id")
     assert rows.loc["Q-metro", "geometry_source"] == "derived_from_feeds"
     assert rows.loc["Q-metro", "geometry"].equals(boundary)
+
+
+def test_unpublished_places_rehome_their_edges_and_the_closure_holds(tmp_path):
+    geom = PLACES[0]["geometry"]
+    places = [
+        _place("Q33", "country", geometry=geom, country_code="FI"),
+        _place("Q-reg", "region", parent_id="Q33"),  # no boundary
+        _place("Q1757", "city", geometry=geom, parent_id="Q-reg", metro_ids=["Q-m"]),
+        _place("Q-city", "city", parent_id="Q-reg", metro_ids=["Q-m"]),  # none
+        _place("Q-m", "metro", member_ids=["Q1757", "Q-city"]),  # none
+        _place("Q-far", "city", country_code="SE"),  # none, and no SE country
+    ]
+    edges = [
+        _edge("Q1757", "f-a"),
+        _edge("Q-city", "f-a"),  # rehomes past the region onto the country
+        _edge("Q33", "f-a"),  # already there: the rehomed edge merges into it
+        _edge("Q-reg", "f-b"),  # rehomes onto the country
+        _edge("Q-far", "f-c"),  # no target at all
+    ]
+    feeds = [_covered_feed(f) for f in ("f-a", "f-b", "f-c")]
+    cache = _cache(tmp_path, feeds, edges, places)
+    manifest = licensing.license_index(cache)
+    assert manifest["rehoming"] == {
+        "edges_rehomed": 2,
+        "edges_merged": 1,
+        "edges_dropped": 1,
+        "places_dropped": 4,
+        "places_reparented": 1,
+        "feeds_without_edges": ["f-c"],
+        "closure": {
+            **{metric: 0 for metric in prune.METRICS},
+            "kept": 2,
+            "default_metro_cleared": 1,
+            "metro_ids_trimmed": 1,
+        },
+    }
+    licensed_places, _ = store.read_jsonl(
+        cache / "license", "licensed.json", "places_licensed.jsonl"
+    )
+    by_id = {p["place_id"]: p for p in licensed_places}
+    assert set(by_id) == {"Q33", "Q1757"}
+    assert by_id["Q1757"]["parent_id"] == "Q33" and by_id["Q1757"]["metro_ids"] == []
+    licensed_edges, _ = store.read_jsonl(
+        cache / "license", "licensed.json", "edges_licensed.jsonl"
+    )
+    by_key = {(e["place_id"], e["feed_id"]): e for e in licensed_edges}
+    assert set(by_key) == {("Q1757", "f-a"), ("Q33", "f-a"), ("Q33", "f-b")}
+    merged = by_key[("Q33", "f-a")]
+    assert merged["rehomed_from"] == ["Q-city"]
+    assert [e["declared_place_id"] for e in merged["merged_evidence"]] == ["Q-city"]
+    assert merged["evidence"]["declared_place_id"] == "Q33"
+    assert by_key[("Q33", "f-b")]["rehomed_from"] == ["Q-reg"]
+    publish.publish(cache)
+    index = transitio_index.read_index(cache / "index")
+    assert sorted(index.edges["place_id"]) == ["Q1757", "Q33", "Q33"]
+
+
+@pytest.mark.parametrize(
+    "states, expected",
+    [
+        (("complete", "complete"), ("complete", {"route_id": ["r1", "r2"]})),
+        (("complete", "whole_feed"), ("whole_feed", None)),  # the union is the feed
+        (("whole_feed", "unavailable"), ("unavailable", None)),  # weakest link
+    ],
+)
+def test_rehomed_edges_merge_column_by_column(states, expected):
+    kept = {
+        **_edge("Q33", "f-a", tier="primary"),
+        "tier_confidence": 0.4,
+        "selector_state": states[0],
+        "selector": {"route_id": ["r1"]} if states[0] == "complete" else None,
+        "curation": {"reason": "kept", "stale": False},
+    }
+    other = {
+        **_edge("Q-city", "f-a", tier="primary"),
+        "tier_confidence": 0.9,
+        "method": "human",
+        "needs_review": False,
+        "selector_state": states[1],
+        "selector": {"route_id": ["r2"]} if states[1] == "complete" else None,
+        "curation": {"reason": "moved", "stale": True},
+        "rehomed_from": ["Q-city"],
+    }
+    kept["needs_review"] = False
+    licensing._merge_edges(kept, other)
+    assert (kept["selector_state"], kept["selector"]) == expected
+    assert kept["tier_confidence"] == 0.9 and kept["method"] == "human"
+    assert kept["curation"] == {"reason": "kept", "stale": True}
+    assert kept["curation_history"] == [{"reason": "moved", "stale": True}]
+    assert kept["rehomed_from"] == ["Q-city"]
+
+
+def test_dangling_references_are_refused():
+    country = _place("Q33", "country", geometry="00")
+    with pytest.raises(licensing.LicenseError, match="Q33.metro_ids -> Q-gone"):
+        licensing._assert_integrity([{**country, "metro_ids": ["Q-gone"]}], [], [])
+    feeds = [{"feed_id": "rt", "static_feed_id": "gone"}]
+    with pytest.raises(licensing.LicenseError, match="rt.static_feed_id -> gone"):
+        licensing._assert_integrity([country], [], feeds)
+    # An edge to a place the table never had is not an unpublished place.
+    with pytest.raises(licensing.LicenseError, match="unknown place Q-x"):
+        licensing._rehome([country], [_edge("Q-x", "f-a")])
+
+
+def test_a_feeds_only_build_still_checks_its_feed_references(tmp_path, monkeypatch):
+    cache, _ = _build_index(tmp_path)
+    read_inputs = publish.read_inputs
+
+    def dangling(cache_dir, overrides_dir):
+        inputs = read_inputs(cache_dir, overrides_dir)
+        inputs["records"][0]["static_feed_id"] = "gone"
+        return inputs
+
+    monkeypatch.setattr(publish, "read_inputs", dangling)
+    with pytest.raises(licensing.LicenseError, match="static_feed_id -> gone"):
+        licensing.license_index(cache)
 
 
 def test_a_derived_boundary_stays_inside_the_wgs84_domain():
