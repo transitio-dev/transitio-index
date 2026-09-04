@@ -13,12 +13,13 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 import publish_index  # noqa: E402
 from index_build import publisher  # noqa: E402
-from index_build import atlas, classify, publish  # noqa: E402
+from index_build import atlas, classify, licensing, publish  # noqa: E402
 from test_index_coverage import _write_crawl  # noqa: E402
 from test_index_publish import (  # noqa: E402
     PLACES,
     _atlas_archive,
     _build_index,
+    _publish_audit,
     _publish_coverage,
     _publish_gen,
 )
@@ -176,6 +177,7 @@ def _index(tmp_path):
     NOTICE, published by the publish stage."""
     pytest.importorskip("geopandas")
     cache, _ = _build_index(tmp_path)
+    audit = _publish_audit(cache)
     expanded = _publish_gen(
         cache,
         "expanded.json",
@@ -185,6 +187,7 @@ def _index(tmp_path):
             "source": "expand",
             "overture_release": "2026-08-19.0",
             "places_overrides_sha256": None,
+            "geometry_generation": audit["generation"],
         },
     )
     _publish_coverage(
@@ -195,8 +198,8 @@ def _index(tmp_path):
         },
     )
     classify.classify(cache)
+    licensing.license_index(cache)
     publish.publish(cache)
-    (cache / "index" / "NOTICE").write_text("attribution\n")
     return cache / "index"
 
 
@@ -418,7 +421,7 @@ def test_an_index_built_from_superseded_generations_is_not_released(tmp_path):
     with pytest.raises(publisher.PublishIndexError, match="gazetteer/names.json"):
         publisher.pack(index_dir, cache_dir=cache)
     # The leaf that produced the edges, gone while its ancestors remain.
-    snapshot["generations"].pop("classify/edges.json")
+    snapshot["generations"].pop("license/licensed.json")
     (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
     with pytest.raises(publisher.PublishIndexError, match="produced its edges"):
         publisher.pack(index_dir, cache_dir=cache)
@@ -567,3 +570,11 @@ def test_a_moved_repository_is_followed_when_reading_and_reported_when_writing(
             transport=fake.transport(),
         )
     assert [r["tag_name"] for r in fake.releases.values()] == ["index-0000000000000001"]
+
+
+def test_an_altered_notice_is_not_released(tmp_path):
+    index_dir = _index(tmp_path)
+    publisher.pack(index_dir, cache_dir=index_dir.parent)
+    (index_dir / "NOTICE").write_text("someone else's attribution\n")
+    with pytest.raises(publisher.PublishIndexError, match="notice_sha256"):
+        publisher.pack(index_dir, cache_dir=index_dir.parent)

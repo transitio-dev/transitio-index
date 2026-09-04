@@ -41,6 +41,7 @@ from index_build import (  # noqa: E402
     metros,
     names,
     overture,
+    licensing,
     prune,
     publish,
     resolve,
@@ -143,6 +144,14 @@ def run_prune(arguments):
     return [prune.prune(arguments.cache_dir)]
 
 
+def run_license(arguments):
+    return [
+        licensing.license_index(
+            arguments.cache_dir, overrides_dir=arguments.overrides_dir
+        )
+    ]
+
+
 def run_publish(arguments):
     golden_path = None if arguments.no_golden else arguments.golden
     if golden_path is not None and not golden_path.is_file():
@@ -171,6 +180,7 @@ STAGES = {
     "classify": run_classify,
     "curate": run_curate,
     "prune": run_prune,
+    "license": run_license,
     "publish": run_publish,
 }
 

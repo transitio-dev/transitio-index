@@ -64,6 +64,28 @@ def _atlas_archive(tmp_path, feeds):
     return path
 
 
+def _publish_audit(cache, notice="Boundary geometry from Overture.\n"):
+    """A geometry generation carrying the licence audit the license stage reads."""
+    directory = store.open_subdir(cache, "gazetteer")
+    try:
+        with store.exclusive_writer(directory):
+            return store.publish(
+                cache / "gazetteer",
+                "geometry.json",
+                {
+                    "places_seed.jsonl": store.jsonl_chunks(PLACES),
+                    "licence_inventory.jsonl": store.jsonl_chunks(
+                        [{"role": "aggregator", "dataset": "Overture", "allowed": True}]
+                    ),
+                    "NOTICE": lambda: [notice],
+                },
+                {"source": "geometry", "places_overrides_sha256": None},
+                held=directory,
+            )
+    finally:
+        directory.close()
+
+
 def _publish_gen(cache, pointer, artifact, records, manifest):
     directory = store.open_subdir(cache, "gazetteer")
     try:
@@ -1011,6 +1033,7 @@ def test_the_snapshot_records_every_generation_it_descends_from(tmp_path):
         "generation": "x",
         "seed_generation": "s",
         "names_generation": "n",
+        "geometry_generation": "g",
         "pruned_generation": "p",
     }
     generations, leaves = publish._generations(
@@ -1028,6 +1051,7 @@ def test_the_snapshot_records_every_generation_it_descends_from(tmp_path):
         "gazetteer/expanded.json": "x",
         "gazetteer/seed.json": "s",
         "gazetteer/names.json": "n",
+        "gazetteer/geometry.json": "g",
         "prune/places_pruned.json": "p",
         "curate/edges_final.json": "e",
         "classify/edges.json": "c",
