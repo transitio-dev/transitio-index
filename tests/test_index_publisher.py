@@ -206,7 +206,7 @@ def _index(tmp_path):
 def _manifest_bytes(**fields):
     manifest = {
         "snapshot_id": "0123456789abcdef",
-        "schema_version": 3,
+        "schema_version": 4,
         "min_reader_version": "0.11.0",
         **fields,
     }
@@ -353,16 +353,16 @@ def test_releases_a_client_must_not_take(release, reason):
             {"snapshot_id": "0123456789abcdef", "schema_version": [3]},
             "schema_version [3]",
         ),
-        ({"schema_version": 3, "min_reader_version": "0.11.0"}, "no snapshot id"),
+        ({"schema_version": 4, "min_reader_version": "0.11.0"}, "no snapshot id"),
         ({"snapshot_id": "0123456789abcdef", "schema_version": 2}, "schema_version 2"),
         (
-            {"snapshot_id": "0123456789abcdef", "schema_version": 3},
+            {"snapshot_id": "0123456789abcdef", "schema_version": 4},
             "no min_reader_version",
         ),
         (
             {
                 "snapshot_id": "0123456789abcdef",
-                "schema_version": 3,
+                "schema_version": 4,
                 "min_reader_version": "999.0.0",
             },
             "needs transitio >= 999.0.0",
