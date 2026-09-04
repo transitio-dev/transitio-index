@@ -125,6 +125,10 @@ def _current(cache_dir, snapshot, overrides_dir):
             "the index records no stage generations to check; re-run the publish "
             "stage"
         )
+    if snapshot.get("licensed") is not True:
+        raise PublishIndexError(
+            "the index is not licensed; run the license stage before publishing"
+        )
     tables = {"feeds"}
     if snapshot.get("edges_sha256"):
         tables.add("edges")
@@ -192,6 +196,11 @@ def pack(index_dir, out_dir=None, *, cache_dir=None, overrides_dir=None):
         if cache_dir is not None:
             snapshot = json.loads(dict(members)["snapshot.json"].decode("utf-8"))
             _current(cache_dir, snapshot, overrides_dir)
+            if snapshot.get("notice_sha256") != _sha256(dict(members)["NOTICE"]):
+                raise PublishIndexError(
+                    "NOTICE does not match the snapshot's notice_sha256; re-run the "
+                    "publish stage"
+                )
     staged = pathlib.Path(tempfile.mkdtemp(prefix="transitio-index-"))
     try:
         directory = store.open_directory(staged)
@@ -231,6 +240,7 @@ def pack(index_dir, out_dir=None, *, cache_dir=None, overrides_dir=None):
                 "feeds_overrides_sha256",
                 "places_overrides_sha256",
                 "crawl_digest",
+                "licensed",
             )
         },
     }

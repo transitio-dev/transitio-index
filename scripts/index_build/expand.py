@@ -300,6 +300,7 @@ def expand(
                 "sources": names_manifest.get("sources"),
                 "seed_generation": names_manifest.get("seed_generation"),
                 "names_generation": names_manifest.get("generation"),
+                "geometry_generation": names_manifest.get("geometry_generation"),
                 "places_overrides_sha256": names_manifest.get(
                     "places_overrides_sha256"
                 ),

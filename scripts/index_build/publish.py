@@ -36,6 +36,7 @@ FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
 SNAPSHOT_FILE = "snapshot.json"
+NOTICE_FILE = "NOTICE"
 
 
 class PublishError(RuntimeError):
@@ -465,6 +466,9 @@ def _generations(cache_dir, edges, resolved, places):
         pointer = "expanded.json" if places.get("source") == "expand" else "names.json"
         found[f"gazetteer/{pointer}"] = places.get("generation")
         leaves["places"] = f"gazetteer/{pointer}"
+        # The geometry generation the places descend from, whose audit the
+        # licence inventory and NOTICE come from.
+        found["gazetteer/geometry.json"] = places.get("geometry_generation")
         found["gazetteer/seed.json"] = places.get("seed_generation")
         if pointer == "expanded.json":
             found["gazetteer/names.json"] = places.get("names_generation")
@@ -640,6 +644,152 @@ def _check_lineage(cache_dir, manifest, ancestors, what, rerun):
             )
 
 
+# The stage locks publication holds, in order; the crawl lock follows them.
+STAGE_LOCKS = (
+    "raw",
+    "crosswalk",
+    "resolve",
+    "gazetteer",
+    "coverage",
+    "classify",
+    "curate",
+    "prune",
+)
+
+
+def read_inputs(cache_dir, overrides_dir):
+    """Everything a publication reads, lineage-checked, under the locks the
+    caller holds: the feeds (from the edge stage, else the resolved feeds,
+    else the crosswalk), the edges and their manifest, the places and the
+    generations all of it descends from. The license stage reads exactly
+    this, so what it licenses is what would ship."""
+    # The override digest the curated edges were checked against is the
+    # baseline: it is re-read once more right before activation, so an
+    # edit during publication cannot ship through a generation built
+    # before it — and never re-established from a later read.
+    records, edges, coverage, override_digest = _read_coverage(
+        cache_dir, locked=True, overrides_dir=overrides_dir
+    )
+    # Without coverage the resolved feeds ship (identity and crawlability
+    # applied), and only without those the crosswalk's.
+    resolved, resolve_manifest = _read_resolved(
+        cache_dir, overrides_dir, check_file=records is None
+    )
+    if records is not None:
+        sources = coverage.get("sources")
+    elif resolved is not None:
+        records, sources = resolved, resolve_manifest.get("sources")
+    else:
+        records, crosswalk = store.read_jsonl(
+            cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
+        )
+        sources = crosswalk.get("sources")
+    if not records:
+        raise PublishError("no feeds to publish")
+    if not sources:
+        raise PublishError("the feed manifest records no source versions")
+    # A gazetteer that ran but produced no places is a places index of zero
+    # places, distinct from a feeds-only build (no gazetteer at all) — hence
+    # ``is not None`` throughout, never a truthiness test that folds the two.
+    places, overture_release, places_generation, places_manifest = _read_places(
+        cache_dir, coverage, overrides_dir
+    )
+    generations, leaves = _generations(
+        cache_dir, coverage, resolve_manifest, places_manifest
+    )
+    if places is not None:
+        # The audit the places descend from must be the current one: a
+        # regenerated geometry cannot relabel places built before it.
+        from index_build import classify
+
+        consumed = (places_manifest or {}).get("geometry_generation")
+        current = classify._current_generation(cache_dir, "gazetteer", "geometry.json")
+        if consumed != current:
+            raise PublishError(
+                "the geometry audit moved since the places were built; re-run the "
+                "gazetteer stage"
+            )
+    if places is not None and not overture_release:
+        # The release folds into the snapshot id; without it a places index would
+        # share the feeds-only id for the same feeds.
+        raise PublishError("gazetteer places carry no overture_release")
+    if edges is not None:
+        if places is None:
+            raise PublishError("coverage edges exist but no places generation does")
+        if coverage.get("overture_release") != overture_release:
+            raise PublishError(
+                "coverage and places come from different Overture releases; "
+                "re-run the pipeline in stage order"
+            )
+        # The exact generation, not just the release: the edges must
+        # reference the places generation this snapshot ships.
+        if coverage.get("expanded_generation") != places_generation:
+            raise PublishError(
+                "the edges were derived from a different places generation "
+                "than the one being published; re-run the pipeline in stage order"
+            )
+        if coverage.get("source") not in ("classify", "curate"):
+            # Candidate edges carry no tiers; shipping them would publish
+            # every edge as unknown with the tier gate silently off.
+            raise PublishError(
+                "the edges are unclassified; run the classify stage before publishing"
+            )
+    return {
+        "records": records,
+        "edges": edges,
+        "coverage": coverage,
+        "override_digest": override_digest,
+        "resolved": resolved,
+        "resolve_manifest": resolve_manifest,
+        "sources": sources,
+        "places": places,
+        "overture_release": overture_release,
+        "places_generation": places_generation,
+        "places_manifest": places_manifest,
+        "generations": generations,
+        "leaves": leaves,
+    }
+
+
+def _read_licensed(cache_dir, inputs):
+    """Swap the license stage's artifacts into ``inputs`` when a license
+    generation exists: it must descend from exactly the generations the
+    inputs do, else it is stale. Returns the NOTICE bytes, or None when the
+    build is not licensed (publication then ships the inputs as they are
+    and says so)."""
+    from index_build import licensing
+
+    pointer = cache_dir / "license" / licensing.POINTER
+    if not (pointer.is_symlink() or pointer.exists()):
+        return None
+    try:
+        generation, manifest = store.resolve(cache_dir / "license", licensing.POINTER)
+    except (store.StoreError, ValueError) as error:
+        raise PublishError(f"the license generation is unreadable: {error}") from error
+    with generation:
+        if manifest.get("generations") != inputs["generations"]:
+            raise PublishError(
+                "the licensed artifacts do not descend from the current inputs; "
+                "re-run the license stage"
+            )
+        inputs["records"] = store.parse_jsonl(
+            generation.read_bytes(licensing.FEEDS_ARTIFACT)
+        )
+        if inputs["places"] is not None:
+            inputs["places"] = store.parse_jsonl(
+                generation.read_bytes(licensing.PLACES_ARTIFACT)
+            )
+        if inputs["edges"] is not None:
+            inputs["edges"] = store.parse_jsonl(
+                generation.read_bytes(licensing.EDGES_ARTIFACT)
+            )
+        notice = generation.read_bytes(licensing.NOTICE_ARTIFACT)
+    key = f"license/{licensing.POINTER}"
+    inputs["generations"] = {**inputs["generations"], key: manifest.get("generation")}
+    inputs["leaves"] = {table: key for table in inputs["leaves"]}
+    return notice
+
+
 def _read_coverage(cache_dir, *, locked=False, overrides_dir=None):
     """The feeds, edges, manifest and override digest of the latest edge
     stage, or ``(None, None, None, None)``; stale classified edges are a
@@ -719,49 +869,29 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
     with contextlib.ExitStack() as stack:
         # Stage locks first, the crawl lock last — the order every stage
         # uses (its own lock, then the crawl's), so no lock-order inversion.
-        for subdir in (
-            "raw",
-            "crosswalk",
-            "resolve",
-            "gazetteer",
-            "coverage",
-            "classify",
-            "curate",
-            "prune",
-        ):
+        for subdir in (*STAGE_LOCKS, "license"):
             # Created when absent, so a stage that has not run yet cannot
             # slip its first publication in between: the lock exists first.
             held = store.open_subdir(cache_dir, subdir)
             stack.callback(held.close)
             stack.enter_context(store.exclusive_writer(held))
         stack.enter_context(crawl.reading(cache_dir))
-        # The override digest the curated edges were checked against is the
-        # baseline: it is re-read once more right before activation, so an
-        # edit during publication cannot ship through a generation built
-        # before it — and never re-established from a later read.
-        records, edges, coverage, override_digest = _read_coverage(
-            cache_dir, locked=True, overrides_dir=overrides_dir
-        )
         from index_build import overrides
 
-        # Without coverage the resolved feeds ship (identity and crawlability
-        # applied), and only without those the crosswalk's.
-        resolved, resolve_manifest = _read_resolved(
-            cache_dir, overrides_dir, check_file=records is None
-        )
-        if records is not None:
-            sources = coverage.get("sources")
-        elif resolved is not None:
-            records, sources = resolved, resolve_manifest.get("sources")
-        else:
-            records, crosswalk = store.read_jsonl(
-                cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
-            )
-            sources = crosswalk.get("sources")
-        if not records:
-            raise PublishError("no feeds to publish")
-        if not sources:
-            raise PublishError("the feed manifest records no source versions")
+        inputs = read_inputs(cache_dir, overrides_dir)
+        licensed = _read_licensed(cache_dir, inputs)
+        records = inputs["records"]
+        edges = inputs["edges"]
+        coverage = inputs["coverage"]
+        override_digest = inputs["override_digest"]
+        resolved = inputs["resolved"]
+        resolve_manifest = inputs["resolve_manifest"]
+        sources = inputs["sources"]
+        places = inputs["places"]
+        overture_release = inputs["overture_release"]
+        places_manifest = inputs["places_manifest"]
+        generations = inputs["generations"]
+        leaves = inputs["leaves"]
         golden_report = None
         if golden_path is not None:
             if edges is None:
@@ -771,41 +901,6 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
                     "snapshot with --no-golden"
                 )
             golden_report = _golden_gate(cache_dir, golden_path, edges, coverage)
-
-        # A gazetteer that ran but produced no places is a places index of zero
-        # places, distinct from a feeds-only build (no gazetteer at all) — hence
-        # ``is not None`` throughout, never a truthiness test that folds the two.
-        places, overture_release, places_generation, places_manifest = _read_places(
-            cache_dir, coverage, overrides_dir
-        )
-        generations, leaves = _generations(
-            cache_dir, coverage, resolve_manifest, places_manifest
-        )
-        if places is not None and not overture_release:
-            # The release folds into the snapshot id; without it a places index would
-            # share the feeds-only id for the same feeds.
-            raise PublishError("gazetteer places carry no overture_release")
-        if edges is not None:
-            if places is None:
-                raise PublishError("coverage edges exist but no places generation does")
-            if coverage.get("overture_release") != overture_release:
-                raise PublishError(
-                    "coverage and places come from different Overture releases; "
-                    "re-run the pipeline in stage order"
-                )
-            # The exact generation, not just the release: the edges must
-            # reference the places generation this snapshot ships.
-            if coverage.get("expanded_generation") != places_generation:
-                raise PublishError(
-                    "the edges were derived from a different places generation "
-                    "than the one being published; re-run the pipeline in stage order"
-                )
-            if coverage.get("source") not in ("classify", "curate"):
-                # Candidate edges carry no tiers; shipping them would publish
-                # every edge as unknown with the tier gate silently off.
-                raise PublishError(
-                    "the edges are unclassified; run the classify stage before publishing"
-                )
         digests = []
         if places is not None:
             digests.append(_content_digest(places))
@@ -815,6 +910,9 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
             digests.append(_content_digest(records))
         if edges is not None:
             digests.append(_content_digest(edges))
+        if licensed is not None:
+            # The NOTICE ships too: a corrected attribution is a new snapshot.
+            digests.append(hashlib.sha256(licensed).hexdigest())
         snapshot_id = _snapshot_id(sources, overture_release, digests)
         feeds_data = _parquet_bytes(records, snapshot_id)
         counts = _counts(records)
@@ -844,6 +942,12 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
             ),
             # The crawl the edges and expanded places were measured against.
             "crawl_digest": crawl.states_digest(cache_dir),
+            # Whether the license stage's artifacts are what ships, and the
+            # NOTICE that ships with them.
+            "licensed": licensed is not None,
+            "notice_sha256": (
+                None if licensed is None else hashlib.sha256(licensed).hexdigest()
+            ),
         }
 
         places_data = None
@@ -926,10 +1030,12 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
                             f"{rerun} stage"
                         )
                 store.write_bytes(directory, FEEDS_FILE, feeds_data)
-                # A table this build lacks must not linger from an earlier one.
+                # A table this build lacks must not linger from an earlier one,
+                # nor a NOTICE from a licensed build under an unlicensed one.
                 for name, data in (
                     (PLACES_FILE, places_data),
                     (EDGES_FILE, edges_data),
+                    (NOTICE_FILE, licensed),
                 ):
                     if data is not None:
                         store.write_bytes(directory, name, data)
