@@ -1,6 +1,7 @@
 import hashlib
 import io
 import sys
+import threading
 import zipfile
 from pathlib import Path
 
@@ -576,3 +577,53 @@ def test_requests_are_throttled_by_host():
         fetcher.read_range("https://feeds.example/gtfs.zip", 0, 1)
         fetcher.read_range("https://feeds.example/gtfs.zip", 1, 1)
     assert slept  # the second request had to wait
+
+
+def test_concurrent_acquire_shares_one_bucket_and_serializes():
+    # Many workers first-touch the same new host together, then keep acquiring:
+    # exactly one bucket is created (atomic get-or-create), no take is lost or
+    # deadlocks (the bucket lock), and only `burst` requests get through free.
+    sleeps = []
+    guard = threading.Lock()
+
+    def sleeper(wait):
+        with guard:
+            sleeps.append(wait)
+
+    buckets = fetch.HostBuckets(rate=1.0, burst=5, clock=lambda: 0.0, sleeper=sleeper)
+    n_threads, per = 16, 10
+    start = threading.Barrier(n_threads, timeout=5)
+
+    def worker():
+        start.wait()
+        for _ in range(per):
+            buckets.acquire("newhost:443")
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    total = n_threads * per
+    assert not any(thread.is_alive() for thread in threads)  # no deadlock
+    assert list(buckets._buckets) == ["newhost:443"]  # one bucket for the host
+    assert len(sleeps) == total - 5  # only burst got through free
+    # Under the lock every acquire is serialized against the same bucket, so the
+    # state is exactly the sequential one: burst free, then each waiter reserves
+    # 1/rate later. A lost update (unsynchronized get-or-create or take) would
+    # double-grant and leave a smaller timestamp, so this pins both.
+    assert buckets._buckets["newhost:443"] == (0.0, float(total - 5))
+
+
+def test_one_host_shares_a_bucket_across_schemes_and_ports():
+    # The limiter is the single per-host authority: a second request to the same
+    # host on another scheme/port shares its one bucket and waits, rather than
+    # minting a fresh bucket that would double the aggregate rate.
+    slept = []
+    with _fetcher(
+        _range_server(BODY), rate=1.0, burst=1, sleeper=lambda w: slept.append(w)
+    ) as fetcher:
+        fetcher.head("https://feeds.example/a.zip")
+        fetcher.head("http://feeds.example:8080/b.zip")
+    assert slept  # the second request shared the host's bucket and waited

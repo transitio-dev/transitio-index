@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import sys
+import threading
 import zipfile
 from pathlib import Path
 
@@ -752,3 +753,117 @@ def test_the_mdb_url_is_the_fallback(tmp_path):
     _publish_resolved(cache, [feed])
     _, log = _crawl(cache, _server({"/a.zip": (data, None)}))
     assert log["f-m"]["method"] == "download"
+
+
+# --- Parallel crawl (workers) -------------------------------------------------
+
+
+def _freeze_clock(monkeypatch):
+    # state.json records a wall-clock retrieved_at; freeze it so a parallel and
+    # a sequential build produce byte-identical artifacts.
+    dt = crawl.datetime
+    fixed = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+
+    class _Frozen(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    monkeypatch.setattr(dt, "datetime", _Frozen)
+
+
+def _crawl_workers(cache, transport, feeds, *, workers):
+    _publish_resolved(cache, feeds)
+    with _fetcher(transport) as fetcher:
+        crawl.crawl(cache, fetcher=fetcher, range_threshold=10**9, workers=workers)
+
+
+def _tree(root):
+    """Every file under ``root`` as ``{relative posix path: bytes}``."""
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_parallel_crawl_is_byte_identical_and_ordered(tmp_path, monkeypatch):
+    _freeze_clock(monkeypatch)
+    # Feeds across several hosts, two sharing one host so a shared bucket is
+    # exercised too.
+    urls = {
+        "f-0": "https://h0.example/a.zip",
+        "f-1": "https://h1.example/b.zip",
+        "f-2": "https://h0.example/c.zip",
+        "f-3": "https://h2.example/d.zip",
+        "f-4": "https://h1.example/e.zip",
+    }
+    feeds = [_feed(fid, url) for fid, url in urls.items()]
+    served = {
+        "/" + url.rsplit("/", 1)[1]: (_zip_bytes(), fid) for fid, url in urls.items()
+    }
+    seq, par = tmp_path / "seq", tmp_path / "par"
+    _crawl_workers(seq, _server(served), feeds, workers=1)
+    _crawl_workers(par, _server(served), feeds, workers=8)
+
+    # The whole crawl tree — every file, both directions — is byte-identical,
+    # so a parallel run can neither drop, add nor alter any persisted artifact.
+    assert _tree(seq / "crawl") == _tree(par / "crawl")
+    order = [
+        record["feed_id"]
+        for record in store.parse_jsonl((seq / "crawl" / crawl.LOG_FILE).read_bytes())
+    ]
+    assert order == [feed["feed_id"] for feed in feeds]  # eligible-input order
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_a_worker_exception_is_contained_at_its_ordinal(tmp_path, monkeypatch, workers):
+    feeds = [_feed(f"f-{i}", f"https://h{i}.example/{i}.zip") for i in range(3)]
+    served = {f"/{i}.zip": (_zip_bytes(), None) for i in range(3)}
+    real = crawl._crawl_one
+
+    def boom(fetcher, cache_dir, feed, **kwargs):
+        if feed["feed_id"] == "f-1":
+            raise RuntimeError("kaboom")
+        return real(fetcher, cache_dir, feed, **kwargs)
+
+    monkeypatch.setattr(crawl, "_crawl_one", boom)
+    cache = tmp_path / "c"
+    _crawl_workers(cache, _server(served), feeds, workers=workers)
+
+    log = store.parse_jsonl((cache / "crawl" / crawl.LOG_FILE).read_bytes())
+    assert [record["feed_id"] for record in log] == ["f-0", "f-1", "f-2"]
+    assert log[1]["method"] == "skipped" and "kaboom" in log[1]["fallback_reason"]
+    assert log[0]["method"] in ("range", "download")
+    assert log[2]["method"] in ("range", "download")
+
+
+def test_workers_crawl_feeds_concurrently(tmp_path):
+    # Two feeds on different hosts whose HEAD blocks on a shared 2-party barrier:
+    # only if both are in flight at once does it release. A serial run trips the
+    # timeout, and ``broke`` proves that — the crawler's whole-GET fallback would
+    # otherwise let both feeds "succeed" even when they never overlapped.
+    barrier = threading.Barrier(2, timeout=5)
+    broke = threading.Event()
+    data = _zip_bytes()
+
+    def handler(request):
+        if request.method == "HEAD":
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                broke.set()
+        headers = {"Content-Length": str(len(data)), "Accept-Ranges": "bytes"}
+        if request.method == "HEAD":
+            return httpx.Response(200, headers=headers)
+        return httpx.Response(200, headers=headers, content=data)
+
+    feeds = [
+        _feed("f-0", "https://h0.example/a.zip"),
+        _feed("f-1", "https://h1.example/b.zip"),
+    ]
+    cache = tmp_path / "c"
+    _crawl_workers(cache, httpx.MockTransport(handler), feeds, workers=2)
+    assert not broke.is_set()  # both HEADs met the barrier: they ran at once
+    log = store.parse_jsonl((cache / "crawl" / crawl.LOG_FILE).read_bytes())
+    assert all(record["method"] in ("range", "download") for record in log)

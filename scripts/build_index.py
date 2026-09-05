@@ -111,7 +111,7 @@ def run_expand(arguments):
 
 
 def run_crawl(arguments):
-    return [crawl.crawl(arguments.cache_dir)]
+    return [crawl.crawl(arguments.cache_dir, workers=arguments.workers)]
 
 
 def run_coverage(arguments):
@@ -256,7 +256,19 @@ def parse_args(argv=None):
         help="also run every later stage, in build order, so nothing downstream "
         "of a rerun is left stale",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="crawl this many feeds concurrently over one shared client "
+        "(default: 1); the network, not cores, is the limit, so a modest cap "
+        "(~8-32) saturates a home connection while staying polite. Each worker "
+        "may buffer one feed's largest member, so lower the cap for feeds with "
+        "very large stop_times.txt",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.workers < 1:
+        parser.error("--workers must be at least 1")
     if not arguments.sources:
         arguments.sources = list(SOURCES)
     return arguments

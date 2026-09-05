@@ -1,7 +1,9 @@
 """HTTP fetch layer for the feed crawler.
 
 One :class:`Fetcher` owns an ``httpx`` client, a per-host token bucket and the
-byte/request counters the crawl log reports. It offers three verbs: ``head``
+per-worker byte/request counters each crawl-log record reads as its own delta
+(the run total is the sum over records, so no counter is shared across
+threads). It offers three verbs: ``head``
 probes a URL for its size and range support; ``read_range`` reads one byte
 range (with :meth:`Fetcher.range_reader` adapting it to the ``ziprange`` read
 contract); ``download`` streams the whole file into a store directory —
@@ -29,6 +31,7 @@ a whole download) rather than being papered over.
 import hashlib
 import ipaddress
 import os
+import threading
 import time
 import urllib.parse
 
@@ -143,17 +146,26 @@ class HostBuckets:
         self._clock = clock
         self._sleeper = sleeper
         self._buckets = {}
+        # Guards the get-or-create-and-update of one host's bucket so many
+        # workers throttle correctly against a shared registry; the sleep is
+        # taken outside it, so one host's wait never blocks another host.
+        self._lock = threading.Lock()
 
     def acquire(self, host):
-        tokens, then = self._buckets.get(host, (float(self._burst), self._clock()))
-        now = self._clock()
-        tokens = min(self._burst, tokens + (now - then) * self._rate)
-        if tokens < 1.0:
-            wait = (1.0 - tokens) / self._rate
+        with self._lock:
+            tokens, then = self._buckets.get(host, (float(self._burst), self._clock()))
+            now = self._clock()
+            tokens = min(self._burst, tokens + (now - then) * self._rate)
+            if tokens < 1.0:
+                # Reserve this request's slot at the future time before sleeping,
+                # so a concurrent waiter on the same host queues behind it.
+                wait = (1.0 - tokens) / self._rate
+                self._buckets[host] = (0.0, now + wait)
+            else:
+                wait = 0.0
+                self._buckets[host] = (tokens - 1.0, now)
+        if wait:
             self._sleeper(wait)
-            now += wait
-            tokens = 1.0
-        self._buckets[host] = (tokens - 1.0, now)
 
 
 def _content_range(response):
@@ -208,8 +220,28 @@ class Fetcher:
             },
         )
         self._buckets = HostBuckets(rate, burst, clock=clock, sleeper=sleeper)
+        # Per-thread counters: one shared Fetcher serves every crawl worker, and
+        # a feed's record reads these as a delta over its own crawl, so each
+        # thread must count only the requests and bytes it made.
+        self._counters = threading.local()
         self.requests = 0
         self.bytes_fetched = 0
+
+    @property
+    def requests(self):
+        return getattr(self._counters, "requests", 0)
+
+    @requests.setter
+    def requests(self, value):
+        self._counters.requests = value
+
+    @property
+    def bytes_fetched(self):
+        return getattr(self._counters, "bytes_fetched", 0)
+
+    @bytes_fetched.setter
+    def bytes_fetched(self, value):
+        self._counters.bytes_fetched = value
 
     def close(self):
         self._client.close()
@@ -221,12 +253,13 @@ class Fetcher:
         self.close()
 
     def _throttle(self, url):
-        # One bucket per real host, keyed by the normalised connect form: a
-        # spelling variant (case, trailing dot, Unicode vs punycode, an IPv6
-        # long form) or an explicit default port must not mint a fresh bucket.
-        split, host = check_url(url)
-        port = split.port or (443 if split.scheme == "https" else 80)
-        self._buckets.acquire(f"{host}:{port}")
+        # One bucket per real host: the single per-host rate authority, so
+        # every scheme and port of one host share it and the aggregate rate to
+        # that host cannot double. The key is the normalised host, so a spelling
+        # variant (case, trailing dot, Unicode vs punycode, an IPv6 long form)
+        # or any port never mints a fresh bucket.
+        _, host = check_url(url)
+        self._buckets.acquire(host)
         self.requests += 1
 
     def _hops(self, method, url, headers, *, stream=False):
