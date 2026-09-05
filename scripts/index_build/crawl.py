@@ -29,6 +29,7 @@ no city) reads the member: the safe direction. A recrawl request always reads
 it.
 """
 
+import concurrent.futures
 import contextlib
 import csv
 import datetime
@@ -754,8 +755,42 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
             feed_dir.close()
 
 
+def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
+    """:func:`_crawl_one`, guaranteed not to raise. An unexpected error (not one
+    it already turns into a ``failed`` record) becomes a ``skipped`` record so a
+    single broken feed never aborts the run — identically on the sequential and
+    the pooled paths, which both call this."""
+    try:
+        return _crawl_one(
+            fetcher,
+            cache_dir,
+            feed,
+            force=force,
+            range_threshold=range_threshold,
+            lookup=lookup,
+        )
+    except Exception as error:  # noqa: B902 — containment at any worker count
+        return {
+            "feed_id": feed["feed_id"],
+            "url": _feed_url(feed),
+            "directory": _dir_name(feed["feed_id"]),
+            "method": "skipped",
+            "bytes_fetched": 0,
+            "bytes_saved": 0,
+            "fallback_reason": f"unexpected error: {error}",
+            "members": [],
+            "stop_times": None,
+            "stop_times_reason": None,
+        }
+
+
 def crawl(
-    cache_dir, *, fetcher=None, range_threshold=fetch.RANGE_THRESHOLD, lookup=None
+    cache_dir,
+    *,
+    fetcher=None,
+    range_threshold=fetch.RANGE_THRESHOLD,
+    lookup=None,
+    workers=1,
 ):
     """Crawl every crawlable resolved feed. Returns the run summary.
 
@@ -765,7 +800,10 @@ def crawl(
     tests. ``lookup`` is the boundary lookup the stop_times predicate answers
     against; by default the memoized one under the cache is opened read-only —
     with no memo (or without its dependencies) every feed reads the complete
-    ``stop_times.txt``, the safe direction.
+    ``stop_times.txt``, the safe direction. ``workers`` runs that many feeds
+    concurrently over one shared network-bound ``Fetcher`` (per-feed dirs never
+    collide, one host stays rate-limited); the built artifacts are identical to
+    a sequential run at any worker count.
     """
     if fetcher is None:
         fetcher = fetch.Fetcher()
@@ -797,19 +835,46 @@ def crawl(
                     for key in [feed["feed_id"], *(feed.get("aliases") or [])]:
                         canonical[key] = feed["feed_id"]
                 forced = {canonical.get(rid, rid) for rid in recrawl}
-                for feed in feeds:
-                    if not feed.get("crawlable"):
-                        continue
-                    log.append(
-                        _crawl_one(
+                # Eligible feeds in traversal order; each keeps its ordinal so
+                # the log is byte-identical to a sequential build whatever order
+                # the workers finish in. Never sort by feed_id: that would
+                # change today's workers=1 output too.
+                eligible = [
+                    (feed, feed["feed_id"] in forced)
+                    for feed in feeds
+                    if feed.get("crawlable")
+                ]
+                if workers == 1:
+                    log = [
+                        _safe_crawl_one(
                             fetcher,
                             cache_dir,
                             feed,
-                            force=feed["feed_id"] in forced,
+                            force=force,
                             range_threshold=range_threshold,
                             lookup=lookup,
                         )
-                    )
+                        for feed, force in eligible
+                    ]
+                else:
+                    log = [None] * len(eligible)
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=workers
+                    ) as pool:
+                        futures = {
+                            pool.submit(
+                                _safe_crawl_one,
+                                fetcher,
+                                cache_dir,
+                                feed,
+                                force=force,
+                                range_threshold=range_threshold,
+                                lookup=lookup,
+                            ): ordinal
+                            for ordinal, (feed, force) in enumerate(eligible)
+                        }
+                        for future in concurrent.futures.as_completed(futures):
+                            log[futures[future]] = future.result()
                 store.write_file(
                     directory,
                     LOG_FILE,
