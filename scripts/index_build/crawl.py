@@ -4,7 +4,8 @@ For every resolved feed that is crawlable, the stage fetches the members later
 stages read — ``agency.txt``, ``routes.txt``, ``stops.txt``, ``trips.txt``,
 ``calendar.txt``, ``calendar_dates.txt`` and the complete ``stop_times.txt`` —
 into ``cache/crawl/<feed dir>/`` alongside a ``state.json`` provenance record
-(URL, validators, digests, members, the member set asked for, time).
+(URL, validators, digests, members, the member set asked for, the archive's full
+root-file manifest, time).
 
 Feeds large enough to pay for it (past the size threshold, on a server that
 honours ranges and offers a strong validator) are read member-by-member through
@@ -494,11 +495,44 @@ def _prune_members(feed_dir, kept):
             store.unlink(feed_dir, name)
 
 
+def _root_files(names):
+    """The archive's distinct root-level file names, sorted: a member with a
+    ``/`` is in a subfolder (which the crawl never reads) or a directory marker,
+    so only root entries count, deduplicated. Restricted to printable ASCII —
+    every GTFS spec file qualifies, while a control-character or non-ASCII entry
+    (which the range and download paths could decode differently, or which could
+    spoof a capability name) is dropped: the manifest is a best-effort
+    capability hint, not a security boundary. Each path names files with the
+    reader that also extracts them — ``ziprange`` on the range path (raw
+    central-directory bytes), ``zipfile`` on the download path (which normalises
+    a name, e.g. truncating at an embedded NUL) — so a feed's manifest always
+    matches its own evidence; a hand-crafted NUL name is a residual of the hint,
+    since real GTFS feeds carry none of these."""
+    return sorted(
+        {
+            name
+            for name in names
+            if name and "/" not in name and name.isascii() and name.isprintable()
+        }
+    )
+
+
+def _manifest_list(value):
+    """The sanitized manifest when ``value`` is a list of strings, else None: a
+    missing (legacy) or corrupt (non-list, or mixed-type) ``files`` re-fetches
+    rather than publishing garbage or raising on ``sorted`` every crawl."""
+    if isinstance(value, list) and all(isinstance(name, str) for name in value):
+        return _root_files(value)
+    return None
+
+
 def _write_ranged(fetcher, url, probe, feed_dir, decide):
-    """Write members via range reads, one at a time; return their digests.
+    """Write members via range reads, one at a time; return their digests and
+    the archive's file manifest.
 
     The cheap members land first; ``decide`` then rules on the complete
-    ``stop_times.txt`` read from what is on disk.
+    ``stop_times.txt`` read from what is on disk. The manifest is the central
+    directory the range reads already parse, so it costs no extra fetch.
     """
     read = fetcher.range_reader(url, validator=_range_validator(probe))
     directory = ziprange.central_directory(read, probe["size"])
@@ -517,7 +551,7 @@ def _write_ranged(fetcher, url, probe, feed_dir, decide):
     skipped, reason = decide(feed_dir, digests)
     if not skipped:
         write(STOP_TIMES)
-    return digests, skipped, reason
+    return digests, _root_files(directory), skipped, reason
 
 
 def _extract_members(feed_dir, decide):
@@ -526,10 +560,14 @@ def _extract_members(feed_dir, decide):
     ``zipfile`` handles what ziprange deliberately refuses (ZIP64, data
     descriptors); each member is capped and streamed straight to its file, so
     members never accumulate in memory. The cheap members land first; ``decide``
-    then rules on extracting ``stop_times.txt``. Returns the digests.
+    then rules on extracting ``stop_times.txt``. Returns the digests and the
+    archive file manifest, which comes from the same ``zipfile`` reader that
+    extracts the members, so the two never disagree about what the archive
+    holds.
     """
     digests = {}
     with zipfile.ZipFile(feed_dir.path / ARCHIVE_FILE) as archive:
+        files = _root_files(archive.namelist())
 
         def extract(name):
             try:
@@ -568,7 +606,7 @@ def _extract_members(feed_dir, decide):
         skipped, reason = decide(feed_dir, digests)
         if not skipped:
             extract(STOP_TIMES)
-    return digests, skipped, reason
+    return digests, files, skipped, reason
 
 
 def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
@@ -584,6 +622,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
         "bytes_saved": 0,
         "fallback_reason": None,
         "members": [],
+        "files": [],
         "stop_times": None,
         "stop_times_reason": None,
     }
@@ -619,13 +658,25 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
             else:
                 unchanged = False
             unchanged = unchanged and state.get("url") == url
-            if unchanged and _cache_reusable(feed_dir, state, url, force, lookup):
+            # A state written before the manifest existed (or a corrupt one)
+            # has no valid ``files`` list; re-fetch it once (rather than carry an
+            # empty or garbage manifest forward) so the directory is read and
+            # recorded. A genuine empty manifest is the list ``[]`` and reuses
+            # the cache.
+            manifest = _manifest_list(state.get("files"))
+            if (
+                unchanged
+                and manifest is not None
+                and _cache_reusable(feed_dir, state, url, force, lookup)
+            ):
                 record["method"] = "not_modified"
                 record["members"] = sorted(state.get("members") or [])
+                record["files"] = manifest
                 record["stop_times"] = (state.get("stop_times") or {}).get("state")
                 return record
 
         digests = None
+        files = []
         # Range reads span several requests, so they are only taken when a
         # strong validator can pin them all to one representation.
         ranged = (
@@ -637,7 +688,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
         )
         if ranged:
             try:
-                digests, skipped, skip_reason = _write_ranged(
+                digests, files, skipped, skip_reason = _write_ranged(
                     fetcher, url, probe, feed_dir, decide
                 )
                 record["method"] = "range"
@@ -664,7 +715,13 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
             # a 304 reuses the cache verbatim, so it may only be requested when
             # the cache verifies against its recorded digests AND any cached
             # skip decision still holds.
-            usable = _cache_reusable(feed_dir, state, url, force, lookup)
+            # As above, a state without a valid recorded manifest is re-fetched
+            # once rather than reused via a 304, so its directory is read.
+            manifest = _manifest_list(state.get("files"))
+            usable = (
+                _cache_reusable(feed_dir, state, url, force, lookup)
+                and manifest is not None
+            )
             conditional = state if usable else {}
             outcome = fetcher.download(
                 url,
@@ -676,10 +733,13 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
             if outcome["status"] == "not_modified":
                 record["method"] = "not_modified"
                 record["members"] = sorted(state.get("members") or [])
+                record["files"] = manifest
                 record["stop_times"] = (state.get("stop_times") or {}).get("state")
                 return record
             try:
-                digests, skipped, skip_reason = _extract_members(feed_dir, decide)
+                digests, files, skipped, skip_reason = _extract_members(
+                    feed_dir, decide
+                )
             finally:
                 # Never leave the archive behind, extraction failures included.
                 store.unlink(feed_dir, ARCHIVE_FILE)
@@ -692,6 +752,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
 
         _prune_members(feed_dir, digests)
         record["members"] = sorted(digests)
+        record["files"] = files
         record["fallback_reason"] = fallback_reason
         # "complete" must mean the member exists AND was read; an archive
         # that simply has none is "absent", never a false completeness claim.
@@ -712,6 +773,9 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 "archive_sha256": record.get("archive_sha256"),
                 "member_sha256": digests,
                 "members": sorted(digests),
+                # Every root file the archive carries (a superset of the
+                # extracted members), so callers can filter feeds by capability.
+                "files": files,
                 # The member set this crawler asked for: a cache written
                 # for a smaller set is not reusable, optional members or not.
                 "members_requested": sorted(MEMBERS),
@@ -779,6 +843,7 @@ def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup)
             "bytes_saved": 0,
             "fallback_reason": f"unexpected error: {error}",
             "members": [],
+            "files": [],
             "stop_times": None,
             "stop_times_reason": None,
         }

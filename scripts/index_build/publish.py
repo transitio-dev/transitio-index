@@ -31,7 +31,7 @@ import pyarrow.parquet as pq
 
 from index_build import store
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
@@ -70,6 +70,9 @@ _SCHEMA = pa.schema(
         ("last_modified", pa.string()),
         ("last_crawled", pa.string()),
         ("crawl_status", pa.string()),
+        # Every root GTFS file the archive carries (schema_version 5), so a
+        # caller can filter feeds by capability without downloading them.
+        ("files", pa.list_(pa.string())),
         # Whether the feed's licence permits redistributing derived data;
         # null when unknown. Set by the license stage.
         ("redistribution_allowed", pa.bool_()),
@@ -110,6 +113,7 @@ def _row(record, snapshot_id):
         "last_modified": record.get("last_modified"),
         "last_crawled": record.get("last_crawled"),
         "crawl_status": record.get("crawl_status"),
+        "files": record.get("files") or [],
         "redistribution_allowed": record.get("redistribution_allowed"),
         "snapshot": snapshot_id,
     }
