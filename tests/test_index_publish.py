@@ -371,6 +371,31 @@ def test_the_reader_refuses_a_non_integer_schema_version(tmp_path):
         transitio_index.read_index(index_dir)
 
 
+def test_the_reader_still_reads_a_schema_4_index(tmp_path):
+    # A shipped schema-4 index has no ``files`` column; the version-keyed check
+    # must read it unchanged. No schema-4 index is committed (the index is
+    # packaged at release), so recreate the exact schema-4 shape by dropping the
+    # column and stamping the manifest back to schema 4.
+    import hashlib
+
+    import pandas
+
+    cache, _ = _build_index(tmp_path)
+    index_dir = cache / "index"
+    feeds = pandas.read_parquet(index_dir / "feeds.parquet").drop(columns=["files"])
+    feeds.to_parquet(index_dir / "feeds.parquet", index=False)
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    snapshot["schema_version"] = 4
+    snapshot["min_reader_version"] = transitio_index.MIN_READER_VERSIONS[4]
+    snapshot["feeds_sha256"] = hashlib.sha256(
+        (index_dir / "feeds.parquet").read_bytes()
+    ).hexdigest()
+    (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+    index = transitio_index.read_index(index_dir)
+    assert index.schema_version == 4
+    assert "files" not in index.feeds.columns
+
+
 def test_the_reader_refuses_a_parquet_that_does_not_match_its_manifest(tmp_path):
     cache, _ = _build_index(tmp_path)
     (cache / "index" / "feeds.parquet").write_bytes(b"not the published parquet")
@@ -840,25 +865,36 @@ def test_crawl_evidence_and_provenance_round_trip(tmp_path):
 
     pytest.importorskip("geopandas")
     hull = "0101000000" + "00" * 16  # a WKB point
+    manifest_files = [
+        "agency.txt",
+        "routes.txt",
+        "shapes.txt",
+        "stops.txt",
+        "trips.txt",
+    ]
     crawled = {
         **_covered_feed("f-a", coverage_source="crawl"),
         "coverage": hull,
         "stop_count": 250,
         "crawl_status": "ok",
         "last_crawled": "2026-09-01T00:00:00+00:00",
+        "files": manifest_files,
     }
     cache, manifest = _edges_index(tmp_path, [_edge("Q1757", "f-a")], feeds=[crawled])
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert (
         manifest["discovery_semantics_version"]
         == transitio_index.DISCOVERY_SEMANTICS_VERSION
     )
-    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS[4]
+    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS[5]
     assert manifest["built_with"] == transitio.__version__
     index = transitio_index.read_index(cache / "index")
     row = index.feeds.set_index("feed_id").loc["f-a"]
     assert row["coverage"] == bytes.fromhex(hull) and row["stop_count"] == 250
     assert row["crawl_status"] == "ok"
+    # The manifest round-trips as a schema-5 column (surfaced on IndexedFeed in
+    # the follow-up; here the frame column is enough).
+    assert list(row["files"]) == manifest_files
     feed = transitio_index.place("Q1757", index=index).feeds()[0]
     assert feed.stop_count == 250 and feed.coverage == bytes.fromhex(hull)
     assert feed.provenance == {
@@ -945,7 +981,8 @@ def test_reader_versions_order_pre_releases_below_finals():
     assert key("1.x") is None and key("") is None
     # Bounded: an untrusted manifest cannot feed int() an unbounded digit run.
     assert key("1" * 400) is None and key("1.0.0rc" + "9" * 40) is None
-    # Schema 3 arrived after the 0.10.0 release, which reads schema 2 only.
+    # The index schema's reader floor is above the 0.10.0 release, which predates
+    # the index entirely.
     assert key(transitio_index.MIN_READER_VERSIONS[4]) > key("0.10.0")
 
 

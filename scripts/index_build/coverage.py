@@ -353,6 +353,10 @@ def crawled_edges(cache_dir, feeds, places, lookup):
             "last_modified": state.get("last_modified"),
             "last_crawled": state.get("retrieved_at"),
             "crawl_status": "ok",
+            # Sanitize the recorded manifest the same way the crawl does, so a
+            # stale or tampered state cannot publish nested or non-printable
+            # names.
+            "files": crawl._manifest_list(state.get("files")) or [],
         }
         if not points:
             continue

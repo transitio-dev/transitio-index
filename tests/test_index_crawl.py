@@ -834,6 +834,7 @@ def test_a_worker_exception_is_contained_at_its_ordinal(tmp_path, monkeypatch, w
     log = store.parse_jsonl((cache / "crawl" / crawl.LOG_FILE).read_bytes())
     assert [record["feed_id"] for record in log] == ["f-0", "f-1", "f-2"]
     assert log[1]["method"] == "skipped" and "kaboom" in log[1]["fallback_reason"]
+    assert log[1]["files"] == []  # the fallback record carries every field
     assert log[0]["method"] in ("range", "download")
     assert log[2]["method"] in ("range", "download")
 
@@ -867,3 +868,93 @@ def test_workers_crawl_feeds_concurrently(tmp_path):
     assert not broke.is_set()  # both HEADs met the barrier: they ran at once
     log = store.parse_jsonl((cache / "crawl" / crawl.LOG_FILE).read_bytes())
     assert all(record["method"] in ("range", "download") for record in log)
+
+
+# --- File manifest (schema 5) -------------------------------------------------
+
+EXTRA_MEMBERS = {
+    **FULL_MEMBERS,
+    "shapes.txt": b"shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n",
+    "fare_attributes.txt": b"fare_id,price,currency_type,payment_method,transfers\n",
+    "sub/": b"",  # an explicit directory marker: excluded
+    "sub/nested.txt": b"x\n",  # a subfolder entry: also excluded
+}
+
+
+@pytest.mark.parametrize("range_threshold", [10**9, 1])
+def test_the_crawl_records_the_full_file_manifest(tmp_path, range_threshold):
+    cache = tmp_path / "cache"
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    data = _zip_bytes(EXTRA_MEMBERS)
+    _, log = _crawl(
+        cache, _server({"/a.zip": (data, '"v1"')}), range_threshold=range_threshold
+    )
+    files = log["f-a"]["files"]
+    # Every root file — including the non-evidence shapes and fares — sorted,
+    # with the directory marker and the subfolder entry both excluded.
+    assert "shapes.txt" in files and "fare_attributes.txt" in files
+    assert "sub/" not in files and "sub/nested.txt" not in files
+    assert "sub" not in files and "nested.txt" not in files
+    assert files == sorted(files)
+    # ``members`` stays the extracted evidence subset; the manifest is a superset.
+    assert set(log["f-a"]["members"]) <= set(crawl.MEMBERS)
+    assert "shapes.txt" not in log["f-a"]["members"]
+    assert set(log["f-a"]["members"]) <= set(files)
+    # state.json carries the same manifest.
+    state = json.loads((_feed_dir(cache, "f-a") / "state.json").read_text())
+    assert state["files"] == files
+
+
+def test_the_manifest_is_carried_and_backfilled(tmp_path):
+    cache = tmp_path / "cache"
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    server = _server({"/a.zip": (_zip_bytes(EXTRA_MEMBERS), '"v1"')})
+    _crawl(cache, server)  # first crawl records the manifest
+    state_path = _feed_dir(cache, "f-a") / "state.json"
+
+    # An unchanged recrawl reuses the cache and keeps the manifest.
+    _, log = _crawl(cache, server)
+    assert log["f-a"]["method"] == "not_modified"
+    assert "shapes.txt" in log["f-a"]["files"]
+
+    # Legacy state predating the manifest (no ``files`` key) is re-fetched once
+    # rather than carrying an empty manifest forward.
+    state = json.loads(state_path.read_text())
+    del state["files"]
+    state_path.write_text(json.dumps(state))
+    _, log = _crawl(cache, server)
+    assert log["f-a"]["method"] in ("range", "download")
+    assert "shapes.txt" in log["f-a"]["files"]
+
+    # A genuine empty manifest keeps its key and still reuses the cache.
+    state = json.loads(state_path.read_text())
+    state["files"] = []
+    state_path.write_text(json.dumps(state))
+    _, log = _crawl(cache, server)
+    assert log["f-a"]["method"] == "not_modified"
+    assert log["f-a"]["files"] == []
+
+    # A corrupt (non-list) manifest is treated like legacy state and re-fetched,
+    # never carried forward as garbage.
+    state = json.loads(state_path.read_text())
+    state["files"] = "shapes.txt"
+    state_path.write_text(json.dumps(state))
+    _, log = _crawl(cache, server)
+    assert log["f-a"]["method"] in ("range", "download")
+    assert "shapes.txt" in log["f-a"]["files"]
+
+
+def test_root_files_keeps_only_printable_ascii_root_names():
+    manifest = crawl._root_files(
+        ["shapes.txt", "shapes.txt", "sub/x.txt", "sub/", "café.txt", "b\x00d.txt", ""]
+    )
+    # Duplicate collapsed; subfolder, marker, non-ascii and NUL all dropped.
+    assert manifest == ["shapes.txt"]
+
+
+def test_manifest_list_rejects_non_list_and_mixed_types():
+    assert crawl._manifest_list(["shapes.txt", "sub/x.txt"]) == ["shapes.txt"]
+    assert crawl._manifest_list([]) == []
+    assert crawl._manifest_list("shapes.txt") is None  # a string is not a manifest
+    assert crawl._manifest_list(["shapes.txt", 1]) is None  # mixed types re-fetch
+    assert crawl._manifest_list(None) is None
