@@ -9,7 +9,7 @@ areas gives its metropolitan region; that membership is derived offline and
 recorded for every such city in ``metro_assignments.jsonl``, but a Eurostat
 metro is published only through a curated ``set_statistical_area`` crosswalk
 naming its QID, and only while every derived input is allowlisted — otherwise
-it is reported for curation. Every
+it is reported with the Wikidata candidates a curator can pick from. Every
 member city carries its metros in ``metro_ids`` — a city can belong to more
 than one. Metro geometry is later work; this stage adds membership only.
 """
@@ -126,13 +126,16 @@ def _set_members(by_id, entries, report):
 
 def _attach_us(places, by_id, metros, report, wikidata):
     """The US branch: each US city's MSA from Wikidata; an MSA without a CBSA
-    code is reported for a later pass rather than published."""
+    code is reported for a later pass rather than published. Returns the
+    branch summary."""
     us_cities = [
         p["place_id"]
         for p in places
         if p["kind"] == "city" and p["country_code"] == "US"
     ]
     membership = wikidata.statistical_metros(us_cities) if us_cities else {}
+    published = set()
+    reported_metros = set()
     for city_qid, found in membership.items():
         city = by_id.get(city_qid)
         if city is None:
@@ -148,14 +151,17 @@ def _attach_us(places, by_id, metros, report, wikidata):
                         "reason": "US MSA without a CBSA code",
                     }
                 )
+                reported_metros.add(record["qid"])
                 continue
-            _join_member(
+            metro = _join_member(
                 by_id,
                 metros,
                 record["qid"],
                 functools.partial(_metro_place, record),
                 city,
             )
+            published.add(metro["place_id"])
+    return {"metros_published": len(published), "metros_reported": len(reported_metros)}
 
 
 def _crosswalk(place_overrides, composition, by_id, metros):
@@ -222,6 +228,59 @@ def _publish_eurostat(by_id, metros, qid, code, metro, city_ids):
     return row
 
 
+def _candidates(wikidata, members):
+    """Per unpublished metro code, the Wikidata metro-like entities its member
+    cities link to and how many members link to each — the curator's
+    shortlist, never an identity."""
+    cities = sorted({city for ids in members.values() for city in ids})
+    linked = wikidata.metro_candidates(cities) if cities else {}
+    result = {}
+    for code, ids in members.items():
+        counts = collections.Counter()
+        names = {}
+        for city in ids:
+            for candidate in linked.get(city, []):
+                counts[candidate["qid"]] += 1
+                names[candidate["qid"]] = candidate["name"]
+        result[code] = [
+            {"qid": qid, "name": names[qid], "cities": count}
+            for qid, count in sorted(
+                counts.items(), key=lambda item: (-item[1], item[0])
+            )
+        ]
+    return result
+
+
+def _derived_inventory(inputs_manifest, memberships):
+    """One licence-inventory row per derived input, at its pinned version and
+    with the credit and terms its source requires, allowed or not."""
+    versions = {
+        "Overture Maps divisions": overture.OVERTURE_RELEASE,
+        "Eurostat metropolitan regions": inputs_manifest["digests"][
+            eurostat.COMPOSITION_FILE
+        ],
+        "GISCO NUTS 2021": inputs_manifest["digests"][eurostat.BOUNDARIES_FILE],
+    }
+    rows = []
+    for dataset, licence in EUROSTAT_DERIVED:
+        meta = geometry.DERIVED_SOURCES[(dataset, licence)]
+        rows.append(
+            {
+                "role": "derived_input",
+                "use": "derived",
+                "dataset": dataset,
+                "license": licence,
+                "credit": meta["credit"],
+                "terms": meta["licence"],
+                "url": meta["url"],
+                "version": versions[dataset],
+                "allowed": (dataset, licence) in geometry.DERIVED_SOURCE_ALLOWLIST,
+                "memberships": memberships,
+            }
+        )
+    return rows
+
+
 def _attach_eurostat(
     places,
     by_id,
@@ -232,17 +291,18 @@ def _attach_eurostat(
     cache_dir,
     dataset,
     pins,
+    wikidata,
     place_overrides,
 ):
-    """The Eurostat branch; returns ``(assignments, summary, applied)``, the
-    last being the crosswalk entries that published.
+    """The Eurostat branch; returns ``(assignments, derived_inventory, summary,
+    applied)``, the last being the crosswalk entries that published.
 
     Every city of a covered country gets an assignment row. Every crosswalk
     entry is judged against the sorted derived member list it named, whether
     or not its metro publishes; a metro publishes only with a crosswalk entry
     and every derived input allowlisted (its derived members may be none), and
     every other
-    composition metro is reported with the reason.
+    composition metro is reported with the reason and its candidates.
     """
     composition, boundaries, inputs_manifest = eurostat.load_inputs(
         cache_dir, expected=pins
@@ -267,6 +327,7 @@ def _attach_eurostat(
     crosswalk = _crosswalk(place_overrides, composition, by_id, metros)
     allowed = all(key in geometry.DERIVED_SOURCE_ALLOWLIST for key in EUROSTAT_DERIVED)
     published = set()
+    unpublished = {}
     # Report-first: every composition metro is reported unless it publishes.
     for code in sorted(composition):
         city_ids = members.get(code, [])
@@ -283,6 +344,8 @@ def _attach_eurostat(
             )
             published.add(code)
             continue
+        if city_ids:
+            unpublished[code] = city_ids
         report.append(
             {
                 "branch": "eurostat",
@@ -293,6 +356,10 @@ def _attach_eurostat(
                 "reason": reason,
             }
         )
+    candidates = _candidates(wikidata, unpublished)
+    for row in report:
+        if row.get("branch") == "eurostat":
+            row["candidates"] = candidates.get(row["metro_code"], [])
     for row in assignments:
         row["published"] = (
             row["status"] == "assigned" and row["metro_code"] in published
@@ -307,7 +374,9 @@ def _attach_eurostat(
             sorted(collections.Counter(row["status"] for row in assignments).items())
         ),
     }
-    return assignments, summary, len(published)
+    assigned = sum(1 for row in assignments if row["status"] == "assigned")
+    inventory = _derived_inventory(inputs_manifest, assigned)
+    return assignments, inventory, summary, len(published)
 
 
 def attach_metros(
@@ -364,17 +433,20 @@ def attach_metros(
             metros = {}
             report = []
             override_report = []
-            _attach_us(places, by_id, metros, report, wikidata)
-            assignments, eurostat_summary, crosswalked = _attach_eurostat(
-                places,
-                by_id,
-                metros,
-                report,
-                override_report,
-                cache_dir=cache_dir,
-                dataset=dataset,
-                pins=pins,
-                place_overrides=place_overrides,
+            us_summary = _attach_us(places, by_id, metros, report, wikidata)
+            assignments, derived_inventory, eurostat_summary, crosswalked = (
+                _attach_eurostat(
+                    places,
+                    by_id,
+                    metros,
+                    report,
+                    override_report,
+                    cache_dir=cache_dir,
+                    dataset=dataset,
+                    pins=pins,
+                    wikidata=wikidata,
+                    place_overrides=place_overrides,
+                )
             )
 
             for metro in metros.values():
@@ -403,7 +475,9 @@ def attach_metros(
                     1 for p in places if p["kind"] == "city" and p["metro_ids"]
                 ),
                 "reported": len(report),
+                "us": us_summary,
                 "eurostat": eurostat_summary,
+                "derived_inventory": derived_inventory,
                 "places_overrides_sha256": places_digest,
                 "overrides_applied": applied,
                 "stale_overrides": len(override_report),
