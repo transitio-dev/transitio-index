@@ -5,8 +5,9 @@ simplifies them to a shipping tolerance, and audits each area's sources against
 an allowlist of audited ``(dataset, licence)`` pairs: geometry ships (as
 hex-encoded WKB) only when every source that built it is on the allowlist, and
 its attribution goes into ``NOTICE``; geometry with any unaudited or unlicensed
-source is omitted and recorded in the licence inventory. Metros carry no geometry
-here — their hulls are a statistical/member-union stage. Only the simplified
+source is omitted and recorded in the licence inventory. A metro's geometry is
+the union of its member cities' shipped polygons, so it never carries what a
+member may not. Only the simplified
 geometry is meant to ship; the full-resolution boundary lookup used for
 point-in-polygon is built by the coverage stage that consumes it.
 """
@@ -287,7 +288,8 @@ def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False
     simplified (unioned) geometry only where every land area's sources are
     allowlisted, recording the audit in the licence inventory and NOTICE; a place
     with a disallowed source, no source, or invalid geometry keeps a null
-    geometry. One writer lock spans the read, the geometry read and the publish.
+    geometry; a metro gets the union of its members' shipped polygons, or none.
+    One writer lock spans the read, the geometry read and the publish.
     Returns the generation manifest.
     """
     directory = store.open_subdir(cache_dir, "gazetteer")
@@ -337,6 +339,27 @@ def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False
                     for source in row["sources"]:
                         shipped.add(_source_key(source))
 
+            by_id = {p["place_id"]: p for p in places}
+            member_union = 0
+            for place in places:
+                if place.get("kind") != "metro" or place.get("geometry"):
+                    continue
+                # Every member must have shipped its own polygon: a metro is
+                # drawn only from what its members already redistribute.
+                members = [by_id.get(qid) for qid in place.get("member_ids") or []]
+                if not members or any(not (m and m.get("geometry")) for m in members):
+                    continue
+                merged = shapely.unary_union(
+                    [shapely.from_wkb(m["geometry"]) for m in members]
+                )
+                simplified = _simplify(merged)
+                if not _valid_polygon(simplified):
+                    invalid += 1
+                    continue
+                place["geometry"] = shapely.to_wkb(simplified).hex()
+                place["geometry_source"] = "member_union"
+                member_union += 1
+
             place_overrides, places_digest = overrides.load_place_overrides(
                 overrides_dir
             )
@@ -347,7 +370,6 @@ def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False
                 "gazetteer",
             )
             override_report = []
-            by_id = {p["place_id"]: p for p in places}
             curated = 0
             for place in places:
                 # A curated place's own boundary, judged already by the seed
@@ -385,6 +407,7 @@ def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False
                 "omitted_by_licence": omitted,
                 "invalid_geometry": invalid,
                 "curated_geometry": curated,
+                "member_union_geometry": member_union,
                 "places_overrides_sha256": places_digest,
                 "stale_overrides": len(override_report),
                 "stale_place_overrides": (
