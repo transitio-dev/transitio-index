@@ -114,10 +114,9 @@ def test_downloaded_inputs_are_verified_against_the_pins(tmp_path, monkeypatch):
 
 # ---- readers and derivation ----
 
-openpyxl = pytest.importorskip("openpyxl")
-pa = pytest.importorskip("pyarrow")
-import pyarrow.parquet as pq  # noqa: E402
 import shapely  # noqa: E402
+
+from eurostat_fixture import parquet, workbook  # noqa: E402
 
 WEST = shapely.box(24.0, 60.0, 25.0, 61.0)  # FI1B1, in the Helsinki metro
 EAST = shapely.box(25.0, 60.0, 26.0, 61.0)  # FI1C1, in the Helsinki metro
@@ -151,38 +150,6 @@ METROS = {
     "EL001MC": {"name": "Athina", "country": "GR", "nuts3": ["EL301"]},
     "UK001MC": {"name": "London", "country": "GB", "nuts3": ["UKI31"]},
 }
-
-
-def workbook(
-    rows, header=eurostat.COMPOSITION_HEADER, sheet=eurostat.COMPOSITION_SHEET
-):
-    book = openpyxl.Workbook()
-    book.active.title = "Version Date"
-    book.active.append(["2.2"])
-    table = book.create_sheet(sheet)
-    table.append(list(header))
-    for row in rows:
-        table.append(list(row))
-    buffer = io.BytesIO()
-    book.save(buffer)
-    return buffer.getvalue()
-
-
-def parquet(regions, level=3):
-    """A GISCO-shaped file: ``(nuts_id, geometry-or-wkb)`` rows."""
-    table = pa.table(
-        {
-            "NUTS_ID": [nuts_id for nuts_id, _ in regions],
-            "LEVL_CODE": [level] * len(regions),
-            "Shape": [
-                geom if isinstance(geom, bytes) else shapely.to_wkb(geom)
-                for _, geom in regions
-            ],
-        }
-    )
-    sink = pa.BufferOutputStream()
-    pq.write_table(table, sink)
-    return sink.getvalue().to_pybytes()
 
 
 def _fixtures(tmp_path, composition=None, boundaries=None):
