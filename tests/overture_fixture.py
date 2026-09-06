@@ -141,9 +141,10 @@ class StubWikidata:
 
     endpoint = "stub://wikidata"
 
-    def __init__(self, mapping=None, metros=None, labels=None):
+    def __init__(self, mapping=None, metros=None, labels=None, candidates=None):
         self.mapping = mapping or {}
         self.metros = metros or {}
+        self.candidates = candidates or {}
         self.labels = labels or {}
         self.queried = []
 
@@ -154,6 +155,9 @@ class StubWikidata:
 
     def statistical_metros(self, city_qids):
         return {c: self.metros[c] for c in city_qids if c in self.metros}
+
+    def metro_candidates(self, city_qids):
+        return {c: self.candidates[c] for c in city_qids if c in self.candidates}
 
     def labels_and_aliases(self, qids):
         return {q: self.labels[q] for q in qids if q in self.labels}

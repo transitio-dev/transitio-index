@@ -74,6 +74,9 @@ USER_AGENT = "transitio-index-build (+https://github.com/cafein-py/transitio)"
 # Wikidata class for a US metropolitan statistical area, and the properties that
 # link a city to its metro (P8138) and carry the metro's CBSA code (P882).
 US_MSA_CLASS = "Q1768043"
+# Metro-like classes a city may be linked to through P8138 that carry no
+# statistical code: metropolitan area, functional urban area.
+METRO_CANDIDATE_CLASSES = ("Q1907114", "Q3175539")
 
 
 class GazetteerError(RuntimeError):
@@ -194,7 +197,8 @@ class WikidataClient:
     """Batched lookups against the Wikidata SPARQL endpoint.
 
     Resolves OSM relations to QIDs (``p402``), a city's US metropolitan area
-    (``statistical_metros``) and a place's labels and aliases
+    (``statistical_metros``), its metro-like candidates (``metro_candidates``)
+    and a place's labels and aliases
     (``labels_and_aliases``), each in id-keyed batches. Only the Overture release
     is pinned; these endpoints are live, so results track Wikidata at build time.
     Tests substitute a stub exposing the same methods rather than reaching the
@@ -227,10 +231,7 @@ class WikidataClient:
         ``US_MSA_CLASS``), carrying the metro's CBSA code (P882) where present. A
         city outside any US MSA — including every non-US city — is simply absent.
         """
-        ids = sorted({str(qid) for qid in city_qids if qid})
-        raw = {}
-        for start in range(0, len(ids), self.batch_size):
-            self._metros_batch(ids[start : start + self.batch_size], raw)
+        raw = self._p8138((US_MSA_CLASS,), city_qids, code_property="P882")
         result = {}
         for city, found in sorted(raw.items()):
             result[city] = [
@@ -239,19 +240,56 @@ class WikidataClient:
                     "name": info["name"],
                     # A metro can carry several CBSA codes and SPARQL order is
                     # unspecified, so pick one deterministically.
-                    "cbsa": min(info["cbsas"]) if info["cbsas"] else None,
+                    "cbsa": min(info["codes"]) if info["codes"] else None,
                 }
                 for metro, info in sorted(found.items())
             ]
         return result
 
-    def _metros_batch(self, batch, raw):
+    def metro_candidates(self, city_qids):
+        """``{city_qid: [{"qid", "name"}, ...]}`` — metro-like entities per city.
+
+        The P8138 targets of class ``METRO_CANDIDATE_CLASSES`` (metropolitan
+        area, functional urban area). They carry no statistical code, so they
+        are suggestions for a curated crosswalk, never identities.
+        """
+        raw = self._p8138(METRO_CANDIDATE_CLASSES, city_qids)
+        return {
+            city: [
+                {"qid": metro, "name": info["name"]}
+                for metro, info in sorted(found.items())
+            ]
+            for city, found in sorted(raw.items())
+        }
+
+    def _p8138(self, classes, city_qids, code_property=None):
+        """``{city: {metro: {"name", "codes"}}}`` for the cities' P8138 links to
+        metros of ``classes``, batched; ``codes`` holds each metro's
+        ``code_property`` values when one is asked for."""
+        ids = sorted({str(qid) for qid in city_qids if qid})
+        # Only QIDs reach the query text: an arbitrary string could alter it.
+        invalid = [qid for qid in [*ids, *classes] if not QID_PATTERN.match(qid)]
+        if invalid:
+            raise GazetteerError(f"not Wikidata QIDs: {invalid[:5]}")
+        raw = {}
+        for start in range(0, len(ids), self.batch_size):
+            self._p8138_batch(
+                ids[start : start + self.batch_size], raw, classes, code_property
+            )
+        return raw
+
+    def _p8138_batch(self, batch, raw, classes, code_property):
         values = " ".join(f"wd:{qid}" for qid in batch)
+        kinds = " ".join(f"wd:{qid}" for qid in classes)
+        code = ""
+        if code_property:
+            code = f"OPTIONAL {{ ?metro wdt:{code_property} ?code }} "
+        select = "?city ?metro ?metroLabel" + (" ?code" if code_property else "")
         query = (
-            "SELECT ?city ?metro ?metroLabel ?cbsa WHERE { "
-            f"VALUES ?city {{ {values} }} "
-            f"?city wdt:P8138 ?metro . ?metro wdt:P31 wd:{US_MSA_CLASS} . "
-            "OPTIONAL { ?metro wdt:P882 ?cbsa } "
+            f"SELECT {select} WHERE {{ "
+            f"VALUES ?city {{ {values} }} VALUES ?class {{ {kinds} }} "
+            "?city wdt:P8138 ?metro . ?metro wdt:P31 ?class . "
+            f"{code}"
             'SERVICE wikibase:label { bd:serviceParam wikibase:language "en". } }'
         )
         for binding in self._get(query):
@@ -260,13 +298,13 @@ class WikidataClient:
             if not (QID_PATTERN.match(city) and QID_PATTERN.match(metro)):
                 continue
             info = raw.setdefault(city, {}).setdefault(
-                metro, {"name": None, "cbsas": set()}
+                metro, {"name": None, "codes": set()}
             )
             if info["name"] is None:
                 info["name"] = binding.get("metroLabel", {}).get("value")
-            cbsa = binding.get("cbsa", {}).get("value")
-            if cbsa:
-                info["cbsas"].add(cbsa)
+            value = binding.get("code", {}).get("value")
+            if value:
+                info["codes"].add(value)
 
     def _query_batch(self, batch, found):
         values = " ".join(f'"{rid}"' for rid in batch)

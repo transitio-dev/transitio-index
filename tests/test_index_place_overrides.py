@@ -45,6 +45,14 @@ def test_every_operation_loads_with_its_operation_key(tmp_path):
                 {"place": "Q3", "set_boundary": "POLYGON((0 0,1 0,1 1,0 0))"},
                 {"place": "Q3", "set_aliases": ["Old name"]},
                 {"place": "Q6", "source_ref": "ov-6", "resolve_place": True},
+                {
+                    "place": "Q7",
+                    "evidence_hash": "0" * 64,
+                    "set_statistical_area": {
+                        "scheme": "eurostat_metro",
+                        "code": "FI001",
+                    },
+                },
             ],
         )
     )
@@ -55,6 +63,7 @@ def test_every_operation_loads_with_its_operation_key(tmp_path):
         "set_boundary",
         "set_aliases",
         "resolve_place",
+        "set_statistical_area",
     ]
     assert len(digest) == 64
     assert overrides.load_place_overrides(None) == ([], None)
@@ -140,6 +149,43 @@ def test_every_operation_loads_with_its_operation_key(tmp_path):
         ({"place": "Q1", "set_boundary": ""}, "must be WKT"),
         ({"place": "Q1", "set_aliases": ["", "x"]}, "non-empty list of strings"),
         ({"place": "Q1", "set_aliases": ["x"], "evidence_hash": 5}, "must be a string"),
+        (
+            {"place": "Q1", "set_statistical_area": {"scheme": "eurostat_metro"}},
+            "scheme and a code",
+        ),
+        (
+            {"place": "Q1", "set_statistical_area": {"scheme": "x", "code": "1"}},
+            "scheme must be one of",
+        ),
+        (
+            {
+                "place": "Q1",
+                "set_statistical_area": {"scheme": "eurostat_metro", "code": " "},
+            },
+            "non-empty string",
+        ),
+        (
+            {
+                "place": "ov-1",
+                "set_statistical_area": {"scheme": "eurostat_metro", "code": "1"},
+            },
+            "real QID",
+        ),
+        (
+            {
+                "place": "Q1",
+                "set_statistical_area": {"scheme": "eurostat_metro", "code": "1"},
+            },
+            "evidence_hash",
+        ),
+        (
+            {
+                "place": "Q1",
+                "set_statistical_area": {"scheme": "eurostat_metro", "code": "1"},
+                "evidence_hash": "abc",
+            },
+            "SHA-256",
+        ),
     ],
 )
 def test_malformed_place_overrides_are_refused(tmp_path, entry, message):

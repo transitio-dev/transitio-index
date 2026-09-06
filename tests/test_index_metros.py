@@ -194,7 +194,7 @@ def test_statistical_metros_parses_and_skips_malformed(monkeypatch):
                     "city": {"value": "http://www.wikidata.org/entity/Q60"},
                     "metro": {"value": "http://www.wikidata.org/entity/Q683705"},
                     "metroLabel": {"value": "New York metropolitan area"},
-                    "cbsa": {"value": "35620"},
+                    "code": {"value": "35620"},
                 },
                 {
                     "city": {"value": "http://www.wikidata.org/entity/Q65"},
@@ -222,6 +222,14 @@ def test_statistical_metros_parses_and_skips_malformed(monkeypatch):
             {"qid": "Q1755545", "name": "Los Angeles metropolitan area", "cbsa": None}
         ],
     }
+    # The same links, read as code-less candidates for a curated crosswalk.
+    assert client.metro_candidates(["Q60", "Q65"]) == {
+        "Q60": [{"qid": "Q683705", "name": "New York metropolitan area"}],
+        "Q65": [{"qid": "Q1755545", "name": "Los Angeles metropolitan area"}],
+    }
+    # An id that is not a QID never reaches the query text.
+    with pytest.raises(overture.GazetteerError, match="not Wikidata QIDs"):
+        client.metro_candidates(["Q60", "Q1 } UNION { ?x ?y ?z"])
 
 
 def test_set_place_members_replaces_a_metros_members_reciprocally(tmp_path):

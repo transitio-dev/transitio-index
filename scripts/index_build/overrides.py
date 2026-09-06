@@ -426,8 +426,19 @@ def load_edge_overrides(overrides_dir):
 # ---- places.yaml ----
 
 _PLACE_OPERATIONS = frozenset(
-    {"add_place", "set_place_members", "set_boundary", "set_aliases", "resolve_place"}
+    {
+        "add_place",
+        "set_place_members",
+        "set_boundary",
+        "set_aliases",
+        "resolve_place",
+        "set_statistical_area",
+    }
 )
+# The statistical schemes a curated crosswalk may name; a metro published
+# under one carries the scheme's code as its ``statistical_area_id``.
+STATISTICAL_SCHEMES = frozenset({"eurostat_metro"})
+_STATISTICAL_AREA_FIELDS = frozenset({"scheme", "code"})
 _PLACE_METADATA = frozenset(
     {"place", "source_ref", "reason", "author", "date", "evidence_hash"}
 )
@@ -459,7 +470,11 @@ def _validate_place_entry(path, entry):
     (operation,) = operations
     if not isinstance(entry.get("place"), str) or not entry["place"]:
         raise OverrideError(f"{path}: {where} needs a 'place' id")
-    if operation in ("add_place", "resolve_place") and not _qid(entry["place"]):
+    if operation in (
+        "add_place",
+        "resolve_place",
+        "set_statistical_area",
+    ) and not _qid(entry["place"]):
         raise OverrideError(f"{path}: {where} {operation} needs a real QID as 'place'")
     if operation == "resolve_place":
         if not isinstance(entry.get("source_ref"), str) or not entry["source_ref"]:
@@ -523,6 +538,26 @@ def _validate_place_entry(path, entry):
         ):
             raise OverrideError(
                 f"{path}: {where} set_aliases must be a non-empty list of strings"
+            )
+    elif operation == "set_statistical_area":
+        if not isinstance(spec, dict) or set(spec) != _STATISTICAL_AREA_FIELDS:
+            raise OverrideError(
+                f"{path}: {where} set_statistical_area needs a scheme and a code"
+            )
+        if spec["scheme"] not in STATISTICAL_SCHEMES:
+            raise OverrideError(
+                f"{path}: {where} set_statistical_area scheme must be one of "
+                f"{sorted(STATISTICAL_SCHEMES)}"
+            )
+        if not isinstance(spec["code"], str) or not spec["code"].strip():
+            raise OverrideError(
+                f"{path}: {where} set_statistical_area code must be a non-empty string"
+            )
+        digest = entry.get("evidence_hash")
+        if not isinstance(digest, str) or not store.DIGEST_PATTERN.match(digest):
+            raise OverrideError(
+                f"{path}: {where} set_statistical_area needs the SHA-256 "
+                "evidence_hash of the derived member list it confirms"
             )
     if "evidence_hash" in entry and not isinstance(entry["evidence_hash"], str):
         raise OverrideError(f"{path}: {where} evidence_hash must be a string")
