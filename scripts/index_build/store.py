@@ -401,7 +401,7 @@ def write_file(directory, name, write):
         with os.fdopen(handle, "wb") as opened_file:
             handle = None
             for chunk in write():
-                data = chunk.encode("utf-8")
+                data = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
                 written += len(data)
                 if written > MAX_ARTIFACT_BYTES:
                     # Refused here, before `replace`: a generation whose
@@ -653,7 +653,7 @@ def read_jsonl(directory, pointer, artifact):
 def publish(directory, pointer, artifacts, manifest, keep=KEEP_GENERATIONS, held=None):
     """Write ``artifacts`` as a new generation and point ``pointer`` at it.
 
-    ``artifacts`` maps file name to a function yielding text chunks;
+    ``artifacts`` maps file name to a function yielding text or bytes chunks;
     ``manifest`` is a dict describing the run, to which this adds the
     generation name and each artifact's digest. Returns the manifest.
 
