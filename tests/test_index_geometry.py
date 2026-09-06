@@ -15,7 +15,7 @@ import overture_fixture as fx  # noqa: E402
 from index_build import geometry, overture, store  # noqa: E402
 
 
-def _place(place_id, kind, *, overture_id=None, country="FI"):
+def _place(place_id, kind, *, overture_id=None, country="FI", members=()):
     return {
         "place_id": place_id,
         "kind": kind,
@@ -29,7 +29,7 @@ def _place(place_id, kind, *, overture_id=None, country="FI"):
         "osm_relation_id": None,
         "statistical_area_id": None,
         "metro_ids": [],
-        "member_ids": [],
+        "member_ids": list(members),
     }
 
 
@@ -45,6 +45,10 @@ PLACES = [
     _place("Q_EMPTY", "city", overture_id="empty"),  # allowed source, empty geometry
     _place("Q_BADWKB", "city", overture_id="badwkb"),  # malformed WKB bytes
     _place("Q_NOSRC", "city", overture_id="nosrc"),  # area with no sources at all
+    _place("Q_UNION", "metro", members=("Q1757", "Q_TWOLAND")),  # shippable members
+    _place(
+        "Q_PARTIAL", "metro", members=("Q1757", "Q_DENIED")
+    ),  # one member unshippable
 ]
 
 BOX = shapely.to_wkb(shapely.box(24.9, 60.1, 25.1, 60.3))
@@ -350,3 +354,16 @@ def test_derived_inputs_are_inventoried_and_credited(tmp_path):
     assert "Some atlas" not in notice
     # Permission is explicit: every approved source is a registered one.
     assert geometry.DERIVED_SOURCE_ALLOWLIST <= set(geometry.DERIVED_SOURCES)
+
+
+def test_a_metro_gets_the_union_of_its_members_shipped_polygons(tmp_path):
+    manifest, places, _ = _run(tmp_path)
+    union = places["Q_UNION"]
+    assert union["geometry_source"] == "member_union"
+    geom = shapely.from_wkb(union["geometry"])
+    for member in ("Q1757", "Q_TWOLAND"):
+        assert geom.contains(shapely.from_wkb(places[member]["geometry"]).centroid)
+    # A member without shipped geometry, or no members at all: no geometry.
+    assert places["Q_PARTIAL"]["geometry"] is None
+    assert places["Q_METRO"]["geometry"] is None
+    assert manifest["member_union_geometry"] == 1
