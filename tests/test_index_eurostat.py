@@ -1,6 +1,7 @@
 import hashlib
 import io
 import sys
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -86,7 +87,7 @@ class _Response:
 
 def test_downloaded_inputs_are_verified_against_the_pins(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        eurostat.csv_source.urllib.request,
+        urllib.request,
         "urlopen",
         lambda url, timeout=None: _Response(PAYLOADS[url.rsplit("/", 1)[-1]]),
     )

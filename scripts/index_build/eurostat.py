@@ -12,11 +12,8 @@ of its Overture land areas.
 """
 
 import collections
-import datetime
-import hashlib
 import io
 import math
-import os
 import re
 
 import pyarrow as pa
@@ -24,7 +21,7 @@ import pyarrow.parquet as pq
 import shapely
 from shapely.strtree import STRtree
 
-from index_build import csv_source, geometry, store
+from index_build import geometry, pinned
 
 NUTS_VERSION = "2021"
 NUTS_SCALE = "01M"
@@ -52,7 +49,6 @@ PINS = {
     ),
 }
 URLS = {COMPOSITION_FILE: COMPOSITION_URL, BOUNDARIES_FILE: BOUNDARIES_URL}
-MAX_INPUT_BYTES = 64 * 1024 * 1024
 
 # Country code, three digits, then M (metro) or MC (capital-city metro).
 METRO_CODE = re.compile(r"\A([A-Z]{2})[0-9]{3}MC?\Z")
@@ -61,92 +57,30 @@ METRO_CODE = re.compile(r"\A([A-Z]{2})[0-9]{3}MC?\Z")
 EUROSTAT_COUNTRY = {"EL": "GR", "UK": "GB"}
 
 
-class EurostatError(RuntimeError):
+class EurostatError(pinned.PinnedInputError):
     """A pinned Eurostat input is missing, altered or inconsistent."""
-
-
-def _read_input(directory, name, files):
-    """The bytes of one input: a caller-supplied local file, else its download."""
-    if files is not None and name in files:
-        try:
-            handle = store.open_regular_path(files[name])
-        except store.StoreError as error:
-            raise EurostatError(str(error)) from None
-        try:
-            return store.read_all(handle, MAX_INPUT_BYTES)
-        finally:
-            os.close(handle)
-    if name not in URLS:
-        raise EurostatError(f"{name}: no pinned URL and no local file")
-    csv_source.download_file(directory, name, URLS[name], limit=MAX_INPUT_BYTES)
-    try:
-        return store.read_bytes(directory, name)
-    finally:
-        store.unlink(directory, name)
 
 
 def prepare_inputs(cache_dir, *, files=None, expected=PINS):
     """Ensure ``raw/eurostat.json`` holds the pinned inputs; return its manifest.
-
-    ``files`` maps an input name to a local path used instead of its URL
-    (how tests and offline builds run); ``expected`` is each input's SHA-256.
-    A generation that resolves — every artifact hashed — under exactly those
-    digests is reused; otherwise every input is read, verified against its
-    pin and published together, so a later build parses identical bytes or
-    refuses.
-    """
-    expected = dict(expected)
-    directory = store.open_subdir(cache_dir, "raw")
-    try:
-        with store.exclusive_writer(directory):
-            try:
-                generation, current = store.resolve(cache_dir / "raw", POINTER)
-            except store.StoreError:
-                current = None
-            else:
-                generation.close()
-            if current is not None and current.get("digests") == expected:
-                return current
-            payloads = {}
-            for name, digest in sorted(expected.items()):
-                data = _read_input(directory, name, files)
-                actual = hashlib.sha256(data).hexdigest()
-                if actual != digest:
-                    raise EurostatError(
-                        f"{name}: sha256 {actual} does not match the pinned {digest}"
-                    )
-                payloads[name] = data
-            manifest = {
-                "source": "eurostat",
-                "nuts_version": NUTS_VERSION,
-                "urls": {
-                    name: None if files and name in files else URLS.get(name)
-                    for name in sorted(expected)
-                },
-                "retrieved_at": datetime.datetime.now(
-                    datetime.timezone.utc
-                ).isoformat(),
-            }
-            return store.publish(
-                cache_dir / "raw",
-                POINTER,
-                {name: (lambda data=data: [data]) for name, data in payloads.items()},
-                manifest,
-                held=directory,
-            )
-    finally:
-        directory.close()
+    See :func:`pinned.prepare`."""
+    return pinned.prepare(
+        cache_dir,
+        pointer=POINTER,
+        urls=URLS,
+        expected=expected,
+        files=files,
+        manifest={"source": "eurostat", "nuts_version": NUTS_VERSION},
+        error=EurostatError,
+    )
 
 
 def resolve_inputs(cache_dir, *, expected=PINS):
-    """``(generation, manifest)`` of the published inputs, which must carry
-    exactly ``expected``: a generation prepared under other pins is refused
-    rather than parsed. The caller closes the generation after reading."""
-    generation, manifest = store.resolve(cache_dir / "raw", POINTER)
-    if manifest.get("digests") != dict(expected):
-        generation.close()
-        raise EurostatError(f"raw/{POINTER} holds other inputs than this build's pins")
-    return generation, manifest
+    """``(generation, manifest)`` of the published inputs under this build's
+    pins; see :func:`pinned.resolve`."""
+    return pinned.resolve(
+        cache_dir, pointer=POINTER, expected=expected, error=EurostatError
+    )
 
 
 # The composition's metros, and every NUTS-3 id its sheet lists (metro or
