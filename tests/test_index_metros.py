@@ -295,14 +295,16 @@ def test_a_city_with_no_metro_keeps_an_empty_list(tmp_path):
 
 def test_a_metro_without_a_cbsa_is_reported_not_published(tmp_path):
     codeless = {"qid": "Q999", "name": "Codeless metro", "cbsa": None}
-    manifest, places = _run(tmp_path, {"Q1297": [codeless]})
+    # Two cities linked to one codeless MSA: one reported metro, two links.
+    manifest, places = _run(tmp_path, {"Q1297": [codeless], "Q28515": [codeless]})
     assert "Q999" not in places
     assert places["Q1297"]["metro_ids"] == []
     assert manifest["metros"] == 0
+    assert manifest["us"] == {"metros_published": 0, "metros_reported": 1}
     report = _artefact(tmp_path, "metro_report.jsonl")
     assert [row["reason"] for row in report if row["branch"] == "us"] == [
         "US MSA without a CBSA code"
-    ]
+    ] * 2
 
 
 def test_get_raises_on_a_response_without_bindings(monkeypatch):
@@ -485,6 +487,8 @@ def test_a_eurostat_metro_publishes_through_the_crosswalk(tmp_path, stale):
     assert summary["covered_countries"] == ["FI"]
     assert summary["assignments"] == {"assigned": 2, "unplaceable": 1}
     assert manifest["overrides_applied"] == 1
+    assert manifest["us"] == {"metros_published": 0, "metros_reported": 0}
+    assert [row["allowed"] for row in manifest["derived_inventory"]] == [True] * 3
     # A confirmation against evidence that moved: applied, reported, counted.
     assert manifest["stale_overrides"] == (1 if stale else 0)
 
@@ -506,15 +510,23 @@ def test_a_curated_twin_keeps_its_name_and_gains_the_eurostat_identity(tmp_path)
     assert metro["member_ids"] == ["Q1757"] and places["Q7"]["metro_ids"] == []
 
 
-def test_a_eurostat_metro_without_a_crosswalk_is_reported(tmp_path):
+def test_a_eurostat_metro_without_a_crosswalk_is_reported_with_candidates(tmp_path):
     from test_index_place_overrides import write_overrides
 
     # Tampere has a crosswalk but no city; Helsinki has cities but no crosswalk.
     tampere = _crosswalk("0" * 64, place="Q999", code="FI002M")
+    linked = {
+        "Q1757": [
+            {"qid": "Q673425", "name": "Helsinki metropolitan area"},
+            {"qid": "Q940914", "name": "Helsinki sub-region"},
+        ],
+        "Q7": [{"qid": "Q673425", "name": "Helsinki metropolitan area"}],
+    }
     manifest, places = _run(
         tmp_path,
         {},
         overrides_dir=write_overrides(tmp_path, places=[tampere]),
+        candidates=linked,
     )
     assert "Q673425" not in places
     empty = places["Q999"]  # crosswalked without a city: published, memberless
@@ -528,6 +540,10 @@ def test_a_eurostat_metro_without_a_crosswalk_is_reported(tmp_path):
             "country": "FI",
             "member_ids": MEMBERS,
             "reason": "no crosswalk entry",
+            "candidates": [
+                {"qid": "Q673425", "name": "Helsinki metropolitan area", "cities": 2},
+                {"qid": "Q940914", "name": "Helsinki sub-region", "cities": 1},
+            ],
         },
     ]
     assert [row[1:] for row in _assignments(tmp_path)] == [
@@ -545,11 +561,7 @@ def test_a_eurostat_metro_without_a_crosswalk_is_reported(tmp_path):
 def test_the_derived_gate_closes_the_eurostat_branch(tmp_path, monkeypatch, missing):
     from test_index_place_overrides import write_overrides
 
-    allowlist = {
-        key: meta
-        for key, meta in geometry.DERIVED_SOURCE_ALLOWLIST.items()
-        if key != missing
-    }
+    allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {missing}
     monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
     manifest, places = _run(
         tmp_path,
@@ -565,6 +577,11 @@ def test_the_derived_gate_closes_the_eurostat_branch(tmp_path, monkeypatch, miss
         "FI001MC": "derived inputs not allowlisted",
         "FI002M": "no member cities",
     }
+    allowed = {
+        (row["dataset"], row["license"]): row["allowed"]
+        for row in manifest["derived_inventory"]
+    }
+    assert allowed[missing] is False and sum(allowed.values()) == 2
     assert not any(row[-1] for row in _assignments(tmp_path))
     # Judged even while the gate is closed.
     assert manifest["stale_overrides"] == 1
@@ -622,9 +639,31 @@ def test_crosswalk_targets_are_checked_before_the_gates(tmp_path, monkeypatch):
 
     # With the derived gate closed nothing publishes, yet a crosswalk naming a
     # seeded city is still refused rather than silently reported.
-    allowlist = dict(geometry.DERIVED_SOURCE_ALLOWLIST)
-    allowlist.pop(metros.EUROSTAT_DERIVED[0])
+    allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {metros.EUROSTAT_DERIVED[0]}
     monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
     entries = [_crosswalk(place="Q1757")]
     with pytest.raises(overture.GazetteerError, match="already seeded as the city"):
         _run(tmp_path, {}, overrides_dir=write_overrides(tmp_path, places=entries))
+
+
+def test_the_derived_credits_reach_the_inventory_and_notice(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    overrides_dir = write_overrides(tmp_path, places=[_crosswalk()])
+    _run(tmp_path, {}, overrides_dir=overrides_dir)
+    cache = tmp_path / "cache"
+    areas = fx.write_area_dataset(tmp_path / "areas-geometry.parquet", AREAS)
+    geometry.attach_geometry(cache, dataset=areas, overrides_dir=overrides_dir)
+    rows, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    derived = [row for row in rows if row["use"] == "derived"]
+    assert [row["dataset"] for row in derived] == [
+        d for d, _ in metros.EUROSTAT_DERIVED
+    ]
+    assert all(row["credit"] and row["url"] and row["allowed"] for row in derived)
+    generation, _ = store.resolve(cache / "gazetteer", "geometry.json")
+    with generation:
+        notice = generation.read_bytes("NOTICE").decode("utf-8")
+    assert "Source: Eurostat, metropolitan regions (NUTS 2021)" in notice
+    assert "© EuroGeographics for the administrative boundaries" in notice

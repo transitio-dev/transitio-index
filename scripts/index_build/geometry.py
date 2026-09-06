@@ -64,11 +64,11 @@ OVERTURE_AGGREGATOR = {
     "url": "https://cdla.dev/permissive-2-0/",
 }
 
-# Sources approved to contribute DERIVED data — memberships and codes computed
-# from them at build time — as opposed to shipped geometry. Keyed like the
-# geometry allowlist; a source absent here contributes nothing, so a build
-# whose derived inputs are not all approved runs that branch report-only.
-DERIVED_SOURCE_ALLOWLIST = {
+# The audited DERIVED-data sources — memberships and codes computed from them
+# at build time, as opposed to shipped geometry — with the credit and licence
+# URL their terms require, kept apart from the permission to use them so that
+# a closed source still names its terms. Keyed like the geometry allowlist.
+DERIVED_SOURCES = {
     ("Overture Maps divisions", "CDLA-Permissive-2.0"): {
         "credit": "Overture Maps Foundation, divisions theme",
         "licence": "CDLA-Permissive-2.0",
@@ -90,6 +90,17 @@ DERIVED_SOURCE_ALLOWLIST = {
         "share_alike": False,
     },
 }
+
+# The sources approved to contribute derived data — an explicit set, never
+# derived from the registry, so registering a source to name its terms does
+# not approve it; a branch whose inputs are not all approved runs report-only.
+DERIVED_SOURCE_ALLOWLIST = frozenset(
+    {
+        ("Overture Maps divisions", "CDLA-Permissive-2.0"),
+        ("Eurostat metropolitan regions", "Eurostat-2011/833/EU"),
+        ("GISCO NUTS 2021", "EuroGeographics-NC"),
+    }
+)
 
 # ~100 m near the equator; the deviation in metres shrinks toward the poles, so
 # this never over-simplifies much beyond that. Point-in-polygon runs against the
@@ -201,8 +212,7 @@ def _notice(shipped, release, derived=()):
             "the derived use ships no boundary data of its own:",
         ]
         for row in credited:
-            meta = DERIVED_SOURCE_ALLOWLIST[(row["dataset"], row["license"])]
-            lines.append(f"  - {meta['credit']} — {meta['licence']} ({meta['url']})")
+            lines.append(f"  - {row['credit']} — {row['terms']} ({row['url']})")
     return "\n".join(lines) + "\n"
 
 

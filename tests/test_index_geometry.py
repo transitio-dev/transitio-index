@@ -318,6 +318,8 @@ def test_derived_inputs_are_inventoried_and_credited(tmp_path):
             "use": "derived",
             "dataset": "GISCO NUTS 2021",
             "license": "EuroGeographics-NC",
+            "credit": "© EuroGeographics for the administrative boundaries",
+            "terms": "Eurostat/GISCO conditions of use (non-commercial)",
             "url": "https://ec.europa.eu/eurostat/en/web/gisco/geodata/statistical-units",
             "version": "2021",
             "allowed": True,
@@ -328,6 +330,8 @@ def test_derived_inputs_are_inventoried_and_credited(tmp_path):
             "use": "derived",
             "dataset": "Some atlas",
             "license": "unknown",
+            "credit": "Some atlas",
+            "terms": "unknown",
             "url": None,
             "version": "1",
             "allowed": False,
@@ -344,3 +348,5 @@ def test_derived_inputs_are_inventoried_and_credited(tmp_path):
     notice = _read_text(cache, "NOTICE")
     assert "© EuroGeographics for the administrative boundaries" in notice
     assert "Some atlas" not in notice
+    # Permission is explicit: every approved source is a registered one.
+    assert geometry.DERIVED_SOURCE_ALLOWLIST <= set(geometry.DERIVED_SOURCES)
