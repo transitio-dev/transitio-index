@@ -125,6 +125,13 @@ def test_publish_writes_a_generation_and_points_at_it(tmp_path):
     assert set(manifest["digests"]) == {"feeds.jsonl", "operators.jsonl"}
     # The generation carries the same manifest the pointer does.
     assert json.loads((generation / "manifest.json").read_text()) == manifest
+    # A bytes chunk is written and hashed as-is beside text chunks.
+    binary = store.publish(
+        tmp_path, "blob.json", {"blob.bin": lambda: [b"\x00\xff", "x"]}, {"source": "b"}
+    )
+    with store.resolve(tmp_path, "blob.json")[0] as blob:
+        assert blob.read_bytes("blob.bin") == b"\x00\xffx"
+    assert binary["digests"]["blob.bin"] == hashlib.sha256(b"\x00\xffx").hexdigest()
 
 
 def test_pointers_sharing_a_tag_do_not_prune_each_other(tmp_path, monkeypatch):

@@ -49,7 +49,7 @@ def _copy_bounded(response, opened_file, limit):
     return digest.hexdigest(), written
 
 
-def download_csv(directory, name, url):
+def download_file(directory, name, url, limit=MAX_CSV_BYTES):
     """Download ``url`` to ``name`` in ``directory``; return its SHA-256.
 
     Each attempt owns an exclusively created temporary file, replaced into
@@ -63,7 +63,7 @@ def download_csv(directory, name, url):
             with opened as response, os.fdopen(handle, "wb") as opened_file:
                 handle = None
                 declared = response.headers.get("Content-Length")
-                digest, written = _copy_bounded(response, opened_file, MAX_CSV_BYTES)
+                digest, written = _copy_bounded(response, opened_file, limit)
                 opened_file.flush()
                 os.fsync(opened_file.fileno())
             if declared is not None and written != int(declared):
@@ -223,7 +223,7 @@ def ingest_csv(
                 fetched_url = None
             else:
                 cached = f"{source}-{label}.csv"
-                download_digest = download_csv(directory, cached, url)
+                download_digest = download_file(directory, cached, url)
                 text = store.read_text(directory, cached)
                 # Parse exactly the bytes the digest was taken over: a
                 # replacement between the download and this read would show

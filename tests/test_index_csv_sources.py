@@ -443,7 +443,7 @@ def test_a_truncated_download_is_refused_and_retried(tmp_path, monkeypatch):
     directory = store.open_directory(tmp_path)
     try:
         with pytest.raises(csv_source.IngestError, match="expected 9999"):
-            csv_source.download_csv(directory, "x.csv", "https://example/x.csv")
+            csv_source.download_file(directory, "x.csv", "https://example/x.csv")
     finally:
         directory.close()
 
