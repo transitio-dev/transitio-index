@@ -97,7 +97,7 @@ AREAS = [
 ]
 
 
-def _publish(cache, records, overrides_dir=None):
+def _publish(cache, records, overrides_dir=None, derived=()):
     from index_build import overrides
 
     directory = store.open_subdir(cache, "gazetteer")
@@ -109,6 +109,7 @@ def _publish(cache, records, overrides_dir=None):
                 {"places_seed.jsonl": store.jsonl_chunks(records)},
                 {
                     "source": "metros",
+                    "derived_inventory": list(derived),
                     "places_overrides_sha256": overrides.places_digest(overrides_dir),
                 },
                 held=directory,
@@ -117,9 +118,9 @@ def _publish(cache, records, overrides_dir=None):
         directory.close()
 
 
-def _run(tmp_path, overrides_dir=None):
+def _run(tmp_path, overrides_dir=None, derived=()):
     cache = tmp_path / "cache"
-    _publish(cache, PLACES, overrides_dir)
+    _publish(cache, PLACES, overrides_dir, derived)
     dataset = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
     manifest = geometry.attach_geometry(
         cache, dataset=dataset, overrides_dir=overrides_dir
@@ -308,3 +309,38 @@ def test_a_curated_places_boundary_is_attached_without_a_second_judgement(tmp_pa
     # The explicit set_boundary correction wins over the add_place boundary.
     assert new["geometry"] == shapely.to_wkb(shapely.from_wkt(fixed)).hex()
     assert manifest["curated_geometry"] == 2 and manifest["stale_overrides"] == 0
+
+
+def test_derived_inputs_are_inventoried_and_credited(tmp_path):
+    derived = [
+        {
+            "role": "derived_input",
+            "use": "derived",
+            "dataset": "GISCO NUTS 2021",
+            "license": "EuroGeographics-NC",
+            "url": "https://ec.europa.eu/eurostat/en/web/gisco/geodata/statistical-units",
+            "version": "2021",
+            "allowed": True,
+            "memberships": 3,
+        },
+        {
+            "role": "derived_input",
+            "use": "derived",
+            "dataset": "Some atlas",
+            "license": "unknown",
+            "url": None,
+            "version": "1",
+            "allowed": False,
+            "memberships": 0,
+        },
+    ]
+    _, _, cache = _run(tmp_path, derived=derived)
+    rows, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    # Geometry rows say so; the derived rows follow them unchanged.
+    assert {row["use"] for row in rows[:-2]} == {"geometry"}
+    assert rows[-2:] == derived
+    notice = _read_text(cache, "NOTICE")
+    assert "© EuroGeographics for the administrative boundaries" in notice
+    assert "Some atlas" not in notice

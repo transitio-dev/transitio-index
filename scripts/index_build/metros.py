@@ -10,6 +10,7 @@ Wikidata, with no geometry.
 """
 
 import datetime
+import functools
 
 from index_build import overrides, overture, store
 
@@ -32,6 +33,30 @@ def _metro_place(metro):
         "metro_ids": [],
         "member_ids": [],
     }
+
+
+def _join_member(by_id, metros, qid, make_row, city):
+    """The metro row for ``qid`` with ``city`` joined as a member, reciprocally.
+
+    A curated metro of the same QID (``add_place``) is the row and the
+    statistical membership joins it, never a second row; a QID seeded as
+    anything but a metro fails the build; a curator's member list wins.
+    """
+    existing = by_id.get(qid)
+    if existing is not None and existing.get("kind") != "metro":
+        raise overture.GazetteerError(
+            f"metro {qid!r} is already seeded as the "
+            f"{existing['kind']} {existing.get('name')!r}"
+        )
+    metro = metros.get(qid) or existing or make_row()
+    metros[qid] = metro
+    if metro.get("members_curated"):
+        return metro
+    if city["place_id"] not in metro["member_ids"]:
+        metro["member_ids"].append(city["place_id"])
+    if qid not in city["metro_ids"]:
+        city["metro_ids"].append(qid)
+    return metro
 
 
 def _set_members(by_id, entries, report):
@@ -66,6 +91,40 @@ def _set_members(by_id, entries, report):
     return applied
 
 
+def _attach_us(places, by_id, metros, report, wikidata):
+    """The US branch: each US city's MSA from Wikidata; an MSA without a CBSA
+    code is reported for a later pass rather than published."""
+    us_cities = [
+        p["place_id"]
+        for p in places
+        if p["kind"] == "city" and p["country_code"] == "US"
+    ]
+    membership = wikidata.statistical_metros(us_cities) if us_cities else {}
+    for city_qid, found in membership.items():
+        city = by_id.get(city_qid)
+        if city is None:
+            continue
+        for record in found:
+            if not record["cbsa"]:
+                report.append(
+                    {
+                        "branch": "us",
+                        "city_id": city_qid,
+                        "metro_id": record["qid"],
+                        "name": record["name"],
+                        "reason": "US MSA without a CBSA code",
+                    }
+                )
+                continue
+            _join_member(
+                by_id,
+                metros,
+                record["qid"],
+                functools.partial(_metro_place, record),
+                city,
+            )
+
+
 def attach_metros(cache_dir, *, wikidata=None, overrides_dir=None, strict=False):
     """Add US metro places and memberships to the seed places.
 
@@ -92,55 +151,6 @@ def attach_metros(cache_dir, *, wikidata=None, overrides_dir=None, strict=False)
                 place.setdefault("metro_ids", [])
                 place.setdefault("statistical_area_id", None)
                 by_id[place["place_id"]] = place
-
-            us_cities = [
-                p["place_id"]
-                for p in places
-                if p["kind"] == "city" and p["country_code"] == "US"
-            ]
-            membership = wikidata.statistical_metros(us_cities) if us_cities else {}
-
-            metros = {}
-            report = []
-            for city_qid, found in membership.items():
-                city = by_id.get(city_qid)
-                if city is None:
-                    continue
-                for record in found:
-                    if not record["cbsa"]:
-                        report.append(
-                            {
-                                "city_id": city_qid,
-                                "metro_id": record["qid"],
-                                "name": record["name"],
-                                "reason": "US MSA without a CBSA code",
-                            }
-                        )
-                        continue
-                    # A curated metro of the same QID (add_place) is the row;
-                    # the statistical membership joins it, never a second row.
-                    existing = by_id.get(record["qid"])
-                    if existing is not None and existing.get("kind") != "metro":
-                        raise overture.GazetteerError(
-                            f"metro {record['qid']!r} is already seeded as the "
-                            f"{existing['kind']} {existing.get('name')!r}"
-                        )
-                    metro = metros.setdefault(
-                        record["qid"], existing or _metro_place(record)
-                    )
-                    if metro.get("members_curated"):
-                        continue
-                    if city_qid not in metro["member_ids"]:
-                        metro["member_ids"].append(city_qid)
-                    if metro["place_id"] not in city["metro_ids"]:
-                        city["metro_ids"].append(metro["place_id"])
-
-            for metro in metros.values():
-                metro["member_ids"].sort()
-            output = places + [
-                metros[qid] for qid in sorted(metros) if qid not in by_id
-            ]
-            by_id.update({m["place_id"]: m for m in metros.values()})
             place_overrides, places_digest = overrides.load_place_overrides(
                 overrides_dir
             )
@@ -150,6 +160,17 @@ def attach_metros(cache_dir, *, wikidata=None, overrides_dir=None, strict=False)
                 "places.yaml",
                 "gazetteer",
             )
+
+            metros = {}
+            report = []
+            _attach_us(places, by_id, metros, report, wikidata)
+
+            for metro in metros.values():
+                metro["member_ids"].sort()
+            output = places + [
+                metros[qid] for qid in sorted(metros) if qid not in by_id
+            ]
+            by_id.update({m["place_id"]: m for m in metros.values()})
             override_report = []
             applied = _set_members(
                 by_id,

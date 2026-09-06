@@ -64,6 +64,33 @@ OVERTURE_AGGREGATOR = {
     "url": "https://cdla.dev/permissive-2-0/",
 }
 
+# Sources approved to contribute DERIVED data — memberships and codes computed
+# from them at build time — as opposed to shipped geometry. Keyed like the
+# geometry allowlist; a source absent here contributes nothing, so a build
+# whose derived inputs are not all approved runs that branch report-only.
+DERIVED_SOURCE_ALLOWLIST = {
+    ("Overture Maps divisions", "CDLA-Permissive-2.0"): {
+        "credit": "Overture Maps Foundation, divisions theme",
+        "licence": "CDLA-Permissive-2.0",
+        "url": "https://cdla.dev/permissive-2-0/",
+        "share_alike": False,
+    },
+    ("Eurostat metropolitan regions", "Eurostat-2011/833/EU"): {
+        "credit": "Source: Eurostat, metropolitan regions (NUTS 2021)",
+        "licence": "Eurostat copyright notice (Commission Decision 2011/833/EU)",
+        "url": "https://ec.europa.eu/eurostat/help/copyright-notice",
+        "share_alike": False,
+    },
+    # Non-commercial terms: used for point-in-polygon at build time only,
+    # never shipped; the credit is the one the terms require.
+    ("GISCO NUTS 2021", "EuroGeographics-NC"): {
+        "credit": "© EuroGeographics for the administrative boundaries",
+        "licence": "Eurostat/GISCO conditions of use (non-commercial)",
+        "url": "https://ec.europa.eu/eurostat/en/web/gisco/geodata/statistical-units",
+        "share_alike": False,
+    },
+}
+
 # ~100 m near the equator; the deviation in metres shrinks toward the poles, so
 # this never over-simplifies much beyond that. Point-in-polygon runs against the
 # full-resolution geometry in the coverage stage, so shipped geometry can be this
@@ -146,8 +173,9 @@ def _simplify(geom):
     return shapely.simplify(geom, SIMPLIFY_TOLERANCE_DEG, preserve_topology=True)
 
 
-def _notice(shipped, release):
-    """The NOTICE text: the release, each shipped source, and share-alike terms."""
+def _notice(shipped, release, derived=()):
+    """The NOTICE text: the release, each shipped source, share-alike terms, and
+    the credits of the derived-data sources that were allowed."""
     lines = [
         "This index includes place boundary geometry from the Overture Maps",
         f"divisions theme (release {release}), provided under "
@@ -165,11 +193,22 @@ def _notice(shipped, release):
             "Open Database License (ODbL 1.0) and is made available under that same",
             "licence; its share-alike terms apply.",
         ]
+    credited = [row for row in derived if row.get("allowed")]
+    if credited:
+        lines += [
+            "",
+            "Metro memberships were derived at build time from these sources;",
+            "the derived use ships no boundary data of its own:",
+        ]
+        for row in credited:
+            meta = DERIVED_SOURCE_ALLOWLIST[(row["dataset"], row["license"])]
+            lines.append(f"  - {meta['credit']} — {meta['licence']} ({meta['url']})")
     return "\n".join(lines) + "\n"
 
 
-def _inventory_rows(inventory, shipped_count):
-    """The licence inventory: the Overture aggregator, then each component source.
+def _inventory_rows(inventory, shipped_count, derived=()):
+    """The licence inventory: the Overture aggregator, each component source,
+    then the derived-data rows an earlier stage recorded.
 
     Every row carries the licence URL and the pinned release as its version, so
     the record answers "what shipped, under what licence, from where, at which
@@ -178,6 +217,7 @@ def _inventory_rows(inventory, shipped_count):
     rows = [
         {
             "role": "aggregator",
+            "use": "geometry",
             "dataset": OVERTURE_AGGREGATOR["dataset"],
             "license": OVERTURE_AGGREGATOR["license"],
             "url": OVERTURE_AGGREGATOR["url"],
@@ -193,6 +233,7 @@ def _inventory_rows(inventory, shipped_count):
         rows.append(
             {
                 "role": "component",
+                "use": "geometry",
                 "dataset": dataset_name,
                 "license": licence,
                 "url": meta["url"] if meta else None,
@@ -201,7 +242,7 @@ def _inventory_rows(inventory, shipped_count):
                 "geometries": count,
             }
         )
-    return rows
+    return rows + list(derived)
 
 
 def _curated_geometry(place, wkt):
@@ -322,8 +363,9 @@ def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False
                 )
                 _curated_geometry(place, entry["set_boundary"])
                 curated += 1
-            inventory_rows = _inventory_rows(inventory, with_geometry)
-            notice = _notice(shipped, overture.OVERTURE_RELEASE)
+            derived = metros_manifest.get("derived_inventory") or []
+            inventory_rows = _inventory_rows(inventory, with_geometry, derived)
+            notice = _notice(shipped, overture.OVERTURE_RELEASE, derived)
             manifest = {
                 "source": "geometry",
                 "sources": metros_manifest.get("sources"),
