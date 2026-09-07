@@ -314,8 +314,10 @@ def _read(path):
         handle = store.open_regular_path(path)
     except FileNotFoundError:
         raise RegistryError(f"{path}: no registry") from None
-    except store.StoreError as error:
-        raise RegistryError(str(error)) from None
+    except (OSError, store.StoreError) as error:
+        # A directory, a symlink or an unreadable file: Windows reports some
+        # of these as a permission error rather than through the store.
+        raise RegistryError(f"{path}: {error}") from None
     try:
         return store.read_all(handle, MAX_REGISTRY_BYTES)
     finally:

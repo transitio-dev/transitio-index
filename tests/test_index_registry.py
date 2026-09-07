@@ -504,7 +504,10 @@ def test_the_history_check_enforces_the_contract(tmp_path, head_rows, next_id, m
     # The head must be a regular file: absent, a directory or a symlink fails.
     assert check_registry_history.main([str(base), str(tmp_path / "absent.jsonl")]) == 1
     assert check_registry_history.main([str(base), str(tmp_path)]) == 1
-    (tmp_path / "link.jsonl").symlink_to(base)
+    try:
+        (tmp_path / "link.jsonl").symlink_to(base)
+    except OSError:  # no symlink privilege (Windows runners)
+        return
     assert check_registry_history.main([str(base), str(tmp_path / "link.jsonl")]) == 1
     # An added id below the base counter would reuse one the base had issued.
     gap = _write(tmp_path / "gap.jsonl", {"registry": 1, "next_id": 5}, [HELSINKI])
