@@ -16,7 +16,7 @@ import shapely  # noqa: E402
 import fao_fixture as ffx  # noqa: E402
 import overture_fixture as fx  # noqa: E402
 
-from index_build import fao, overrides, store  # noqa: E402
+from index_build import fao, geometry, overrides, store, ucdb  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -121,18 +121,46 @@ METRO_REPORT = [
 ]
 
 
-def _inputs(tmp_path, patches=None, regions=None):
-    files = {
-        fao.PATCHES_FILE: tmp_path / "patches.zip",
-        fao.REGIONS_FILE: tmp_path / "regions.csv",
-    }
-    files[fao.PATCHES_FILE].write_bytes(patches or ffx.patches_zip(PATCHES))
-    files[fao.REGIONS_FILE].write_bytes(regions or ffx.regions_csv(REGIONS))
+def _pinned(tmp_path, payloads):
+    """``(files, expected)`` for pinned inputs written from ``{name: bytes}``."""
+    files = {}
+    for name, data in payloads.items():
+        files[name] = tmp_path / name
+        files[name].write_bytes(data)
     expected = {
         name: hashlib.sha256(path.read_bytes()).hexdigest()
         for name, path in files.items()
     }
     return files, expected
+
+
+def _inputs(tmp_path, patches=None, regions=None):
+    return _pinned(
+        tmp_path,
+        {
+            fao.PATCHES_FILE: patches or ffx.patches_zip(PATCHES),
+            fao.REGIONS_FILE: regions or ffx.regions_csv(REGIONS),
+        },
+    )
+
+
+# The centres of regions 20 and 30 (a region's id is its centre's): 20 lies
+# 0.6 in Helsinki and 0.4 in Espoo, an ambiguous match; 30 overlaps nothing.
+CENTRES = [(20, 2, shapely.box(50, 0, 51, 1)), (30, 1, shapely.box(60, 0, 61, 1))]
+UCDB = [
+    (572, "Helsinki", "Helsinki;Helsingfors", "Finland", shapely.box(50, 0, 50.6, 1)),
+    (573, "Espoo", "Espoo", "Finland", shapely.box(50.6, 0, 51, 1)),
+]
+
+
+def _ucdb_inputs(tmp_path):
+    return _pinned(
+        tmp_path,
+        {
+            ucdb.CENTRES_FILE: ffx.centres_zip(CENTRES),
+            ucdb.UCDB_FILE: ffx.ucdb_zip(UCDB, ucdb.UCDB_MEMBER, ucdb.UCDB_LAYER),
+        },
+    )
 
 
 def _metros_generation(cache, places, assignments=(), report=()):
@@ -285,23 +313,39 @@ def test_a_patches_file_without_a_crs_is_refused():
         fao._patches_table(ffx.patches_zip(PATCHES, crs=None))
 
 
-def test_the_stage_reports_eligible_cities_by_highest_tier_region(tmp_path):
+def test_the_stage_reports_eligible_cities_by_highest_tier_region(
+    tmp_path, monkeypatch
+):
     cache = tmp_path / "cache"
     files, expected = _inputs(tmp_path)
     fao.prepare_inputs(cache, files=files, expected=expected)
+    ucdb_files, ucdb_expected = _ucdb_inputs(tmp_path)
+    ucdb.prepare_inputs(cache, files=ucdb_files, expected=ucdb_expected)
     _metros_generation(cache, PLACES, ASSIGNMENTS, METRO_REPORT)
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
-    manifest = fao.suggest_metros(cache, dataset=areas, pins=expected)
+    manifest = fao.suggest_metros(
+        cache, dataset=areas, pins=expected, ucdb_pins=ucdb_expected
+    )
     entries, _ = store.read_jsonl(
         cache / "gazetteer", "fao.json", "suggested_metros_report.jsonl"
     )
     digest = overrides.canonical_digest
+    names = {
+        "source": "ghs-ucdb",
+        "release": ucdb.RELEASE,
+        "doi": ucdb.DOI,
+        "license": ucdb.LICENCE,
+        "credit": geometry.DERIVED_SOURCES[ucdb.DERIVED]["credit"],
+        "digests": ucdb_expected,
+        "allowed": True,
+    }
     provenance = {
         "doi": fao.DOI,
         "cutoff_hours": 1,
         "license": fao.LICENCE,
         "credit": fao.CREDIT,
         "digests": expected,
+        "names": names,
     }
     assert entries == [
         {
@@ -310,6 +354,12 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(tmp_path):
             "tier": 2,
             "category": "P",
             "country": "FIN",
+            "name": "Helsinki",
+            "name_ambiguous": True,
+            "name_candidates": [
+                {"ucdb_id": 572, "name": "Helsinki", "share": 0.6},
+                {"ucdb_id": 573, "name": "Espoo", "share": 0.4},
+            ],
             "cities": ["Q_A", "Q_B", "Q_L"],
             "context": ["Q_C"],
             "evidence_hash": digest(["Q_A", "Q_B", "Q_L"]),
@@ -318,7 +368,7 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(tmp_path):
                     "place": "<QID>",
                     "add_place": {
                         "kind": "metro",
-                        "name": "<name>",
+                        "name": "Helsinki",
                         "country_code": "FI",
                     },
                 },
@@ -335,6 +385,9 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(tmp_path):
             "tier": 1,
             "category": "S",
             "country": "SWE",
+            "name": None,
+            "name_ambiguous": False,
+            "name_candidates": [],
             "cities": ["Q_H", "Q_J", "Q_O"],
             "context": ["Q_D", "Q_E", "Q_I"],
             "evidence_hash": digest(["Q_H", "Q_J", "Q_O"]),
@@ -357,6 +410,20 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(tmp_path):
     assert manifest["entries"] == 2 and manifest["eligible_cities"] == 6
     assert manifest["tiers"] == {1: 1, 2: 1}
     assert manifest["unplaced"] == 3 and manifest["doi"] == fao.DOI
+    assert manifest["named_entries"] == 1 and manifest["names"] == names
+    # Names are a derived use: with the UCDB entry out of the allowlist the
+    # report goes out unnamed, saying so.
+    allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {ucdb.DERIVED}
+    monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
+    manifest = fao.suggest_metros(
+        cache, dataset=areas, pins=expected, ucdb_pins=ucdb_expected
+    )
+    entries, _ = store.read_jsonl(
+        cache / "gazetteer", "fao.json", "suggested_metros_report.jsonl"
+    )
+    assert [e["name"] for e in entries] == [None, None]
+    assert all(e["override"][0]["add_place"]["name"] == "<name>" for e in entries)
+    assert manifest["named_entries"] == 0 and manifest["names"]["allowed"] is False
     # The places are untouched: nothing is minted.
     places, _ = store.read_jsonl(
         cache / "gazetteer", "metros.json", "places_seed.jsonl"

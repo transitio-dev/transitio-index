@@ -312,14 +312,20 @@ def _patch_of(footprint, containment, geoms, region_by_patch):
     return eurostat._pick(hits, footprint, geoms, region_by_patch)
 
 
-def suggest(places, areas, regions, patches, assignments, metro_report, provenance):
+def suggest(
+    places, areas, regions, patches, assignments, metro_report, provenance, names=None
+):
     """``(entries, unplaced)``: one report entry per city-region holding an
     eligible city — a city with no metro and no known official assignment —
     with the cities already in a metro there as context; and every city, eligible
     or not, that could not be placed (no usable land area, or a footprint on a
     boundary between regions) with the reason. ``provenance`` (DOI, cutoff,
     licence, credit, input digests) is copied into every entry so each stands
-    on its own."""
+    on its own. ``names`` maps a centre id to its matched UCDB name row; a
+    region is named after its centre (a region's id is its centre's), the
+    match's ambiguity and candidates carried along, and the pasteable
+    ``add_place`` prefilled with the name — a region without one keeps the
+    placeholder."""
     known = {
         row["city_id"]
         for row in assignments
@@ -374,7 +380,8 @@ def suggest(places, areas, regions, patches, assignments, metro_report, provenan
         # city in the region shares — omitted for a cross-border region, and
         # when any city's country is unknown.
         codes = countries[region_id]
-        add_place = {"kind": "metro", "name": "<name>"}
+        named = (names or {}).get(region_id)
+        add_place = {"kind": "metro", "name": named["name"] if named else "<name>"}
         if len(codes) == 1 and None not in codes:
             add_place["country_code"] = next(iter(codes))
         entries.append(
@@ -384,6 +391,9 @@ def suggest(places, areas, regions, patches, assignments, metro_report, provenan
                 "tier": region["tier"],
                 "category": region["category"],
                 "country": region["country"],
+                "name": named["name"] if named else None,
+                "name_ambiguous": bool(named and named["ambiguous"]),
+                "name_candidates": named["candidates"] if named else [],
                 "cities": cities,
                 "context": sorted(context.get(region_id, [])),
                 "evidence_hash": overrides.canonical_digest(cities),
@@ -405,15 +415,20 @@ def suggest(places, areas, regions, patches, assignments, metro_report, provenan
     return entries, sorted(unplaced, key=lambda row: row["city_id"])
 
 
-def suggest_metros(cache_dir, *, dataset=None, pins=None):
+def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None):
     """Publish ``gazetteer/fao.json``: the suggested-curation report of FAO
-    city-regions holding cities no official metro covers. ``dataset`` is the
-    Overture ``division_area`` dataset (the pinned release by default) and
-    ``pins`` the FAO inputs' digests. Returns the generation manifest."""
+    city-regions holding cities no official metro covers, each named after
+    its centre's GHS-UCDB match. ``dataset`` is the Overture ``division_area``
+    dataset (the pinned release by default), ``pins`` the FAO inputs' digests
+    and ``ucdb_pins`` the UCDB inputs'. Returns the generation manifest."""
+    from index_build import ucdb  # builds on this module, so imported here
+
     pins = dict(pins or PINS)
-    # Both under the raw store's own lock, before the gazetteer lock below.
+    ucdb_pins = dict(ucdb_pins or ucdb.PINS)
+    # All under the raw store's own lock, before the gazetteer lock below.
     prepare_inputs(cache_dir, expected=pins)
     convert_patches(cache_dir, expected=pins)
+    ucdb.prepare_inputs(cache_dir, expected=ucdb_pins)
 
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
@@ -436,15 +451,35 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None):
             if wanted and dataset is None:
                 dataset = geometry.division_area_dataset()
             areas = geometry.read_areas(dataset, wanted) if wanted else {}
+            # Names are a derived use of the UCDB: attached only while its
+            # allowlist entry stands; the report goes out unnamed otherwise.
+            names, names_manifest = ucdb.load_names(cache_dir, expected=ucdb_pins)
+            allowed = ucdb.DERIVED in geometry.DERIVED_SOURCE_ALLOWLIST
             provenance = {
                 "doi": DOI,
                 "cutoff_hours": CUTOFF_HOURS,
                 "license": LICENCE,
                 "credit": CREDIT,
                 "digests": inputs_manifest.get("digests"),
+                "names": {
+                    "source": "ghs-ucdb",
+                    "release": ucdb.RELEASE,
+                    "doi": ucdb.DOI,
+                    "license": ucdb.LICENCE,
+                    "credit": geometry.DERIVED_SOURCES[ucdb.DERIVED]["credit"],
+                    "digests": names_manifest.get("sources"),
+                    "allowed": allowed,
+                },
             }
             entries, unplaced = suggest(
-                places, areas, regions, patches, assignments, metro_report, provenance
+                places,
+                areas,
+                regions,
+                patches,
+                assignments,
+                metro_report,
+                provenance,
+                names if allowed else {},
             )
             manifest = {
                 "source": "fao",
@@ -454,7 +489,10 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None):
                 "credit": CREDIT,
                 "digests": inputs_manifest.get("digests"),
                 "metros_generation": metros_manifest.get("generation"),
+                "names": provenance["names"],
+                "names_generation": names_manifest.get("generation"),
                 "entries": len(entries),
+                "named_entries": sum(1 for entry in entries if entry["name"]),
                 "eligible_cities": sum(len(entry["cities"]) for entry in entries),
                 "tiers": dict(
                     sorted(collections.Counter(e["tier"] for e in entries).items())
