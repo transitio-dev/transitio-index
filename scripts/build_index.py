@@ -35,6 +35,7 @@ from index_build import (  # noqa: E402
     crosswalk,
     curate,
     expand,
+    fao,
     gbfs,
     geometry,
     mdb,
@@ -99,6 +100,7 @@ def run_gazetteer(arguments):
         metros.attach_metros(arguments.cache_dir, **options),
         geometry.attach_geometry(arguments.cache_dir, **options),
         names.merge_names(arguments.cache_dir, **options),
+        fao.suggest_metros(arguments.cache_dir),
     ]
 
 

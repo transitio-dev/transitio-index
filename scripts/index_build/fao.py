@@ -4,9 +4,13 @@ the suggested-curation report for metros the official sources do not cover.
 The city-region patches (a zipped shapefile, converted once to GeoParquet
 from the verified bytes) and the regions table are pinned like the Eurostat
 inputs. Regions nest — each is one urban centre's patch set at its tier — so
-a patch's region is that of its highest-tier centre.
+a patch's region is that of its highest-tier centre. Gazetteer cities with no
+metro and no known official assignment are joined to their patch's region and
+grouped, one report entry per region, for a curator to publish through the
+``set_statistical_area`` crosswalk. Nothing is minted here.
 """
 
+import collections
 import datetime
 import json
 import os
@@ -16,7 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import shapely
 
-from index_build import csv_source, pinned, store
+from index_build import csv_source, eurostat, geometry, overrides, pinned, store
 
 CUTOFF_HOURS = 1
 DOI = "10.5281/zenodo.11187634"
@@ -289,3 +293,178 @@ def load_inputs(cache_dir, *, expected=PINS):
                     f"higher-tier region {region_of(patch)}"
                 )
     return regions, patches, manifest
+
+
+def _patch_of(footprint, containment, geoms, region_by_patch):
+    """``(patch_id, ambiguous)`` for the patches covering the footprint's
+    representative point, settled as NUTS-3 regions are: one candidate, or
+    several of one region, or the one holding the larger share of the
+    footprint; equal shares between regions are ambiguous."""
+    hits = containment.regions_at(footprint.representative_point())
+    return eurostat._pick(hits, footprint, geoms, region_by_patch)
+
+
+def suggest(places, areas, regions, patches, assignments, metro_report, provenance):
+    """``(entries, unplaced)``: one report entry per city-region holding an
+    eligible city — a city with no metro and no known official assignment —
+    with the cities already in a metro there as context; and every city, eligible
+    or not, that could not be placed (no usable land area, or a footprint on a
+    boundary between regions) with the reason. ``provenance`` (DOI, cutoff,
+    licence, credit, input digests) is copied into every entry so each stands
+    on its own."""
+    known = {
+        row["city_id"]
+        for row in assignments
+        if row.get("status") in ("assigned", "ambiguous")
+    }
+    known |= {
+        row["city_id"]
+        for row in metro_report
+        if row.get("branch") == "us" and row.get("city_id")
+    }
+    geoms = {pid: p["geom"] for pid, p in patches.items()}
+    region_by_patch = {pid: region_of(p) for pid, p in patches.items()}
+    containment = eurostat.Containment(geoms)
+    grouped = {}
+    context = {}
+    countries = {}
+    unplaced = []
+    for place in places:
+        if place.get("kind") != "city":
+            continue
+        city = place["place_id"]
+        eligible = not place.get("metro_ids") and city not in known
+        overture_id = place.get("overture_id")
+        footprint = eurostat._footprint(areas.get(overture_id)) if overture_id else None
+        if footprint is None:
+            unplaced.append(
+                {"city_id": city, "eligible": eligible, "reason": "no usable land area"}
+            )
+            continue
+        patch_id, ambiguous = _patch_of(footprint, containment, geoms, region_by_patch)
+        if ambiguous:
+            unplaced.append(
+                {
+                    "city_id": city,
+                    "eligible": eligible,
+                    "reason": "on a boundary between regions",
+                }
+            )
+            continue
+        if patch_id is None:
+            continue
+        region_id = region_by_patch[patch_id]
+        if region_id is None:
+            continue
+        (grouped if eligible else context).setdefault(region_id, []).append(city)
+        countries.setdefault(region_id, set()).add(place.get("country_code"))
+    entries = []
+    for region_id, cities in sorted(grouped.items()):
+        region = regions[region_id]
+        cities = sorted(cities)
+        # FAO's country is ISO-3; the pasteable code is the gazetteer code every
+        # city in the region shares — omitted for a cross-border region, and
+        # when any city's country is unknown.
+        codes = countries[region_id]
+        add_place = {"kind": "metro", "name": "<name>"}
+        if len(codes) == 1 and None not in codes:
+            add_place["country_code"] = next(iter(codes))
+        entries.append(
+            {
+                **provenance,
+                "region_id": region_id,
+                "tier": region["tier"],
+                "category": region["category"],
+                "country": region["country"],
+                "cities": cities,
+                "context": sorted(context.get(region_id, [])),
+                "evidence_hash": overrides.canonical_digest(cities),
+                # The pair a curator pastes into places.yaml, QID and name filled
+                # in; refused until the scheme is registered (PR D).
+                "override": [
+                    {"place": "<QID>", "add_place": add_place},
+                    {
+                        "place": "<QID>",
+                        "set_statistical_area": {
+                            "scheme": "fao_city_region",
+                            "code": region_id,
+                        },
+                        "evidence_hash": overrides.canonical_digest(cities),
+                    },
+                ],
+            }
+        )
+    return entries, sorted(unplaced, key=lambda row: row["city_id"])
+
+
+def suggest_metros(cache_dir, *, dataset=None, pins=None):
+    """Publish ``gazetteer/fao.json``: the suggested-curation report of FAO
+    city-regions holding cities no official metro covers. ``dataset`` is the
+    Overture ``division_area`` dataset (the pinned release by default) and
+    ``pins`` the FAO inputs' digests. Returns the generation manifest."""
+    pins = dict(pins or PINS)
+    # Both under the raw store's own lock, before the gazetteer lock below.
+    prepare_inputs(cache_dir, expected=pins)
+    convert_patches(cache_dir, expected=pins)
+
+    directory = store.open_subdir(cache_dir, "gazetteer")
+    try:
+        with store.exclusive_writer(directory):
+            places, metros_manifest = store.read_jsonl(
+                cache_dir / "gazetteer", "metros.json", "places_seed.jsonl"
+            )
+            assignments, _ = store.read_jsonl(
+                cache_dir / "gazetteer", "metros.json", "metro_assignments.jsonl"
+            )
+            metro_report, _ = store.read_jsonl(
+                cache_dir / "gazetteer", "metros.json", "metro_report.jsonl"
+            )
+            regions, patches, inputs_manifest = load_inputs(cache_dir, expected=pins)
+            wanted = {
+                p["overture_id"]
+                for p in places
+                if p.get("kind") == "city" and p.get("overture_id")
+            }
+            if wanted and dataset is None:
+                dataset = geometry.division_area_dataset()
+            areas = geometry.read_areas(dataset, wanted) if wanted else {}
+            provenance = {
+                "doi": DOI,
+                "cutoff_hours": CUTOFF_HOURS,
+                "license": LICENCE,
+                "credit": CREDIT,
+                "digests": inputs_manifest.get("digests"),
+            }
+            entries, unplaced = suggest(
+                places, areas, regions, patches, assignments, metro_report, provenance
+            )
+            manifest = {
+                "source": "fao",
+                "doi": DOI,
+                "cutoff_hours": CUTOFF_HOURS,
+                "license": LICENCE,
+                "credit": CREDIT,
+                "digests": inputs_manifest.get("digests"),
+                "metros_generation": metros_manifest.get("generation"),
+                "entries": len(entries),
+                "eligible_cities": sum(len(entry["cities"]) for entry in entries),
+                "tiers": dict(
+                    sorted(collections.Counter(e["tier"] for e in entries).items())
+                ),
+                "unplaced": len(unplaced),
+                "retrieved_at": datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat(),
+            }
+            return store.publish(
+                cache_dir / "gazetteer",
+                "fao.json",
+                {
+                    "suggested_metros_report.jsonl": store.jsonl_chunks(entries),
+                    "unplaced.jsonl": store.jsonl_chunks(unplaced),
+                },
+                manifest,
+                held=directory,
+            )
+    finally:
+        directory.close()
