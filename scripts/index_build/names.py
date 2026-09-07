@@ -45,7 +45,9 @@ def _set_aliases(places, entries, report):
     return len(entries)
 
 
-def merge_names(cache_dir, *, wikidata=None, overrides_dir=None, strict=False):
+def merge_names(
+    cache_dir, *, wikidata=None, overrides_dir=None, strict=False, run=None
+):
     """Enrich the places' names and aliases from Wikidata, and republish them.
 
     Reads the geometry-stage places, fetches labels and aliases for their QIDs and
@@ -59,7 +61,10 @@ def merge_names(cache_dir, *, wikidata=None, overrides_dir=None, strict=False):
     try:
         with store.exclusive_writer(directory):
             places, geometry_manifest = store.read_jsonl(
-                cache_dir / "gazetteer", "geometry.json", "places_seed.jsonl"
+                cache_dir / "gazetteer",
+                "geometry.json",
+                "places_seed.jsonl",
+                generations=run,
             )
             qids = [
                 p["place_id"]
@@ -123,7 +128,10 @@ def merge_names(cache_dir, *, wikidata=None, overrides_dir=None, strict=False):
                 },
                 manifest,
                 held=directory,
+                staged=run is not None,
             )
+            if run is not None:
+                run["names.json"] = published["generation"]
             overrides.strict_check(strict, override_report, "names")
             return published
     finally:

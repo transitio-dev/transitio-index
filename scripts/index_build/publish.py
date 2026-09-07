@@ -405,10 +405,9 @@ def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
         ("expanded.json", "places_expanded.jsonl"),
         ("names.json", "places_seed.jsonl"),
     ):
-        path = cache_dir / "gazetteer" / pointer
-        if not (path.is_symlink() or path.exists()):
-            continue
         try:
+            if store.current_generation(cache_dir / "gazetteer", pointer) is None:
+                continue
             places, manifest = store.read_jsonl(
                 cache_dir / "gazetteer", pointer, artifact
             )
@@ -626,9 +625,14 @@ def _check_lineage(cache_dir, manifest, ancestors, what, rerun):
     """The ``what`` must descend from the current ``ancestors`` generations
     (subdirectory, pointer, manifest key), else ``rerun`` is the stage to run."""
     for subdir, pointer, key in ancestors:
-        path = cache_dir / subdir / pointer
         recorded = manifest.get(key)
-        if not (path.is_symlink() or path.exists()):
+        try:
+            present = store.current_generation(cache_dir / subdir, pointer) is not None
+        except (store.StoreError, ValueError) as error:
+            raise PublishError(
+                f"the {pointer} generation is unreadable: {error}"
+            ) from error
+        if not present:
             if recorded is not None:
                 # The ancestor these descend from is gone: nothing can
                 # verify them any more.

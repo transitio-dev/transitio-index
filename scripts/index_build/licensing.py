@@ -328,10 +328,9 @@ def _assert_integrity(places, edges, records):
 def _geometry_audit(cache_dir):
     """The geometry stage's inventory rows, NOTICE and generation, or none
     without it."""
-    pointer = cache_dir / "gazetteer" / "geometry.json"
-    if not (pointer.is_symlink() or pointer.exists()):
-        return [], None, None
     try:
+        if store.current_generation(cache_dir / "gazetteer", "geometry.json") is None:
+            return [], None, None
         rows, manifest = store.read_jsonl(
             cache_dir / "gazetteer", "geometry.json", "licence_inventory.jsonl"
         )

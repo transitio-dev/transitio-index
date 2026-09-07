@@ -472,6 +472,7 @@ def resolve_seed(
     overrides_dir=None,
     strict=False,
     registry=None,
+    run=None,
 ):
     """Build ``places_seed.jsonl`` from the feeds' declared locations.
 
@@ -490,7 +491,10 @@ def resolve_seed(
         cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
     )
     resolved_divisions, _ = store.read_jsonl(
-        cache_dir / "gazetteer", "overture.json", "overture_divisions.jsonl"
+        cache_dir / "gazetteer",
+        "overture.json",
+        "overture_divisions.jsonl",
+        generations=run,
     )
     skeleton = {record["overture_id"]: record for record in resolved_divisions}
     region_index = _index([r for r in skeleton.values() if r["kind"] == "region"])
@@ -606,7 +610,10 @@ def resolve_seed(
                 },
                 manifest,
                 held=directory,
+                staged=run is not None,
             )
+            if run is not None:
+                run["seed.json"] = published["generation"]
             overrides.strict_check(strict, override_report, "seed")
             return published
     finally:

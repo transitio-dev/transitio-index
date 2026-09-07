@@ -426,7 +426,7 @@ def resolve_qid(record, p402_map):
     return None, "name_country", "no wikidata property and no P402 match"
 
 
-def resolve(cache_dir, *, dataset=None, wikidata=None):
+def resolve(cache_dir, *, dataset=None, wikidata=None, run=None):
     """Ingest the Overture admin skeleton and resolve each division to a QID.
 
     Reads the whole skeleton from the pinned Overture release and resolves each
@@ -494,7 +494,7 @@ def resolve(cache_dir, *, dataset=None, wikidata=None):
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
         with store.exclusive_writer(directory):
-            return store.publish(
+            published = store.publish(
                 out,
                 "overture.json",
                 {
@@ -503,6 +503,10 @@ def resolve(cache_dir, *, dataset=None, wikidata=None):
                 },
                 manifest,
                 held=directory,
+                staged=run is not None,
             )
+            if run is not None:
+                run["overture.json"] = published["generation"]
+            return published
     finally:
         directory.close()

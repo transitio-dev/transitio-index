@@ -37,6 +37,10 @@ except ImportError:  # pragma: no cover - exercised on Unix
     msvcrt = None
 
 KEEP_GENERATIONS = 3
+# The run manifest a directory's transactional run publishes last: its
+# ``generations`` name the staged generation each pointer stands for.
+RUN_POINTER = "run.json"
+RUN_LOCK = "run.lock"
 GENERATION_ATTEMPTS = 8
 
 # Artifacts are JSONL of a few MB. `resolve` holds the verified bytes in
@@ -643,9 +647,9 @@ def parse_jsonl(raw):
     return [json.loads(line) for line in raw.decode("utf-8").split("\n") if line]
 
 
-def read_jsonl(directory, pointer, artifact):
+def read_jsonl(directory, pointer, artifact, *, generations=None):
     """Resolve a generation and parse one JSONL artifact into ``(records, manifest)``."""
-    generation, manifest = resolve(directory, pointer)
+    generation, manifest = resolve(directory, pointer, generations=generations)
     with generation:
         return parse_jsonl(generation.read_bytes(artifact)), manifest
 
@@ -994,7 +998,64 @@ def _check_digests(digests, generation, pointer):
 RESOLVE_ATTEMPTS = 3
 
 
-def resolve(directory, pointer):
+def _pointer_text(directory, pointer):
+    """The pointer file's text, or ``None`` when the cache, the store or the
+    pointer does not exist — the only absence; an unreadable or symlinked
+    entry is an error."""
+    try:
+        with open_subdir(directory.parent, directory.name, create=False) as opened:
+            return read_text(opened, pointer)
+    except MissingEntry:
+        return None
+    except OSError as error:
+        raise StoreError(f"{directory / pointer}: {error}") from None
+
+
+def run_manifest(directory):
+    """The directory's current run manifest — the set a transactional run
+    made visible together, which takes precedence over any per-stage
+    pointer — or ``None`` without one. A manifest that is present but
+    unverifiable is an error, never an absence."""
+    if _pointer_text(directory, RUN_POINTER) is None:
+        return None
+    generation, manifest = _resolve_once(directory, RUN_POINTER)
+    generation.close()
+    listed = manifest.get("generations")
+    if not isinstance(listed, dict) or not all(
+        isinstance(pointer, str) and isinstance(name, str)
+        for pointer, name in listed.items()
+    ):
+        raise StoreError(f"{directory / RUN_POINTER}: manifest names no generations")
+    return manifest
+
+
+def run_generations(directory):
+    """``{pointer: generation}`` from :func:`run_manifest`, or ``None``."""
+    manifest = run_manifest(directory)
+    return None if manifest is None else dict(manifest["generations"])
+
+
+def current_generation(directory, pointer, *, generations=None):
+    """The generation name ``pointer`` stands for now — through an explicit
+    map, the run manifest, or the pointer file — or ``None`` for none."""
+    if generations is None:
+        generations = run_generations(directory)
+    if generations is not None and pointer in generations:
+        return generations[pointer]
+    raw = _pointer_text(directory, pointer)
+    if raw is None:
+        return None
+    try:
+        manifest = json.loads(raw)
+    except ValueError:
+        raise StoreError(f"{directory / pointer}: pointer is not JSON") from None
+    name = manifest.get("generation") if isinstance(manifest, dict) else None
+    if not isinstance(name, str) or not GENERATION_PATTERN.match(name):
+        raise StoreError(f"{directory / pointer}: manifest names no generation")
+    return name
+
+
+def resolve(directory, pointer, *, generations=None):
     """Read the pointer manifest and verify the generation it names.
 
     Every artifact is hashed and compared with the manifest before a reader
@@ -1002,7 +1063,17 @@ def resolve(directory, pointer):
     rather than something a later stage silently consumes. Returns
     ``(Generation, manifest)``; hold the :class:`Generation` open for the
     reads it covers.
+
+    A pointer the directory's run manifest names — or one named by an
+    explicit ``generations`` map, as a stage reading its predecessor inside
+    a run before the manifest exists — resolves to that staged generation,
+    never to a per-stage pointer file.
     """
+    if pointer != RUN_POINTER:
+        if generations is None:
+            generations = run_generations(directory)
+        if generations is not None and pointer in generations:
+            return resolve_generation(directory, generations[pointer])
     for attempt in range(1, RESOLVE_ATTEMPTS + 1):
         try:
             return _resolve_once(directory, pointer)

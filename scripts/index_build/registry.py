@@ -475,7 +475,7 @@ class Registry:
         changed; refused, changed or not, when the file is no longer the one
         this session last saw, so a run never commits against an edit made
         underneath it."""
-        if hashlib.sha256(_read(self.path)).hexdigest() != self.digest:
+        if file_digest(self.path) != self.digest:
             raise RegistryError(f"{self.path}: changed since it was loaded; not saved")
         if not self.changed:
             return self.digest
@@ -499,6 +499,11 @@ class Registry:
             "minted": self.minted,
             "enriched": self.enriched,
         }
+
+
+def file_digest(path):
+    """The SHA-256 of the registry file as it is on disk."""
+    return hashlib.sha256(_read(path)).hexdigest()
 
 
 def load(path):

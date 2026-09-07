@@ -415,7 +415,7 @@ def suggest(
     return entries, sorted(unplaced, key=lambda row: row["city_id"])
 
 
-def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None):
+def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=None):
     """Publish ``gazetteer/fao.json``: the suggested-curation report of FAO
     city-regions holding cities no official metro covers, each named after
     its centre's GHS-UCDB match. ``dataset`` is the Overture ``division_area``
@@ -434,13 +434,22 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None):
     try:
         with store.exclusive_writer(directory):
             places, metros_manifest = store.read_jsonl(
-                cache_dir / "gazetteer", "metros.json", "places_seed.jsonl"
+                cache_dir / "gazetteer",
+                "metros.json",
+                "places_seed.jsonl",
+                generations=run,
             )
             assignments, _ = store.read_jsonl(
-                cache_dir / "gazetteer", "metros.json", "metro_assignments.jsonl"
+                cache_dir / "gazetteer",
+                "metros.json",
+                "metro_assignments.jsonl",
+                generations=run,
             )
             metro_report, _ = store.read_jsonl(
-                cache_dir / "gazetteer", "metros.json", "metro_report.jsonl"
+                cache_dir / "gazetteer",
+                "metros.json",
+                "metro_report.jsonl",
+                generations=run,
             )
             regions, patches, inputs_manifest = load_inputs(cache_dir, expected=pins)
             wanted = {
@@ -502,7 +511,7 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None):
                     datetime.timezone.utc
                 ).isoformat(),
             }
-            return store.publish(
+            published = store.publish(
                 cache_dir / "gazetteer",
                 "fao.json",
                 {
@@ -511,6 +520,10 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None):
                 },
                 manifest,
                 held=directory,
+                staged=run is not None,
             )
+            if run is not None:
+                run["fao.json"] = published["generation"]
+            return published
     finally:
         directory.close()

@@ -16,6 +16,9 @@ table as the shippable ``index/`` (Parquet + manifest).
 """
 
 import argparse
+import contextlib
+import datetime
+import functools
 import json
 import os
 import pathlib
@@ -48,6 +51,7 @@ from index_build import (  # noqa: E402
     registry,
     resolve,
     seed,
+    store,
 )
 
 DEFAULT_CACHE_DIR = pathlib.Path("cache")
@@ -95,33 +99,116 @@ def registry_path(arguments):
     return arguments.registry or arguments.overrides_dir / registry.FILE
 
 
+def commit_run(cache_dir, path, *, read_only, stages):
+    """Run the gazetteer stages as one transaction: every stage identifies
+    places through one registry session and publishes its generation
+    staged, the registry is saved once after the last stage, and the run
+    manifest published last makes the whole set visible together — so a
+    failure anywhere before that leaves the previous set current and, until
+    the save, the registry untouched. The run lock is held throughout, so runs on
+    one cache never interleave. Returns the stage summaries and the run
+    manifest."""
+    run = {}
+    directory = store.open_subdir(cache_dir, "gazetteer")
+    try:
+        # The run lock outlives every stage: a second run on this cache
+        # cannot stage, prune or publish under this one.
+        with (
+            store.exclusive_writer(directory, store.RUN_LOCK),
+            registry.session(path, read_only=read_only) as places,
+        ):
+            summaries = [stage(places, run) for stage in stages]
+            digest = places.save()
+            manifest = {
+                "source": "gazetteer-run",
+                "generations": dict(run),
+                "registry_base": places.base,
+                "registry_digest": digest,
+                "next_id": places.next_id,
+                "minted": places.minted,
+                "enriched": places.enriched,
+                "retrieved_at": datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat(),
+            }
+            rows = [{"pointer": p, "generation": g} for p, g in sorted(run.items())]
+            with store.exclusive_writer(directory):
+                summaries.append(
+                    store.publish(
+                        cache_dir / "gazetteer",
+                        store.RUN_POINTER,
+                        {"generations.jsonl": store.jsonl_chunks(rows)},
+                        manifest,
+                        held=directory,
+                    )
+                )
+    finally:
+        directory.close()
+    return summaries
+
+
+@contextlib.contextmanager
+def check_registry_state(cache_dir, path):
+    """Refuse to consume a gazetteer run whose registry is not the file on
+    disk: after a pull, a branch switch or a curation edit, the gazetteer
+    must run again before anything reads its places. The registry is held
+    read-only for the block, so no run can save it under the consumer."""
+    gazetteer = cache_dir / "gazetteer"
+    if store.run_manifest(gazetteer) is None:
+        yield
+        return
+    with registry.session(path, read_only=True) as places:
+        manifest = store.run_manifest(gazetteer) or {}
+        if manifest.get("registry_digest") != places.digest:
+            raise registry.RegistryError(
+                f"{path}: changed since the gazetteer ran; rerun the gazetteer"
+            )
+        yield
+
+
+def consumes_run(command):
+    """A command that reads the gazetteer run, guarded for its whole
+    duration by :func:`check_registry_state`."""
+
+    @functools.wraps(command)
+    def guarded(arguments):
+        with check_registry_state(arguments.cache_dir, registry_path(arguments)):
+            return command(arguments)
+
+    return guarded
+
+
 def run_gazetteer(arguments):
+    cache_dir = arguments.cache_dir
     options = {
         "overrides_dir": arguments.overrides_dir,
         "strict": arguments.strict_overrides,
     }
-    # One registry session spans the run: the seed and metros stages identify
-    # every place through it, and it is saved once, after the last stage.
-    with registry.session(
-        registry_path(arguments), read_only=arguments.registry_read_only
-    ) as places:
-        summaries = [
-            overture.resolve(arguments.cache_dir),
-            seed.resolve_seed(arguments.cache_dir, registry=places, **options),
-            metros.attach_metros(arguments.cache_dir, registry=places, **options),
-            geometry.attach_geometry(arguments.cache_dir, **options),
-            names.merge_names(arguments.cache_dir, **options),
-            fao.suggest_metros(arguments.cache_dir),
-        ]
-        places.save()
-        summaries.append({"source": "registry", **places.manifest()})
-    return summaries
+    stages = [
+        lambda places, run: overture.resolve(cache_dir, run=run),
+        lambda places, run: seed.resolve_seed(
+            cache_dir, registry=places, run=run, **options
+        ),
+        lambda places, run: metros.attach_metros(
+            cache_dir, registry=places, run=run, **options
+        ),
+        lambda places, run: geometry.attach_geometry(cache_dir, run=run, **options),
+        lambda places, run: names.merge_names(cache_dir, run=run, **options),
+        lambda places, run: fao.suggest_metros(cache_dir, run=run),
+    ]
+    return commit_run(
+        cache_dir,
+        registry_path(arguments),
+        read_only=arguments.registry_read_only,
+        stages=stages,
+    )
 
 
 def run_resolve(arguments):
     return [resolve.resolve(arguments.cache_dir, overrides_dir=arguments.overrides_dir)]
 
 
+@consumes_run
 def run_expand(arguments):
     return [expand.expand(arguments.cache_dir, overrides_dir=arguments.overrides_dir)]
 
@@ -130,6 +217,7 @@ def run_crawl(arguments):
     return [crawl.crawl(arguments.cache_dir, workers=arguments.workers)]
 
 
+@consumes_run
 def run_coverage(arguments):
     return [
         coverage.cover(
@@ -140,12 +228,14 @@ def run_coverage(arguments):
     ]
 
 
+@consumes_run
 def run_classify(arguments):
     return [
         classify.classify(arguments.cache_dir, overrides_dir=arguments.overrides_dir)
     ]
 
 
+@consumes_run
 def run_curate(arguments):
     return [
         curate.curate(
@@ -156,10 +246,12 @@ def run_curate(arguments):
     ]
 
 
+@consumes_run
 def run_prune(arguments):
     return [prune.prune(arguments.cache_dir)]
 
 
+@consumes_run
 def run_license(arguments):
     return [
         licensing.license_index(
@@ -168,6 +260,7 @@ def run_license(arguments):
     ]
 
 
+@consumes_run
 def run_publish(arguments):
     golden_path = None if arguments.no_golden else arguments.golden
     if golden_path is not None and not golden_path.is_file():

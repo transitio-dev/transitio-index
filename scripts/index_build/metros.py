@@ -440,6 +440,7 @@ def attach_metros(
     dataset=None,
     pins=None,
     registry=None,
+    run=None,
 ):
     """Add metro places and memberships to the seed places.
 
@@ -465,7 +466,10 @@ def attach_metros(
     try:
         with store.exclusive_writer(directory):
             places, seed_manifest = store.read_jsonl(
-                cache_dir / "gazetteer", "seed.json", "places_seed.jsonl"
+                cache_dir / "gazetteer",
+                "seed.json",
+                "places_seed.jsonl",
+                generations=run,
             )
             by_id = {}
             for place in places:
@@ -558,7 +562,10 @@ def attach_metros(
                 },
                 manifest,
                 held=directory,
+                staged=run is not None,
             )
+            if run is not None:
+                run["metros.json"] = published["generation"]
             overrides.strict_check(strict, override_report, "metros")
             return published
     finally:
