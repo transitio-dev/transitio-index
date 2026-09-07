@@ -650,7 +650,15 @@ def read_jsonl(directory, pointer, artifact):
         return parse_jsonl(generation.read_bytes(artifact)), manifest
 
 
-def publish(directory, pointer, artifacts, manifest, keep=KEEP_GENERATIONS, held=None):
+def publish(
+    directory,
+    pointer,
+    artifacts,
+    manifest,
+    keep=KEEP_GENERATIONS,
+    held=None,
+    staged=False,
+):
     """Write ``artifacts`` as a new generation and point ``pointer`` at it.
 
     ``artifacts`` maps file name to a function yielding text or bytes chunks;
@@ -661,6 +669,11 @@ def publish(directory, pointer, artifacts, manifest, keep=KEEP_GENERATIONS, held
     holds. A stage that touched shared state before publishing — a cached
     download, say — must hold one lock across the whole thing, or another
     run can change that state between the two.
+
+    ``staged`` writes the generation complete and verifiable by name
+    (:func:`resolve_generation`) but leaves ``pointer`` untouched, so no
+    reader sees it until a run manifest lists it under ``generations``;
+    ``pointer`` still names the generation's family for pruning.
     """
     # Snapshot the mapping once: iterating a second time to write could see
     # different entries from a custom or mutated mapping, past this check.
@@ -723,7 +736,15 @@ def publish(directory, pointer, artifacts, manifest, keep=KEEP_GENERATIONS, held
                                 f"{directory}: generation over the "
                                 f"{MAX_RESOLUTION_BYTES}-byte ceiling"
                             )
-                    published = dict(manifest, generation=generation, digests=digests)
+                    # The pointer's exact spelling as the family, beside the
+                    # truncated tag in the name: pruning compares it, so
+                    # neither a tag collision nor a case or normalisation
+                    # variant of the pointer can prune another's generations.
+                    published = dict(
+                        manifest, generation=generation, digests=digests, family=pointer
+                    )
+                    if staged:
+                        published["staged"] = True
                     # Serialized once: writing the same bytes to the
                     # generation and the pointer means a later mutation of a
                     # nested value in the caller's manifest cannot make the
@@ -743,12 +764,17 @@ def publish(directory, pointer, artifacts, manifest, keep=KEEP_GENERATIONS, held
                         )
                     generation_dir.sync()
 
-                # The pointer swap is the moment the generation becomes
-                # visible; from here it is active, so a later durability
-                # sync failing must not undo it.
-                write_file(opened, pointer, write_manifest)
-                activated = True
-                opened.sync()
+                if staged:
+                    # Complete on disk and named by nothing: kept until a
+                    # run manifest lists it or pruning outlives it.
+                    activated = True
+                else:
+                    # The pointer swap is the moment the generation becomes
+                    # visible; from here it is active, so a later durability
+                    # sync failing must not undo it.
+                    write_file(opened, pointer, write_manifest)
+                    activated = True
+                    opened.sync()
             finally:
                 # Remove the generation this call created only if it did not
                 # become live. `activated` covers the ordinary path;
@@ -768,7 +794,7 @@ def publish(directory, pointer, artifacts, manifest, keep=KEEP_GENERATIONS, held
             # one open makes deletion a sharing violation, and failing here
             # would report a publish that in fact happened as an error.
             try:
-                _prune(opened, keep, generation, _generation_tag(pointer))
+                _prune(opened, keep, generation, tag, pointer)
             except (OSError, StoreError):
                 pass
         return published
@@ -778,7 +804,8 @@ def publish(directory, pointer, artifacts, manifest, keep=KEEP_GENERATIONS, held
 
 
 def _referenced_generations(directory):
-    """Generation names any pointer in the store currently points at.
+    """Generation names any pointer in the store currently points at, and
+    every generation a run manifest lists under ``generations``.
 
     Read fresh from disk, so pruning never deletes a generation a live
     pointer still names — even a different pointer than the one publishing,
@@ -806,9 +833,16 @@ def _referenced_generations(directory):
             manifest = json.loads(raw)
         except ValueError:
             continue  # readable but not JSON — a stray file, not a pointer
-        generation = manifest.get("generation") if isinstance(manifest, dict) else None
+        if not isinstance(manifest, dict):
+            continue
+        generation = manifest.get("generation")
         if isinstance(generation, str):
             referenced.add(generation)
+        listed = manifest.get("generations")
+        if isinstance(listed, dict):
+            listed = list(listed.values())
+        if isinstance(listed, list):
+            referenced.update(n for n in listed if isinstance(n, str))
     return referenced
 
 
@@ -854,12 +888,28 @@ def _remove_generation(directory, name):
         pass
 
 
-def _prune(directory, keep, active, tag):
+def _family(directory, name):
+    """The exact family a generation's own manifest records, ``None`` when it
+    predates the field or cannot be read — and an unknown family is never
+    pruned, since it might be another pointer's."""
+    try:
+        with directory.subdirectory(name) as generation_dir:
+            manifest = json.loads(read_bytes(generation_dir, "manifest.json"))
+    except (OSError, StoreError, ValueError):
+        return None
+    family = manifest.get("family") if isinstance(manifest, dict) else None
+    return family if isinstance(family, str) else None
+
+
+def _prune(directory, keep, active, tag, family):
     """Drop the oldest generations of this pointer, keeping ``keep``.
 
     A generation any pointer still references is never a candidate, so
     pruning cannot delete a live generation regardless of tag collisions;
-    the tag only groups a pointer's own history for the keep count.
+    the tag groups a pointer's own history for the keep count, and only a
+    candidate whose manifest records this exact family is pruned — one
+    recording another family (a pointer whose tag collides), none, or an
+    unreadable one is left alone.
     """
     referenced = _referenced_generations(directory)
     referenced.add(active)
@@ -867,7 +917,9 @@ def _prune(directory, keep, active, tag):
     candidates = [
         name
         for name in _generation_names(directory)
-        if name.startswith(prefix) and name not in referenced
+        if name.startswith(prefix)
+        and name not in referenced
+        and _family(directory, name) == family
     ]
     keep_besides_active = max(0, keep - 1)
     for name in candidates[: max(0, len(candidates) - keep_besides_active)]:
@@ -978,36 +1030,58 @@ def _resolve_once(directory, pointer):
         generation = manifest.get("generation")
         if not isinstance(generation, str) or not GENERATION_PATTERN.match(generation):
             raise StoreError(f"{directory / pointer}: manifest names no generation")
-        digests = manifest.get("digests")
-        _check_digests(digests, generation, directory / pointer)
+        _check_digests(manifest.get("digests"), generation, directory / pointer)
+        return _verified(opened, generation, manifest), manifest
 
-        generation_dir = opened.subdirectory(generation)
-        contents = {}
+
+def resolve_generation(directory, name):
+    """Verify the generation ``name`` by its own manifest, without a pointer:
+    how the consumers of a run manifest read the staged generations it
+    lists. Returns ``(Generation, manifest)`` like :func:`resolve`."""
+    if not isinstance(name, str) or not GENERATION_PATTERN.match(name):
+        raise StoreError(f"{directory}: {name!r} is not a generation name")
+    with open_subdir(directory.parent, directory.name) as opened:
         try:
-            # The generation carries its own copy; if the two disagree, the
-            # pointer is describing a generation it did not publish.
-            own = json.loads(read_bytes(generation_dir, "manifest.json"))
-            if own != manifest:
-                raise StoreError(f"{generation}: does not match the pointer manifest")
-            retained = 0
-            for name, expected in digests.items():
-                handle = open_regular(generation_dir, name)
-                try:
-                    # A per-artifact limit that also respects what is left
-                    # of the whole-resolution budget.
-                    content = read_all(
-                        handle, min(MAX_ARTIFACT_BYTES, MAX_RESOLUTION_BYTES - retained)
-                    )
-                finally:
-                    os.close(handle)
-                if hashlib.sha256(content).hexdigest() != expected:
-                    raise StoreError(f"{generation}/{name}: digest mismatch")
-                retained += len(content)
-                contents[name] = content
-        except BaseException:
-            generation_dir.close()
-            raise
-        return Generation(generation_dir, manifest, contents), manifest
+            with opened.subdirectory(name) as generation_dir:
+                manifest = json.loads(read_bytes(generation_dir, "manifest.json"))
+        except MissingEntry:
+            raise StoreError(f"{directory / name}: no such generation") from None
+        if not isinstance(manifest, dict) or manifest.get("generation") != name:
+            raise StoreError(f"{directory / name}: manifest names another generation")
+        _check_digests(manifest.get("digests"), name, directory / name)
+        return _verified(opened, name, manifest), manifest
+
+
+def _verified(opened, generation, manifest):
+    """The generation with every declared artifact hashed against ``manifest``
+    and the exact bytes retained."""
+    generation_dir = opened.subdirectory(generation)
+    contents = {}
+    try:
+        # The generation carries its own copy; if the two disagree, the
+        # pointer is describing a generation it did not publish.
+        own = json.loads(read_bytes(generation_dir, "manifest.json"))
+        if own != manifest:
+            raise StoreError(f"{generation}: does not match the pointer manifest")
+        retained = 0
+        for name, expected in manifest["digests"].items():
+            handle = open_regular(generation_dir, name)
+            try:
+                # A per-artifact limit that also respects what is left
+                # of the whole-resolution budget.
+                content = read_all(
+                    handle, min(MAX_ARTIFACT_BYTES, MAX_RESOLUTION_BYTES - retained)
+                )
+            finally:
+                os.close(handle)
+            if hashlib.sha256(content).hexdigest() != expected:
+                raise StoreError(f"{generation}/{name}: digest mismatch")
+            retained += len(content)
+            contents[name] = content
+    except BaseException:
+        generation_dir.close()
+        raise
+    return Generation(generation_dir, manifest, contents)
 
 
 def regular_file_size(directory, name):
