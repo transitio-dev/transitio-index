@@ -26,6 +26,7 @@ from index_build import overrides  # noqa: E402
 # the source (which would lack it) fails loudly rather than skipping the module.
 from transitio import index as transitio_index  # noqa: E402
 from transitio.exceptions import IncompatibleIndexError  # noqa: E402
+from transitio.exceptions import PlaceNotFoundError  # noqa: E402
 
 
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
@@ -1145,3 +1146,57 @@ def test_a_table_declaring_more_than_the_reader_loads_is_refused(tmp_path, monke
     monkeypatch.setattr(transitio_index, "_MAX_TABLE_ROWS", 1)
     with pytest.raises(IncompatibleIndexError, match="declares more than"):
         transitio_index.read_index(cache / "index")
+
+
+def _restamp(index_dir, version, places):
+    """Rewrite the places table and stamp the manifest to ``version``."""
+    places.to_parquet(index_dir / "places.parquet", index=False)
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    snapshot["schema_version"] = version
+    snapshot["min_reader_version"] = transitio_index.MIN_READER_VERSIONS[version]
+    snapshot["places_sha256"] = hashlib.sha256(
+        (index_dir / "places.parquet").read_bytes()
+    ).hexdigest()
+    (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+
+
+def test_the_reader_reads_schema_6_places_and_refuses_a_mismatch(tmp_path):
+    # Nothing publishes schema 6 yet: build its shape from a published index
+    # — own ids as keys, the QID beside them (one row without), the ids each
+    # place carries, and a distinct former id per row — and stamp the manifest.
+    geopandas = pytest.importorskip("geopandas")
+    cache, _ = _build_index(tmp_path, places=PLACES)
+    index_dir = cache / "index"
+    published = geopandas.read_parquet(index_dir / "places.parquet")
+    qids = [str(q) for q in published["place_id"]]
+    own = {qid: f"tp_{n}" for n, qid in enumerate(qids, start=1)}
+    places = published.copy()
+    places["place_id"] = [own[q] for q in qids]
+    places["parent_id"] = [own.get(p, p) for p in places["parent_id"]]
+    places["wikidata_id"] = [None, *qids[1:]]
+    places["concordances"] = [
+        json.dumps({"overture": [f"ov-{n}"]} if n == 1 else {"wikidata": [q]})
+        for n, q in enumerate(qids, start=1)
+    ]
+    places["former_ids"] = [[f"tp_9{n}"] for n in range(1, len(qids) + 1)]
+    _restamp(index_dir, 6, places)
+    index = transitio_index.read_index(index_dir)
+    assert index.schema_version == 6
+    unnamed = transitio_index.place("tp_1", index=index)
+    assert unnamed.wikidata_id is None
+    assert unnamed.concordances == {"overture": ["ov-1"]}
+    second = transitio_index.place("tp_2", index=index)
+    assert second.wikidata_id == qids[1] and second.former_ids == ["tp_92"]
+    assert second.concordances == {"wikidata": [qids[1]]}
+    # The QID beside the id and the former id resolve to the same row; the
+    # unnamed place's old QID names nothing.
+    assert transitio_index.place(qids[1], index=index) == second
+    assert transitio_index.place("tp_92", index=index) == second
+    with pytest.raises(PlaceNotFoundError):
+        transitio_index.place(qids[0], index=index)
+    # The columns are keyed on the version: schema 6 without them, and
+    # schema 5 with them, are both refused.
+    for version, table in ((6, published), (5, places)):
+        _restamp(index_dir, version, table)
+        with pytest.raises(IncompatibleIndexError, match=f"schema_version {version}"):
+            transitio_index.read_index(index_dir)
