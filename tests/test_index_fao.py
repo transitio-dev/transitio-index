@@ -14,8 +14,9 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import fao_fixture as ffx  # noqa: E402
+import overture_fixture as fx  # noqa: E402
 
-from index_build import fao, store  # noqa: E402
+from index_build import fao, overrides, store  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +50,77 @@ REGIONS = [
 ]
 
 
+def _city(place_id, country, overture_id, metro_ids=()):
+    return {
+        "place_id": place_id,
+        "kind": "city",
+        "country_code": country,
+        "overture_id": overture_id,
+        "metro_ids": list(metro_ids),
+    }
+
+
+PLACES = [
+    _city("Q_A", "FI", "a"),  # eligible, patch 1
+    _city("Q_B", "FI", "b"),  # eligible, patch 2: same tier-2 region as A
+    _city("Q_C", "FI", "c", metro_ids=["Q_M"]),  # already in a metro: context
+    _city("Q_D", "SE", "d"),  # an official assignment exists: context
+    _city("Q_E", "SE", "e"),  # linked to a US MSA in the report: context
+    _city("Q_F", "FI", "f"),  # outside every patch
+    _city("Q_G", "FI", None),  # no land area: unplaceable
+    _city("Q_H", "SE", "h"),  # eligible, patch 3
+    _city("Q_I", "SE", "i"),  # an ambiguous official assignment: context
+    _city("Q_J", "SE", "j"),  # explicitly unassigned officially: eligible
+    _city(
+        "Q_K", "FI", None, metro_ids=["Q_M"]
+    ),  # no land area, not eligible: still listed
+    _city("Q_L", "FI", "l"),  # astride patches 1 and 2, one region: placed
+    _city(
+        "Q_N", "FI", "n"
+    ),  # astride patches 2 and 4, two regions, equal shares: ambiguous
+    _city(
+        "Q_O", None, "o"
+    ),  # patch 3, country unknown: no pasteable country code there
+    {"place_id": "Q_FI", "kind": "country", "country_code": "FI", "overture_id": "fi"},
+]
+AREAS = [
+    fx.area(name, shapely.to_wkb(shapely.box(x, y, x + 0.2, y + 0.2)), [])
+    for name, x, y in [
+        ("a", 0.2, 0.2),
+        ("b", 1.2, 0.2),
+        ("c", 0.6, 0.6),
+        ("d", 5.2, 5.2),
+        ("e", 5.6, 5.2),
+        ("f", 9.0, 9.0),
+        ("h", 5.2, 5.6),
+        ("i", 5.6, 5.6),
+        ("j", 5.4, 5.4),
+        ("l", 0.9, 0.4),
+        ("n", 1.9, 0.4),
+        ("o", 5.7, 5.7),
+        ("fi", 0.0, 0.0),
+    ]
+]
+ASSIGNMENTS = [
+    {
+        "city_id": "Q_D",
+        "status": "assigned",
+        "metro_code": "SE001M",
+        "published": False,
+    },
+    {"city_id": "Q_I", "status": "ambiguous", "metro_code": None, "published": False},
+    {"city_id": "Q_J", "status": "unassigned", "metro_code": None, "published": False},
+]
+METRO_REPORT = [
+    {
+        "branch": "us",
+        "city_id": "Q_E",
+        "metro_id": "Q_MSA",
+        "reason": "US MSA without a CBSA code",
+    }
+]
+
+
 def _inputs(tmp_path, patches=None, regions=None):
     files = {
         fao.PATCHES_FILE: tmp_path / "patches.zip",
@@ -61,6 +133,25 @@ def _inputs(tmp_path, patches=None, regions=None):
         for name, path in files.items()
     }
     return files, expected
+
+
+def _metros_generation(cache, places, assignments=(), report=()):
+    directory = store.open_subdir(cache, "gazetteer")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "gazetteer",
+                "metros.json",
+                {
+                    "places_seed.jsonl": store.jsonl_chunks(places),
+                    "metro_assignments.jsonl": store.jsonl_chunks(list(assignments)),
+                    "metro_report.jsonl": store.jsonl_chunks(list(report)),
+                },
+                {"source": "metros"},
+                held=directory,
+            )
+    finally:
+        directory.close()
 
 
 def test_inputs_are_converted_once_and_loaded_under_the_contract(tmp_path):
@@ -178,3 +269,82 @@ def test_the_input_contract_is_enforced(tmp_path, patches, regions, message):
 def test_a_patches_file_without_a_crs_is_refused():
     with pytest.raises(fao.FaoError, match="no CRS"):
         fao._patches_table(ffx.patches_zip(PATCHES, crs=None))
+
+
+def test_the_stage_reports_eligible_cities_by_highest_tier_region(tmp_path):
+    cache = tmp_path / "cache"
+    files, expected = _inputs(tmp_path)
+    fao.prepare_inputs(cache, files=files, expected=expected)
+    _metros_generation(cache, PLACES, ASSIGNMENTS, METRO_REPORT)
+    areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
+    manifest = fao.suggest_metros(cache, dataset=areas, pins=expected)
+    entries, _ = store.read_jsonl(
+        cache / "gazetteer", "fao.json", "suggested_metros_report.jsonl"
+    )
+    digest = overrides.canonical_digest
+    provenance = {
+        "doi": fao.DOI,
+        "cutoff_hours": 1,
+        "license": fao.LICENCE,
+        "credit": fao.CREDIT,
+        "digests": expected,
+    }
+    assert entries == [
+        {
+            **provenance,
+            "region_id": "20",
+            "tier": 2,
+            "category": "P",
+            "country": "FIN",
+            "cities": ["Q_A", "Q_B", "Q_L"],
+            "context": ["Q_C"],
+            "evidence_hash": digest(["Q_A", "Q_B", "Q_L"]),
+            "override": [
+                {
+                    "place": "<QID>",
+                    "add_place": {
+                        "kind": "metro",
+                        "name": "<name>",
+                        "country_code": "FI",
+                    },
+                },
+                {
+                    "place": "<QID>",
+                    "set_statistical_area": {"scheme": "fao_city_region", "code": "20"},
+                    "evidence_hash": digest(["Q_A", "Q_B", "Q_L"]),
+                },
+            ],
+        },
+        {
+            **provenance,
+            "region_id": "30",
+            "tier": 1,
+            "category": "S",
+            "country": "SWE",
+            "cities": ["Q_H", "Q_J", "Q_O"],
+            "context": ["Q_D", "Q_E", "Q_I"],
+            "evidence_hash": digest(["Q_H", "Q_J", "Q_O"]),
+            "override": [
+                {"place": "<QID>", "add_place": {"kind": "metro", "name": "<name>"}},
+                {
+                    "place": "<QID>",
+                    "set_statistical_area": {"scheme": "fao_city_region", "code": "30"},
+                    "evidence_hash": digest(["Q_H", "Q_J", "Q_O"]),
+                },
+            ],
+        },
+    ]
+    unplaced, _ = store.read_jsonl(cache / "gazetteer", "fao.json", "unplaced.jsonl")
+    assert unplaced == [
+        {"city_id": "Q_G", "eligible": True, "reason": "no usable land area"},
+        {"city_id": "Q_K", "eligible": False, "reason": "no usable land area"},
+        {"city_id": "Q_N", "eligible": True, "reason": "on a boundary between regions"},
+    ]
+    assert manifest["entries"] == 2 and manifest["eligible_cities"] == 6
+    assert manifest["tiers"] == {1: 1, 2: 1}
+    assert manifest["unplaced"] == 3 and manifest["doi"] == fao.DOI
+    # The places are untouched: nothing is minted.
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "metros.json", "places_seed.jsonl"
+    )
+    assert [p["place_id"] for p in places] == [p["place_id"] for p in PLACES]
