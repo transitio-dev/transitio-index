@@ -161,7 +161,7 @@ def test_inputs_are_converted_once_and_loaded_under_the_contract(tmp_path):
     assert manifest["digests"] == expected and manifest["cutoff_hours"] == 1
     converted = fao.convert_patches(cache, expected=expected)
     assert converted["patches"] == 4
-    assert converted["source_sha256"] == expected[fao.PATCHES_FILE]
+    assert converted["sources"] == {fao.PATCHES_FILE: expected[fao.PATCHES_FILE]}
     # Converted once: the same source digest is reused, not re-read.
     assert (
         fao.convert_patches(cache, expected=expected)["generation"]
@@ -264,6 +264,20 @@ def test_the_input_contract_is_enforced(tmp_path, patches, regions, message):
     with pytest.raises(fao.FaoError, match=message):
         fao.prepare_inputs(cache, files=files, expected=expected)
         fao.load_inputs(cache, expected=expected)
+
+
+@pytest.mark.parametrize("dtype", ["float64", "float32", "longdouble"])
+def test_float_ids_are_exact_only_within_their_width_and_int64(dtype):
+    import numpy
+    import pandas
+
+    # The last exactly representable integer of the width, capped at int64.
+    bound = min(2 ** (numpy.finfo(dtype).nmant + 1), 2**63)
+    frame = pandas.DataFrame({"id": numpy.array([bound - 1], dtype=dtype)})
+    assert fao.integer_ids(frame, "id", "ids").tolist() == [bound - 1]
+    frame = pandas.DataFrame({"id": numpy.array([bound], dtype=dtype)})
+    with pytest.raises(fao.FaoError, match="integer ids"):
+        fao.integer_ids(frame, "id", "ids")
 
 
 def test_a_patches_file_without_a_crs_is_refused():

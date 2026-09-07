@@ -72,42 +72,70 @@ def prepare_inputs(cache_dir, *, files=None, expected=PINS):
     return manifest
 
 
-def _patches_table(data):
-    """The patch polygons and their tier centres as an Arrow table with WKB
-    geometry in EPSG:4326, read from the zipped shapefile bytes."""
+def read_zipped(data, name, *, member=None, error=FaoError, **options):
+    """A GeoDataFrame, with its CRS, read from the bytes of a zip archive:
+    the zipped shapefile itself, or ``member`` inside it. ``name`` labels
+    the diagnostics only; the bytes land under a fixed scratch filename."""
     import geopandas
+
+    with tempfile.TemporaryDirectory() as scratch:
+        path = os.path.join(scratch, "input.zip")
+        with open(path, "wb") as opened:
+            opened.write(data)
+        source = f"zip://{path}" if member is None else f"zip://{path}!{member}"
+        try:
+            frame = geopandas.read_file(source, **options)
+        except Exception as exc:  # noqa: B902 - geopandas raises its own hierarchy
+            raise error(f"{name}: not readable: {exc}") from None
+    if frame.crs is None:
+        raise error(f"{name}: no CRS")
+    return frame
+
+
+def integer_ids(frame, column, name, *, error=FaoError):
+    """The column as exact int64 ids, never coerced: an integer column as it
+    is, a float column only while every value is integral and within both
+    the range its width represents exactly (2**53 for float64, 2**24 for
+    float32) and int64, anything else refused — a rounded or overflowing
+    value would otherwise pass the relational checks under the wrong
+    identity."""
     import numpy
     import pandas
 
-    with tempfile.TemporaryDirectory() as scratch:
-        path = os.path.join(scratch, PATCHES_FILE)
-        with open(path, "wb") as opened:
-            opened.write(data)
-        try:
-            frame = geopandas.read_file(f"zip://{path}")
-        except Exception as error:  # noqa: B902 - geopandas raises its own hierarchy
-            raise FaoError(f"{PATCHES_FILE}: not readable: {error}") from None
-    if frame.crs is None:
-        raise FaoError(f"{PATCHES_FILE}: no CRS")
+    values = frame[column]
+    problem = error(f"{name}: {column} is not a column of integer ids")
+    if values.isna().any():
+        raise problem
+    array = values.to_numpy()
+    if pandas.api.types.is_integer_dtype(values):
+        if (array > numpy.iinfo("int64").max).any():
+            raise problem
+    elif pandas.api.types.is_float_dtype(values):
+        exact = min(2 ** (numpy.finfo(array.dtype).nmant + 1), 2**63)
+        if (
+            not numpy.isfinite(array).all()
+            or (array != numpy.floor(array)).any()
+            or (numpy.abs(array) >= exact).any()
+        ):
+            raise problem
+    else:
+        raise problem
+    return array.astype("int64")
+
+
+def _patches_table(data):
+    """The patch polygons and their tier centres as an Arrow table with WKB
+    geometry in EPSG:4326, read from the zipped shapefile bytes."""
+    frame = read_zipped(data, PATCHES_FILE)
     if frame.crs.to_epsg() != 4326:
         frame = frame.to_crs(4326)
     missing = [c for c in ("id", *CENTRE_COLUMNS) if c not in frame.columns]
     if missing:
         raise FaoError(f"{PATCHES_FILE}: missing columns {missing}")
-    # Ids are read as exact integers, never coerced: a fractional or
-    # out-of-range value would otherwise pass the relational checks under the
-    # wrong identity.
-    columns = {}
-    for column in ("id", *CENTRE_COLUMNS):
-        values = pandas.to_numeric(frame[column], errors="coerce")
-        if (
-            values.isna().any()
-            or not numpy.isfinite(values).all()
-            or (values != numpy.floor(values)).any()
-            or (values.abs() >= 2**63).any()
-        ):
-            raise FaoError(f"{PATCHES_FILE}: {column} is not a column of integer ids")
-        columns[column] = pa.array(values.to_numpy().astype("int64"))
+    columns = {
+        column: pa.array(integer_ids(frame, column, PATCHES_FILE))
+        for column in ("id", *CENTRE_COLUMNS)
+    }
     ids = columns["id"].to_pylist()
     if len(set(ids)) != len(ids):
         raise FaoError(f"{PATCHES_FILE}: patch ids are not unique")
@@ -144,45 +172,23 @@ def convert_patches(cache_dir, *, expected=PINS):
     )
     with generation:
         data = generation.read_bytes(PATCHES_FILE)
-    source = manifest["digests"][PATCHES_FILE]
-    directory = store.open_subdir(cache_dir, "raw")
-    try:
-        with store.exclusive_writer(directory):
-            try:
-                current, current_manifest = store.resolve(
-                    cache_dir / "raw", CONVERTED_POINTER
-                )
-            except store.StoreError:
-                current_manifest = None
-            else:
-                current.close()
-            # ``store.resolve`` hashed the cached artifact against the digest the
-            # manifest records; reuse it only for the same source bytes.
-            if (
-                current_manifest is not None
-                and current_manifest.get("source_sha256") == source
-            ):
-                return current_manifest
-            table = _patches_table(data)
-            sink = pa.BufferOutputStream()
-            pq.write_table(table, sink)
-            payload = sink.getvalue().to_pybytes()
-            return store.publish(
-                cache_dir / "raw",
-                CONVERTED_POINTER,
-                {PATCHES_PARQUET: lambda: [payload]},
-                {
-                    "source": "fao-patches",
-                    "source_sha256": source,
-                    "patches": table.num_rows,
-                    "retrieved_at": datetime.datetime.now(
-                        datetime.timezone.utc
-                    ).isoformat(),
-                },
-                held=directory,
-            )
-    finally:
-        directory.close()
+
+    def build():
+        table = _patches_table(data)
+        sink = pa.BufferOutputStream()
+        pq.write_table(table, sink)
+        payload = sink.getvalue().to_pybytes()
+        return {PATCHES_PARQUET: lambda: [payload]}, {
+            "source": "fao-patches",
+            "patches": table.num_rows,
+        }
+
+    return pinned.derive(
+        cache_dir,
+        pointer=CONVERTED_POINTER,
+        sources={PATCHES_FILE: manifest["digests"][PATCHES_FILE]},
+        build=build,
+    )
 
 
 def read_regions(data):
@@ -261,7 +267,9 @@ def load_inputs(cache_dir, *, expected=PINS):
         regions = read_regions(generation.read_bytes(REGIONS_FILE))
     converted, converted_manifest = store.resolve(cache_dir / "raw", CONVERTED_POINTER)
     with converted:
-        if converted_manifest.get("source_sha256") != manifest["digests"][PATCHES_FILE]:
+        if converted_manifest.get("sources") != {
+            PATCHES_FILE: manifest["digests"][PATCHES_FILE]
+        }:
             raise FaoError(f"raw/{CONVERTED_POINTER} was converted from other bytes")
         patches = read_patches(converted.read_bytes(PATCHES_PARQUET))
     for patch_id, patch in patches.items():

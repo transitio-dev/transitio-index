@@ -108,3 +108,40 @@ def resolve(cache_dir, *, pointer, expected, error=PinnedInputError):
         generation.close()
         raise error(f"raw/{pointer} holds other inputs than this build's pins")
     return generation, manifest
+
+
+def derive(cache_dir, *, pointer, sources, build):
+    """Ensure ``raw/<pointer>`` holds an artifact derived once from verified
+    inputs; return its manifest. ``sources`` maps each input name to the
+    digest it was read at: a generation that resolves — every artifact hashed
+    — with the same ``sources`` in its manifest is reused, otherwise
+    ``build()`` returns ``(artifacts, fields)``, the artifacts to publish and
+    the manifest fields beside ``sources`` and ``retrieved_at``."""
+    sources = dict(sources)
+    directory = store.open_subdir(cache_dir, "raw")
+    try:
+        with store.exclusive_writer(directory):
+            try:
+                generation, current = store.resolve(cache_dir / "raw", pointer)
+            except store.StoreError:
+                current = None
+            else:
+                generation.close()
+            if current is not None and current.get("sources") == sources:
+                return current
+            artifacts, fields = build()
+            return store.publish(
+                cache_dir / "raw",
+                pointer,
+                artifacts,
+                {
+                    **fields,
+                    "sources": sources,
+                    "retrieved_at": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
+                },
+                held=directory,
+            )
+    finally:
+        directory.close()
