@@ -90,6 +90,19 @@ DERIVED_SOURCES = {
         "url": "https://ec.europa.eu/eurostat/en/web/gisco/geodata/statistical-units",
         "share_alike": False,
     },
+    ("GHS-UCDB R2024A", "CC-BY-4.0"): {
+        "credit": (
+            "GHS Urban Centre Database 2025 (GHS-UCDB R2024A), European "
+            "Commission, Joint Research Centre, "
+            "doi:10.2905/1a338be6-7eaf-480c-9664-3a8ade88cbcd"
+        ),
+        "licence": "CC BY 4.0 (Commission Decision 2011/833/EU)",
+        "url": (
+            "https://jeodpp.jrc.ec.europa.eu/ftp/jrc-opendata/GHSL/"
+            "GHS_UCDB_GLOBE_R2024A/copyright.txt"
+        ),
+        "share_alike": False,
+    },
 }
 
 # The sources approved to contribute derived data — an explicit set, never
@@ -100,6 +113,7 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
         ("Overture Maps divisions", "CDLA-Permissive-2.0"),
         ("Eurostat metropolitan regions", "Eurostat-2011/833/EU"),
         ("GISCO NUTS 2021", "EuroGeographics-NC"),
+        ("GHS-UCDB R2024A", "CC-BY-4.0"),
     }
 )
 
