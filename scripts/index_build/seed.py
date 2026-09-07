@@ -22,6 +22,7 @@ import unicodedata
 import pyarrow.dataset as ds
 
 from index_build import overrides, overture, store
+from index_build import registry as _registry
 
 # The Overture subtypes that stand in for a city, most specific first: a name
 # resolving to both prefers the locality (decision in the plan's subtype table).
@@ -421,8 +422,56 @@ def _add_place_overrides(places, entries, report):
             place_id = (places.get(place_id) or {}).get("parent_id")
 
 
+def _identify_places(places, registry, places_digest):
+    """Give every place its registry id — found by its concordances or
+    minted — beside the QID, which stays the key for now."""
+    if registry is None:
+        return 0
+    for place_id in sorted(places):
+        row = places[place_id]
+        concordances = {"wikidata": [place_id]}
+        if row.get("overture_id"):
+            concordances["overture"] = [row["overture_id"]]
+            minted_from = f"overture:{row['overture_id']}"
+            minted_in = f"overture {overture.OVERTURE_RELEASE}"
+        else:
+            minted_from = f"places.yaml:{place_id}"
+            minted_in = f"places.yaml {places_digest}"
+        if row.get("osm_relation_id"):
+            concordances["osm_relation"] = [str(row["osm_relation_id"])]
+        row["tp_id"] = registry.identify(
+            concordances,
+            kind=row["kind"],
+            name=row.get("name"),
+            country_code=row.get("country_code"),
+            minted_from=minted_from,
+            minted_in=minted_in,
+        )
+        _shadow_gate(registry, row["tp_id"], place_id)
+        row["wikidata_id"] = place_id
+    return len(places)
+
+
+def _shadow_gate(registry, tp_id, qid):
+    """While the QID is the place key, it must be the registry's canonical
+    QID for the id: a QID merged into another place would otherwise give
+    two keyed rows one id. Re-keying arrives with the cutover."""
+    canonical = registry.canonical_qid(tp_id)
+    if canonical != qid:
+        raise _registry.RegistryError(
+            f"{qid}: the registry keys {tp_id} by {canonical!r}; "
+            "the shadow phase cannot re-key it"
+        )
+
+
 def resolve_seed(
-    cache_dir, *, dataset=None, wikidata=None, overrides_dir=None, strict=False
+    cache_dir,
+    *,
+    dataset=None,
+    wikidata=None,
+    overrides_dir=None,
+    strict=False,
+    registry=None,
 ):
     """Build ``places_seed.jsonl`` from the feeds' declared locations.
 
@@ -430,7 +479,9 @@ def resolve_seed(
     matches each feed's declared municipality to a QID-bearing Overture city (its
     subdivision to a region, or its country to a country, when no finer level is
     declared), and emits that place with its administrative ancestors; unmatched
-    feeds go to ``seed_report.jsonl``. Returns the generation manifest.
+    feeds go to ``seed_report.jsonl``. With a ``registry`` session every place
+    also gets its registry id (``tp_id``) and ``wikidata_id``. Returns the
+    generation manifest.
     """
     if wikidata is None:
         wikidata = overture.WikidataClient()
@@ -517,9 +568,14 @@ def resolve_seed(
         _add_place(places, skeleton, division)
     added = overrides.by_operation(place_overrides, "add_place")
     _add_place_overrides(places, added, override_report)
+    identified = _identify_places(places, registry, places_digest)
 
     manifest = {
         "source": "seed",
+        "identified": identified,
+        # The digest loaded, never the one to be saved: the run saves the
+        # registry only after its last stage.
+        "registry_base": registry.base if registry is not None else None,
         # The exact places.yaml applied: every later gazetteer stage must read
         # the same bytes, and publish checks the file against it.
         "places_overrides_sha256": places_digest,

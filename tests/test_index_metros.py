@@ -23,6 +23,7 @@ from index_build import (  # noqa: E402
     metros,
     overrides,
     overture,
+    registry,
     seed,
     store,
 )
@@ -242,14 +243,18 @@ def _inputs(tmp_path, cache):
     return pins
 
 
-def _run(tmp_path, metro_map, overrides_dir=None, candidates=None):
+def _run(tmp_path, metro_map, overrides_dir=None, candidates=None, registry=None):
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
     _publish(cache, "crosswalk", "feeds.json", "feeds.jsonl", FEEDS)
     overture.resolve(cache, dataset=dataset, wikidata=fx.StubWikidata())
     seed.resolve_seed(
-        cache, dataset=dataset, wikidata=fx.StubWikidata(), overrides_dir=overrides_dir
+        cache,
+        dataset=dataset,
+        wikidata=fx.StubWikidata(),
+        overrides_dir=overrides_dir,
+        registry=registry,
     )
     pins = _inputs(tmp_path, cache)
     manifest = metros.attach_metros(
@@ -258,6 +263,7 @@ def _run(tmp_path, metro_map, overrides_dir=None, candidates=None):
         overrides_dir=overrides_dir,
         dataset=areas,
         pins=pins,
+        registry=registry,
     )
     places, _ = store.read_jsonl(
         cache / "gazetteer", "metros.json", "places_seed.jsonl"
@@ -268,6 +274,55 @@ def _run(tmp_path, metro_map, overrides_dir=None, candidates=None):
 def _artefact(tmp_path, name):
     rows, _ = store.read_jsonl(tmp_path / "cache" / "gazetteer", "metros.json", name)
     return rows
+
+
+def test_metro_rows_are_identified_with_their_statistical_code(tmp_path):
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        manifest, places = _run(
+            tmp_path,
+            {"Q1297": [CHICAGO_METRO], "Q28515": [CHICAGO_METRO]},
+            registry=reg,
+        )
+        reg.save()
+    metro = places["Q1754965"]
+    assert metro["wikidata_id"] == "Q1754965" and manifest["identified"] == 1
+    saved = registry.load(path)
+    assert saved.resolve("cbsa:16980") == metro["tp_id"] == saved.resolve("Q1754965")
+    assert saved.rows[metro["tp_id"]]["minted_from"] == "cbsa:16980"
+    assert saved.rows[metro["tp_id"]]["minted_in"].startswith("wikidata P8138 ")
+    assert places["Q1297"]["tp_id"] == saved.resolve("Q1297")
+
+
+def test_a_curated_metro_gains_its_discovered_code_before_identification(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    entries = [
+        {
+            "place": "Q1754965",
+            "add_place": {
+                "kind": "metro",
+                "name": "Chicagoland",
+                "member_ids": ["Q1297"],
+            },
+        }
+    ]
+    directory = write_overrides(tmp_path, places=entries)
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        _, places = _run(
+            tmp_path, {"Q28515": [CHICAGO_METRO]}, overrides_dir=directory, registry=reg
+        )
+        # The seed minted the curated metro by its QID; the metros stage
+        # enriched that same row with the CBSA code it discovered.
+        assert reg.minted == len(places) and reg.enriched == 1
+        reg.save()
+    metro = places["Q1754965"]
+    assert metro["statistical_area_id"] == "16980" and metro["country_code"] == "US"
+    saved = registry.load(path)
+    assert saved.resolve("cbsa:16980") == metro["tp_id"] == saved.resolve("Q1754965")
 
 
 def test_a_metro_place_and_its_memberships_are_attached(tmp_path):

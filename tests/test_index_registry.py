@@ -321,6 +321,8 @@ def test_identification_mints_enriches_refuses_and_saves_once(tmp_path):
             _identify(reg, {})
         with pytest.raises(registry.RegistryError, match="kind"):
             _identify(reg, {"geonames": ["1"]}, kind="planet")
+        with pytest.raises(registry.RegistryError, match="is a city, not a metro"):
+            _identify(reg, {"overture": ["ov-hel"]}, kind="metro")
         # Unknown everywhere: minted from the counter; a detached value may
         # be re-attached to the new place, which then owns it alone.
         assert _identify(reg, {"wikidata": ["Q999"]}, name="Elsewhere") == "tp_5"
@@ -401,6 +403,23 @@ def test_read_only_refuses_every_change_at_the_point_of_discovery(tmp_path):
         assert _identify(reg, {"overture": ["ov-hel"]}) == "tp_1"
         assert reg.save() == reg.base
     assert path.read_bytes() == before
+
+
+def test_the_build_defaults_the_registry_to_the_overrides_directory():
+    import pathlib
+
+    import build_index
+
+    arguments = build_index.parse_args(
+        ["--stage", "gazetteer", "--overrides-dir", "ov"]
+    )
+    assert build_index.registry_path(arguments) == pathlib.Path("ov") / registry.FILE
+    assert not arguments.registry_read_only
+    arguments = build_index.parse_args(
+        ["--stage", "gazetteer", "--registry", "r.jsonl", "--registry-read-only"]
+    )
+    assert build_index.registry_path(arguments) == pathlib.Path("r.jsonl")
+    assert arguments.registry_read_only
 
 
 @pytest.mark.parametrize(
