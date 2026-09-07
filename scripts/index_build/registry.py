@@ -5,11 +5,13 @@ numeric order — is the durable authority on place identity. Ids are minted
 from the header's counter and never reused; a place is found again through
 the concordances (external ids, one ordered list per namespace) its row
 carries; a merged row resolves to its successor and a retired one is
-refused. This is the read side; the session that holds the writer lock and
-saves, and identification (minting and enrichment), follow. See
-``plans/place-identity.md``.
+refused. A session holds the writer lock that lives beside the file and
+saves once by atomic replacement, only when something changed and only if
+the file is still the one it loaded. Identification (minting and
+enrichment) follows. See ``plans/place-identity.md``.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -249,6 +251,16 @@ def _index(rows, where):
     return index
 
 
+def _serialize(header, rows):
+    ordered = sorted(rows.values(), key=lambda row: _number(row["place_id"]))
+    lines = [json.dumps(header, sort_keys=True)]
+    lines.extend(
+        json.dumps(row, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        for row in ordered
+    )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def _read(path):
     try:
         handle = store.open_regular_path(path)
@@ -263,14 +275,20 @@ def _read(path):
 
 
 class Registry:
-    """The loaded registry and its lookups."""
+    """The loaded registry: lookups and the one save."""
 
-    def __init__(self, path, header, rows, base):
+    def __init__(self, path, header, rows, base, *, read_only, locked=False):
         self.path = path
         self.header = header
         self.rows = rows
-        # The digest of the file as loaded, for provenance.
+        # ``base`` is the digest of the file as loaded, kept for provenance;
+        # ``digest`` follows the file through this session's saves.
         self.base = base
+        self.read_only = read_only
+        self._locked = locked
+        self.digest = base
+        self.minted = 0
+        self.enriched = 0
         self._index = _index(rows, str(path))
 
     @property
@@ -318,9 +336,82 @@ class Registry:
             raise RegistryError(f"{reference!r}: no place carries it")
         return found
 
+    @property
+    def changed(self):
+        return bool(self.minted or self.enriched)
+
+    def save(self):
+        """Replace the file atomically with the current state, if anything
+        changed; refused, changed or not, when the file is no longer the one
+        this session last saw, so a run never commits against an edit made
+        underneath it."""
+        if hashlib.sha256(_read(self.path)).hexdigest() != self.digest:
+            raise RegistryError(f"{self.path}: changed since it was loaded; not saved")
+        if not self.changed:
+            return self.digest
+        if self.read_only:
+            raise RegistryError("saving: the registry is read-only")
+        if not self._locked:
+            raise RegistryError("saving: only a session holding the lock may save")
+        payload = _serialize(self.header, self.rows)
+        directory = store.open_directory(self.path.parent)
+        try:
+            self.digest = store.write_bytes(directory, self.path.name, payload)
+            directory.sync()
+        finally:
+            directory.close()
+        return self.digest
+
+    def manifest(self):
+        return {
+            "registry_base": self.base,
+            "registry_digest": self.digest,
+            "next_id": self.header["next_id"],
+            "minted": self.minted,
+            "enriched": self.enriched,
+        }
+
 
 def load(path):
-    """The registry at ``path``, validated."""
+    """The registry at ``path``, validated, for reading: a registry that may
+    change comes only from :func:`session`, under the lock."""
+    return _load(path, read_only=True)
+
+
+def _load(path, *, read_only, locked=False):
     raw = _read(path)
     header, rows = parse(raw, str(path))
-    return Registry(path, header, rows, hashlib.sha256(raw).hexdigest())
+    return Registry(
+        path,
+        header,
+        rows,
+        hashlib.sha256(raw).hexdigest(),
+        read_only=read_only,
+        locked=locked,
+    )
+
+
+@contextlib.contextmanager
+def session(path, *, read_only=False):
+    """The registry loaded under the writer lock beside its file, held until
+    the block ends; the caller saves explicitly, before it publishes what
+    depends on the ids. A second writer is refused rather than queued."""
+    directory = store.open_directory(path.parent)
+    try:
+        try:
+            lock = store.exclusive_writer(directory, path.name + ".lock")
+            lock.__enter__()
+        except store.StoreError:
+            raise RegistryError(f"{path}: another build holds the registry") from None
+        loaded = None
+        try:
+            loaded = _load(path, read_only=read_only, locked=True)
+            yield loaded
+        finally:
+            # A registry kept past its session can no longer save: the lock
+            # it saved under is about to be released.
+            if loaded is not None:
+                loaded._locked = False
+            lock.__exit__(None, None, None)
+    finally:
+        directory.close()

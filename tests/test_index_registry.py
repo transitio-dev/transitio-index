@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -176,3 +177,82 @@ def test_references_resolve_through_concordances_and_aliases(
     assert reg.canonical_qid("tp_3") == "Q1757"
     with pytest.raises(registry.RegistryError, match="retired"):
         reg.canonical_qid("tp_4")
+
+
+def test_the_lock_refuses_a_second_writer_and_a_changed_file_is_not_overwritten(
+    tmp_path, monkeypatch
+):
+    path = _write(tmp_path / "r.jsonl")
+    with registry.session(path) as reg:
+        with pytest.raises(registry.RegistryError, match="another build"):
+            with registry.session(path):
+                pass
+        # The lock is held through the save's own window too: a writer that
+        # arrives between the re-read and the replacement is refused.
+        real = registry.store.write_bytes
+
+        def paused(directory, name, data):
+            with pytest.raises(registry.RegistryError, match="another build"):
+                with registry.session(path):
+                    pass
+            return real(directory, name, data)
+
+        monkeypatch.setattr(registry.store, "write_bytes", paused)
+        reg.minted += 1
+        reg.save()
+        monkeypatch.setattr(registry.store, "write_bytes", real)
+        reg.minted = 0
+        # A non-cooperating edit between load and save: the save aborts,
+        # whether or not the session has anything to write.
+        path.write_bytes(path.read_bytes() + b"\n")
+        with pytest.raises(registry.RegistryError, match="changed since"):
+            reg.save()
+        reg.minted += 1  # a change to save, as identification will make
+        with pytest.raises(registry.RegistryError, match="changed since"):
+            reg.save()
+    with registry.session(path, read_only=True):
+        pass
+    # Outside a session the registry is read-only: it cannot save at all;
+    # a registry kept past its session lost the lock and cannot either.
+    outside = registry.load(path)
+    outside.minted += 1
+    with pytest.raises(registry.RegistryError, match="read-only"):
+        outside.save()
+    with registry.session(path) as kept:
+        pass
+    kept.minted += 1
+    with pytest.raises(registry.RegistryError, match="holding the lock"):
+        kept.save()
+
+
+def test_a_changed_registry_is_saved_canonically_and_an_unchanged_one_not_at_all(
+    tmp_path, monkeypatch
+):
+    path = _write(tmp_path / "r.jsonl", rows=[HELSINKI, ESPOO])
+    before = path.read_bytes()
+    with registry.session(path) as reg:
+        # Unchanged: no write at all, not even of identical bytes.
+        monkeypatch.setattr(registry.store, "write_bytes", None)
+        assert reg.save() == reg.base and path.read_bytes() == before
+        monkeypatch.undo()
+        reg.rows["tp_1"]["concordances"]["cbsa"] = ["12345"]
+        reg.enriched += 1
+        digest = reg.save()
+    saved = path.read_bytes()
+    assert hashlib.sha256(saved).hexdigest() == digest
+    # Provenance keeps the digest loaded beside the one written.
+    assert reg.manifest()["registry_base"] == hashlib.sha256(before).hexdigest()
+    assert (
+        reg.manifest()["registry_digest"] == digest and reg.manifest()["enriched"] == 1
+    )
+    assert saved.decode().split("\n")[1] == json.dumps(
+        dict(HELSINKI, concordances={**HELSINKI["concordances"], "cbsa": ["12345"]}),
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    with registry.session(path, read_only=True) as reg:
+        reg.rows["tp_1"]["name"] = "x"
+        reg.enriched += 1
+        with pytest.raises(registry.RegistryError, match="read-only"):
+            reg.save()
+    assert path.read_bytes() == saved
