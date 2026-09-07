@@ -387,6 +387,20 @@ class Registry:
             raise RegistryError(f"{reference!r}: no place carries it")
         return found
 
+    def key_for(self, reference):
+        """The current key of the row ``reference`` names — its canonical
+        QID during the shadow phase — or the reference itself when it is a
+        bare QID no row carries yet, a place still to be minted. Any other
+        reference must name a row."""
+        if isinstance(reference, str) and QID_PATTERN.match(reference):
+            if self.lookup("wikidata", reference) is None:
+                return reference
+        place_id = self.resolve(reference)
+        qid = self.canonical_qid(place_id)
+        if qid is None:
+            raise RegistryError(f"{reference}: {place_id} has no wikidata concordance")
+        return qid
+
     def _refuse_change(self, what):
         if self.read_only:
             raise RegistryError(f"{what}: the registry is read-only")

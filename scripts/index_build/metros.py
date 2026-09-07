@@ -479,7 +479,7 @@ def attach_metros(
                 place.setdefault("statistical_area_id", None)
                 by_id[place["place_id"]] = place
             place_overrides, places_digest = overrides.load_place_overrides(
-                overrides_dir
+                overrides_dir, registry=registry
             )
             overrides.expect_digest(
                 seed_manifest.get("places_overrides_sha256"),

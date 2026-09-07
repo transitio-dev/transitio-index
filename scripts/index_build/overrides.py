@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 
+from index_build import registry as _registry
 from index_build import store
 
 import re
@@ -166,7 +167,7 @@ def _validate_operations(path, ref, entry):
             )
 
 
-def load_feed_overrides(overrides_dir):
+def load_feed_overrides(overrides_dir, *, registry=None):
     """The ``feeds.yaml`` entries keyed by feed reference and the digest of
     the bytes they came from: ``({}, None)`` when absent.
 
@@ -203,6 +204,10 @@ def load_feed_overrides(overrides_dir):
                 f"{path}: feed {ref!r} has unknown keys {sorted(unknown)}"
             )
         _validate_operations(path, ref, entry)
+        if registry is not None and "set_coverage" in entry:
+            entry["set_coverage"]["place_id"] = _key(
+                registry, entry["set_coverage"]["place_id"], f"{path}: feed {ref!r}"
+            )
         by_feed[ref] = entry
     return by_feed, digest
 
@@ -319,7 +324,7 @@ def _validate_confidence(path, where, value):
         raise OverrideError(f"{path}: {where} tier_confidence must lie in [0, 1]")
 
 
-def load_edge_overrides(overrides_dir):
+def load_edge_overrides(overrides_dir, *, registry=None):
     """``(entries, sha256)``: the ``edges.yaml`` entries in file order and
     the digest of the bytes they were parsed from — ``([], None)`` when
     there is no file.
@@ -352,6 +357,8 @@ def load_edge_overrides(overrides_dir):
             if not isinstance(entry.get(key), str) or not entry[key]:
                 raise OverrideError(f"{path}: every entry needs a non-empty '{key}'")
         where = f"{entry['feed']}/{entry['place']}"
+        if registry is not None and entry["place"] != "*":
+            entry["place"] = _key(registry, entry["place"], f"{path}: {where}")
         unknown = set(entry) - _EDGE_OPERATIONS - _EDGE_METADATA - {"tier_confidence"}
         if unknown:
             raise OverrideError(f"{path}: {where} has unknown keys {sorted(unknown)}")
@@ -451,12 +458,40 @@ def _qid(value):
     return isinstance(value, str) and bool(re.match(r"\AQ[1-9][0-9]*\Z", value))
 
 
-def _qid_list(value):
-    return (
-        isinstance(value, list)
-        and bool(value)
-        and all(isinstance(v, str) and v for v in value)
-    )
+def is_reference(value):
+    """A place reference: a QID, a ``tp_`` id or ``namespace:value``."""
+    if not isinstance(value, str) or not value:
+        return False
+    if _qid(value) or _registry.ID_PATTERN.match(value):
+        return True
+    namespace, _, rest = value.partition(":")
+    return namespace in _registry.NAMESPACES and bool(rest)
+
+
+def _reference_list(value):
+    return isinstance(value, list) and bool(value) and all(map(is_reference, value))
+
+
+def _key(registry, reference, where):
+    """``reference`` as the registry's current key for the place it names."""
+    try:
+        return registry.key_for(reference)
+    except _registry.RegistryError as error:
+        raise OverrideError(f"{where}: {error}") from None
+
+
+def _resolve_place_entry(entry, registry, where):
+    entry["place"] = _key(registry, entry["place"], where)
+    spec = entry.get("add_place")
+    if isinstance(spec, dict):
+        if "parent_id" in spec:
+            spec["parent_id"] = _key(registry, spec["parent_id"], where)
+        if "member_ids" in spec:
+            spec["member_ids"] = [_key(registry, m, where) for m in spec["member_ids"]]
+    if "set_place_members" in entry:
+        entry["set_place_members"] = [
+            _key(registry, m, where) for m in entry["set_place_members"]
+        ]
 
 
 def _validate_place_entry(path, entry):
@@ -474,8 +509,10 @@ def _validate_place_entry(path, entry):
         "add_place",
         "resolve_place",
         "set_statistical_area",
-    ) and not _qid(entry["place"]):
-        raise OverrideError(f"{path}: {where} {operation} needs a real QID as 'place'")
+    ) and not is_reference(entry["place"]):
+        raise OverrideError(
+            f"{path}: {where} {operation} needs a place reference as 'place'"
+        )
     if operation == "resolve_place":
         if not isinstance(entry.get("source_ref"), str) or not entry["source_ref"]:
             raise OverrideError(f"{path}: {where} resolve_place needs a source_ref")
@@ -504,11 +541,13 @@ def _validate_place_entry(path, entry):
                 f"{path}: {where} add_place country_code must be a two-letter "
                 "upper-case ISO code"
             )
-        if spec["kind"] in ("city", "region") and not (
-            isinstance(spec.get("parent_id"), str) and spec["parent_id"]
-        ):
+        if spec["kind"] in ("city", "region") and "parent_id" not in spec:
             raise OverrideError(
                 f"{path}: {where} add_place: a {spec['kind']} needs a parent_id"
+            )
+        if "parent_id" in spec and not is_reference(spec["parent_id"]):
+            raise OverrideError(
+                f"{path}: {where} add_place parent_id must be a place reference"
             )
         if "boundary" in spec and "member_ids" in spec:
             raise OverrideError(
@@ -517,15 +556,17 @@ def _validate_place_entry(path, entry):
         if "boundary" in spec and not isinstance(spec["boundary"], str):
             raise OverrideError(f"{path}: {where} add_place boundary must be WKT")
         if "member_ids" in spec and (
-            spec["kind"] != "metro" or not _qid_list(spec["member_ids"])
+            spec["kind"] != "metro" or not _reference_list(spec["member_ids"])
         ):
             raise OverrideError(
-                f"{path}: {where} add_place member_ids belong to a metro, as a QID list"
+                f"{path}: {where} add_place member_ids belong to a metro, as a list "
+                "of place references"
             )
     elif operation == "set_place_members":
-        if not _qid_list(spec):
+        if not _reference_list(spec):
             raise OverrideError(
-                f"{path}: {where} set_place_members must be a non-empty QID list"
+                f"{path}: {where} set_place_members must be a non-empty list of "
+                "place references"
             )
     elif operation == "set_boundary":
         if not isinstance(spec, str) or not spec:
@@ -564,12 +605,14 @@ def _validate_place_entry(path, entry):
     return operation
 
 
-def load_place_overrides(overrides_dir):
+def load_place_overrides(overrides_dir, *, registry=None):
     """``(entries, sha256)``: the ``places.yaml`` entries in file order, each
     with an ``operation`` key, and the digest of the bytes they were parsed
     from — ``([], None)`` when there is no file. Every entry names the
-    ``place`` QID it concerns; ``resolve_place`` also names the ``source_ref``
-    (the unresolved candidate's Overture id) it assigns that QID to."""
+    ``place`` it concerns by a reference; ``resolve_place`` also names the
+    ``source_ref`` (the unresolved candidate's Overture id) it assigns it. With
+    ``registry``, every place reference becomes the registry's current key
+    for the place it names."""
     if overrides_dir is None:
         return [], None
     path = pathlib.Path(overrides_dir) / PLACES_FILE
@@ -589,6 +632,8 @@ def load_place_overrides(overrides_dir):
         if not isinstance(entry, dict):
             raise OverrideError(f"{path}: every entry must be a mapping")
         operation = _validate_place_entry(path, entry)
+        if registry is not None:
+            _resolve_place_entry(entry, registry, f"{path}: place {entry['place']!r}")
         # resolve_place is keyed by the candidate it resolves: two entries
         # naming one candidate would race for its QID.
         key = (

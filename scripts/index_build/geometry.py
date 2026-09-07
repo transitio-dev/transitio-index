@@ -296,7 +296,13 @@ def _curated_geometry(place, wkt):
 
 
 def attach_geometry(
-    cache_dir, *, dataset=None, overrides_dir=None, strict=False, run=None
+    cache_dir,
+    *,
+    dataset=None,
+    overrides_dir=None,
+    strict=False,
+    registry=None,
+    run=None,
 ):
     """Attach simplified geometry to the seeded places and write the NOTICE.
 
@@ -380,7 +386,7 @@ def attach_geometry(
                 member_union += 1
 
             place_overrides, places_digest = overrides.load_place_overrides(
-                overrides_dir
+                overrides_dir, registry=registry
             )
             overrides.expect_digest(
                 metros_manifest.get("places_overrides_sha256"),

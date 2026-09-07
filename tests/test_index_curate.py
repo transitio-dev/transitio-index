@@ -1186,3 +1186,17 @@ def test_feeds_yaml_edited_after_the_resolve_stage_refuses_to_curate(tmp_path):
     )
     with pytest.raises(overrides.OverrideError, match="re-run the coverage"):
         curate.curate(cache, overrides_dir=directory)
+
+
+def test_edge_overrides_resolve_place_references(tmp_path):
+    class Keys:
+        def key_for(self, reference):
+            return {"tp_1": "Q-city"}[reference]
+
+    _, manifest, edges = _curate(
+        tmp_path,
+        [{"feed": "f-a", "place": "tp_1", "set_tiers": ["local"], **ENTRY}],
+        registry=Keys(),
+    )
+    assert manifest["overrides_applied"] == 1
+    assert edges["f-a"][("Q-city", "local")]["curation"]["reason"] == "curated"

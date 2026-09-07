@@ -511,7 +511,9 @@ def resolve_seed(
         dataset = overture.overture_dataset()
     candidates = read_city_candidates(dataset, countries, wanted)
     _resolve_candidates(candidates, wikidata)
-    place_overrides, places_digest = overrides.load_place_overrides(overrides_dir)
+    place_overrides, places_digest = overrides.load_place_overrides(
+        overrides_dir, registry=registry
+    )
     override_report = []
     resolved_by_hand = _resolve_place_overrides(
         candidates,

@@ -504,7 +504,7 @@ def _set_coverage(
     return applied, curated
 
 
-def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False):
+def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=None):
     """Derive declared membership edges; publish the ``coverage`` generation.
 
     Reads the resolved feeds, the expanded places and the seed placements, and
@@ -528,7 +528,9 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False):
 
             places = {place["place_id"]: place for place in place_rows}
             override_report = []
-            feed_overrides, feeds_digest = overrides.load_feed_overrides(overrides_dir)
+            feed_overrides, feeds_digest = overrides.load_feed_overrides(
+                overrides_dir, registry=registry
+            )
             overrides.expect_digest(
                 resolve_manifest.get("feeds_resolve_sha256"),
                 overrides.phase_digest(feed_overrides, overrides.RESOLVE_OPERATIONS),

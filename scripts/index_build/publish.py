@@ -843,14 +843,16 @@ def _read_coverage(cache_dir, *, locked=False, overrides_dir=None):
     return feeds, edges, manifest, current
 
 
-def _golden_gate(cache_dir, golden_path, edges, manifest):
+def _golden_gate(cache_dir, golden_path, edges, manifest, registry=None):
     """The golden diff over the very edges about to ship, run before
     anything is written: a violation fails the publish loudly rather than
     shipping a regression."""
     from index_build import golden
 
     try:
-        report = golden.check(cache_dir, golden_path, edges=edges, manifest=manifest)
+        report = golden.check(
+            cache_dir, golden_path, edges=edges, manifest=manifest, registry=registry
+        )
     except golden.GoldenError as error:
         raise PublishError(f"golden diff could not run: {error}") from error
     if not report["passed"]:
@@ -862,7 +864,7 @@ def _golden_gate(cache_dir, golden_path, edges, manifest):
     return report
 
 
-def publish(cache_dir, *, golden_path=None, overrides_dir=None):
+def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
     """Build ``<cache>/index`` from the crosswalk (and gazetteer). Returns the manifest.
 
     The source versions come from the crosswalk manifest — the ones it actually
@@ -917,7 +919,9 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None):
                     "the golden diff needs classified edges; publish a feeds-only "
                     "snapshot with --no-golden"
                 )
-            golden_report = _golden_gate(cache_dir, golden_path, edges, coverage)
+            golden_report = _golden_gate(
+                cache_dir, golden_path, edges, coverage, registry=registry
+            )
         digests = []
         if places is not None:
             digests.append(_content_digest(places))

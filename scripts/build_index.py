@@ -152,18 +152,25 @@ def check_registry_state(cache_dir, path):
     """Refuse to consume a gazetteer run whose registry is not the file on
     disk: after a pull, a branch switch or a curation edit, the gazetteer
     must run again before anything reads its places. The registry is held
-    read-only for the block, so no run can save it under the consumer."""
+    read-only for the block, so no run can save it under the consumer, and
+    yields it for resolving override references."""
     gazetteer = cache_dir / "gazetteer"
-    if store.run_manifest(gazetteer) is None:
-        yield
-        return
-    with registry.session(path, read_only=True) as places:
-        manifest = store.run_manifest(gazetteer) or {}
-        if manifest.get("registry_digest") != places.digest:
+    if not path.is_file():
+        if store.run_manifest(gazetteer) is not None:
             raise registry.RegistryError(
                 f"{path}: changed since the gazetteer ran; rerun the gazetteer"
             )
-        yield
+        yield None
+        return
+    # The manifest is read under the registry lock, so the two are one
+    # consistent view: no run can commit between them.
+    with registry.session(path, read_only=True) as places:
+        manifest = store.run_manifest(gazetteer)
+        if manifest is not None and manifest.get("registry_digest") != places.digest:
+            raise registry.RegistryError(
+                f"{path}: changed since the gazetteer ran; rerun the gazetteer"
+            )
+        yield places
 
 
 def consumes_run(command):
@@ -172,8 +179,10 @@ def consumes_run(command):
 
     @functools.wraps(command)
     def guarded(arguments):
-        with check_registry_state(arguments.cache_dir, registry_path(arguments)):
-            return command(arguments)
+        with check_registry_state(
+            arguments.cache_dir, registry_path(arguments)
+        ) as places:
+            return command(arguments, places)
 
     return guarded
 
@@ -192,8 +201,12 @@ def run_gazetteer(arguments):
         lambda places, run: metros.attach_metros(
             cache_dir, registry=places, run=run, **options
         ),
-        lambda places, run: geometry.attach_geometry(cache_dir, run=run, **options),
-        lambda places, run: names.merge_names(cache_dir, run=run, **options),
+        lambda places, run: geometry.attach_geometry(
+            cache_dir, registry=places, run=run, **options
+        ),
+        lambda places, run: names.merge_names(
+            cache_dir, registry=places, run=run, **options
+        ),
         lambda places, run: fao.suggest_metros(cache_dir, run=run),
     ]
     return commit_run(
@@ -209,7 +222,7 @@ def run_resolve(arguments):
 
 
 @consumes_run
-def run_expand(arguments):
+def run_expand(arguments, places):
     return [expand.expand(arguments.cache_dir, overrides_dir=arguments.overrides_dir)]
 
 
@@ -218,41 +231,43 @@ def run_crawl(arguments):
 
 
 @consumes_run
-def run_coverage(arguments):
+def run_coverage(arguments, places):
     return [
         coverage.cover(
             arguments.cache_dir,
             overrides_dir=arguments.overrides_dir,
             strict=arguments.strict_overrides,
+            registry=places,
         )
     ]
 
 
 @consumes_run
-def run_classify(arguments):
+def run_classify(arguments, places):
     return [
         classify.classify(arguments.cache_dir, overrides_dir=arguments.overrides_dir)
     ]
 
 
 @consumes_run
-def run_curate(arguments):
+def run_curate(arguments, places):
     return [
         curate.curate(
             arguments.cache_dir,
             overrides_dir=arguments.overrides_dir,
             strict=arguments.strict_overrides,
+            registry=places,
         )
     ]
 
 
 @consumes_run
-def run_prune(arguments):
+def run_prune(arguments, places):
     return [prune.prune(arguments.cache_dir)]
 
 
 @consumes_run
-def run_license(arguments):
+def run_license(arguments, places):
     return [
         licensing.license_index(
             arguments.cache_dir, overrides_dir=arguments.overrides_dir
@@ -261,7 +276,7 @@ def run_license(arguments):
 
 
 @consumes_run
-def run_publish(arguments):
+def run_publish(arguments, places):
     golden_path = None if arguments.no_golden else arguments.golden
     if golden_path is not None and not golden_path.is_file():
         # The gate must never vanish because a file went missing.
@@ -274,6 +289,7 @@ def run_publish(arguments):
             arguments.cache_dir,
             golden_path=golden_path,
             overrides_dir=arguments.overrides_dir,
+            registry=places,
         )
     ]
 

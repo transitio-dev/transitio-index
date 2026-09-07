@@ -309,3 +309,19 @@ def test_the_committed_golden_file_is_valid():
         "bike share",
     ):
         assert marker in whys
+
+
+def test_golden_references_resolve_through_the_registry(tmp_path):
+    from test_index_place_overrides import registry_with_two_places
+
+    reg = registry_with_two_places(tmp_path)
+    cache = _write_cache(tmp_path, [_edge("f-ok", "Q1")])
+    path = _golden_file(tmp_path, [_entry("f-ok", ["tp_1"])])
+    assert golden.check(cache, path, registry=reg)["passed"] is True
+    assert golden.check(cache, path)["passed"] is False
+    # The standalone diff resolves through the same registry.
+    argv = ["--cache-dir", str(cache), "--golden", str(path), "--membership-only"]
+    assert golden.main(argv + ["--registry", str(reg.path)]) == 0
+    assert golden.main(argv + ["--overrides-dir", str(tmp_path / "none")]) == 1
+    with pytest.raises(golden.GoldenError, match="place references"):
+        golden.check(cache, _golden_file(tmp_path, [_entry("f-ok", ["bogus"])]))

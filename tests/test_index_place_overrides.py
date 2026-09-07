@@ -80,7 +80,7 @@ def test_every_operation_loads_with_its_operation_key(tmp_path):
                 "place": "not-a-qid",
                 "add_place": {"kind": "country", "name": "X", "boundary": "P"},
             },
-            "needs a real QID",
+            "needs a place reference",
         ),
         ({"place": "Q1", "set_aliases": ["x"], "bogus": 1}, "unknown keys"),
         (
@@ -145,7 +145,7 @@ def test_every_operation_loads_with_its_operation_key(tmp_path):
             },
             "belong to a metro",
         ),
-        ({"place": "Q1", "set_place_members": []}, "non-empty QID list"),
+        ({"place": "Q1", "set_place_members": []}, "non-empty list of place"),
         ({"place": "Q1", "set_boundary": ""}, "must be WKT"),
         ({"place": "Q1", "set_aliases": ["", "x"]}, "non-empty list of strings"),
         ({"place": "Q1", "set_aliases": ["x"], "evidence_hash": 5}, "must be a string"),
@@ -169,7 +169,7 @@ def test_every_operation_loads_with_its_operation_key(tmp_path):
                 "place": "ov-1",
                 "set_statistical_area": {"scheme": "eurostat_metro", "code": "1"},
             },
-            "real QID",
+            "place reference",
         ),
         (
             {
@@ -245,3 +245,75 @@ def test_staleness_is_judged_against_the_current_evidence():
         is False
     )
     assert len(report) == 1
+
+
+def registry_with_two_places(tmp_path):
+    from index_build import registry
+
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        for concordances in (
+            {"wikidata": ["Q1"], "overture": ["ov1"]},
+            {"wikidata": ["Q2"]},
+        ):
+            reg.identify(concordances, kind="city", minted_from="t", minted_in="t 1")
+        reg.save()
+    return registry.load(path)
+
+
+def test_loaders_resolve_references_through_the_registry(tmp_path):
+    reg = registry_with_two_places(tmp_path)
+    directory = write_overrides(
+        tmp_path,
+        places=[
+            {"place": "tp_1", "set_aliases": ["x"]},
+            {
+                "place": "Q7",
+                "add_place": {
+                    "kind": "metro",
+                    "name": "M",
+                    "member_ids": ["overture:ov1", "tp_2"],
+                },
+            },
+            {"place": "Q1", "set_place_members": ["tp_2"]},
+        ],
+        feeds=[
+            {"feed": "f", "set_coverage": {"level": "municipality", "place_id": "tp_1"}}
+        ],
+    )
+    entries, _ = overrides.load_place_overrides(directory, registry=reg)
+    assert [e["place"] for e in entries] == ["Q1", "Q7", "Q1"]
+    assert entries[1]["add_place"]["member_ids"] == ["Q1", "Q2"]
+    assert entries[2]["set_place_members"] == ["Q2"]
+    feeds, _ = overrides.load_feed_overrides(directory, registry=reg)
+    assert feeds["f"]["set_coverage"]["place_id"] == "Q1"
+    (directory / "edges.yaml").write_text(
+        yaml.safe_dump(
+            [
+                {"feed": "f", "place": "tp_1", "set_tiers": ["local"], **_STAMP},
+                {"feed": "f", "place": "*", "set_tiers": ["local"], **_STAMP},
+            ]
+        )
+    )
+    edges, _ = overrides.load_edge_overrides(directory, registry=reg)
+    assert [e["place"] for e in edges] == ["Q1", "*"]
+    # Two references to one place are one duplicate; an unknown non-QID
+    # reference names nothing.
+    for places, message in [
+        (
+            [
+                {"place": "tp_1", "set_aliases": ["x"]},
+                {"place": "Q1", "set_aliases": ["y"]},
+            ],
+            "duplicate set_aliases",
+        ),
+        ([{"place": "tp_9", "set_aliases": ["x"]}], "no such place"),
+    ]:
+        with pytest.raises(overrides.OverrideError, match=message):
+            overrides.load_place_overrides(
+                write_overrides(tmp_path, places=places, name="bad"), registry=reg
+            )
+
+
+_STAMP = {"reason": "curated", "author": "HT", "date": "2026-09-02"}

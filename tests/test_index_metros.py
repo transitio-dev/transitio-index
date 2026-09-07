@@ -722,3 +722,21 @@ def test_the_derived_credits_reach_the_inventory_and_notice(tmp_path):
         notice = generation.read_bytes("NOTICE").decode("utf-8")
     assert "Source: Eurostat, metropolitan regions (NUTS 2021)" in notice
     assert "© EuroGeographics for the administrative boundaries" in notice
+
+
+def test_curated_members_resolve_through_the_registry(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    metro_map = {"Q1297": [CHICAGO_METRO], "Q28515": [CHICAGO_METRO]}
+    with registry.session(path) as reg:
+        _run(tmp_path, metro_map, registry=reg)
+        reg.save()
+    chicago = registry.load(path).resolve("Q1297")
+    directory = write_overrides(
+        tmp_path, places=[{"place": "cbsa:16980", "set_place_members": [chicago]}]
+    )
+    with registry.session(path) as reg:
+        _, places = _run(tmp_path, metro_map, overrides_dir=directory, registry=reg)
+    assert places["Q1754965"]["member_ids"] == ["Q1297"]

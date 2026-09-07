@@ -623,11 +623,11 @@ class _Curator:
         )
 
 
-def curate(cache_dir, *, overrides_dir=None, strict=False):
+def curate(cache_dir, *, overrides_dir=None, strict=False, registry=None):
     """Apply the edge overrides; publish the ``curate`` generation. Returns
     the manifest. With ``strict``, a stale override fails the stage after
     the staleness report is written."""
-    entries, digest = overrides.load_edge_overrides(overrides_dir)
+    entries, digest = overrides.load_edge_overrides(overrides_dir, registry=registry)
     # Every upstream stage's writer lock is held from the lineage checks
     # through the commit, in the order publish takes them, then this
     # stage's own, then the crawl's: no parent pointer can move in between,

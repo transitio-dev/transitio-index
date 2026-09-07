@@ -537,3 +537,28 @@ def test_the_history_check_enforces_the_contract(tmp_path, head_rows, next_id, m
         check_registry_history._load(gap), check_registry_history._load(added)
     )
     assert found == ["tp_2: added below the base counter"]
+
+
+def test_key_for_resolves_every_reference_form(tmp_path):
+    path = tmp_path / "places_registry.jsonl"
+    _write(path)
+    reg = registry.load(path)
+    helsinki = reg.canonical_qid("tp_1")
+    for reference, key in [
+        ("tp_2", "Q5342"),
+        ("overture:ov-esp", "Q5342"),
+        ("Q5342", "Q5342"),
+        ("Q777", helsinki),  # a merged alias's QID names the survivor
+        ("tp_3", helsinki),
+        ("Q424242", "Q424242"),  # no row yet: a place still to be minted
+    ]:
+        assert reg.key_for(reference) == key, reference
+    for reference, message in [
+        ("tp_9", "no such place"),
+        ("tp_4", "retired"),
+        ("overture:nope", "no place carries it"),
+        ("bogus", "not a place reference"),
+        ("", "not a place reference"),
+    ]:
+        with pytest.raises(registry.RegistryError, match=message):
+            reg.key_for(reference)

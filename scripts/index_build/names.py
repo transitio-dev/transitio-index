@@ -46,7 +46,13 @@ def _set_aliases(places, entries, report):
 
 
 def merge_names(
-    cache_dir, *, wikidata=None, overrides_dir=None, strict=False, run=None
+    cache_dir,
+    *,
+    wikidata=None,
+    overrides_dir=None,
+    strict=False,
+    registry=None,
+    run=None,
 ):
     """Enrich the places' names and aliases from Wikidata, and republish them.
 
@@ -82,7 +88,7 @@ def merge_names(
                 _merge(place, entry)
                 enriched += 1
             place_overrides, places_digest = overrides.load_place_overrides(
-                overrides_dir
+                overrides_dir, registry=registry
             )
             overrides.expect_digest(
                 geometry_manifest.get("places_overrides_sha256"),

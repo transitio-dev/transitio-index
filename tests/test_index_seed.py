@@ -569,3 +569,27 @@ def test_resolve_place_to_a_qid_of_another_kind_is_a_collision(tmp_path):
     entries = [{"place": "Q1204", "source_ref": "us-noqid", "resolve_place": True}]
     with pytest.raises(overture.GazetteerError, match="is both the region"):
         _seed(tmp_path, overrides_dir=write_overrides(tmp_path, places=entries))
+
+
+def test_curated_references_resolve_before_the_seed_applies_them(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        _seed(tmp_path, registry=reg)
+        reg.save()
+    helsinki = registry.load(path).resolve("Q1757")
+    directory = write_overrides(
+        tmp_path,
+        places=[
+            {
+                "place": "Q77",
+                "add_place": {"kind": "metro", "name": "M", "member_ids": [helsinki]},
+            }
+        ],
+    )
+    with registry.session(path) as reg:
+        _, places, _ = _seed(tmp_path, overrides_dir=directory, registry=reg)
+    assert places["Q77"]["member_ids"] == ["Q1757"]
+    assert "Q77" in places["Q1757"]["metro_ids"]
