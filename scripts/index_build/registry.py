@@ -5,11 +5,15 @@ numeric order — is the durable authority on place identity. Ids are minted
 from the header's counter and never reused; a place is found again through
 the concordances (external ids, one ordered list per namespace) its row
 carries; a merged row resolves to its successor and a retired one is
-refused. This is the read side; the session that holds the writer lock and
-saves, and identification (minting and enrichment), follow. See
-``plans/place-identity.md``.
+refused. A session holds the writer lock that lives beside the file,
+identifies places through the registry — a known place by any of its
+concordances, gaining the ones it lacked; a new one minted from the counter
+— and saves once by atomic replacement, only when something changed and
+only if the file is still the one it loaded. Values a curator detached stay
+in a row's history but count for nothing. See ``plans/place-identity.md``.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -21,6 +25,9 @@ VERSION = 1
 # Up to 18 digits: far beyond any counter, safely within int64 and the
 # digit limit int() enforces, so a matching id always converts.
 ID_PATTERN = re.compile(r"\Atp_[1-9][0-9]{0,17}\Z")
+# The last id the pattern admits; a header may name one past it, meaning
+# the id space is exhausted, and minting then refuses.
+MAX_ID = 10**18 - 1
 QID_PATTERN = re.compile(r"\AQ[1-9][0-9]*\Z")
 NAMESPACES = (
     "wikidata",
@@ -42,10 +49,11 @@ LIVE_FIELDS = frozenset(
         "country_code",
         "minted_from",
         "minted_in",
+        "detached",
     }
 )
 MERGED_FIELDS = frozenset(
-    {"place_id", "status", "into", "concordances", "at", "reason"}
+    {"place_id", "status", "into", "concordances", "detached", "at", "reason"}
 )
 RETIRED_FIELDS = frozenset({"place_id", "status", "at", "reason"})
 MAX_REGISTRY_BYTES = 256 * 1024 * 1024
@@ -117,6 +125,36 @@ def _concordances(value, where):
     return result
 
 
+def _detached(value, concordances, where):
+    """Detachments validated against the stored concordances: each names a
+    value the same namespace still stores, once."""
+    if not isinstance(value, dict):
+        raise RegistryError(f"{where}: detached must be a mapping")
+    result = {}
+    for namespace, entries in value.items():
+        if namespace not in NAMESPACES:
+            raise RegistryError(f"{where}: unknown namespace {namespace!r}")
+        if not isinstance(entries, list) or not entries:
+            raise RegistryError(f"{where}: detached {namespace} must be a list")
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"value", "at", "reason"}:
+                raise RegistryError(f"{where}: a detached {namespace} entry")
+            for field in ("value", "at", "reason"):
+                _text(entry[field], where, f"detached {field}")
+            if entry["value"] not in concordances.get(namespace, ()):
+                raise RegistryError(
+                    f"{where}: detached {namespace}:{entry['value']} is not stored"
+                )
+            if entry["value"] in seen:
+                raise RegistryError(
+                    f"{where}: {namespace}:{entry['value']} detached twice"
+                )
+            seen.add(entry["value"])
+        result[namespace] = entries
+    return result
+
+
 def _row(record, where):
     if not isinstance(record, dict):
         raise RegistryError(f"{where}: not an object")
@@ -144,6 +182,8 @@ def _row(record, where):
         }
         if not row["concordances"]:
             raise RegistryError(f"{where}: a live place needs a concordance")
+        if "detached" in record:
+            row["detached"] = _detached(record["detached"], row["concordances"], where)
         return row
     if status == "merged":
         unknown = set(record) - MERGED_FIELDS
@@ -155,6 +195,10 @@ def _row(record, where):
         row = {"place_id": place_id, "status": status, "into": into}
         if "concordances" in record:
             row["concordances"] = _concordances(record["concordances"], where)
+        if "detached" in record:
+            row["detached"] = _detached(
+                record["detached"], row.get("concordances", {}), where
+            )
     elif status == "retired":
         unknown = set(record) - RETIRED_FIELDS
         if unknown:
@@ -171,18 +215,24 @@ def _row(record, where):
 
 
 def effective(row):
-    """The row's concordances as every lookup sees them, order kept (the
-    detachments a curator records arrive with identification)."""
-    return {
-        namespace: list(values)
-        for namespace, values in row.get("concordances", {}).items()
+    """The row's concordances net of its detached values, order kept."""
+    detached = {
+        namespace: {entry["value"] for entry in entries}
+        for namespace, entries in row.get("detached", {}).items()
     }
+    result = {}
+    for namespace, values in row.get("concordances", {}).items():
+        kept = [v for v in values if v not in detached.get(namespace, ())]
+        if kept:
+            result[namespace] = kept
+    return result
 
 
 def parse(raw, where):
     """``(header, rows)`` from the file bytes, every row validated and the
     links between them checked: ids in order and below the counter, merge
-    targets live with no chains, a concordance value on at most one place."""
+    targets live with no chains, an effective concordance value (stored minus
+    detached) on at most one place."""
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -197,7 +247,7 @@ def parse(raw, where):
         or not _integer(header["registry"])
         or header["registry"] != VERSION
         or not _integer(header["next_id"])
-        or header["next_id"] < 1
+        or not 1 <= header["next_id"] <= MAX_ID + 1
     ):
         raise RegistryError(f"{where}: header must be {{registry: 1, next_id: n}}")
     rows = {}
@@ -249,13 +299,25 @@ def _index(rows, where):
     return index
 
 
+def _serialize(header, rows):
+    ordered = sorted(rows.values(), key=lambda row: _number(row["place_id"]))
+    lines = [json.dumps(header, sort_keys=True)]
+    lines.extend(
+        json.dumps(row, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        for row in ordered
+    )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def _read(path):
     try:
         handle = store.open_regular_path(path)
     except FileNotFoundError:
         raise RegistryError(f"{path}: no registry") from None
-    except store.StoreError as error:
-        raise RegistryError(str(error)) from None
+    except (OSError, store.StoreError) as error:
+        # A directory, a symlink or an unreadable file: Windows reports some
+        # of these as a permission error rather than through the store.
+        raise RegistryError(f"{path}: {error}") from None
     try:
         return store.read_all(handle, MAX_REGISTRY_BYTES)
     finally:
@@ -263,14 +325,20 @@ def _read(path):
 
 
 class Registry:
-    """The loaded registry and its lookups."""
+    """The loaded registry: lookups, identification and the one save."""
 
-    def __init__(self, path, header, rows, base):
+    def __init__(self, path, header, rows, base, *, read_only, locked=False):
         self.path = path
         self.header = header
         self.rows = rows
-        # The digest of the file as loaded, for provenance.
+        # ``base`` is the digest of the file as loaded, kept for provenance;
+        # ``digest`` follows the file through this session's saves.
         self.base = base
+        self.read_only = read_only
+        self._locked = locked
+        self.digest = base
+        self.minted = 0
+        self.enriched = 0
         self._index = _index(rows, str(path))
 
     @property
@@ -318,9 +386,156 @@ class Registry:
             raise RegistryError(f"{reference!r}: no place carries it")
         return found
 
+    def _refuse_change(self, what):
+        if self.read_only:
+            raise RegistryError(f"{what}: the registry is read-only")
+
+    def identify(
+        self,
+        concordances,
+        *,
+        kind,
+        minted_from,
+        minted_in,
+        name=None,
+        country_code=None,
+    ):
+        """The id of the place the concordances name: the one they all agree
+        on, which gains any it lacked (an enrichment); a value detached from
+        that place refuses the candidate; none of them known mints the next
+        id. A candidate without any concordance is refused, and in a
+        read-only session so is every change, at the point of discovery."""
+        where = f"{minted_from}"
+        wanted = _concordances(concordances, where)
+        pairs = [(ns, v) for ns, values in wanted.items() for v in values]
+        if not pairs:
+            raise RegistryError(
+                f"{where}: a place needs a concordance to be identified"
+            )
+        hits = sorted({self._index[pair] for pair in pairs if pair in self._index})
+        if len(hits) > 1:
+            raise RegistryError(f"{where}: concordances name several places {hits}")
+        if hits:
+            (place_id,) = hits
+            row = self.rows[place_id]
+            # A detachment on the survivor or on any alias merged into it
+            # stands: enrichment must not undo a curated correction.
+            for owner, detached_row in self.rows.items():
+                if _survivor(self.rows, owner) != place_id:
+                    continue
+                for namespace, entries in detached_row.get("detached", {}).items():
+                    for entry in entries:
+                        if (namespace, entry["value"]) in pairs:
+                            raise RegistryError(
+                                f"{where}: {namespace}:{entry['value']} was detached "
+                                f"from {owner} ({entry['reason']})"
+                            )
+            missing = [pair for pair in pairs if self._index.get(pair) != place_id]
+            if missing:
+                self._refuse_change(f"{place_id} would gain {missing}")
+                for namespace, value in missing:
+                    row["concordances"].setdefault(namespace, []).append(value)
+                    self._index[(namespace, value)] = place_id
+                self.enriched += 1
+            return place_id
+        self._refuse_change(f"{where}: a new place would be minted")
+        if kind not in KINDS:
+            raise RegistryError(f"{where}: kind {kind!r}")
+        # Everything is validated before anything is mutated, so a refused
+        # candidate consumes no id and leaves the session unchanged.
+        row = {
+            "kind": kind,
+            "concordances": wanted,
+            "name": _text(name, where, "name", optional=True),
+            "country_code": _text(country_code, where, "country_code", optional=True),
+            "minted_from": _text(minted_from, where, "minted_from"),
+            "minted_in": _text(minted_in, where, "minted_in"),
+        }
+        if self.header["next_id"] > MAX_ID:
+            raise RegistryError(f"{where}: the id space is exhausted")
+        place_id = f"tp_{self.header['next_id']}"
+        self.header["next_id"] += 1
+        self.rows[place_id] = {"place_id": place_id, **row}
+        for pair in pairs:
+            self._index[pair] = place_id
+        self.minted += 1
+        return place_id
+
+    @property
+    def changed(self):
+        return bool(self.minted or self.enriched)
+
+    def save(self):
+        """Replace the file atomically with the current state, if anything
+        changed; refused, changed or not, when the file is no longer the one
+        this session last saw, so a run never commits against an edit made
+        underneath it."""
+        if hashlib.sha256(_read(self.path)).hexdigest() != self.digest:
+            raise RegistryError(f"{self.path}: changed since it was loaded; not saved")
+        if not self.changed:
+            return self.digest
+        self._refuse_change("saving")
+        if not self._locked:
+            raise RegistryError("saving: only a session holding the lock may save")
+        payload = _serialize(self.header, self.rows)
+        directory = store.open_directory(self.path.parent)
+        try:
+            self.digest = store.write_bytes(directory, self.path.name, payload)
+            directory.sync()
+        finally:
+            directory.close()
+        return self.digest
+
+    def manifest(self):
+        return {
+            "registry_base": self.base,
+            "registry_digest": self.digest,
+            "next_id": self.header["next_id"],
+            "minted": self.minted,
+            "enriched": self.enriched,
+        }
+
 
 def load(path):
-    """The registry at ``path``, validated."""
+    """The registry at ``path``, validated, for reading: a registry that may
+    change comes only from :func:`session`, under the lock."""
+    return _load(path, read_only=True)
+
+
+def _load(path, *, read_only, locked=False):
     raw = _read(path)
     header, rows = parse(raw, str(path))
-    return Registry(path, header, rows, hashlib.sha256(raw).hexdigest())
+    return Registry(
+        path,
+        header,
+        rows,
+        hashlib.sha256(raw).hexdigest(),
+        read_only=read_only,
+        locked=locked,
+    )
+
+
+@contextlib.contextmanager
+def session(path, *, read_only=False):
+    """The registry loaded under the writer lock beside its file, held until
+    the block ends; the caller saves explicitly, before it publishes what
+    depends on the ids. A second writer is refused rather than queued."""
+    directory = store.open_directory(path.parent)
+    try:
+        try:
+            lock = store.exclusive_writer(directory, path.name + ".lock")
+            lock.__enter__()
+        except store.StoreError:
+            raise RegistryError(f"{path}: another build holds the registry") from None
+        loaded = None
+        try:
+            loaded = _load(path, read_only=read_only, locked=True)
+            yield loaded
+        finally:
+            # A registry kept past its session can no longer save: the lock
+            # it saved under is about to be released.
+            if loaded is not None:
+                loaded._locked = False
+            lock.__exit__(None, None, None)
+    finally:
+        directory.close()
