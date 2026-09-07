@@ -38,13 +38,14 @@ from index_build import (  # noqa: E402
     fao,
     gbfs,
     geometry,
+    licensing,
     mdb,
     metros,
     names,
     overture,
-    licensing,
     prune,
     publish,
+    registry,
     resolve,
     seed,
 )
@@ -89,19 +90,32 @@ def run_crosswalk(arguments):
     return [crosswalk.crosswalk(arguments.cache_dir)]
 
 
+def registry_path(arguments):
+    """The place registry: ``--registry``, else the overrides directory's."""
+    return arguments.registry or arguments.overrides_dir / registry.FILE
+
+
 def run_gazetteer(arguments):
     options = {
         "overrides_dir": arguments.overrides_dir,
         "strict": arguments.strict_overrides,
     }
-    return [
-        overture.resolve(arguments.cache_dir),
-        seed.resolve_seed(arguments.cache_dir, **options),
-        metros.attach_metros(arguments.cache_dir, **options),
-        geometry.attach_geometry(arguments.cache_dir, **options),
-        names.merge_names(arguments.cache_dir, **options),
-        fao.suggest_metros(arguments.cache_dir),
-    ]
+    # One registry session spans the run: the seed and metros stages identify
+    # every place through it, and it is saved once, after the last stage.
+    with registry.session(
+        registry_path(arguments), read_only=arguments.registry_read_only
+    ) as places:
+        summaries = [
+            overture.resolve(arguments.cache_dir),
+            seed.resolve_seed(arguments.cache_dir, registry=places, **options),
+            metros.attach_metros(arguments.cache_dir, registry=places, **options),
+            geometry.attach_geometry(arguments.cache_dir, **options),
+            names.merge_names(arguments.cache_dir, **options),
+            fao.suggest_metros(arguments.cache_dir),
+        ]
+        places.save()
+        summaries.append({"source": "registry", **places.manifest()})
+    return summaries
 
 
 def run_resolve(arguments):
@@ -245,6 +259,19 @@ def parse_args(argv=None):
         type=pathlib.Path,
         default=pathlib.Path("overrides"),
         help="directory of override YAML files (default: overrides)",
+    )
+    parser.add_argument(
+        "--registry",
+        type=pathlib.Path,
+        default=None,
+        help="the place registry (default: places_registry.jsonl in the overrides "
+        "directory)",
+    )
+    parser.add_argument(
+        "--registry-read-only",
+        action="store_true",
+        help="refuse to mint or enrich a place: the gazetteer fails at the first "
+        "change the registry would need, and never writes it (CI, pinned builds)",
     )
     parser.add_argument(
         "--strict-overrides",

@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 pytest.importorskip("pyarrow")
 import overture_fixture as fx  # noqa: E402
 
-from index_build import overture, seed, store  # noqa: E402
+from index_build import overture, registry, seed, store  # noqa: E402
 
 # Skeleton (resolved by the 5a stage) + localities (resolved by the seed stage).
 ROWS = [
@@ -209,17 +209,65 @@ def _publish(cache, subdir, pointer, artifact, records):
         directory.close()
 
 
-def _seed(tmp_path, feeds=FEEDS, overrides_dir=None):
+def _seed(tmp_path, feeds=FEEDS, overrides_dir=None, registry=None):
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
     _publish(cache, "crosswalk", "feeds.json", "feeds.jsonl", feeds)
     overture.resolve(cache, dataset=dataset, wikidata=fx.StubWikidata())
     manifest = seed.resolve_seed(
-        cache, dataset=dataset, wikidata=fx.StubWikidata(), overrides_dir=overrides_dir
+        cache,
+        dataset=dataset,
+        wikidata=fx.StubWikidata(),
+        overrides_dir=overrides_dir,
+        registry=registry,
     )
     places, _ = store.read_jsonl(cache / "gazetteer", "seed.json", "places_seed.jsonl")
     report, _ = store.read_jsonl(cache / "gazetteer", "seed.json", "seed_report.jsonl")
     return manifest, {p["place_id"]: p for p in places}, report
+
+
+def test_the_seed_identifies_every_place_in_the_registry(tmp_path):
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        manifest, places, _ = _seed(tmp_path, registry=reg)
+        assert reg.minted == len(places) and manifest["registry_base"] == reg.base
+        reg.save()
+    ids = {qid: place["tp_id"] for qid, place in places.items()}
+    assert all(registry.ID_PATTERN.match(tp) for tp in ids.values())
+    assert len(set(ids.values())) == len(ids)
+    assert all(place["wikidata_id"] == qid for qid, place in places.items())
+    assert manifest["identified"] == len(places)
+    saved = registry.load(path)
+    assert saved.resolve("Q1757") == ids["Q1757"]
+    concordances = saved.effective(ids["Q1757"])
+    assert concordances["wikidata"] == ["Q1757"]
+    assert concordances["overture"] == [places["Q1757"]["overture_id"]]
+    assert saved.rows[ids["Q1757"]]["minted_in"].startswith("overture ")
+    # A rebuild finds every place again and mints nothing; the ids hold.
+    with registry.session(path) as again:
+        _, places_again, _ = _seed(tmp_path, registry=again)
+        assert (again.minted, again.enriched) == (0, 0)
+    assert {qid: p["tp_id"] for qid, p in places_again.items()} == ids
+    # Read-only against a header-only registry: refused at the first place.
+    empty = tmp_path / "empty_registry.jsonl"
+    empty.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(empty, read_only=True) as read_only:
+        with pytest.raises(registry.RegistryError, match="read-only"):
+            _seed(tmp_path, registry=read_only)
+    # A QID the registry keeps as a merged alias of another place cannot be
+    # the key while the QID is the key: refused, not silently re-keyed.
+    aliased = tmp_path / "aliased_registry.jsonl"
+    aliased.write_text(
+        '{"next_id": 3, "registry": 1}\n'
+        '{"place_id": "tp_1", "kind": "city", "concordances": {"wikidata": ["Q999"]}, '
+        '"name": "Helsinki", "country_code": "FI", "minted_from": "x", "minted_in": "y"}\n'
+        '{"place_id": "tp_2", "status": "merged", "into": "tp_1", '
+        '"concordances": {"wikidata": ["Q1757"]}, "at": "2026-09-08", "reason": "dup"}\n'
+    )
+    with registry.session(aliased) as merged:
+        with pytest.raises(registry.RegistryError, match="keys tp_1 by 'Q999'"):
+            _seed(tmp_path, registry=merged)
 
 
 def test_seed_places_a_city_with_its_ancestors(tmp_path):

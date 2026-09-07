@@ -17,8 +17,10 @@ than one. Metro geometry is later work; this stage adds membership only.
 import collections
 import datetime
 import functools
+import json
+import hashlib
 
-from index_build import eurostat, geometry, overrides, overture, store
+from index_build import eurostat, geometry, overrides, overture, seed, store
 
 # The derived inputs the Eurostat branch needs approved, as allowlist keys;
 # any one missing runs the branch report-only.
@@ -159,6 +161,19 @@ def _attach_us(places, by_id, metros, report, wikidata):
                 record["qid"],
                 functools.partial(_metro_place, record),
                 city,
+            )
+            # A curated metro of this QID takes the discovered identity it
+            # lacks; a different code already on it is a conflict.
+            code_now = metro.get("statistical_area_id")
+            if code_now not in (None, record["cbsa"]):
+                raise overture.GazetteerError(
+                    f"metro {record['qid']!r} carries statistical code "
+                    f"{code_now!r}, not CBSA {record['cbsa']!r}"
+                )
+            metro["statistical_area_id"] = record["cbsa"]
+            metro["country_code"] = metro.get("country_code") or "US"
+            metro["source_subtype"] = (
+                metro.get("source_subtype") or "metropolitan statistical area"
             )
             published.add(metro["place_id"])
     return {"metros_published": len(published), "metros_reported": len(reported_metros)}
@@ -379,6 +394,43 @@ def _attach_eurostat(
     return assignments, inventory, summary, len(published)
 
 
+def _identify_metros(metros, registry, pins):
+    """Give every metro row its registry id: found by its QID (a curated
+    metro the seed identified) or minted, and enriched with its statistical
+    code as a concordance."""
+    if registry is None:
+        return 0
+    for qid in sorted(metros):
+        row = metros[qid]
+        code = row.get("statistical_area_id")
+        if row.get("source_subtype") == "metropolitan region":
+            namespace = "eurostat_metro"
+            minted_in = f"eurostat {pins[eurostat.COMPOSITION_FILE]}"
+        else:
+            # Wikidata is live, so the provenance is a digest of the exact
+            # identity this row was minted from, not a version.
+            namespace = "cbsa"
+            identity = {"qid": qid, "cbsa": code, "name": row.get("name")}
+            digest = hashlib.sha256(
+                json.dumps(identity, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            minted_in = f"wikidata P8138 {digest[:16]}"
+        concordances = {"wikidata": [qid]}
+        if code:
+            concordances[namespace] = [str(code)]
+        row["tp_id"] = registry.identify(
+            concordances,
+            kind="metro",
+            name=row.get("name"),
+            country_code=row.get("country_code"),
+            minted_from=f"{namespace}:{code}" if code else f"wikidata:{qid}",
+            minted_in=minted_in,
+        )
+        seed._shadow_gate(registry, row["tp_id"], qid)
+        row["wikidata_id"] = qid
+    return len(metros)
+
+
 def attach_metros(
     cache_dir,
     *,
@@ -387,6 +439,7 @@ def attach_metros(
     strict=False,
     dataset=None,
     pins=None,
+    registry=None,
 ):
     """Add metro places and memberships to the seed places.
 
@@ -398,7 +451,8 @@ def attach_metros(
     (the pinned release by default) and ``pins`` the Eurostat inputs' digests
     (the module's pins by default). One writer lock spans the seed read, the
     live queries and the publish, so a concurrent gazetteer run cannot shift
-    the seed under it. Returns the generation manifest.
+    the seed under it. With a ``registry`` session every metro row gets its
+    registry id and ``wikidata_id``. Returns the generation manifest.
     """
     if wikidata is None:
         wikidata = overture.WikidataClient()
@@ -462,9 +516,12 @@ def attach_metros(
             )
             for place in output:
                 place["metro_ids"] = sorted(place["metro_ids"])
+            identified = _identify_metros(metros, registry, pins)
 
             manifest = {
                 "source": "metros",
+                "identified": identified,
+                "registry_base": registry.base if registry is not None else None,
                 # Carried forward so downstream lineage checks can prove the
                 # expanded places descend from this catalogue snapshot.
                 "sources": seed_manifest.get("sources"),

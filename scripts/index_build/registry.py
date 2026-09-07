@@ -22,6 +22,7 @@ import re
 from index_build import store
 
 VERSION = 1
+FILE = "places_registry.jsonl"
 # Up to 18 digits: far beyond any counter, safely within int64 and the
 # digit limit int() enforces, so a matching id always converts.
 ID_PATTERN = re.compile(r"\Atp_[1-9][0-9]{0,17}\Z")
@@ -406,6 +407,8 @@ class Registry:
         id. A candidate without any concordance is refused, and in a
         read-only session so is every change, at the point of discovery."""
         where = f"{minted_from}"
+        if kind not in KINDS:
+            raise RegistryError(f"{where}: kind {kind!r}")
         wanted = _concordances(concordances, where)
         pairs = [(ns, v) for ns, values in wanted.items() for v in values]
         if not pairs:
@@ -418,6 +421,10 @@ class Registry:
         if hits:
             (place_id,) = hits
             row = self.rows[place_id]
+            if row["kind"] != kind:
+                raise RegistryError(
+                    f"{where}: {place_id} is a {row['kind']}, not a {kind}"
+                )
             # A detachment on the survivor or on any alias merged into it
             # stands: enrichment must not undo a curated correction.
             for owner, detached_row in self.rows.items():
@@ -439,8 +446,6 @@ class Registry:
                 self.enriched += 1
             return place_id
         self._refuse_change(f"{where}: a new place would be minted")
-        if kind not in KINDS:
-            raise RegistryError(f"{where}: kind {kind!r}")
         # Everything is validated before anything is mutated, so a refused
         # candidate consumes no id and leaves the session unchanged.
         row = {
