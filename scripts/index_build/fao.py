@@ -1,0 +1,291 @@
+"""FAO multi-tier city-regions at the 1-hour cutoff: the pinned inputs and
+the suggested-curation report for metros the official sources do not cover.
+
+The city-region patches (a zipped shapefile, converted once to GeoParquet
+from the verified bytes) and the regions table are pinned like the Eurostat
+inputs. Regions nest — each is one urban centre's patch set at its tier — so
+a patch's region is that of its highest-tier centre.
+"""
+
+import datetime
+import json
+import os
+import tempfile
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import shapely
+
+from index_build import csv_source, pinned, store
+
+CUTOFF_HOURS = 1
+DOI = "10.5281/zenodo.11187634"
+RECORD_FILES = "https://zenodo.org/api/records/11187634/files/{name}/content"
+PATCHES_FILE = f"City_Region_Patches_{CUTOFF_HOURS}h.shp.zip"
+REGIONS_FILE = f"City_Regions_{CUTOFF_HOURS}h.csv"
+POINTER = "fao.json"
+CONVERTED_POINTER = "fao-patches.json"
+PATCHES_PARQUET = "patches.parquet"
+LICENCE = "CC-BY-4.0"
+CREDIT = (
+    "Girgin, Cattaneo, de By, McMenomy, Nelson and Vaz (2024), Worldwide "
+    "Delineation of Multi-Tier City-Regions (Zenodo), CC BY 4.0"
+)
+
+# The bytes verified live on 2026-09-06; a fetch that differs is refused.
+PINS = {
+    PATCHES_FILE: ("c25044aa9d4821a57cb97b3fa9f2ba7a6b2adb6893c27b300d8fd4f72a6ab077"),
+    REGIONS_FILE: ("e8eab0eebeb6d2e11b0657eeec17a147b35900a911d9c75d0f6e83866b91b22f"),
+}
+URLS = {name: RECORD_FILES.format(name=name) for name in PINS}
+REGION_COLUMNS = {"id", "country", "tier", "patches", "category"}
+CENTRE_COLUMNS = ("T1_id", "T2_id", "T3_id", "T4_id")
+TIERS = (1, 2, 3, 4)
+
+
+class FaoError(pinned.PinnedInputError):
+    """A pinned FAO input is missing, altered or inconsistent."""
+
+
+def prepare_inputs(cache_dir, *, files=None, expected=PINS):
+    """Ensure ``raw/fao.json`` holds the pinned inputs and ``raw/fao-patches.json``
+    their converted patches; returns the inputs' manifest."""
+    manifest = pinned.prepare(
+        cache_dir,
+        pointer=POINTER,
+        urls=URLS,
+        expected=expected,
+        files=files,
+        manifest={
+            "source": "fao",
+            "doi": DOI,
+            "cutoff_hours": CUTOFF_HOURS,
+            "license": LICENCE,
+        },
+        error=FaoError,
+    )
+    convert_patches(cache_dir, expected=expected)
+    return manifest
+
+
+def _patches_table(data):
+    """The patch polygons and their tier centres as an Arrow table with WKB
+    geometry in EPSG:4326, read from the zipped shapefile bytes."""
+    import geopandas
+    import numpy
+    import pandas
+
+    with tempfile.TemporaryDirectory() as scratch:
+        path = os.path.join(scratch, PATCHES_FILE)
+        with open(path, "wb") as opened:
+            opened.write(data)
+        try:
+            frame = geopandas.read_file(f"zip://{path}")
+        except Exception as error:  # noqa: B902 - geopandas raises its own hierarchy
+            raise FaoError(f"{PATCHES_FILE}: not readable: {error}") from None
+    if frame.crs is None:
+        raise FaoError(f"{PATCHES_FILE}: no CRS")
+    if frame.crs.to_epsg() != 4326:
+        frame = frame.to_crs(4326)
+    missing = [c for c in ("id", *CENTRE_COLUMNS) if c not in frame.columns]
+    if missing:
+        raise FaoError(f"{PATCHES_FILE}: missing columns {missing}")
+    # Ids are read as exact integers, never coerced: a fractional or
+    # out-of-range value would otherwise pass the relational checks under the
+    # wrong identity.
+    columns = {}
+    for column in ("id", *CENTRE_COLUMNS):
+        values = pandas.to_numeric(frame[column], errors="coerce")
+        if (
+            values.isna().any()
+            or not numpy.isfinite(values).all()
+            or (values != numpy.floor(values)).any()
+            or (values.abs() >= 2**63).any()
+        ):
+            raise FaoError(f"{PATCHES_FILE}: {column} is not a column of integer ids")
+        columns[column] = pa.array(values.to_numpy().astype("int64"))
+    ids = columns["id"].to_pylist()
+    if len(set(ids)) != len(ids):
+        raise FaoError(f"{PATCHES_FILE}: patch ids are not unique")
+    geoms = frame.geometry
+    if geoms.isna().any() or geoms.is_empty.any() or not geoms.is_valid.all():
+        raise FaoError(f"{PATCHES_FILE}: a patch geometry is missing, empty or invalid")
+    if not set(geoms.geom_type) <= {"Polygon", "MultiPolygon"}:
+        raise FaoError(f"{PATCHES_FILE}: a patch is not a polygon")
+    columns["geometry"] = pa.array(
+        [shapely.to_wkb(shapely.force_2d(geom)) for geom in geoms], pa.binary()
+    )
+    geo = {
+        "version": "1.0.0",
+        "primary_column": "geometry",
+        "columns": {
+            "geometry": {
+                "encoding": "WKB",
+                "geometry_types": sorted(set(geoms.geom_type)),
+                "crs": frame.crs.to_json_dict(),
+            }
+        },
+    }
+    return pa.table(columns).replace_schema_metadata(
+        {b"geo": json.dumps(geo).encode("utf-8")}
+    )
+
+
+def convert_patches(cache_dir, *, expected=PINS):
+    """Publish ``raw/fao-patches.json`` holding the patches as GeoParquet,
+    converted once from the verified shapefile bytes and reused while its
+    manifest names the same source digest. Returns the manifest."""
+    generation, manifest = pinned.resolve(
+        cache_dir, pointer=POINTER, expected=expected, error=FaoError
+    )
+    with generation:
+        data = generation.read_bytes(PATCHES_FILE)
+    source = manifest["digests"][PATCHES_FILE]
+    directory = store.open_subdir(cache_dir, "raw")
+    try:
+        with store.exclusive_writer(directory):
+            try:
+                current, current_manifest = store.resolve(
+                    cache_dir / "raw", CONVERTED_POINTER
+                )
+            except store.StoreError:
+                current_manifest = None
+            else:
+                current.close()
+            # ``store.resolve`` hashed the cached artifact against the digest the
+            # manifest records; reuse it only for the same source bytes.
+            if (
+                current_manifest is not None
+                and current_manifest.get("source_sha256") == source
+            ):
+                return current_manifest
+            table = _patches_table(data)
+            sink = pa.BufferOutputStream()
+            pq.write_table(table, sink)
+            payload = sink.getvalue().to_pybytes()
+            return store.publish(
+                cache_dir / "raw",
+                CONVERTED_POINTER,
+                {PATCHES_PARQUET: lambda: [payload]},
+                {
+                    "source": "fao-patches",
+                    "source_sha256": source,
+                    "patches": table.num_rows,
+                    "retrieved_at": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
+                },
+                held=directory,
+            )
+    finally:
+        directory.close()
+
+
+def read_regions(data):
+    """``{region_id: {"tier", "country", "category", "patches"}}`` from the
+    regions table, under the verified contract: unique digit ids, a tier in
+    1–4, patch lists of digit ids, a category of P, S or T."""
+    try:
+        rows = csv_source.read_rows(data.decode("utf-8"), REGION_COLUMNS)
+    except (UnicodeDecodeError, csv_source.IngestError) as error:
+        raise FaoError(f"{REGIONS_FILE}: {error}") from None
+    regions = {}
+    for position, row in enumerate(rows, 2):
+        region_id = row["id"].strip()
+        if not region_id.isdigit():
+            raise FaoError(f"{REGIONS_FILE}: row {position}: id {region_id!r}")
+        if region_id in regions:
+            raise FaoError(f"{REGIONS_FILE}: row {position}: id {region_id} twice")
+        tier = row["tier"].strip()
+        if tier not in {str(t) for t in TIERS}:
+            raise FaoError(f"{REGIONS_FILE}: row {position}: tier {tier!r}")
+        patches = [p.strip() for p in row["patches"].split(";") if p.strip()]
+        if any(not p.isdigit() for p in patches):
+            raise FaoError(f"{REGIONS_FILE}: row {position}: patch ids")
+        category = row["category"].strip()
+        if category not in {"P", "S", "T"}:
+            raise FaoError(f"{REGIONS_FILE}: row {position}: category {category!r}")
+        regions[region_id] = {
+            "tier": int(tier),
+            "country": row["country"].strip() or None,
+            "category": category,
+            "patches": patches,
+        }
+    if not regions:
+        raise FaoError(f"{REGIONS_FILE}: no regions")
+    return regions
+
+
+def read_patches(data):
+    """``{patch_id: {"centres": (T1_id, …, T4_id), "geom"}}`` from the
+    converted GeoParquet bytes."""
+    try:
+        table = pq.read_table(pa.BufferReader(data))
+    except Exception as error:  # noqa: B902 - pyarrow raises its own hierarchy
+        raise FaoError(f"{PATCHES_PARQUET}: not readable: {error}") from None
+    patches = {}
+    for row in table.to_pylist():
+        patches[str(row["id"])] = {
+            "centres": tuple(int(row[column]) for column in CENTRE_COLUMNS),
+            "geom": shapely.from_wkb(row["geometry"]),
+        }
+    return patches
+
+
+def region_of(patch):
+    """The id of the patch's highest-tier centre — its city-region."""
+    for centre in reversed(patch["centres"]):
+        if centre:
+            return str(centre)
+    return None
+
+
+def load_inputs(cache_dir, *, expected=PINS):
+    """``(regions, patches, manifest)`` parsed from the verified bytes under
+    this build's pins. The verified contract is asserted on every run: every
+    non-zero centre id of a patch is a region of at least that column's tier
+    (a centre of tier t serves tiers 1 to t); every patch a region lists exists
+    and names that region as its centre at the region's tier; the patches a
+    primary (category P) region lists resolve to it as their highest-tier
+    region — only the listed ones: on the pinned data 15 unlisted patches name
+    a primary region at its tier yet belong to a higher-tier one; and the
+    converted patches derive from the pinned shapefile."""
+    generation, manifest = pinned.resolve(
+        cache_dir, pointer=POINTER, expected=expected, error=FaoError
+    )
+    with generation:
+        regions = read_regions(generation.read_bytes(REGIONS_FILE))
+    converted, converted_manifest = store.resolve(cache_dir / "raw", CONVERTED_POINTER)
+    with converted:
+        if converted_manifest.get("source_sha256") != manifest["digests"][PATCHES_FILE]:
+            raise FaoError(f"raw/{CONVERTED_POINTER} was converted from other bytes")
+        patches = read_patches(converted.read_bytes(PATCHES_PARQUET))
+    for patch_id, patch in patches.items():
+        for tier, centre in zip(TIERS, patch["centres"]):
+            if not centre:
+                continue
+            region = regions.get(str(centre))
+            if region is None or region["tier"] < tier:
+                raise FaoError(
+                    f"patch {patch_id}: tier-{tier} centre {centre} is not a "
+                    f"region of tier {tier} or above"
+                )
+    for region_id, region in regions.items():
+        column = region["tier"] - 1
+        for patch_id in region["patches"]:
+            patch = patches.get(patch_id)
+            if patch is None:
+                raise FaoError(
+                    f"region {region_id}: patch {patch_id} is not in the patches file"
+                )
+            if str(patch["centres"][column]) != region_id:
+                raise FaoError(
+                    f"region {region_id}: patch {patch_id} does not list it as its "
+                    f"tier-{region['tier']} centre"
+                )
+            if region["category"] == "P" and region_of(patch) != region_id:
+                raise FaoError(
+                    f"primary region {region_id}: patch {patch_id} belongs to the "
+                    f"higher-tier region {region_of(patch)}"
+                )
+    return regions, patches, manifest
