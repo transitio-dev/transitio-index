@@ -268,7 +268,7 @@ def _run(tmp_path, metro_map, overrides_dir=None, candidates=None, registry=None
     places, _ = store.read_jsonl(
         cache / "gazetteer", "metros.json", "places_seed.jsonl"
     )
-    return manifest, {p["place_id"]: p for p in places}
+    return manifest, {p.get("wikidata_id") or p["place_id"]: p for p in places}
 
 
 def _artefact(tmp_path, name):
@@ -289,10 +289,10 @@ def test_metro_rows_are_identified_with_their_statistical_code(tmp_path):
     metro = places["Q1754965"]
     assert metro["wikidata_id"] == "Q1754965" and manifest["identified"] == 1
     saved = registry.load(path)
-    assert saved.resolve("cbsa:16980") == metro["tp_id"] == saved.resolve("Q1754965")
-    assert saved.rows[metro["tp_id"]]["minted_from"] == "cbsa:16980"
-    assert saved.rows[metro["tp_id"]]["minted_in"].startswith("wikidata P8138 ")
-    assert places["Q1297"]["tp_id"] == saved.resolve("Q1297")
+    assert saved.resolve("cbsa:16980") == metro["place_id"] == saved.resolve("Q1754965")
+    assert saved.rows[metro["place_id"]]["minted_from"] == "cbsa:16980"
+    assert saved.rows[metro["place_id"]]["minted_in"].startswith("wikidata P8138 ")
+    assert places["Q1297"]["place_id"] == saved.resolve("Q1297")
 
 
 def test_a_curated_metro_gains_its_discovered_code_before_identification(tmp_path):
@@ -322,7 +322,7 @@ def test_a_curated_metro_gains_its_discovered_code_before_identification(tmp_pat
     metro = places["Q1754965"]
     assert metro["statistical_area_id"] == "16980" and metro["country_code"] == "US"
     saved = registry.load(path)
-    assert saved.resolve("cbsa:16980") == metro["tp_id"] == saved.resolve("Q1754965")
+    assert saved.resolve("cbsa:16980") == metro["place_id"] == saved.resolve("Q1754965")
 
 
 def test_a_metro_place_and_its_memberships_are_attached(tmp_path):
@@ -739,4 +739,94 @@ def test_curated_members_resolve_through_the_registry(tmp_path):
     )
     with registry.session(path) as reg:
         _, places = _run(tmp_path, metro_map, overrides_dir=directory, registry=reg)
-    assert places["Q1754965"]["member_ids"] == ["Q1297"]
+    assert places["Q1754965"]["member_ids"] == [places["Q1297"]["place_id"]]
+
+
+def test_wikidata_is_asked_for_qids_only(tmp_path):
+    class Recording(fx.StubWikidata):
+        asked = []
+
+        def statistical_metros(self, city_qids):
+            self.asked.append(list(city_qids))
+            return {}
+
+        def metro_candidates(self, city_qids):
+            self.asked.append(list(city_qids))
+            return {}
+
+    # A city keyed by its own id — a curated place without a QID — is
+    # never sent to Wikidata; the QID-keyed one is.
+    places = [
+        {"place_id": "tp_9", "kind": "city", "country_code": "US", "metro_ids": []},
+        {"place_id": "Q1297", "kind": "city", "country_code": "US", "metro_ids": []},
+    ]
+    stub = Recording()
+    metros._attach_us(places, {p["place_id"]: p for p in places}, {}, [], stub)
+    metros._candidates(stub, {"C1": ["tp_9", "Q1297"]})
+    assert stub.asked == [["Q1297"], ["Q1297"]]
+
+
+def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    # Curated without a QID, by its CBSA concordance: the metro Wikidata
+    # discovers under that code joins the row rather than doubling it.
+    directory = write_overrides(
+        tmp_path,
+        places=[
+            {
+                "place": "cbsa:16980",
+                "add_place": {
+                    "kind": "metro",
+                    "name": "Chicagoland",
+                    "member_ids": ["Q1297"],
+                },
+            }
+        ],
+    )
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        _, places = _run(
+            tmp_path, {"Q28515": [CHICAGO_METRO]}, overrides_dir=directory, registry=reg
+        )
+        assert reg.enriched == 1
+        reg.save()
+    metro = places["Q1754965"]
+    assert metro["name"] == "Chicagoland" and metro["members_curated"]
+    assert metro["member_ids"] == [places["Q1297"]["place_id"]]
+    assert sum(1 for p in places.values() if p["kind"] == "metro") == 1
+    saved = registry.load(path)
+    assert saved.resolve("Q1754965") == saved.resolve("cbsa:16980") == metro["place_id"]
+    # A rebuild keys the curated metro by its own id and still joins on the
+    # code it carries; nothing is minted.
+    with registry.session(path) as again:
+        _, places = _run(
+            tmp_path,
+            {"Q28515": [CHICAGO_METRO]},
+            overrides_dir=directory,
+            registry=again,
+        )
+        assert again.minted == 0
+    assert sum(1 for p in places.values() if p["kind"] == "metro") == 1
+    assert places["Q1754965"]["statistical_area_id"] == "16980"
+
+
+def test_a_code_matches_only_within_its_scheme():
+    rows = {
+        "tp_1": {
+            "kind": "metro",
+            "statistical_area_id": "16980",
+            "source_subtype": "metropolitan region",
+        },
+        "tp_2": {
+            "kind": "metro",
+            "statistical_area_id": "16980",
+            "source_subtype": "metropolitan statistical area",
+        },
+    }
+    assert (
+        metros._by_code(rows, "16980", "metropolitan statistical area") is rows["tp_2"]
+    )
+    assert metros._by_code(rows, "16980", "metropolitan region") is rows["tp_1"]
+    assert metros._by_code(rows, "99999", "metropolitan region") is None

@@ -70,12 +70,31 @@ def _eurostat_place(qid, code, metro):
     }
 
 
-def _join_member(by_id, metros, qid, make_row, city):
+def _by_code(by_id, code, subtype):
+    """A seeded metro carrying the statistical code ``code`` of the scheme
+    ``subtype`` names — a curated one keyed by that concordance rather than
+    a QID included — or None. Codes are namespaced: a CBSA never matches a
+    Eurostat metro's code."""
+    if not code:
+        return None
+    for row in by_id.values():
+        if (
+            row.get("kind") == "metro"
+            and row.get("statistical_area_id") == code
+            and row.get("source_subtype") == subtype
+        ):
+            return row
+    return None
+
+
+def _join_member(by_id, metros, qid, make_row, city, code=None, subtype=None):
     """The metro row for ``qid`` with ``city`` joined as a member, reciprocally.
 
-    A curated metro of the same QID (``add_place``) is the row and the
-    statistical membership joins it, never a second row; a QID seeded as
-    anything but a metro fails the build; a curator's member list wins.
+    A curated metro of the same QID (``add_place``), or one keyed by the
+    statistical code ``code``, is the row and the statistical membership
+    joins it, never a second row — the discovered QID becoming its QID; a
+    QID seeded as anything but a metro fails the build; a curator's member
+    list wins.
     """
     existing = by_id.get(qid)
     if existing is not None and existing.get("kind") != "metro":
@@ -83,14 +102,20 @@ def _join_member(by_id, metros, qid, make_row, city):
             f"metro {qid!r} is already seeded as the "
             f"{existing['kind']} {existing.get('name')!r}"
         )
-    metro = metros.get(qid) or existing or make_row()
-    metros[qid] = metro
+    metro = metros.get(qid) or existing or _by_code(by_id, code, subtype)
+    if metro is None:
+        metro = make_row()
+    elif overture.QID_PATTERN.match(qid):
+        # Every QID a source names for the row: enriched onto it, or a
+        # conflict, at identification.
+        metro.setdefault("discovered_qids", []).append(qid)
+    metros[metro["place_id"]] = metro
     if metro.get("members_curated"):
         return metro
     if city["place_id"] not in metro["member_ids"]:
         metro["member_ids"].append(city["place_id"])
-    if qid not in city["metro_ids"]:
-        city["metro_ids"].append(qid)
+    if metro["place_id"] not in city["metro_ids"]:
+        city["metro_ids"].append(metro["place_id"])
     return metro
 
 
@@ -137,14 +162,27 @@ def _take_cbsa(metro, qid, cbsa):
     metro["statistical_area_id"] = cbsa
 
 
+def _take_msa(metro, record):
+    """The discovered MSA identity: its CBSA code, and the country and
+    subtype every US metro carries."""
+    _take_cbsa(metro, record["qid"], record["cbsa"])
+    metro["country_code"] = metro.get("country_code") or "US"
+    metro["source_subtype"] = (
+        metro.get("source_subtype") or "metropolitan statistical area"
+    )
+
+
 def _attach_us(places, by_id, metros, report, wikidata):
     """The US branch: each US city's MSA from Wikidata; an MSA without a CBSA
     code is reported for a later pass rather than published. Returns the
     branch summary."""
+    # Wikidata answers for QIDs only; a city keyed by its own id has none.
     us_cities = [
         p["place_id"]
         for p in places
-        if p["kind"] == "city" and p["country_code"] == "US"
+        if p["kind"] == "city"
+        and p["country_code"] == "US"
+        and overture.QID_PATTERN.match(p["place_id"])
     ]
     membership = wikidata.statistical_metros(us_cities) if us_cities else {}
     published = set()
@@ -172,12 +210,10 @@ def _attach_us(places, by_id, metros, report, wikidata):
                 record["qid"],
                 functools.partial(_metro_place, record),
                 city,
+                code=record["cbsa"],
+                subtype="metropolitan statistical area",
             )
-            _take_cbsa(metro, record["qid"], record["cbsa"])
-            metro["country_code"] = metro.get("country_code") or "US"
-            metro["source_subtype"] = (
-                metro.get("source_subtype") or "metropolitan statistical area"
-            )
+            _take_msa(metro, record)
             published.add(metro["place_id"])
     return {"metros_published": len(published), "metros_reported": len(reported_metros)}
 
@@ -236,7 +272,15 @@ def _publish_eurostat(by_id, metros, qid, code, metro, city_ids):
     row = metros.get(qid) or by_id.get(qid) or make_row()
     metros[qid] = row
     for city_id in city_ids:
-        _join_member(by_id, metros, qid, make_row, by_id[city_id])
+        _join_member(
+            by_id,
+            metros,
+            qid,
+            make_row,
+            by_id[city_id],
+            code=code,
+            subtype="metropolitan region",
+        )
     row.update(
         source_subtype="metropolitan region",
         resolution_method="statistical_code",
@@ -250,7 +294,14 @@ def _candidates(wikidata, members):
     """Per unpublished metro code, the Wikidata metro-like entities its member
     cities link to and how many members link to each — the curator's
     shortlist, never an identity."""
-    cities = sorted({city for ids in members.values() for city in ids})
+    cities = sorted(
+        {
+            city
+            for ids in members.values()
+            for city in ids
+            if overture.QID_PATTERN.match(city)
+        }
+    )
     linked = wikidata.metro_candidates(cities) if cities else {}
     result = {}
     for code, ids in members.items():
@@ -418,7 +469,10 @@ def _identify_metros(metros, registry, pins):
                 json.dumps(identity, sort_keys=True).encode("utf-8")
             ).hexdigest()
             minted_in = f"wikidata P8138 {digest[:16]}"
-        concordances = {"wikidata": [qid]}
+        concordances = seed._key_concordance(qid, registry)
+        for discovered in row.pop("discovered_qids", []):
+            if discovered not in concordances.get("wikidata", []):
+                concordances.setdefault("wikidata", []).append(discovered)
         if code:
             concordances[namespace] = [str(code)]
         row["tp_id"] = registry.identify(
@@ -429,8 +483,7 @@ def _identify_metros(metros, registry, pins):
             minted_from=f"{namespace}:{code}" if code else f"wikidata:{qid}",
             minted_in=minted_in,
         )
-        seed._shadow_gate(registry, row["tp_id"], qid)
-        row["wikidata_id"] = qid
+        row["wikidata_id"] = registry.canonical_qid(row["tp_id"])
     return len(metros)
 
 
@@ -481,8 +534,12 @@ def attach_metros(
                 place.setdefault("metro_ids", [])
                 place.setdefault("statistical_area_id", None)
                 by_id[place["place_id"]] = place
+            if registry is not None:
+                # The stage joins Wikidata and Eurostat by QID: the seed's
+                # rows are keyed by it again here, and by their ids below.
+                by_id = seed.rekey_by_qid(by_id)
             place_overrides, places_digest = overrides.load_place_overrides(
-                overrides_dir, registry=registry
+                overrides_dir, registry=registry, internal=True
             )
             overrides.expect_digest(
                 seed_manifest.get("places_overrides_sha256"),
@@ -524,6 +581,14 @@ def attach_metros(
             for place in output:
                 place["metro_ids"] = sorted(place["metro_ids"])
             identified = _identify_metros(metros, registry, pins)
+            if registry is not None:
+                output = list(
+                    seed.rekey_by_own_id(
+                        {p["place_id"]: p for p in output},
+                        registry,
+                        records=[*assignments, *report],
+                    ).values()
+                )
 
             manifest = {
                 "source": "metros",

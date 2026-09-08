@@ -223,7 +223,9 @@ def _seed(tmp_path, feeds=FEEDS, overrides_dir=None, registry=None):
     )
     places, _ = store.read_jsonl(cache / "gazetteer", "seed.json", "places_seed.jsonl")
     report, _ = store.read_jsonl(cache / "gazetteer", "seed.json", "seed_report.jsonl")
-    return manifest, {p["place_id"]: p for p in places}, report
+    # Keyed by QID where the row has one: the key the tests know the
+    # fixtures by, whether or not a registry re-keyed the rows by own id.
+    return manifest, {p.get("wikidata_id") or p["place_id"]: p for p in places}, report
 
 
 def test_the_seed_identifies_every_place_in_the_registry(tmp_path):
@@ -233,7 +235,7 @@ def test_the_seed_identifies_every_place_in_the_registry(tmp_path):
         manifest, places, _ = _seed(tmp_path, registry=reg)
         assert reg.minted == len(places) and manifest["registry_base"] == reg.base
         reg.save()
-    ids = {qid: place["tp_id"] for qid, place in places.items()}
+    ids = {qid: place["place_id"] for qid, place in places.items()}
     assert all(registry.ID_PATTERN.match(tp) for tp in ids.values())
     assert len(set(ids.values())) == len(ids)
     assert all(place["wikidata_id"] == qid for qid, place in places.items())
@@ -248,26 +250,37 @@ def test_the_seed_identifies_every_place_in_the_registry(tmp_path):
     with registry.session(path) as again:
         _, places_again, _ = _seed(tmp_path, registry=again)
         assert (again.minted, again.enriched) == (0, 0)
-    assert {qid: p["tp_id"] for qid, p in places_again.items()} == ids
+    assert {qid: p["place_id"] for qid, p in places_again.items()} == ids
+    # Links between places are own ids too, the placements included.
+    assert places["Q1757"]["parent_id"] == ids["Q1508"]
+    placements, _ = store.read_jsonl(
+        tmp_path / "cache" / "gazetteer", "seed.json", "feed_places.jsonl"
+    )
+    assert {p["feed_id"]: p["place_id"] for p in placements}["f-hel"] == ids["Q1757"]
     # Read-only against a header-only registry: refused at the first place.
     empty = tmp_path / "empty_registry.jsonl"
     empty.write_text('{"next_id": 1, "registry": 1}\n')
     with registry.session(empty, read_only=True) as read_only:
         with pytest.raises(registry.RegistryError, match="read-only"):
             _seed(tmp_path, registry=read_only)
-    # A QID the registry keeps as a merged alias of another place cannot be
-    # the key while the QID is the key: refused, not silently re-keyed.
+    # Two seeded QIDs the registry has merged — Espoo's into Helsinki's,
+    # the alias sorting first — become one row under the survivor's id,
+    # the row keyed by the canonical QID kept.
     aliased = tmp_path / "aliased_registry.jsonl"
     aliased.write_text(
         '{"next_id": 3, "registry": 1}\n'
-        '{"place_id": "tp_1", "kind": "city", "concordances": {"wikidata": ["Q999"]}, '
+        '{"place_id": "tp_1", "kind": "city", "concordances": {"wikidata": ["Q1757"]}, '
         '"name": "Helsinki", "country_code": "FI", "minted_from": "x", "minted_in": "y"}\n'
         '{"place_id": "tp_2", "status": "merged", "into": "tp_1", '
-        '"concordances": {"wikidata": ["Q1757"]}, "at": "2026-09-08", "reason": "dup"}\n'
+        '"concordances": {"wikidata": ["Q13291"]}, "at": "2026-09-08", "reason": "dup"}\n'
     )
     with registry.session(aliased) as merged:
-        with pytest.raises(registry.RegistryError, match="keys tp_1 by 'Q999'"):
-            _seed(tmp_path, registry=merged)
+        _, places_merged, _ = _seed(tmp_path, registry=merged)
+        assert merged.minted == len(places) - 2
+    assert "Q13291" not in places_merged
+    helsinki = places_merged["Q1757"]
+    assert helsinki["place_id"] == "tp_1" and helsinki["name"] == "Helsinki"
+    assert helsinki["parent_id"] == places_merged["Q1508"]["place_id"]
 
 
 def test_seed_places_a_city_with_its_ancestors(tmp_path):
@@ -591,5 +604,72 @@ def test_curated_references_resolve_before_the_seed_applies_them(tmp_path):
     )
     with registry.session(path) as reg:
         _, places, _ = _seed(tmp_path, overrides_dir=directory, registry=reg)
-    assert places["Q77"]["member_ids"] == ["Q1757"]
-    assert "Q77" in places["Q1757"]["metro_ids"]
+    assert places["Q77"]["member_ids"] == [places["Q1757"]["place_id"]]
+    assert places["Q77"]["place_id"] in places["Q1757"]["metro_ids"]
+
+
+def test_a_curated_place_without_a_qid_is_minted_and_keyed_by_its_own_id(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    directory = write_overrides(
+        tmp_path,
+        places=[
+            {
+                "place": "fao_city_region:R1",
+                "add_place": {
+                    "kind": "metro",
+                    "name": "Region",
+                    "member_ids": ["Q1757"],
+                },
+            }
+        ],
+    )
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        _, places, _ = _seed(tmp_path, overrides_dir=directory, registry=reg)
+        reg.save()
+    saved = registry.load(path)
+    region_id = saved.resolve("fao_city_region:R1")
+    region = places[region_id]
+    assert region["wikidata_id"] is None and region["kind"] == "metro"
+    assert region["member_ids"] == [places["Q1757"]["place_id"]]
+    # A rebuild resolves the reference to the own id and finds the row.
+    with registry.session(path) as again:
+        _, places_again, _ = _seed(tmp_path, overrides_dir=directory, registry=again)
+        assert again.minted == 0
+    assert places_again[region_id]["place_id"] == region_id
+
+
+def test_rekey_folds_the_links_of_rows_the_registry_merged():
+    rows = {
+        "Q1": {
+            "tp_id": "tp_1",
+            "metro_ids": ["Q9"],
+            "member_ids": [],
+            "wikidata_id": "Q1",
+        },
+        "Q2": {
+            "tp_id": "tp_1",
+            "metro_ids": ["Q8"],
+            "member_ids": [],
+            "wikidata_id": "Q1",
+        },
+        "Q8": {
+            "tp_id": "tp_8",
+            "metro_ids": [],
+            "member_ids": ["Q2"],
+            "wikidata_id": "Q8",
+        },
+        "Q9": {
+            "tp_id": "tp_9",
+            "metro_ids": [],
+            "member_ids": ["Q1"],
+            "wikidata_id": "Q9",
+        },
+    }
+    out = seed.rekey(rows, by="tp_id", canonical={"tp_1": "Q1"})
+    assert set(out) == {"tp_1", "tp_8", "tp_9"}
+    # The survivor keeps both metros; each metro's member list names it.
+    assert out["tp_1"]["metro_ids"] == ["tp_8", "tp_9"]
+    assert out["tp_8"]["member_ids"] == out["tp_9"]["member_ids"] == ["tp_1"]

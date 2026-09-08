@@ -206,7 +206,10 @@ def load_feed_overrides(overrides_dir, *, registry=None):
         _validate_operations(path, ref, entry)
         if registry is not None and "set_coverage" in entry:
             entry["set_coverage"]["place_id"] = _key(
-                registry, entry["set_coverage"]["place_id"], f"{path}: feed {ref!r}"
+                registry,
+                entry["set_coverage"]["place_id"],
+                f"{path}: feed {ref!r}",
+                strict=True,
             )
         by_feed[ref] = entry
     return by_feed, digest
@@ -358,7 +361,9 @@ def load_edge_overrides(overrides_dir, *, registry=None):
                 raise OverrideError(f"{path}: every entry needs a non-empty '{key}'")
         where = f"{entry['feed']}/{entry['place']}"
         if registry is not None and entry["place"] != "*":
-            entry["place"] = _key(registry, entry["place"], f"{path}: {where}")
+            entry["place"] = _key(
+                registry, entry["place"], f"{path}: {where}", strict=True
+            )
         unknown = set(entry) - _EDGE_OPERATIONS - _EDGE_METADATA - {"tier_confidence"}
         if unknown:
             raise OverrideError(f"{path}: {where} has unknown keys {sorted(unknown)}")
@@ -472,26 +477,35 @@ def _reference_list(value):
     return isinstance(value, list) and bool(value) and all(map(is_reference, value))
 
 
-def _key(registry, reference, where):
+def _key(registry, reference, where, **options):
     """``reference`` as the registry's current key for the place it names."""
     try:
-        return registry.key_for(reference)
+        return registry.key_for(reference, **options)
     except _registry.RegistryError as error:
         raise OverrideError(f"{where}: {error}") from None
 
 
-def _resolve_place_entry(entry, registry, where):
-    entry["place"] = _key(registry, entry["place"], where)
+def _resolve_place_entry(entry, registry, where, internal, pending):
+    # Only add_place may name a place no row carries yet, to mint it; the
+    # file's other entries may name the places its add_place entries create.
+    def key(reference, mint=False):
+        return _key(
+            registry,
+            reference,
+            where,
+            mint=mint or reference in pending,
+            internal=internal,
+        )
+
+    entry["place"] = key(entry["place"], mint="add_place" in entry)
     spec = entry.get("add_place")
     if isinstance(spec, dict):
         if "parent_id" in spec:
-            spec["parent_id"] = _key(registry, spec["parent_id"], where)
+            spec["parent_id"] = key(spec["parent_id"])
         if "member_ids" in spec:
-            spec["member_ids"] = [_key(registry, m, where) for m in spec["member_ids"]]
+            spec["member_ids"] = [key(m) for m in spec["member_ids"]]
     if "set_place_members" in entry:
-        entry["set_place_members"] = [
-            _key(registry, m, where) for m in entry["set_place_members"]
-        ]
+        entry["set_place_members"] = [key(m) for m in entry["set_place_members"]]
 
 
 def _validate_place_entry(path, entry):
@@ -605,14 +619,15 @@ def _validate_place_entry(path, entry):
     return operation
 
 
-def load_place_overrides(overrides_dir, *, registry=None):
+def load_place_overrides(overrides_dir, *, registry=None, internal=False):
     """``(entries, sha256)``: the ``places.yaml`` entries in file order, each
     with an ``operation`` key, and the digest of the bytes they were parsed
     from — ``([], None)`` when there is no file. Every entry names the
     ``place`` it concerns by a reference; ``resolve_place`` also names the
     ``source_ref`` (the unresolved candidate's Overture id) it assigns it. With
     ``registry``, every place reference becomes the registry's current key
-    for the place it names."""
+    for the place it names — its own id, or with ``internal`` the QID the
+    seed and metros stages join on."""
     if overrides_dir is None:
         return [], None
     path = pathlib.Path(overrides_dir) / PLACES_FILE
@@ -628,12 +643,19 @@ def load_place_overrides(overrides_dir, *, registry=None):
         raise OverrideError(f"{path}: expected a list of override entries")
     entries = []
     seen = set()
+    pending = {
+        entry.get("place")
+        for entry in raw
+        if isinstance(entry, dict) and "add_place" in entry
+    }
     for entry in raw:
         if not isinstance(entry, dict):
             raise OverrideError(f"{path}: every entry must be a mapping")
         operation = _validate_place_entry(path, entry)
         if registry is not None:
-            _resolve_place_entry(entry, registry, f"{path}: place {entry['place']!r}")
+            _resolve_place_entry(
+                entry, registry, f"{path}: place {entry['place']!r}", internal, pending
+            )
         # resolve_place is keyed by the candidate it resolves: two entries
         # naming one candidate would race for its QID.
         key = (

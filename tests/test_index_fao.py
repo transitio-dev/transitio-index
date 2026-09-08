@@ -361,11 +361,12 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
                 {"ucdb_id": 573, "name": "Espoo", "share": 0.4},
             ],
             "cities": ["Q_A", "Q_B", "Q_L"],
+            "cities_wikidata": [None] * len(["Q_A", "Q_B", "Q_L"]),
             "context": ["Q_C"],
             "evidence_hash": digest(["Q_A", "Q_B", "Q_L"]),
             "override": [
                 {
-                    "place": "<QID>",
+                    "place": "fao_city_region:20",
                     "add_place": {
                         "kind": "metro",
                         "name": "Helsinki",
@@ -373,7 +374,7 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
                     },
                 },
                 {
-                    "place": "<QID>",
+                    "place": "fao_city_region:20",
                     "set_statistical_area": {"scheme": "fao_city_region", "code": "20"},
                     "evidence_hash": digest(["Q_A", "Q_B", "Q_L"]),
                 },
@@ -389,12 +390,16 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
             "name_ambiguous": False,
             "name_candidates": [],
             "cities": ["Q_H", "Q_J", "Q_O"],
+            "cities_wikidata": [None] * len(["Q_H", "Q_J", "Q_O"]),
             "context": ["Q_D", "Q_E", "Q_I"],
             "evidence_hash": digest(["Q_H", "Q_J", "Q_O"]),
             "override": [
-                {"place": "<QID>", "add_place": {"kind": "metro", "name": "<name>"}},
                 {
-                    "place": "<QID>",
+                    "place": "fao_city_region:30",
+                    "add_place": {"kind": "metro", "name": "<name>"},
+                },
+                {
+                    "place": "fao_city_region:30",
                     "set_statistical_area": {"scheme": "fao_city_region", "code": "30"},
                     "evidence_hash": digest(["Q_H", "Q_J", "Q_O"]),
                 },

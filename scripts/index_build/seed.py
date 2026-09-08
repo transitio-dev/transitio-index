@@ -329,10 +329,11 @@ def _resolve_place_overrides(candidates, entries, report):
 
 
 def _add_place_overrides(places, entries, report):
-    """Curated places upserted into the seed: a real QID, a kind, a name,
-    and either a boundary (attached by the geometry stage) or a member list
-    (a metro's cities, linked reciprocally). ``curated`` exempts them from
-    pruning. Judged against the row that exists, if any."""
+    """Curated places upserted into the seed: a place reference — a QID, or
+    a concordance the place is minted from — a kind, a name, and either a
+    boundary (attached by the geometry stage) or a member list (a metro's
+    cities, linked reciprocally). ``curated`` exempts them from pruning.
+    Judged against the row that exists, if any."""
     for entry in entries:
         spec = entry["add_place"]
         place_id = entry["place"]
@@ -422,14 +423,27 @@ def _add_place_overrides(places, entries, report):
             place_id = (places.get(place_id) or {}).get("parent_id")
 
 
+def _key_concordance(key, registry):
+    """The concordances a stage's key states: a QID; ``namespace:value``
+    for a curated place minted from another concordance; or, for an own id
+    a QID-less place resolves to on a rebuild, everything its row carries."""
+    if overture.QID_PATTERN.match(key):
+        return {"wikidata": [key]}
+    if _registry.ID_PATTERN.match(key):
+        return {ns: list(values) for ns, values in registry.effective(key).items()}
+    namespace, value = key.split(":", 1)
+    return {namespace: [value]}
+
+
 def _identify_places(places, registry, places_digest):
     """Give every place its registry id — found by its concordances or
-    minted — beside the QID, which stays the key for now."""
+    minted — and the QID the registry keys it by; ``rekey_by_own_id`` then
+    makes the id the key."""
     if registry is None:
         return 0
     for place_id in sorted(places):
         row = places[place_id]
-        concordances = {"wikidata": [place_id]}
+        concordances = _key_concordance(place_id, registry)
         if row.get("overture_id"):
             concordances["overture"] = [row["overture_id"]]
             minted_from = f"overture:{row['overture_id']}"
@@ -447,21 +461,91 @@ def _identify_places(places, registry, places_digest):
             minted_from=minted_from,
             minted_in=minted_in,
         )
-        _shadow_gate(registry, row["tp_id"], place_id)
-        row["wikidata_id"] = place_id
+        row["wikidata_id"] = registry.canonical_qid(row["tp_id"])
+        if row["kind"] == "metro" and not row.get("statistical_area_id"):
+            _restore_statistical_identity(row, registry.effective(row["tp_id"]))
     return len(places)
 
 
-def _shadow_gate(registry, tp_id, qid):
-    """While the QID is the place key, it must be the registry's canonical
-    QID for the id: a QID merged into another place would otherwise give
-    two keyed rows one id. Re-keying arrives with the cutover."""
-    canonical = registry.canonical_qid(tp_id)
-    if canonical != qid:
-        raise _registry.RegistryError(
-            f"{qid}: the registry keys {tp_id} by {canonical!r}; "
-            "the shadow phase cannot re-key it"
-        )
+STATISTICAL_SUBTYPES = {
+    "cbsa": "metropolitan statistical area",
+    "eurostat_metro": "metropolitan region",
+}
+
+
+def _restore_statistical_identity(row, concordances):
+    """A metro keyed by its statistical code carries that code and its
+    scheme's subtype on every build, so the metro a stage discovers under
+    the code joins it."""
+    for namespace, subtype in STATISTICAL_SUBTYPES.items():
+        if concordances.get(namespace):
+            row["statistical_area_id"] = concordances[namespace][0]
+            row["source_subtype"] = row.get("source_subtype") or subtype
+            return
+
+
+def rekey(rows, *, by, records=(), canonical=None):
+    """``rows`` keyed by the field ``by`` — ``tp_id`` for the own id every
+    identified row carries, ``wikidata_id`` for the QID a stage joins on —
+    with the links between them (``parent_id``, ``default_metro_id``,
+    ``metro_ids``, ``member_ids``) and the place ids in ``records`` mapped
+    alike. A row without the field keeps its key. Two rows the registry
+    calls one place become one: the row keyed by the place's canonical QID
+    (``canonical``, key by target) survives, else the first."""
+    mapping = {key: row.get(by) or key for key, row in rows.items()}
+    canonical = canonical or {}
+
+    def order(key):
+        # The key is the QID the row was seeded by; identification has
+        # already given every converging row the survivor's canonical QID.
+        return (mapping[key], key != canonical.get(mapping[key]), key)
+
+    out = {}
+    for key in sorted(rows, key=order):
+        row = rows[key]
+        target = mapping[key]
+        if target in out:
+            # The same place under another key: its links fold into the
+            # survivor, the rest of the row is the survivor's.
+            survivor = out[target]
+            for field in ("metro_ids", "member_ids"):
+                survivor[field] = sorted(
+                    set(survivor.get(field) or []) | set(row.get(field) or [])
+                )
+            continue
+        row["place_id"] = target
+        for field in ("parent_id", "default_metro_id"):
+            if row.get(field):
+                row[field] = mapping.get(row[field], row[field])
+        for field in ("metro_ids", "member_ids"):
+            if field in row:
+                row[field] = sorted({mapping.get(v, v) for v in row[field] or []})
+        out[target] = row
+    for row in out.values():
+        for field in ("metro_ids", "member_ids"):
+            if field in row:
+                row[field] = sorted({mapping.get(v, v) for v in row[field]})
+    for record in records:
+        for field in ("place_id", "city_id", "metro_id"):
+            if record.get(field) in mapping:
+                record[field] = mapping[record[field]]
+    return out
+
+
+def rekey_by_own_id(rows, registry, records=()):
+    """The rows of a stage keyed by their own ids, the way it publishes them."""
+    canonical = {
+        row["tp_id"]: registry.canonical_qid(row["tp_id"])
+        for row in rows.values()
+        if row.get("tp_id")
+    }
+    return rekey(rows, by="tp_id", records=records, canonical=canonical)
+
+
+def rekey_by_qid(rows):
+    """Published rows keyed by their QIDs again, for a stage that joins on
+    them; a row without a QID keeps its own id."""
+    return rekey(rows, by="wikidata_id")
 
 
 def resolve_seed(
@@ -512,7 +596,7 @@ def resolve_seed(
     candidates = read_city_candidates(dataset, countries, wanted)
     _resolve_candidates(candidates, wikidata)
     place_overrides, places_digest = overrides.load_place_overrides(
-        overrides_dir, registry=registry
+        overrides_dir, registry=registry, internal=True
     )
     override_report = []
     resolved_by_hand = _resolve_place_overrides(
@@ -575,6 +659,8 @@ def resolve_seed(
     added = overrides.by_operation(place_overrides, "add_place")
     _add_place_overrides(places, added, override_report)
     identified = _identify_places(places, registry, places_digest)
+    if registry is not None:
+        places = rekey_by_own_id(places, registry, records=placements)
 
     manifest = {
         "source": "seed",

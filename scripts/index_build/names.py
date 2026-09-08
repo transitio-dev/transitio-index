@@ -72,17 +72,18 @@ def merge_names(
                 "places_seed.jsonl",
                 generations=run,
             )
-            qids = [
-                p["place_id"]
-                for p in places
-                if p.get("place_id") and overture.QID_PATTERN.match(p["place_id"])
-            ]
-            data = wikidata.labels_and_aliases(qids)
+            # The QID beside an own id, or the id itself while it is one.
+            qid_of = {}
+            for p in places:
+                qid = p.get("wikidata_id") or p.get("place_id")
+                if qid and overture.QID_PATTERN.match(qid):
+                    qid_of[p["place_id"]] = qid
+            data = wikidata.labels_and_aliases(sorted(set(qid_of.values())))
 
             enriched = 0
             for place in places:
                 place.setdefault("aliases", [])
-                entry = data.get(place.get("place_id"))
+                entry = data.get(qid_of.get(place.get("place_id")))
                 if entry is None:
                     continue
                 _merge(place, entry)

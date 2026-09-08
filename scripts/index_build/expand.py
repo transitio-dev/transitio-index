@@ -136,7 +136,10 @@ def _attach_metros(places_by_id, new_cities, wikidata, report):
     ``(added, touched)`` — the metros minted, and every metro a discovered
     CBSA pair names, a seeded one included."""
     us_cities = [
-        qid for qid in new_cities if places_by_id[qid].get("country_code") == "US"
+        qid
+        for qid in new_cities
+        if places_by_id[qid].get("country_code") == "US"
+        and overture.QID_PATTERN.match(qid)
     ]
     added = []
     touched = []
@@ -157,16 +160,23 @@ def _attach_metros(places_by_id, new_cities, wikidata, report):
                 )
                 continue
             metro = places_by_id.get(record["qid"])
-            if metro is None:
-                metro = metros._metro_place(record)
-                places_by_id[metro["place_id"]] = metro
-                added.append(metro["place_id"])
-            elif metro.get("kind") != "metro":
+            if metro is not None and metro.get("kind") != "metro":
                 raise overture.GazetteerError(
                     f"metro {record['qid']!r} is already seeded as the "
                     f"{metro['kind']} {metro.get('name')!r}"
                 )
-            metros._take_cbsa(metro, record["qid"], record["cbsa"])
+            if metro is None:
+                # A curated metro keyed by the code takes the discovered QID.
+                metro = metros._by_code(
+                    places_by_id, record["cbsa"], "metropolitan statistical area"
+                )
+                if metro is not None:
+                    metro.setdefault("discovered_qids", []).append(record["qid"])
+            if metro is None:
+                metro = metros._metro_place(record)
+                places_by_id[metro["place_id"]] = metro
+                added.append(metro["place_id"])
+            metros._take_msa(metro, record)
             if metro["place_id"] not in touched:
                 touched.append(metro["place_id"])
             if metro.get("members_curated"):
@@ -395,6 +405,10 @@ def expand(
                         "rerun the gazetteer"
                     )
             places_by_id = {place["place_id"]: place for place in places}
+            if registry is not None:
+                # Discovery joins by QID; the rows are keyed by their ids
+                # again before they are published.
+                places_by_id = seed.rekey_by_qid(places_by_id)
             report = []
             counts = {
                 "feeds_scanned": 0,
@@ -419,7 +433,10 @@ def expand(
                 )
             # Saved before the generation is visible, as the gazetteer run
             # does: a crash between the two leaves rows a rerun reproduces.
-            registry_digest = registry.save() if registry is not None else None
+            registry_digest = None
+            if registry is not None:
+                places_by_id = seed.rekey_by_own_id(places_by_id, registry)
+                registry_digest = registry.save()
             manifest = {
                 "source": "expand",
                 "registry_base": anchor,

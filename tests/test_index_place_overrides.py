@@ -283,11 +283,15 @@ def test_loaders_resolve_references_through_the_registry(tmp_path):
         ],
     )
     entries, _ = overrides.load_place_overrides(directory, registry=reg)
+    assert [e["place"] for e in entries] == ["tp_1", "Q7", "tp_1"]
+    assert entries[1]["add_place"]["member_ids"] == ["tp_1", "tp_2"]
+    assert entries[2]["set_place_members"] == ["tp_2"]
+    # The QID-keyed stages join on the canonical QID instead.
+    entries, _ = overrides.load_place_overrides(directory, registry=reg, internal=True)
     assert [e["place"] for e in entries] == ["Q1", "Q7", "Q1"]
     assert entries[1]["add_place"]["member_ids"] == ["Q1", "Q2"]
-    assert entries[2]["set_place_members"] == ["Q2"]
     feeds, _ = overrides.load_feed_overrides(directory, registry=reg)
-    assert feeds["f"]["set_coverage"]["place_id"] == "Q1"
+    assert feeds["f"]["set_coverage"]["place_id"] == "tp_1"
     (directory / "edges.yaml").write_text(
         yaml.safe_dump(
             [
@@ -297,7 +301,7 @@ def test_loaders_resolve_references_through_the_registry(tmp_path):
         )
     )
     edges, _ = overrides.load_edge_overrides(directory, registry=reg)
-    assert [e["place"] for e in edges] == ["Q1", "*"]
+    assert [e["place"] for e in edges] == ["tp_1", "*"]
     # Two references to one place are one duplicate; an unknown non-QID
     # reference names nothing.
     for places, message in [
@@ -309,6 +313,7 @@ def test_loaders_resolve_references_through_the_registry(tmp_path):
             "duplicate set_aliases",
         ),
         ([{"place": "tp_9", "set_aliases": ["x"]}], "no such place"),
+        ([{"place": "overture:new", "set_aliases": ["x"]}], "no place carries it"),
     ]:
         with pytest.raises(overrides.OverrideError, match=message):
             overrides.load_place_overrides(
@@ -317,3 +322,38 @@ def test_loaders_resolve_references_through_the_registry(tmp_path):
 
 
 _STAMP = {"reason": "curated", "author": "HT", "date": "2026-09-02"}
+
+
+def test_a_file_may_reference_the_places_its_add_place_entries_create(tmp_path):
+    reg = registry_with_two_places(tmp_path)
+    entries, _ = overrides.load_place_overrides(
+        write_overrides(
+            tmp_path,
+            places=[
+                {
+                    "place": "fao_city_region:R1",
+                    "add_place": {"kind": "metro", "name": "R", "member_ids": ["tp_1"]},
+                },
+                {"place": "fao_city_region:R1", "set_aliases": ["Region one"]},
+            ],
+        ),
+        registry=reg,
+    )
+    assert [e["place"] for e in entries] == ["fao_city_region:R1"] * 2
+    # Consumers of the finished gazetteer refuse a QID no place carries.
+    directory = write_overrides(
+        tmp_path,
+        feeds=[
+            {"feed": "f", "set_coverage": {"level": "municipality", "place_id": "Q404"}}
+        ],
+        name="strict",
+    )
+    with pytest.raises(overrides.OverrideError, match="no place carries it"):
+        overrides.load_feed_overrides(directory, registry=reg)
+    (directory / "edges.yaml").write_text(
+        yaml.safe_dump(
+            [{"feed": "f", "place": "Q404", "set_tiers": ["local"], **_STAMP}]
+        )
+    )
+    with pytest.raises(overrides.OverrideError, match="no place carries it"):
+        overrides.load_edge_overrides(directory, registry=reg)

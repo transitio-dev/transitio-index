@@ -240,7 +240,9 @@ def test_a_clean_build_passes(tmp_path):
     path = _golden_file(tmp_path, [_entry("f-ok", ["Q1"])])
     report = golden.check(cache, path)
     assert report["passed"] is True
-    assert golden.main(["--cache-dir", str(cache), "--golden", str(path)]) == 0
+    # No overrides directory: the fixture QIDs resolve through no registry.
+    argv = ["--cache-dir", str(cache), "--golden", str(path)]
+    assert golden.main(argv + ["--overrides-dir", str(tmp_path / "none")]) == 0
 
 
 @pytest.mark.parametrize(
@@ -315,8 +317,9 @@ def test_golden_references_resolve_through_the_registry(tmp_path):
     from test_index_place_overrides import registry_with_two_places
 
     reg = registry_with_two_places(tmp_path)
-    cache = _write_cache(tmp_path, [_edge("f-ok", "Q1")])
-    path = _golden_file(tmp_path, [_entry("f-ok", ["tp_1"])])
+    # The index keys places by own id; the golden file may name them by QID.
+    cache = _write_cache(tmp_path, [_edge("f-ok", "tp_1")])
+    path = _golden_file(tmp_path, [_entry("f-ok", ["Q1"])])
     assert golden.check(cache, path, registry=reg)["passed"] is True
     assert golden.check(cache, path)["passed"] is False
     # The standalone diff resolves through the same registry.
@@ -325,3 +328,7 @@ def test_golden_references_resolve_through_the_registry(tmp_path):
     assert golden.main(argv + ["--overrides-dir", str(tmp_path / "none")]) == 1
     with pytest.raises(golden.GoldenError, match="place references"):
         golden.check(cache, _golden_file(tmp_path, [_entry("f-ok", ["bogus"])]))
+    with pytest.raises(golden.GoldenError, match="no place carries it"):
+        golden.check(
+            cache, _golden_file(tmp_path, [_entry("f-ok", ["Q404"])]), registry=reg
+        )

@@ -1190,7 +1190,7 @@ def test_feeds_yaml_edited_after_the_resolve_stage_refuses_to_curate(tmp_path):
 
 def test_edge_overrides_resolve_place_references(tmp_path):
     class Keys:
-        def key_for(self, reference):
+        def key_for(self, reference, **options):
             return {"tp_1": "Q-city"}[reference]
 
     _, manifest, edges = _curate(

@@ -669,7 +669,7 @@ def test_set_coverage_resolves_its_place_reference(tmp_path):
     from test_index_place_overrides import write_overrides
 
     class Keys:
-        def key_for(self, reference):
+        def key_for(self, reference, **options):
             return {"tp_reg": "Q-reg"}[reference]
 
     entries = [

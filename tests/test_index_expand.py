@@ -190,7 +190,7 @@ def _expand(tmp_path, cache, registry=None):
     report, _ = store.read_jsonl(
         cache / "gazetteer", "expanded.json", "expansion_report.jsonl"
     )
-    return manifest, {p["place_id"]: p for p in places}, report
+    return manifest, {p.get("wikidata_id") or p["place_id"]: p for p in places}, report
 
 
 def test_no_crawl_artifacts_pass_the_seed_through(tmp_path):
@@ -415,8 +415,8 @@ def test_discoveries_are_identified_through_the_registry(tmp_path):
     assert manifest["registry_base"] == run_digest
     assert manifest["registry_digest"] == hashlib.sha256(path.read_bytes()).hexdigest()
     saved = registry.load(path)
-    assert places["Q40840"]["tp_id"] == saved.resolve("overture:fi-tre")
-    assert places["Q912579"]["tp_id"] == saved.resolve("cbsa:44100")
+    assert places["Q40840"]["place_id"] == saved.resolve("overture:fi-tre")
+    assert places["Q912579"]["place_id"] == saved.resolve("cbsa:44100")
     # A rerun opens on the registry the first expand saved — the run's
     # successor in the chain — finds every place again and mints nothing,
     # and still anchors on the run's digest, so consumers and a further
@@ -531,3 +531,41 @@ def test_a_crash_after_the_registry_save_is_recovered_by_a_gazetteer_rerun(
     with registry.session(path) as reg:
         manifest, _, _ = _expand(tmp_path, cache, registry=reg)
         assert manifest["minted"] == 0
+
+
+def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
+    from index_build import registry
+
+    cache = tmp_path / "cache"
+    path = tmp_path / "places_registry.jsonl"
+    _seeded_registry(path)
+    with registry.session(path) as reg:
+        curated = reg.identify(
+            {"cbsa": ["44100"]}, kind="metro", minted_from="t", minted_in="t 1"
+        )
+        reg.save()
+    _publish_names(
+        cache,
+        SEED_PLACES
+        + [
+            {
+                "place_id": curated,
+                "kind": "metro",
+                "source_subtype": "metropolitan statistical area",
+                "name": "Curated MSA",
+                "country_code": "US",
+                "statistical_area_id": "44100",
+                "members_curated": True,
+                "metro_ids": [],
+                "member_ids": [],
+            }
+        ],
+    )
+    _write_crawl(cache, "f-us", ["s2,39.8,-89.65\n"])
+    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    with registry.session(path) as reg:
+        manifest, places, _ = _expand(tmp_path, cache, registry=reg)
+        assert (manifest["metros_added"], reg.enriched) == (0, 1)
+    metro = places["Q912579"]
+    assert metro["place_id"] == curated and metro["name"] == "Curated MSA"
+    assert sum(1 for p in places.values() if p["kind"] == "metro") == 1

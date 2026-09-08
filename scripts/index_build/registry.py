@@ -387,19 +387,30 @@ class Registry:
             raise RegistryError(f"{reference!r}: no place carries it")
         return found
 
-    def key_for(self, reference):
-        """The current key of the row ``reference`` names — its canonical
-        QID during the shadow phase — or the reference itself when it is a
-        bare QID no row carries yet, a place still to be minted. Any other
-        reference must name a row."""
+    def key_for(self, reference, *, mint=False, internal=False, strict=False):
+        """The current key of the row ``reference`` names — its own id, or
+        with ``internal`` the canonical QID a QID-keyed stage joins on (the
+        own id for a row without one) — or the reference itself when no row
+        carries it and it may name a place still to be minted: a bare QID
+        always — on a first build no row exists yet, and a QID that names
+        nothing surfaces as a stale override where it is applied — and any
+        concordance under ``mint``; ``strict``, for a consumer of the
+        finished gazetteer, refuses an unknown QID too. Other unknown
+        references are refused."""
         if isinstance(reference, str) and QID_PATTERN.match(reference):
             if self.lookup("wikidata", reference) is None:
+                if strict:
+                    raise RegistryError(f"{reference!r}: no place carries it")
                 return reference
-        place_id = self.resolve(reference)
-        qid = self.canonical_qid(place_id)
-        if qid is None:
-            raise RegistryError(f"{reference}: {place_id} has no wikidata concordance")
-        return qid
+        try:
+            place_id = self.resolve(reference)
+        except RegistryError:
+            if mint and _mintable(reference):
+                return reference
+            raise
+        if internal:
+            return self.canonical_qid(place_id) or place_id
+        return place_id
 
     def _refuse_change(self, what):
         if self.read_only:
@@ -518,6 +529,15 @@ class Registry:
 def file_digest(path):
     """The SHA-256 of the registry file as it is on disk."""
     return hashlib.sha256(_read(path)).hexdigest()
+
+
+def _mintable(reference):
+    """A well-formed ``namespace:value`` no row carries: a place a curated
+    ``add_place`` may mint from."""
+    if not isinstance(reference, str) or ":" not in reference:
+        return False
+    namespace, value = reference.split(":", 1)
+    return namespace in NAMESPACES and bool(value)
 
 
 def load(path):

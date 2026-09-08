@@ -63,7 +63,7 @@ def load_golden(path, *, registry=None):
                 )
             if registry is not None and key in record:
                 try:
-                    record[key] = [registry.key_for(q) for q in places]
+                    record[key] = [registry.key_for(q, strict=True) for q in places]
                 except _registry.RegistryError as error:
                     raise GoldenError(f"{record['feed_id']}: {error}") from None
         if "membership_exact" in record and not isinstance(
