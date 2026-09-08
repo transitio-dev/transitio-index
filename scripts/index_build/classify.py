@@ -978,9 +978,9 @@ def _pointer_present(path):
 def _current_generation(cache_dir, subdir, pointer):
     """The generation id the pointer names now, None with no pointer; a
     pointer that exists but will not resolve is corruption, never absence."""
-    if not _pointer_present(cache_dir / subdir / pointer):
-        return None
     try:
+        if store.current_generation(cache_dir / subdir, pointer) is None:
+            return None
         generation, manifest = store.resolve(cache_dir / subdir, pointer)
     except (store.StoreError, ValueError) as error:
         raise ClassifyError(

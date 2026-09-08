@@ -663,3 +663,24 @@ def test_set_coverage_wins_over_a_feeds_crawl(tmp_path):
             "crawled": {p: e["evidence"] for p, e in measured["f-city"].items()},
         }
     )
+
+
+def test_set_coverage_resolves_its_place_reference(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    class Keys:
+        def key_for(self, reference, **options):
+            return {"tp_reg": "Q-reg"}[reference]
+
+    entries = [
+        {
+            "feed": "f-city",
+            "set_coverage": {"level": "subdivision", "place_id": "tp_reg"},
+        }
+    ]
+    manifest, _, edges = _cover(
+        tmp_path,
+        overrides_dir=write_overrides(tmp_path, feeds=entries),
+        registry=Keys(),
+    )
+    assert manifest["overrides_applied"] == 1 and "Q-reg" in edges["f-city"]

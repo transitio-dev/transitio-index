@@ -19,7 +19,8 @@ import json
 import math
 import os
 
-from index_build import overture, store
+from index_build import overrides, store
+from index_build import registry as _registry
 
 REQUIRED_KEYS = ("feed_id", "name", "why", "membership", "tiers", "review_state")
 REVIEW_STATES = ("confident", "needs_review")
@@ -33,7 +34,7 @@ class GoldenError(RuntimeError):
     """The golden file itself is malformed."""
 
 
-def load_golden(path):
+def load_golden(path, *, registry=None):
     """The validated golden entries, or :class:`GoldenError`.
 
     A malformed golden file must fail the gate itself, never read as an
@@ -51,14 +52,20 @@ def load_golden(path):
             raise GoldenError(f"{record['feed_id']}: duplicate entry")
         seen.add(record["feed_id"])
         for key in ("membership", "membership_excludes"):
-            # Present means a QID list — a falsy non-list (0, false, "") is
-            # malformed, never an empty contract.
+            # Present means a list of place references — a falsy non-list
+            # (0, false, "") is malformed, never an empty contract.
             places = record.get(key, [])
-            if not isinstance(places, list) or any(
-                not (isinstance(q, str) and overture.QID_PATTERN.match(q))
-                for q in places
+            if not isinstance(places, list) or not all(
+                map(overrides.is_reference, places)
             ):
-                raise GoldenError(f"{record['feed_id']}: {key} must be a QID list")
+                raise GoldenError(
+                    f"{record['feed_id']}: {key} must be a list of place references"
+                )
+            if registry is not None and key in record:
+                try:
+                    record[key] = [registry.key_for(q, strict=True) for q in places]
+                except _registry.RegistryError as error:
+                    raise GoldenError(f"{record['feed_id']}: {error}") from None
         if "membership_exact" in record and not isinstance(
             record["membership_exact"], bool
         ):
@@ -166,6 +173,7 @@ def check(
     edges=None,
     manifest=None,
     overrides_dir=None,
+    registry=None,
 ):
     """Diff the build against the golden entries; returns the report.
 
@@ -177,9 +185,10 @@ def check(
     any of its edges needs review — so a rule change that moves a golden
     feed across the cutoff fails the diff without anyone remembering a
     flag. ``edges``/``manifest`` let a caller check the edges it already
-    read instead of resolving the latest generation again.
+    read instead of resolving the latest generation again; ``registry``
+    resolves the entries' place references to the index's keys.
     """
-    entries = load_golden(golden_path)
+    entries = load_golden(golden_path, registry=registry)
     if edges is None:
         actual, manifest = _actual(cache_dir, overrides_dir)
     else:
@@ -297,12 +306,25 @@ def main(argv=None):
         default=pathlib.Path("overrides"),
         help="directory of override YAML files (default: overrides)",
     )
+    parser.add_argument(
+        "--registry",
+        type=pathlib.Path,
+        help="place registry the golden references resolve through "
+        "(default: places_registry.jsonl beside the overrides, when present)",
+    )
     args = parser.parse_args(argv)
+    registry_path = args.registry or args.overrides_dir / _registry.FILE
+    places = (
+        _registry.load(registry_path)
+        if args.registry is not None or registry_path.is_file()
+        else None
+    )
     report = check(
         args.cache_dir,
         args.golden,
         assert_tiers=False if args.membership_only else None,
         overrides_dir=args.overrides_dir,
+        registry=places,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 1

@@ -4,8 +4,9 @@ Reads the pinned Overture ``divisions`` release as projected GeoParquet, keeps
 the whole administrative skeleton (country, region, county, localadmin — geometry
 excluded), and resolves each division to a canonical Wikidata QID: the
 division's own ``wikidata`` property, else a reverse lookup
-from an OSM relation id it was built from (Wikidata ``P402``), else — for a bare
-name/level/country candidate — the resolution report only, never a minted
+from an OSM relation id it was built from (Wikidata ``P402``), else — for a
+named division — its Overture id as the identity; only a nameless division, or
+one whose signals conflict, goes to the resolution report, never a minted
 identity. Localities are feed-driven (3.5M rows, ~26% carry a QID) and are
 matched from feed municipalities in a later stage rather than bulk-resolved here.
 
@@ -423,16 +424,27 @@ def resolve_qid(record, p402_map):
         # One clean QID alongside an ambiguous relation is still ambiguous:
         # any conflict signal leaves the division unresolved, never minted.
         return None, "name_country", "conflicting P402 identities"
-    return None, "name_country", "no wikidata property and no P402 match"
+    return None, "name_country", UNRESOLVED
 
 
-def resolve(cache_dir, *, dataset=None, wikidata=None):
+UNRESOLVED = "no wikidata property and no P402 match"
+
+
+def qidless_place(record):
+    """Whether a division no QID names is a place in its own right: it has
+    a name and its signals merely lack a QID — conflicting signals leave it
+    to curation."""
+    return bool(record.get("name")) and record.get("resolution_reason") == UNRESOLVED
+
+
+def resolve(cache_dir, *, dataset=None, wikidata=None, run=None):
     """Ingest the Overture admin skeleton and resolve each division to a QID.
 
     Reads the whole skeleton from the pinned Overture release and resolves each
-    division to a QID. Divisions with a QID are published to
+    division to a QID. Divisions with a QID, and named divisions without one
+    (identified by their Overture id), are published to
     ``overture_divisions.jsonl`` (with the OSM relation ids kept as a
-    crosswalk); bare name/level/country candidates go to
+    crosswalk); a nameless division, or one whose signals conflict, goes to
     ``place_resolution_report.jsonl`` for curation, never minted. Returns the
     generation manifest.
     """
@@ -454,10 +466,17 @@ def resolve(cache_dir, *, dataset=None, wikidata=None):
 
     resolved = []
     report = []
-    by_method = {"overture_wikidata": 0, "osm_p402": 0}
+    by_method = {"overture_wikidata": 0, "osm_p402": 0, "overture_id": 0}
     for record in records:
         qid, method, reason = resolve_qid(record, p402_map)
-        if qid is None:
+        record["resolution_reason"] = reason
+        if qid is None and qidless_place(record):
+            # A named division no QID names is a place in its own right,
+            # identified by its Overture id; only a nameless division, or
+            # one whose signals conflict, is left to curation.
+            method = "overture_id"
+            reason = None
+        if qid is None and reason is not None:
             report.append(
                 {
                     "overture_id": record["overture_id"],
@@ -494,7 +513,7 @@ def resolve(cache_dir, *, dataset=None, wikidata=None):
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
         with store.exclusive_writer(directory):
-            return store.publish(
+            published = store.publish(
                 out,
                 "overture.json",
                 {
@@ -503,6 +522,10 @@ def resolve(cache_dir, *, dataset=None, wikidata=None):
                 },
                 manifest,
                 held=directory,
+                staged=run is not None,
             )
+            if run is not None:
+                run["overture.json"] = published["generation"]
+            return published
     finally:
         directory.close()

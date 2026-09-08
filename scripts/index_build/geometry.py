@@ -295,7 +295,15 @@ def _curated_geometry(place, wkt):
     place["geometry_source"] = "curated"
 
 
-def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False):
+def attach_geometry(
+    cache_dir,
+    *,
+    dataset=None,
+    overrides_dir=None,
+    strict=False,
+    registry=None,
+    run=None,
+):
     """Attach simplified geometry to the seeded places and write the NOTICE.
 
     Resolves each seeded place's ``division_area`` polygon(s) and ships the
@@ -310,7 +318,10 @@ def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False
     try:
         with store.exclusive_writer(directory):
             places, metros_manifest = store.read_jsonl(
-                cache_dir / "gazetteer", "metros.json", "places_seed.jsonl"
+                cache_dir / "gazetteer",
+                "metros.json",
+                "places_seed.jsonl",
+                generations=run,
             )
             wanted = {p["overture_id"] for p in places if p.get("overture_id")}
             if dataset is None:
@@ -375,7 +386,7 @@ def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False
                 member_union += 1
 
             place_overrides, places_digest = overrides.load_place_overrides(
-                overrides_dir
+                overrides_dir, registry=registry
             )
             overrides.expect_digest(
                 metros_manifest.get("places_overrides_sha256"),
@@ -444,7 +455,10 @@ def attach_geometry(cache_dir, *, dataset=None, overrides_dir=None, strict=False
                 },
                 manifest,
                 held=directory,
+                staged=run is not None,
             )
+            if run is not None:
+                run["geometry.json"] = published["generation"]
             overrides.strict_check(strict, override_report, "geometry")
             return published
     finally:

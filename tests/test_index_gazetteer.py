@@ -111,11 +111,18 @@ def test_resolve_publishes_resolved_and_report(tmp_path):
     assert by_id["ov-fi"]["qid"] == "Q33"
     # localities and finer subtypes are not part of the skeleton read.
     assert "ov-loc" not in by_id
-    # The bare name/level/country candidate is reported, never minted.
-    assert [r["overture_id"] for r in report] == ["ov-noqid"]
-    assert manifest["resolved"] == 4
-    assert manifest["reported"] == 1
-    assert manifest["resolved_by_method"] == {"overture_wikidata": 3, "osm_p402": 1}
+    # A named division no QID names is a place of its own, identified by
+    # its Overture id; only a conflicting or nameless one is reported.
+    assert by_id["ov-noqid"]["qid"] is None
+    assert by_id["ov-noqid"]["resolution_method"] == "overture_id"
+    assert report == []
+    assert manifest["resolved"] == 5
+    assert manifest["reported"] == 0
+    assert manifest["resolved_by_method"] == {
+        "overture_wikidata": 3,
+        "osm_p402": 1,
+        "overture_id": 1,
+    }
     assert manifest["countries"] == ["FI", "US"]
     assert manifest["overture_release"] == overture.OVERTURE_RELEASE
 
@@ -225,3 +232,35 @@ def test_wikidata_client_parses_and_rejects_ambiguous(monkeypatch):
     client = overture.WikidataClient()
     # 10 is unique; 20 is ambiguous (None, present as a conflict); 30 is absent.
     assert client.p402(["10", "20", "30"]) == {"10": "Q10", "20": None}
+
+
+def test_a_division_is_a_place_without_a_qid_only_when_named_and_unresolved():
+    unresolved = {"name": "X", "resolution_reason": overture.UNRESOLVED}
+    assert overture.qidless_place(unresolved)
+    assert not overture.qidless_place({**unresolved, "name": ""})
+    assert not overture.qidless_place(
+        {**unresolved, "resolution_reason": "conflicting P402 identities"}
+    )
+
+
+def test_a_nameless_division_is_reported_not_published(tmp_path):
+    nameless = fx.division(
+        "ov-nameless",
+        "US",
+        "localadmin",
+        name="",
+        admin_level=2,
+        hierarchies=fx.chain(US, ("ov-nameless", "localadmin", "")),
+    )
+    cache = tmp_path / "cache"
+    dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS + [nameless])
+    manifest = overture.resolve(
+        cache, dataset=dataset, wikidata=fx.StubWikidata({"2552450": "Q11299"})
+    )
+    resolved, _ = _read(cache, "overture_divisions.jsonl")
+    report, _ = _read(cache, "place_resolution_report.jsonl")
+    assert "ov-nameless" not in {r["overture_id"] for r in resolved}
+    assert [(r["overture_id"], r["reason"]) for r in report] == [
+        ("ov-nameless", overture.UNRESOLVED)
+    ]
+    assert manifest["reported"] == 1

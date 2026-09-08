@@ -45,7 +45,15 @@ def _set_aliases(places, entries, report):
     return len(entries)
 
 
-def merge_names(cache_dir, *, wikidata=None, overrides_dir=None, strict=False):
+def merge_names(
+    cache_dir,
+    *,
+    wikidata=None,
+    overrides_dir=None,
+    strict=False,
+    registry=None,
+    run=None,
+):
     """Enrich the places' names and aliases from Wikidata, and republish them.
 
     Reads the geometry-stage places, fetches labels and aliases for their QIDs and
@@ -59,25 +67,29 @@ def merge_names(cache_dir, *, wikidata=None, overrides_dir=None, strict=False):
     try:
         with store.exclusive_writer(directory):
             places, geometry_manifest = store.read_jsonl(
-                cache_dir / "gazetteer", "geometry.json", "places_seed.jsonl"
+                cache_dir / "gazetteer",
+                "geometry.json",
+                "places_seed.jsonl",
+                generations=run,
             )
-            qids = [
-                p["place_id"]
-                for p in places
-                if p.get("place_id") and overture.QID_PATTERN.match(p["place_id"])
-            ]
-            data = wikidata.labels_and_aliases(qids)
+            # The QID beside an own id, or the id itself while it is one.
+            qid_of = {}
+            for p in places:
+                qid = p.get("wikidata_id") or p.get("place_id")
+                if qid and overture.QID_PATTERN.match(qid):
+                    qid_of[p["place_id"]] = qid
+            data = wikidata.labels_and_aliases(sorted(set(qid_of.values())))
 
             enriched = 0
             for place in places:
                 place.setdefault("aliases", [])
-                entry = data.get(place.get("place_id"))
+                entry = data.get(qid_of.get(place.get("place_id")))
                 if entry is None:
                     continue
                 _merge(place, entry)
                 enriched += 1
             place_overrides, places_digest = overrides.load_place_overrides(
-                overrides_dir
+                overrides_dir, registry=registry
             )
             overrides.expect_digest(
                 geometry_manifest.get("places_overrides_sha256"),
@@ -123,7 +135,10 @@ def merge_names(cache_dir, *, wikidata=None, overrides_dir=None, strict=False):
                 },
                 manifest,
                 held=directory,
+                staged=run is not None,
             )
+            if run is not None:
+                run["names.json"] = published["generation"]
             overrides.strict_check(strict, override_report, "names")
             return published
     finally:

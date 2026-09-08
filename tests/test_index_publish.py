@@ -26,6 +26,7 @@ from index_build import overrides  # noqa: E402
 # the source (which would lack it) fails loudly rather than skipping the module.
 from transitio import index as transitio_index  # noqa: E402
 from transitio.exceptions import IncompatibleIndexError  # noqa: E402
+from transitio.exceptions import PlaceNotFoundError  # noqa: E402
 
 
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
@@ -231,7 +232,29 @@ def _edges_index(
     return cache, manifest
 
 
-def _build_index(tmp_path, archive=None, places=None, release="2026-08-19.0"):
+def _publish_run_manifest(cache, registry_digest):
+    directory = store.open_subdir(cache, "gazetteer")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "gazetteer",
+                store.RUN_POINTER,
+                {"generations.jsonl": store.jsonl_chunks([])},
+                {"generations": {}, "registry_digest": registry_digest},
+                held=directory,
+            )
+    finally:
+        directory.close()
+
+
+def _build_index(
+    tmp_path,
+    archive=None,
+    places=None,
+    release="2026-08-19.0",
+    registry=None,
+    run_digest=None,
+):
     """Ingest a small fixture through crosswalk and publish; return the cache."""
     cache = tmp_path / "cache"
     url = "https://example.org/gtfs.zip"
@@ -283,7 +306,10 @@ def _build_index(tmp_path, archive=None, places=None, release="2026-08-19.0"):
                 "overture_release": release,
             },
         )
-    manifest = publish.publish(cache)
+    if run_digest is not None:
+        # The gazetteer run the registry-backed publish proves itself against.
+        _publish_run_manifest(cache, run_digest)
+    manifest = publish.publish(cache, registry=registry)
     return cache, manifest
 
 
@@ -592,7 +618,12 @@ def test_an_empty_gazetteer_is_a_places_index_not_feeds_only(tmp_path):
 def test_an_explicit_default_metro_wins_over_metro_derivation(tmp_path):
     pytest.importorskip("geopandas")
     places = [
-        _place("Q-pick", "city", metro_ids=["Q-a", "Q-b"], default_metro_id="Q-b"),
+        _place(
+            "Q-pick",
+            "city",
+            metro_ids=["Q-a", "Q-b"],
+            default_metro_id="Q-b",
+        ),
     ]
     cache, _ = _build_index(tmp_path, places=places)
     index = transitio_index.read_index(cache / "index")
@@ -881,12 +912,15 @@ def test_crawl_evidence_and_provenance_round_trip(tmp_path):
         "files": manifest_files,
     }
     cache, manifest = _edges_index(tmp_path, [_edge("Q1757", "f-a")], feeds=[crawled])
-    assert manifest["schema_version"] == 5
+    assert manifest["schema_version"] == 6
     assert (
         manifest["discovery_semantics_version"]
         == transitio_index.DISCOVERY_SEMANTICS_VERSION
     )
-    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS[5]
+    assert (
+        manifest["min_reader_version"]
+        == transitio_index.MIN_READER_VERSIONS[publish.SCHEMA_VERSION]
+    )
     assert manifest["built_with"] == transitio.__version__
     index = transitio_index.read_index(cache / "index")
     row = index.feeds.set_index("feed_id").loc["f-a"]
@@ -1145,3 +1179,221 @@ def test_a_table_declaring_more_than_the_reader_loads_is_refused(tmp_path, monke
     monkeypatch.setattr(transitio_index, "_MAX_TABLE_ROWS", 1)
     with pytest.raises(IncompatibleIndexError, match="declares more than"):
         transitio_index.read_index(cache / "index")
+
+
+def _restamp(index_dir, version, places):
+    """Rewrite the places table and stamp the manifest to ``version``."""
+    places.to_parquet(index_dir / "places.parquet", index=False)
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    snapshot["schema_version"] = version
+    snapshot["min_reader_version"] = transitio_index.MIN_READER_VERSIONS[version]
+    snapshot["places_sha256"] = hashlib.sha256(
+        (index_dir / "places.parquet").read_bytes()
+    ).hexdigest()
+    (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+
+
+def test_the_reader_reads_schema_6_places_and_refuses_a_mismatch(tmp_path):
+    # A published index carries the identity columns; rewrite its shape
+    # — own ids as keys, the QID beside them (one row without), the ids each
+    # place carries, and a distinct former id per row — and stamp the manifest.
+    geopandas = pytest.importorskip("geopandas")
+    cache, _ = _build_index(tmp_path, places=PLACES)
+    index_dir = cache / "index"
+    published = geopandas.read_parquet(index_dir / "places.parquet")
+    qids = [str(q) for q in published["place_id"]]
+    own = {qid: f"tp_{n}" for n, qid in enumerate(qids, start=1)}
+    places = published.copy()
+    places["place_id"] = [own[q] for q in qids]
+    places["parent_id"] = [own.get(p, p) for p in places["parent_id"]]
+    places["wikidata_id"] = [None, *qids[1:]]
+    places["concordances"] = [
+        json.dumps({"overture": [f"ov-{n}"]} if n == 1 else {"wikidata": [q]})
+        for n, q in enumerate(qids, start=1)
+    ]
+    places["former_ids"] = [[f"tp_9{n}"] for n in range(1, len(qids) + 1)]
+    _restamp(index_dir, 6, places)
+    index = transitio_index.read_index(index_dir)
+    assert index.schema_version == 6
+    unnamed = transitio_index.place("tp_1", index=index)
+    assert unnamed.wikidata_id is None
+    assert unnamed.concordances == {"overture": ["ov-1"]}
+    second = transitio_index.place("tp_2", index=index)
+    assert second.wikidata_id == qids[1] and second.former_ids == ["tp_92"]
+    assert second.concordances == {"wikidata": [qids[1]]}
+    # The QID beside the id and the former id resolve to the same row; the
+    # unnamed place's old QID names nothing.
+    assert transitio_index.place(qids[1], index=index) == second
+    assert transitio_index.place("tp_92", index=index) == second
+    with pytest.raises(PlaceNotFoundError):
+        transitio_index.place(qids[0], index=index)
+    # The columns are keyed on the version: schema 6 without them, and
+    # schema 5 with them, are both refused.
+    stripped = published.drop(columns=["wikidata_id", "concordances", "former_ids"])
+    for version, table in ((6, stripped), (5, places)):
+        _restamp(index_dir, version, table)
+        with pytest.raises(IncompatibleIndexError, match=f"schema_version {version}"):
+            transitio_index.read_index(index_dir)
+
+
+def test_the_publisher_writes_the_identity_beside_every_place(tmp_path):
+    from index_build import registry
+
+    # Without a registry — the fixture path — a QID-keyed row is its own
+    # identity: schema 6 with the QID beside the id and nothing merged.
+    cache, _ = _build_index(tmp_path, places=PLACES)
+    index = transitio_index.read_index(cache / "index")
+    assert index.schema_version == 6
+    place = transitio_index.place("Q1757", index=index)
+    assert place.wikidata_id == "Q1757" and place.former_ids == []
+    assert place.concordances == {"wikidata": ["Q1757"]}
+    assert transitio_index.place("Q-metro", index=index).wikidata_id is None
+    # With a registry, the identity is the registry's: the union of what the
+    # place and the rows merged into it carry, and those rows' ids.
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text(
+        '{"next_id": 4, "registry": 1}\n'
+        '{"place_id": "tp_1", "kind": "city", "concordances": {"wikidata": ["Q1757"], '
+        '"overture": ["ov-hel"]}, "name": "Helsinki", "country_code": "FI", '
+        '"minted_from": "t", "minted_in": "t 1"}\n'
+        '{"place_id": "tp_2", "kind": "metro", "concordances": {"cbsa": ["16980"]}, '
+        '"name": "M", "country_code": "US", "minted_from": "t", "minted_in": "t 1"}\n'
+        '{"place_id": "tp_3", "status": "merged", "into": "tp_1", '
+        '"concordances": {"wikidata": ["Q13291"]}, "at": "2026-09-08", "reason": "dup"}\n'
+    )
+    reg = registry.load(path)
+    helsinki = publish._identity({"place_id": "tp_1", "wikidata_id": "Q1757"}, reg)
+    assert helsinki == {
+        "wikidata_id": "Q1757",
+        "concordances": json.dumps(
+            {"overture": ["ov-hel"], "wikidata": ["Q1757", "Q13291"]}, sort_keys=True
+        ),
+        "former_ids": ["tp_3"],
+    }
+    metro = publish._identity({"place_id": "tp_2", "wikidata_id": None}, reg)
+    assert metro == {
+        "wikidata_id": None,
+        "concordances": json.dumps({"cbsa": ["16980"]}),
+        "former_ids": [],
+    }
+    # A generation built on another registry — a QID key, a merged id, a
+    # QID the registry does not key the place by — is refused.
+    for record, message in (
+        ({"place_id": "Q1757"}, "live own ids"),
+        ({"place_id": "tp_3"}, "live own ids"),
+        ({"place_id": "tp_9"}, "no such place"),
+        ({"place_id": "tp_1", "wikidata_id": "Q13291"}, "the registry 'Q1757'"),
+    ):
+        with pytest.raises(publish.PublishError, match=message):
+            publish._identity(record, reg)
+    # Without a registry, an own-id key or a disagreeing QID is refused.
+    for record in ({"place_id": "tp_1"}, {"place_id": "Q1757", "wikidata_id": "Q2"}):
+        with pytest.raises(publish.PublishError):
+            publish._identity(record, None)
+    # A registry-only change is a new snapshot: the identity digest moves.
+    rows = [{"place_id": "tp_1", "wikidata_id": "Q1757"}]
+    before = publish._identity_digest(publish._identities(rows, reg))
+    path.write_text(
+        path.read_text().replace(
+            '"overture": ["ov-hel"]', '"overture": ["ov-hel", "ov-2"]'
+        )
+    )
+    after = publish._identity_digest(publish._identities(rows, registry.load(path)))
+    assert before != after
+
+
+def test_a_registry_backed_index_reads_back_its_identity(tmp_path):
+    from index_build import registry
+
+    # Helsinki keyed by its own id, with a QID the registry merged into it,
+    # and a QID-less metro: published and read back as schema 6.
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text(
+        '{"next_id": 4, "registry": 1}\n'
+        '{"place_id": "tp_1", "kind": "city", "concordances": {"wikidata": ["Q1757"], '
+        '"overture": ["ov-hel"]}, "name": "Helsinki", "country_code": "FI", '
+        '"minted_from": "t", "minted_in": "t 1"}\n'
+        '{"place_id": "tp_2", "kind": "metro", "concordances": {"cbsa": ["16980"]}, '
+        '"name": "M", "country_code": "US", "minted_from": "t", "minted_in": "t 1"}\n'
+        '{"place_id": "tp_3", "status": "merged", "into": "tp_1", '
+        '"concordances": {"wikidata": ["Q13291"]}, "at": "2026-09-08", "reason": "dup"}\n'
+    )
+    places = [
+        {
+            **_place(
+                "tp_1", "city", geometry=GEOM_HEX, name="Helsinki", metro_ids=["tp_2"]
+            ),
+            "wikidata_id": "Q1757",
+        },
+        {**_place("tp_2", "metro", name="M", member_ids=["tp_1"]), "wikidata_id": None},
+    ]
+    cache, _ = _build_index(
+        tmp_path,
+        places=places,
+        registry=registry.load(path),
+        run_digest=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    index = transitio_index.read_index(cache / "index")
+    assert index.schema_version == 6
+    helsinki = transitio_index.place("tp_1", index=index)
+    assert helsinki.wikidata_id == "Q1757" and helsinki.former_ids == ["tp_3"]
+    assert helsinki.concordances == {
+        "overture": ["ov-hel"],
+        "wikidata": ["Q1757", "Q13291"],
+    }
+    # The canonical QID, the merged-away QID and the former id all resolve.
+    for query in ("Q1757", "Q13291", "tp_3"):
+        assert transitio_index.place(query, index=index) == helsinki
+    metro = transitio_index.place("tp_2", index=index)
+    assert metro.wikidata_id is None and metro.concordances == {"cbsa": ["16980"]}
+    assert helsinki.metros == [metro] and metro.members == [helsinki]
+
+
+def test_the_publisher_refuses_a_registry_the_gazetteer_did_not_run_with(tmp_path):
+    from index_build import registry
+
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    cache, _ = _build_index(tmp_path, places=PLACES)
+    # A writable session, no run at all, then a run on another registry:
+    # each refused.
+    with registry.session(path) as writable:
+        with pytest.raises(publish.PublishError, match="read-only"):
+            publish._check_registry(cache, writable)
+    with pytest.raises(publish.PublishError, match="no gazetteer run"):
+        publish.publish(cache, registry=registry.load(path))
+    _publish_run_manifest(cache, "0" * 64)
+    with pytest.raises(publish.PublishError, match="rerun the gazetteer"):
+        publish.publish(cache, registry=registry.load(path))
+
+
+def test_a_place_without_a_qid_publishes_and_reads_back(tmp_path):
+    from index_build import registry
+
+    # Seeded by its Overture division and identified by it: published under
+    # its own id with a null QID, found by name.
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text(
+        '{"next_id": 2, "registry": 1}\n'
+        '{"place_id": "tp_1", "kind": "city", "concordances": {"overture": ["fi-tre"]}, '
+        '"name": "Tampere", "country_code": "FI", "minted_from": "t", "minted_in": "t 1"}\n'
+    )
+    places = [
+        {
+            **_place(
+                "tp_1", "city", geometry=GEOM_HEX, name="Tampere", country_code="FI"
+            ),
+            "wikidata_id": None,
+            "overture_id": "fi-tre",
+        }
+    ]
+    cache, _ = _build_index(
+        tmp_path,
+        places=places,
+        registry=registry.load(path),
+        run_digest=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    index = transitio_index.read_index(cache / "index")
+    tampere = transitio_index.place("Tampere", index=index)
+    assert tampere.id == "tp_1" and tampere.wikidata_id is None
+    assert tampere.concordances == {"overture": ["fi-tre"]} and tampere.former_ids == []

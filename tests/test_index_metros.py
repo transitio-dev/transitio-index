@@ -268,7 +268,7 @@ def _run(tmp_path, metro_map, overrides_dir=None, candidates=None, registry=None
     places, _ = store.read_jsonl(
         cache / "gazetteer", "metros.json", "places_seed.jsonl"
     )
-    return manifest, {p["place_id"]: p for p in places}
+    return manifest, {p.get("wikidata_id") or p["place_id"]: p for p in places}
 
 
 def _artefact(tmp_path, name):
@@ -289,10 +289,10 @@ def test_metro_rows_are_identified_with_their_statistical_code(tmp_path):
     metro = places["Q1754965"]
     assert metro["wikidata_id"] == "Q1754965" and manifest["identified"] == 1
     saved = registry.load(path)
-    assert saved.resolve("cbsa:16980") == metro["tp_id"] == saved.resolve("Q1754965")
-    assert saved.rows[metro["tp_id"]]["minted_from"] == "cbsa:16980"
-    assert saved.rows[metro["tp_id"]]["minted_in"].startswith("wikidata P8138 ")
-    assert places["Q1297"]["tp_id"] == saved.resolve("Q1297")
+    assert saved.resolve("cbsa:16980") == metro["place_id"] == saved.resolve("Q1754965")
+    assert saved.rows[metro["place_id"]]["minted_from"] == "cbsa:16980"
+    assert saved.rows[metro["place_id"]]["minted_in"].startswith("wikidata P8138 ")
+    assert places["Q1297"]["place_id"] == saved.resolve("Q1297")
 
 
 def test_a_curated_metro_gains_its_discovered_code_before_identification(tmp_path):
@@ -322,7 +322,7 @@ def test_a_curated_metro_gains_its_discovered_code_before_identification(tmp_pat
     metro = places["Q1754965"]
     assert metro["statistical_area_id"] == "16980" and metro["country_code"] == "US"
     saved = registry.load(path)
-    assert saved.resolve("cbsa:16980") == metro["tp_id"] == saved.resolve("Q1754965")
+    assert saved.resolve("cbsa:16980") == metro["place_id"] == saved.resolve("Q1754965")
 
 
 def test_a_metro_place_and_its_memberships_are_attached(tmp_path):
@@ -488,7 +488,7 @@ def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
     assert metro["member_ids"] == ["Q1297"]
     assert "Q1754965" not in places["Q28515"]["metro_ids"]
     wikidata = fx.StubWikidata(metros={"Q28515": [CHICAGO_METRO]})
-    assert expand._attach_metros(places, ["Q28515"], wikidata, []) == []
+    assert expand._attach_metros(places, ["Q28515"], wikidata, []) == ([], ["Q1754965"])
     assert metro["member_ids"] == ["Q1297"]
     assert manifest["places"] == len(places)
     # places.yaml edited between the seed and metros stages: refused.
@@ -722,3 +722,147 @@ def test_the_derived_credits_reach_the_inventory_and_notice(tmp_path):
         notice = generation.read_bytes("NOTICE").decode("utf-8")
     assert "Source: Eurostat, metropolitan regions (NUTS 2021)" in notice
     assert "© EuroGeographics for the administrative boundaries" in notice
+
+
+def test_curated_members_resolve_through_the_registry(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    metro_map = {"Q1297": [CHICAGO_METRO], "Q28515": [CHICAGO_METRO]}
+    with registry.session(path) as reg:
+        _run(tmp_path, metro_map, registry=reg)
+        reg.save()
+    chicago = registry.load(path).resolve("Q1297")
+    directory = write_overrides(
+        tmp_path, places=[{"place": "cbsa:16980", "set_place_members": [chicago]}]
+    )
+    with registry.session(path) as reg:
+        _, places = _run(tmp_path, metro_map, overrides_dir=directory, registry=reg)
+    assert places["Q1754965"]["member_ids"] == [places["Q1297"]["place_id"]]
+
+
+def test_wikidata_is_asked_for_qids_only(tmp_path):
+    class Recording(fx.StubWikidata):
+        asked = []
+
+        def statistical_metros(self, city_qids):
+            self.asked.append(list(city_qids))
+            return {}
+
+        def metro_candidates(self, city_qids):
+            self.asked.append(list(city_qids))
+            return {}
+
+    # A city keyed by its own id — a curated place without a QID — is
+    # never sent to Wikidata; the QID-keyed one is.
+    places = [
+        {"place_id": "tp_9", "kind": "city", "country_code": "US", "metro_ids": []},
+        {"place_id": "Q1297", "kind": "city", "country_code": "US", "metro_ids": []},
+    ]
+    stub = Recording()
+    metros._attach_us(places, {p["place_id"]: p for p in places}, {}, [], stub)
+    metros._candidates(stub, {"C1": ["tp_9", "Q1297"]})
+    assert stub.asked == [["Q1297"], ["Q1297"]]
+
+
+def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    # Curated without a QID, by its CBSA concordance: the metro Wikidata
+    # discovers under that code joins the row rather than doubling it.
+    directory = write_overrides(
+        tmp_path,
+        places=[
+            {
+                "place": "cbsa:16980",
+                "add_place": {
+                    "kind": "metro",
+                    "name": "Chicagoland",
+                    "member_ids": ["Q1297"],
+                },
+            }
+        ],
+    )
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        _, places = _run(
+            tmp_path, {"Q28515": [CHICAGO_METRO]}, overrides_dir=directory, registry=reg
+        )
+        assert reg.enriched == 1
+        reg.save()
+    metro = places["Q1754965"]
+    assert metro["name"] == "Chicagoland" and metro["members_curated"]
+    assert metro["member_ids"] == [places["Q1297"]["place_id"]]
+    assert sum(1 for p in places.values() if p["kind"] == "metro") == 1
+    saved = registry.load(path)
+    assert saved.resolve("Q1754965") == saved.resolve("cbsa:16980") == metro["place_id"]
+    # A rebuild keys the curated metro by its own id and still joins on the
+    # code it carries; nothing is minted.
+    with registry.session(path) as again:
+        _, places = _run(
+            tmp_path,
+            {"Q28515": [CHICAGO_METRO]},
+            overrides_dir=directory,
+            registry=again,
+        )
+        assert again.minted == 0
+    assert sum(1 for p in places.values() if p["kind"] == "metro") == 1
+    assert places["Q1754965"]["statistical_area_id"] == "16980"
+
+
+def test_a_code_matches_only_within_its_scheme():
+    rows = {
+        "tp_1": {
+            "kind": "metro",
+            "statistical_area_id": "16980",
+            "source_subtype": "metropolitan region",
+        },
+        "tp_2": {
+            "kind": "metro",
+            "statistical_area_id": "16980",
+            "source_subtype": "metropolitan statistical area",
+        },
+    }
+    assert (
+        metros._by_code(rows, "16980", "metropolitan statistical area") is rows["tp_2"]
+    )
+    assert metros._by_code(rows, "16980", "metropolitan region") is rows["tp_1"]
+    assert metros._by_code(rows, "99999", "metropolitan region") is None
+
+
+@pytest.mark.parametrize("alias_first", [False, True])
+@pytest.mark.parametrize("code", ["16980", "99999"], ids=["same code", "other code"])
+def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, code):
+    # Q999 is a merged alias of the Chicago MSA's QID in the registry: a
+    # source naming it finds the survivor's row whichever record comes
+    # first — one row with the same code, a conflict with another — never a
+    # second row that folds away silently.
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text(
+        '{"next_id": 3, "registry": 1}\n'
+        '{"place_id": "tp_1", "kind": "metro", "concordances": {"wikidata": ["Q1754965"], '
+        '"cbsa": ["16980"]}, "name": "Chicago", "country_code": "US", '
+        '"minted_from": "t", "minted_in": "t 1"}\n'
+        '{"place_id": "tp_2", "status": "merged", "into": "tp_1", '
+        '"concordances": {"wikidata": ["Q999"]}, "at": "2026-09-08", "reason": "dup"}\n'
+    )
+    other = {**CHICAGO_METRO, "qid": "Q999", "cbsa": code}
+    metro_map = {"Q1297": [CHICAGO_METRO], "Q28515": [other]}
+    if alias_first:
+        metro_map = dict(reversed(metro_map.items()))
+    with registry.session(path) as reg:
+        if code != "16980":
+            with pytest.raises(
+                overture.GazetteerError, match="carries statistical code"
+            ):
+                _run(tmp_path, metro_map, registry=reg)
+            return
+        _, places = _run(tmp_path, metro_map, registry=reg)
+    assert sum(1 for p in places.values() if p["kind"] == "metro") == 1
+    metro = places["Q1754965"]
+    assert metro["place_id"] == "tp_1" and "discovered_qids" not in metro
+    assert sorted(metro["member_ids"]) == sorted(
+        places[q]["place_id"] for q in ("Q1297", "Q28515")
+    )

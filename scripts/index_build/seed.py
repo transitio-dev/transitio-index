@@ -5,8 +5,9 @@ to an Overture locality/localadmin by name within its country — disambiguated 
 the declared subdivision — resolves that division to a QID with the same rules as
 the skeleton stage, and emits the city place plus its administrative ancestors as
 ``places_seed.jsonl``. A feed that declares only a subdivision resolves to that
-region instead. A feed whose location does not resolve to a single QID-bearing
-place is reported, never minted.
+region instead. A feed whose location does not resolve to a single place — a
+QID-bearing division, or a named one no QID names, identified by its Overture
+id — is reported, never minted.
 
 Matching folds accents and case and considers every language label a division
 carries, so a feed naming a place in a local language still resolves. Only feeds
@@ -143,8 +144,13 @@ def _resolve_candidates(candidates, wikidata):
     }
     p402_map = wikidata.p402(pending) if pending else {}
     for record in candidates:
-        qid, method, _ = overture.resolve_qid(record, p402_map)
+        qid, method, reason = overture.resolve_qid(record, p402_map)
         record["qid"] = qid
+        record["resolution_reason"] = reason
+        # Resolved like the skeleton stage resolves it: a named division no
+        # QID names is identified by its Overture id.
+        if qid is None and overture.qidless_place(record):
+            method = "overture_id"
         record["resolution_method"] = method
 
 
@@ -168,11 +174,13 @@ def _unique_identity(candidates):
     qids = {c["qid"] for c in candidates if c["qid"]}
     if len(qids) > 1:
         return None, "the name matches divisions with conflicting QIDs"
-    if not qids:
-        return None, "the matched division has no QID"
-    if any(not c["qid"] for c in candidates):
+    if not qids and len({c["overture_id"] for c in candidates}) > 1:
+        return None, "the name matches several divisions without a QID"
+    if not qids and not all(overture.qidless_place(c) for c in candidates):
+        return None, "the matched division's identity signals conflict"
+    if qids and any(not c["qid"] for c in candidates):
         return None, "the name also matches a division without a QID"
-    qid = qids.pop()
+    qid = qids.pop() if qids else None
     best = min(
         (c for c in candidates if c["qid"] == qid),
         key=lambda c: (
@@ -193,7 +201,8 @@ def _lookup(index, country, name):
 
 
 def match(index, country, subdivision, municipality, skeleton):
-    """The single QID-bearing city for a declared location, or ``(None, why)``.
+    """The single city for a declared location — QID-bearing, or a named
+    division no QID names — or ``(None, why)``.
 
     A declared subdivision must corroborate the match: it is required to name
     one of the candidate's region/county ancestors, so a lone same-name city in
@@ -211,11 +220,18 @@ def match(index, country, subdivision, municipality, skeleton):
     return _unique_identity(candidates)
 
 
+def place_key(record):
+    """The key a resolved division has inside the stages: its QID, or
+    ``overture:<id>`` for a division no QID names — the concordance the
+    registry identifies it by."""
+    return record["qid"] or f"overture:{record['overture_id']}"
+
+
 def _place(record, *, parent_id):
     """A places_seed row from a resolved division (geometry added later)."""
     relations = record.get("osm_relation_ids") or []
     return {
-        "place_id": record["qid"],
+        "place_id": place_key(record),
         "kind": record["kind"],
         "source_subtype": record["source_subtype"],
         "name": record["name"],
@@ -232,10 +248,11 @@ def _place(record, *, parent_id):
 
 
 def _ancestor_places(division, skeleton):
-    """The division's admin ancestors as places, and its parent QID.
+    """The division's admin ancestors as places, and its parent key.
 
     Ancestors come from the division's Overture hierarchy; each is emitted as a
-    place using the QID the skeleton stage already resolved for it. An ancestor
+    place under the key the skeleton stage gives it — its QID, or its Overture
+    id for a named division no QID names. An ancestor
     the skeleton could not resolve is skipped, and ``parent_id`` links only
     resolved rungs, so the chain never points at an id that was never minted.
     """
@@ -246,7 +263,7 @@ def _ancestor_places(division, skeleton):
         if resolved is None:
             continue
         places.append(_place(resolved, parent_id=parent_id))
-        parent_id = resolved["qid"]
+        parent_id = place_key(resolved)
     return places, parent_id
 
 
@@ -329,10 +346,11 @@ def _resolve_place_overrides(candidates, entries, report):
 
 
 def _add_place_overrides(places, entries, report):
-    """Curated places upserted into the seed: a real QID, a kind, a name,
-    and either a boundary (attached by the geometry stage) or a member list
-    (a metro's cities, linked reciprocally). ``curated`` exempts them from
-    pruning. Judged against the row that exists, if any."""
+    """Curated places upserted into the seed: a place reference — a QID, or
+    a concordance the place is minted from — a kind, a name, and either a
+    boundary (attached by the geometry stage) or a member list (a metro's
+    cities, linked reciprocally). ``curated`` exempts them from pruning.
+    Judged against the row that exists, if any."""
     for entry in entries:
         spec = entry["add_place"]
         place_id = entry["place"]
@@ -422,14 +440,27 @@ def _add_place_overrides(places, entries, report):
             place_id = (places.get(place_id) or {}).get("parent_id")
 
 
+def _key_concordance(key, registry):
+    """The concordances a stage's key states: a QID; ``namespace:value``
+    for a curated place minted from another concordance; or, for an own id
+    a QID-less place resolves to on a rebuild, everything its row carries."""
+    if overture.QID_PATTERN.match(key):
+        return {"wikidata": [key]}
+    if _registry.ID_PATTERN.match(key):
+        return {ns: list(values) for ns, values in registry.effective(key).items()}
+    namespace, value = key.split(":", 1)
+    return {namespace: [value]}
+
+
 def _identify_places(places, registry, places_digest):
     """Give every place its registry id — found by its concordances or
-    minted — beside the QID, which stays the key for now."""
+    minted — and the QID the registry keys it by; ``rekey_by_own_id`` then
+    makes the id the key."""
     if registry is None:
         return 0
     for place_id in sorted(places):
         row = places[place_id]
-        concordances = {"wikidata": [place_id]}
+        concordances = _key_concordance(place_id, registry)
         if row.get("overture_id"):
             concordances["overture"] = [row["overture_id"]]
             minted_from = f"overture:{row['overture_id']}"
@@ -447,21 +478,91 @@ def _identify_places(places, registry, places_digest):
             minted_from=minted_from,
             minted_in=minted_in,
         )
-        _shadow_gate(registry, row["tp_id"], place_id)
-        row["wikidata_id"] = place_id
+        row["wikidata_id"] = registry.canonical_qid(row["tp_id"])
+        if row["kind"] == "metro" and not row.get("statistical_area_id"):
+            _restore_statistical_identity(row, registry.effective(row["tp_id"]))
     return len(places)
 
 
-def _shadow_gate(registry, tp_id, qid):
-    """While the QID is the place key, it must be the registry's canonical
-    QID for the id: a QID merged into another place would otherwise give
-    two keyed rows one id. Re-keying arrives with the cutover."""
-    canonical = registry.canonical_qid(tp_id)
-    if canonical != qid:
-        raise _registry.RegistryError(
-            f"{qid}: the registry keys {tp_id} by {canonical!r}; "
-            "the shadow phase cannot re-key it"
-        )
+STATISTICAL_SUBTYPES = {
+    "cbsa": "metropolitan statistical area",
+    "eurostat_metro": "metropolitan region",
+}
+
+
+def _restore_statistical_identity(row, concordances):
+    """A metro keyed by its statistical code carries that code and its
+    scheme's subtype on every build, so the metro a stage discovers under
+    the code joins it."""
+    for namespace, subtype in STATISTICAL_SUBTYPES.items():
+        if concordances.get(namespace):
+            row["statistical_area_id"] = concordances[namespace][0]
+            row["source_subtype"] = row.get("source_subtype") or subtype
+            return
+
+
+def rekey(rows, *, by, records=(), canonical=None):
+    """``rows`` keyed by the field ``by`` — ``tp_id`` for the own id every
+    identified row carries, ``wikidata_id`` for the QID a stage joins on —
+    with the links between them (``parent_id``, ``default_metro_id``,
+    ``metro_ids``, ``member_ids``) and the place ids in ``records`` mapped
+    alike. A row without the field keeps its key. Two rows the registry
+    calls one place become one: the row keyed by the place's canonical QID
+    (``canonical``, key by target) survives, else the first."""
+    mapping = {key: row.get(by) or key for key, row in rows.items()}
+    canonical = canonical or {}
+
+    def order(key):
+        # The key is the QID the row was seeded by; identification has
+        # already given every converging row the survivor's canonical QID.
+        return (mapping[key], key != canonical.get(mapping[key]), key)
+
+    out = {}
+    for key in sorted(rows, key=order):
+        row = rows[key]
+        target = mapping[key]
+        if target in out:
+            # The same place under another key: its links fold into the
+            # survivor, the rest of the row is the survivor's.
+            survivor = out[target]
+            for field in ("metro_ids", "member_ids"):
+                survivor[field] = sorted(
+                    set(survivor.get(field) or []) | set(row.get(field) or [])
+                )
+            continue
+        row["place_id"] = target
+        for field in ("parent_id", "default_metro_id"):
+            if row.get(field):
+                row[field] = mapping.get(row[field], row[field])
+        for field in ("metro_ids", "member_ids"):
+            if field in row:
+                row[field] = sorted({mapping.get(v, v) for v in row[field] or []})
+        out[target] = row
+    for row in out.values():
+        for field in ("metro_ids", "member_ids"):
+            if field in row:
+                row[field] = sorted({mapping.get(v, v) for v in row[field]})
+    for record in records:
+        for field in ("place_id", "city_id", "metro_id"):
+            if record.get(field) in mapping:
+                record[field] = mapping[record[field]]
+    return out
+
+
+def rekey_by_own_id(rows, registry, records=()):
+    """The rows of a stage keyed by their own ids, the way it publishes them."""
+    canonical = {
+        row["tp_id"]: registry.canonical_qid(row["tp_id"])
+        for row in rows.values()
+        if row.get("tp_id")
+    }
+    return rekey(rows, by="tp_id", records=records, canonical=canonical)
+
+
+def rekey_by_qid(rows):
+    """Published rows keyed by their QIDs again, for a stage that joins on
+    them; a row without a QID keeps its own id."""
+    return rekey(rows, by="wikidata_id")
 
 
 def resolve_seed(
@@ -472,6 +573,7 @@ def resolve_seed(
     overrides_dir=None,
     strict=False,
     registry=None,
+    run=None,
 ):
     """Build ``places_seed.jsonl`` from the feeds' declared locations.
 
@@ -490,7 +592,10 @@ def resolve_seed(
         cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
     )
     resolved_divisions, _ = store.read_jsonl(
-        cache_dir / "gazetteer", "overture.json", "overture_divisions.jsonl"
+        cache_dir / "gazetteer",
+        "overture.json",
+        "overture_divisions.jsonl",
+        generations=run,
     )
     skeleton = {record["overture_id"]: record for record in resolved_divisions}
     region_index = _index([r for r in skeleton.values() if r["kind"] == "region"])
@@ -507,7 +612,9 @@ def resolve_seed(
         dataset = overture.overture_dataset()
     candidates = read_city_candidates(dataset, countries, wanted)
     _resolve_candidates(candidates, wikidata)
-    place_overrides, places_digest = overrides.load_place_overrides(overrides_dir)
+    place_overrides, places_digest = overrides.load_place_overrides(
+        overrides_dir, registry=registry, internal=True
+    )
     override_report = []
     resolved_by_hand = _resolve_place_overrides(
         candidates,
@@ -561,7 +668,7 @@ def resolve_seed(
         placements.append(
             {
                 "feed_id": location["feed_id"],
-                "place_id": division["qid"],
+                "place_id": place_key(division),
                 "level": level,
             }
         )
@@ -569,6 +676,8 @@ def resolve_seed(
     added = overrides.by_operation(place_overrides, "add_place")
     _add_place_overrides(places, added, override_report)
     identified = _identify_places(places, registry, places_digest)
+    if registry is not None:
+        places = rekey_by_own_id(places, registry, records=placements)
 
     manifest = {
         "source": "seed",
@@ -606,7 +715,10 @@ def resolve_seed(
                 },
                 manifest,
                 held=directory,
+                staged=run is not None,
             )
+            if run is not None:
+                run["seed.json"] = published["generation"]
             overrides.strict_check(strict, override_report, "seed")
             return published
     finally:

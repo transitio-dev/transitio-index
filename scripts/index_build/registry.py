@@ -282,6 +282,16 @@ def _survivor(rows, place_id):
     return row["into"] if row.get("status") == "merged" else place_id
 
 
+def _former_index(rows):
+    """``{survivor: [merged ids]}`` over the merged rows, each list in
+    numeric order of the ids."""
+    former = {}
+    for place_id, row in rows.items():
+        if row.get("status") == "merged":
+            former.setdefault(_survivor(rows, place_id), []).append(place_id)
+    return {k: sorted(v, key=lambda i: int(i[3:])) for k, v in former.items()}
+
+
 def _index(rows, where):
     """``{(namespace, value): live id}`` over effective values, merged rows
     resolving to their successor; a value on two places is an error."""
@@ -341,6 +351,8 @@ class Registry:
         self.minted = 0
         self.enriched = 0
         self._index = _index(rows, str(path))
+        # Merges arrive only with the file, so the index is built once.
+        self._former = _former_index(rows)
 
     @property
     def next_id(self):
@@ -364,6 +376,11 @@ class Registry:
         (a merged id's survivor; a retired one refused), or None."""
         return (self.effective(self.survivor(place_id)).get("wikidata") or [None])[0]
 
+    def former_ids(self, place_id):
+        """The ids merged into the live place ``place_id``, each of which
+        still resolves to it, in numeric order."""
+        return list(self._former.get(self.survivor(place_id), []))
+
     def lookup(self, namespace, value):
         return self._index.get((namespace, value))
 
@@ -386,6 +403,31 @@ class Registry:
         if found is None:
             raise RegistryError(f"{reference!r}: no place carries it")
         return found
+
+    def key_for(self, reference, *, mint=False, internal=False, strict=False):
+        """The current key of the row ``reference`` names — its own id, or
+        with ``internal`` the canonical QID a QID-keyed stage joins on (the
+        own id for a row without one) — or the reference itself when no row
+        carries it and it may name a place still to be minted: a bare QID
+        always — on a first build no row exists yet, and a QID that names
+        nothing surfaces as a stale override where it is applied — and any
+        concordance under ``mint``; ``strict``, for a consumer of the
+        finished gazetteer, refuses an unknown QID too. Other unknown
+        references are refused."""
+        if isinstance(reference, str) and QID_PATTERN.match(reference):
+            if self.lookup("wikidata", reference) is None:
+                if strict:
+                    raise RegistryError(f"{reference!r}: no place carries it")
+                return reference
+        try:
+            place_id = self.resolve(reference)
+        except RegistryError:
+            if mint and _mintable(reference):
+                return reference
+            raise
+        if internal:
+            return self.canonical_qid(place_id) or place_id
+        return place_id
 
     def _refuse_change(self, what):
         if self.read_only:
@@ -475,7 +517,7 @@ class Registry:
         changed; refused, changed or not, when the file is no longer the one
         this session last saw, so a run never commits against an edit made
         underneath it."""
-        if hashlib.sha256(_read(self.path)).hexdigest() != self.digest:
+        if file_digest(self.path) != self.digest:
             raise RegistryError(f"{self.path}: changed since it was loaded; not saved")
         if not self.changed:
             return self.digest
@@ -499,6 +541,20 @@ class Registry:
             "minted": self.minted,
             "enriched": self.enriched,
         }
+
+
+def file_digest(path):
+    """The SHA-256 of the registry file as it is on disk."""
+    return hashlib.sha256(_read(path)).hexdigest()
+
+
+def _mintable(reference):
+    """A well-formed ``namespace:value`` no row carries: a place a curated
+    ``add_place`` may mint from."""
+    if not isinstance(reference, str) or ":" not in reference:
+        return False
+    namespace, value = reference.split(":", 1)
+    return namespace in NAMESPACES and bool(value)
 
 
 def load(path):
