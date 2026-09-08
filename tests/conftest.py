@@ -15,4 +15,4 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 _fixtures = os.environ.get("TRANSITIO_TESTS")
 if _fixtures:
-    sys.path.insert(0, _fixtures)
+    sys.path.append(_fixtures)
