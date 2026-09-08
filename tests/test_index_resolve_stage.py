@@ -1,6 +1,4 @@
-
 import pytest
-
 
 pytest.importorskip("yaml")
 import yaml  # noqa: E402

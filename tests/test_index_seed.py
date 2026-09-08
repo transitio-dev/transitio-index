@@ -1,6 +1,4 @@
-
 import pytest
-
 
 pytest.importorskip("pyarrow")
 import overture_fixture as fx  # noqa: E402

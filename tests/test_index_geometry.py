@@ -1,6 +1,4 @@
-
 import pytest
-
 
 pytest.importorskip("pyarrow")
 import shapely  # noqa: E402

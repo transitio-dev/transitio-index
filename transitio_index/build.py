@@ -329,7 +329,8 @@ STAGES = {
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        prog="python -m transitio_index.build", description="Build the transitio feed index"
+        prog="python -m transitio_index.build",
+        description="Build the transitio feed index",
     )
     parser.add_argument(
         "--stage", required=True, choices=sorted(STAGES), help="build stage to run"

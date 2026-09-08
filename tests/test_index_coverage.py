@@ -1,4 +1,3 @@
-
 import pytest
 
 import hashlib  # noqa: E402

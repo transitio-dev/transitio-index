@@ -5,7 +5,6 @@ import urllib.request
 
 import pytest
 
-
 pytest.importorskip("pyarrow")
 import eurostat_fixture as efx  # noqa: E402
 import overture_fixture as fx  # noqa: E402
