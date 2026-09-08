@@ -449,7 +449,7 @@ _PLACE_OPERATIONS = frozenset(
 )
 # The statistical schemes a curated crosswalk may name; a metro published
 # under one carries the scheme's code as its ``statistical_area_id``.
-STATISTICAL_SCHEMES = frozenset({"eurostat_metro"})
+STATISTICAL_SCHEMES = frozenset({"eurostat_metro", "fao_city_region"})
 _STATISTICAL_AREA_FIELDS = frozenset({"scheme", "code"})
 _PLACE_METADATA = frozenset(
     {"place", "source_ref", "reason", "author", "date", "evidence_hash"}
