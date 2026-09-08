@@ -1,16 +1,11 @@
 import io
 import struct
-import sys
 import zipfile
 import zlib
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import ziprange  # noqa: E402
+from transitio_index import ziprange  # noqa: E402
 
 STOPS = b"stop_id,stop_name\n1,Central\n2,Harbour\n"
 ROUTES = b"route_id,route_type\nr1,3\n"

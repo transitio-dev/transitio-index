@@ -1,15 +1,9 @@
 """The places.yaml loader and the shared override staleness helpers."""
 
-import sys
-from pathlib import Path
-
 import pytest
 import yaml
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import overrides  # noqa: E402
+from transitio_index import overrides  # noqa: E402
 
 
 def write_overrides(tmp_path, *, places=None, feeds=None, name="overrides"):
@@ -248,7 +242,7 @@ def test_staleness_is_judged_against_the_current_evidence():
 
 
 def registry_with_two_places(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     path = tmp_path / "places_registry.jsonl"
     path.write_text('{"next_id": 1, "registry": 1}\n')

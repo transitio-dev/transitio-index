@@ -4,16 +4,10 @@ import os
 import subprocess
 import sys
 import tarfile
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "scripts" / "build_index.py"
-
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import csv_source, gbfs, mdb, store  # noqa: E402
+from transitio_index import csv_source, gbfs, mdb, store  # noqa: E402
 
 
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
@@ -503,7 +497,7 @@ def _atlas_archive(tmp_path):
 def test_mdb_and_atlas_coexist_in_one_cache(tmp_path):
     # Two catalogue sources, two pointers in one store: re-publishing one
     # must not prune the other's live generation.
-    from index_build import atlas
+    from transitio_index import atlas
 
     cache = tmp_path / "cache"
     atlas.ingest(cache, archive=_atlas_archive(tmp_path), commit="a" * 40)
@@ -537,7 +531,8 @@ def test_cli_ingests_mdb_offline(tmp_path):
     completed = subprocess.run(
         [
             sys.executable,
-            str(SCRIPT),
+            "-m",
+            "transitio_index.build",
             "--stage",
             "ingest",
             "--source",
@@ -566,7 +561,8 @@ def test_cli_ingests_mdb_and_gbfs_offline(tmp_path):
     completed = subprocess.run(
         [
             sys.executable,
-            str(SCRIPT),
+            "-m",
+            "transitio_index.build",
             "--stage",
             "ingest",
             "--source",

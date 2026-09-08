@@ -1,20 +1,14 @@
 import hashlib
-import sys
 import urllib.request
-from pathlib import Path
 
 import pytest
-
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import fao_fixture as ffx  # noqa: E402
 
-from index_build import geometry, store, ucdb  # noqa: E402
+from transitio_index import geometry, store, ucdb  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

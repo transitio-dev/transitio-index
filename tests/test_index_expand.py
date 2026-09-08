@@ -1,18 +1,13 @@
 import hashlib
 import json
-import sys
-from pathlib import Path
 
 import pytest
-
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
 
 pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
-from index_build import boundaries, crawl, expand, overture, store  # noqa: E402
+from transitio_index import boundaries, crawl, expand, overture, store  # noqa: E402
 
 # A source the geometry allowlist accepts, and one it does not.
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
@@ -340,7 +335,7 @@ def test_unparsable_stop_rows_are_skipped(tmp_path):
 def test_places_yaml_edited_after_the_gazetteer_refuses_to_expand(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     cache = tmp_path / "cache"
     _publish_names(cache, [])
@@ -390,7 +385,7 @@ def _publish_run(cache, registry_digest):
 
 def _seeded_registry(path, *seeded):
     """The registry the seed left: a row per seeded place, saved."""
-    from index_build import registry
+    from transitio_index import registry
 
     path.write_text(HEADER)
     rows = [("country", {"wikidata": ["Q33"], "overture": ["fi"]})]
@@ -403,7 +398,7 @@ def _seeded_registry(path, *seeded):
 
 
 def test_discoveries_are_identified_through_the_registry(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     cache = _crawled_cache(tmp_path)
     path = tmp_path / "places_registry.jsonl"
@@ -446,7 +441,7 @@ def test_discoveries_are_identified_through_the_registry(tmp_path):
 
 
 def test_expand_refuses_a_read_only_mint_and_a_stale_registry(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     cache = _crawled_cache(tmp_path)
     path = tmp_path / "places_registry.jsonl"
@@ -468,7 +463,7 @@ def test_expand_refuses_a_read_only_mint_and_a_stale_registry(tmp_path):
 
 
 def test_a_seeded_place_reached_through_a_new_division_is_enriched(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     cache = tmp_path / "cache"
     tampere = {
@@ -506,7 +501,7 @@ def test_a_seeded_place_reached_through_a_new_division_is_enriched(tmp_path):
 def test_a_crash_after_the_registry_save_is_recovered_by_a_gazetteer_rerun(
     tmp_path, monkeypatch
 ):
-    from index_build import registry
+    from transitio_index import registry
 
     cache = _crawled_cache(tmp_path)
     path = tmp_path / "places_registry.jsonl"
@@ -537,7 +532,7 @@ def test_a_crash_after_the_registry_save_is_recovered_by_a_gazetteer_rerun(
 
 
 def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     cache = tmp_path / "cache"
     path = tmp_path / "places_registry.jsonl"
@@ -576,7 +571,7 @@ def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
 
 @pytest.mark.parametrize("seeded", [False, True], ids=["new", "survivor seeded"])
 def test_a_discovered_alias_qid_is_its_survivor(tmp_path, seeded):
-    from index_build import registry
+    from transitio_index import registry
 
     cache = tmp_path / "cache"
     survivor = {
@@ -625,7 +620,7 @@ def test_a_discovered_alias_qid_is_its_survivor(tmp_path, seeded):
 
 
 def test_a_crawled_qid_for_a_place_known_by_its_division_joins_it(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     # Tampere was seeded without a QID, identified by its Overture division;
     # the crawl resolves that division with a QID: the seeded row gains the

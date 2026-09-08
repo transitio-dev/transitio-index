@@ -11,7 +11,7 @@ import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 import shapely  # noqa: E402
 
-from index_build import eurostat  # noqa: E402
+from transitio_index import eurostat  # noqa: E402
 
 
 def workbook(

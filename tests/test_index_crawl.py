@@ -1,18 +1,13 @@
 import hashlib
 import io
 import json
-import sys
 import threading
 import zipfile
-from pathlib import Path
 
 import httpx
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import crawl, fetch, store  # noqa: E402
+from transitio_index import crawl, fetch, store  # noqa: E402
 
 STOPS = b"stop_id,stop_lat,stop_lon\ns1,60.1,24.9\n"
 ROUTES = b"route_id,route_type\nr1,3\n"
@@ -609,7 +604,7 @@ def test_a_stale_skip_is_corrected_on_the_next_build(tmp_path):
     # complete read clears it, and classification builds the selectors.
     from test_index_classify import _candidate, _coverage, _records
 
-    from index_build import classify
+    from transitio_index import classify
 
     cache = tmp_path / "cache"
     members = _members(

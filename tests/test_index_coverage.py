@@ -1,15 +1,9 @@
-import sys
-from pathlib import Path
-
 import pytest
-
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
 
 import hashlib  # noqa: E402
 import json  # noqa: E402
 
-from index_build import coverage, crawl, overrides, store  # noqa: E402
+from transitio_index import coverage, crawl, overrides, store  # noqa: E402
 
 
 def _publish(cache, subdir, pointer, artifact, records, manifest=None):
@@ -540,7 +534,7 @@ def test_a_parent_cycle_cannot_loop_the_reach():
 def test_set_coverage_replaces_a_feeds_declared_placement(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     entries = [
         {

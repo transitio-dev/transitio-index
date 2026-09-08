@@ -1,13 +1,11 @@
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
 
-from index_build import golden, publish, store  # noqa: E402
+from transitio_index import golden, publish, store  # noqa: E402
 
 
 def _generation(cache, subdir, pointer, artifacts, manifest):

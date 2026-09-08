@@ -1,22 +1,16 @@
 import hashlib
 import io
 import json
-import sys
 import urllib.request
-from pathlib import Path
 
 import pytest
-
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 pytest.importorskip("pyarrow")
 import eurostat_fixture as efx  # noqa: E402
 import overture_fixture as fx  # noqa: E402
 import shapely  # noqa: E402
 
-from index_build import (  # noqa: E402
+from transitio_index import (  # noqa: E402
     eurostat,
     expand,
     geometry,
@@ -433,7 +427,7 @@ def test_statistical_metros_parses_and_skips_malformed(monkeypatch):
 def test_set_place_members_replaces_a_metros_members_reciprocally(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     both = {"Q1297": [CHICAGO_METRO], "Q28515": [CHICAGO_METRO]}
     entries = [
@@ -470,7 +464,7 @@ def test_set_place_members_replaces_a_metros_members_reciprocally(tmp_path):
 def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     entries = [
         {
@@ -878,7 +872,7 @@ def _fao_inputs(tmp_path):
     import hashlib
 
     import fao_fixture as ffx
-    from index_build import fao
+    from transitio_index import fao
 
     payloads = {
         fao.PATCHES_FILE: ffx.patches_zip(
@@ -1054,7 +1048,7 @@ def test_a_registry_backed_fao_metro_carries_its_region_not_a_cbsa(tmp_path):
 
 
 def test_the_fao_derived_version_covers_both_inputs():
-    from index_build import fao
+    from transitio_index import fao
 
     base = {"digests": {fao.PATCHES_FILE: "a" * 64, fao.REGIONS_FILE: "b" * 64}}
     other = {"digests": {fao.PATCHES_FILE: "c" * 64, fao.REGIONS_FILE: "b" * 64}}

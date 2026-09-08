@@ -1,15 +1,10 @@
 import hashlib
 import io
 import json
-import sys
 import tarfile
-from pathlib import Path
 
 import httpx
 import pytest
-
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
 
 from index_fixture import (  # noqa: E402
     API,
@@ -19,9 +14,9 @@ from index_fixture import (  # noqa: E402
     write_index,
 )
 
-import publish_index  # noqa: E402
-from index_build import publisher  # noqa: E402
-from index_build import atlas, classify, licensing, publish  # noqa: E402
+from transitio_index import publish_cli as publish_index  # noqa: E402
+from transitio_index import publisher  # noqa: E402
+from transitio_index import atlas, classify, licensing, publish  # noqa: E402
 from test_index_coverage import _write_crawl  # noqa: E402
 from test_index_publish import (  # noqa: E402
     PLACES,

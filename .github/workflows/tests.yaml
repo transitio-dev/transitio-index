@@ -20,8 +20,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install black flake8 flake8-bugbear
-      - run: black --check scripts tests
-      - run: flake8 scripts tests
+      - run: black --check transitio_index tests
+      - run: flake8 transitio_index tests
 
   test:
     needs: lint
@@ -44,13 +44,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      # The build runs from the checkout: install the released reader it
-      # writes for and the build's own libraries, then run the suite from
-      # scripts/ on the path (set up by conftest). There is no package to
-      # install yet.
-      - run: >
-          pip install "transitio>=0.11" geopandas httpx openpyxl pandas
-          pyarrow pyyaml shapely pytest
+      # Install the build as an editable package; its dependencies pull in the
+      # released reader it writes for and the build's own libraries. Editable
+      # keeps the golden default resolving to the repository's golden/.
+      - run: pip install -e ".[test]"
       - run: pytest
         env:
           TRANSITIO_TESTS: ${{ github.workspace }}/transitio-src/tests
@@ -76,4 +73,4 @@ jobs:
             rm -f "$RUNNER_TEMP/base_registry.jsonl"
             echo "no registry on the base commit: comparing against the header-only registry"
           fi
-          python scripts/check_registry_history.py "$RUNNER_TEMP/base_registry.jsonl" overrides/places_registry.jsonl
+          python -m transitio_index.registry_history "$RUNNER_TEMP/base_registry.jsonl" overrides/places_registry.jsonl

@@ -1,15 +1,10 @@
 import hashlib
 import io
-import sys
 import urllib.request
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import eurostat  # noqa: E402
+from transitio_index import eurostat  # noqa: E402
 
 PAYLOADS = {
     eurostat.COMPOSITION_FILE: b"PK\x03\x04 a workbook",

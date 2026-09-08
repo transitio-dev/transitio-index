@@ -1,17 +1,12 @@
 import json
-import sys
-from pathlib import Path
 
 import pytest
-
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
 
 pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
-from index_build import boundaries, store  # noqa: E402
+from transitio_index import boundaries, store  # noqa: E402
 
 CC0 = [{"dataset": "OpenStreetMap", "license": "ODbL", "property": ""}]
 
