@@ -830,3 +830,39 @@ def test_a_code_matches_only_within_its_scheme():
     )
     assert metros._by_code(rows, "16980", "metropolitan region") is rows["tp_1"]
     assert metros._by_code(rows, "99999", "metropolitan region") is None
+
+
+@pytest.mark.parametrize("alias_first", [False, True])
+@pytest.mark.parametrize("code", ["16980", "99999"], ids=["same code", "other code"])
+def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, code):
+    # Q999 is a merged alias of the Chicago MSA's QID in the registry: a
+    # source naming it finds the survivor's row whichever record comes
+    # first — one row with the same code, a conflict with another — never a
+    # second row that folds away silently.
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text(
+        '{"next_id": 3, "registry": 1}\n'
+        '{"place_id": "tp_1", "kind": "metro", "concordances": {"wikidata": ["Q1754965"], '
+        '"cbsa": ["16980"]}, "name": "Chicago", "country_code": "US", '
+        '"minted_from": "t", "minted_in": "t 1"}\n'
+        '{"place_id": "tp_2", "status": "merged", "into": "tp_1", '
+        '"concordances": {"wikidata": ["Q999"]}, "at": "2026-09-08", "reason": "dup"}\n'
+    )
+    other = {**CHICAGO_METRO, "qid": "Q999", "cbsa": code}
+    metro_map = {"Q1297": [CHICAGO_METRO], "Q28515": [other]}
+    if alias_first:
+        metro_map = dict(reversed(metro_map.items()))
+    with registry.session(path) as reg:
+        if code != "16980":
+            with pytest.raises(
+                overture.GazetteerError, match="carries statistical code"
+            ):
+                _run(tmp_path, metro_map, registry=reg)
+            return
+        _, places = _run(tmp_path, metro_map, registry=reg)
+    assert sum(1 for p in places.values() if p["kind"] == "metro") == 1
+    metro = places["Q1754965"]
+    assert metro["place_id"] == "tp_1" and "discovered_qids" not in metro
+    assert sorted(metro["member_ids"]) == sorted(
+        places[q]["place_id"] for q in ("Q1297", "Q28515")
+    )

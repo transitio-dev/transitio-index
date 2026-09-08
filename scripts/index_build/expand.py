@@ -87,6 +87,25 @@ def _digest(value):
     return isinstance(value, str) and bool(store.DIGEST_PATTERN.match(value))
 
 
+def _canonical_place_key(registry, qid, row):
+    """The key a discovered division stands for inside the stage: the key
+    the registry gives its QID, or — when the QID names no row — the one it
+    gives the division's Overture or OSM id, else the QID itself."""
+    key = metros._canonical_key(registry, qid)
+    if registry is None or key != qid:
+        return key
+    for namespace, value in (
+        ("overture", row.get("overture_id")),
+        ("osm_relation", row.get("osm_relation_id")),
+    ):
+        if value:
+            try:
+                return registry.key_for(f"{namespace}:{value}", internal=True)
+            except _registry.RegistryError:
+                continue
+    return key
+
+
 def _stop_points(feed_dir, state):
     """``(points, dropped)`` for one crawled feed's stops, or None.
 
@@ -131,7 +150,7 @@ def _attach_boundary(place, rows):
     place["geometry_source"] = "overture"
 
 
-def _attach_metros(places_by_id, new_cities, wikidata, report):
+def _attach_metros(places_by_id, new_cities, wikidata, report, registry=None):
     """US metro membership for the discovered cities, like the metros stage;
     ``(added, touched)`` — the metros minted, and every metro a discovered
     CBSA pair names, a seeded one included."""
@@ -159,7 +178,8 @@ def _attach_metros(places_by_id, new_cities, wikidata, report):
                     }
                 )
                 continue
-            metro = places_by_id.get(record["qid"])
+            key = metros._canonical_key(registry, record["qid"])
+            metro = places_by_id.get(key)
             if metro is not None and metro.get("kind") != "metro":
                 raise overture.GazetteerError(
                     f"metro {record['qid']!r} is already seeded as the "
@@ -173,9 +193,14 @@ def _attach_metros(places_by_id, new_cities, wikidata, report):
                 if metro is not None:
                     metro.setdefault("discovered_qids", []).append(record["qid"])
             if metro is None:
+                # Keyed by the lookup key, so a later record for the same
+                # place finds it; the QID the source named stays a concordance.
                 metro = metros._metro_place(record)
-                places_by_id[metro["place_id"]] = metro
-                added.append(metro["place_id"])
+                metro["place_id"] = key
+                if key != record["qid"]:
+                    metro.setdefault("discovered_qids", []).append(record["qid"])
+                places_by_id[key] = metro
+                added.append(key)
             metros._take_msa(metro, record)
             if metro["place_id"] not in touched:
                 touched.append(metro["place_id"])
@@ -247,15 +272,28 @@ def _discover(
     discovered = {}
     for record in skeleton.values():
         seed._add_place(discovered, skeleton, record)
+    # A discovered place the registry already knows — by a merged alias of
+    # its QID, or by its division when the QID is new — is the seeded row,
+    # and two aliases of one place are one row; every discovered row is
+    # still identified, enriching the survivor.
+    canonical = {
+        qid: _canonical_place_key(registry, qid, row) for qid, row in discovered.items()
+    }
     for qid, place in discovered.items():
-        existing = places_by_id.get(qid)
+        existing = places_by_id.get(canonical[qid])
         if existing is not None and existing.get("kind") != place.get("kind"):
             raise overture.GazetteerError(
                 f"{qid!r} is both the seeded {existing['kind']} "
                 f"{existing.get('name')!r} and the crawled {place['kind']} "
                 f"{place.get('name')!r}"
             )
-    new_ids = [qid for qid in discovered if qid not in places_by_id]
+    new_ids = []
+    taken = set()
+    for qid in discovered:
+        if canonical[qid] in places_by_id or canonical[qid] in taken:
+            continue
+        taken.add(canonical[qid])
+        new_ids.append(qid)
     # Boundaries come from a complete, id-filtered area read, so a multi-part
     # place ships whole even when its stops touched only one component.
     areas = geometry.read_areas(
@@ -269,7 +307,9 @@ def _discover(
         places_by_id[qid] = place
 
     new_cities = [qid for qid in new_ids if places_by_id[qid].get("kind") == "city"]
-    new_metros, metro_pairs = _attach_metros(places_by_id, new_cities, wikidata, report)
+    new_metros, metro_pairs = _attach_metros(
+        places_by_id, new_cities, wikidata, report, registry
+    )
     identified = 0
     if registry is not None:
         # Every resolved signal, a seeded place reached through a new
@@ -279,15 +319,29 @@ def _discover(
         identified += metros._identify_metros(
             {qid: places_by_id[qid] for qid in metro_pairs}, registry, None
         )
+        # A seeded row a discovery joined through its division publishes
+        # the QID the registry now keys it by, and is enriched under it.
+        joined = []
+        for qid, key in canonical.items():
+            row = places_by_id.get(key)
+            if key != qid and row is not None and row.get("tp_id"):
+                row["wikidata_id"] = registry.canonical_qid(row["tp_id"])
+                joined.append(key)
 
     # Enrichment covers the minted metros too, so every new place carries the
-    # same multilingual labels the names stage gives seeded ones.
-    enrich = new_ids + new_metros
-    labels = wikidata.labels_and_aliases(enrich) if enrich else {}
-    for qid in enrich:
+    # same multilingual labels the names stage gives seeded ones — by the
+    # QID each row carries after identification: a discovered alias takes
+    # its survivor's labels.
+    enrich = {
+        key: places_by_id[key].get("wikidata_id") or key
+        for key in new_ids + new_metros + (joined if registry is not None else [])
+    }
+    qids = sorted({q for q in enrich.values() if overture.QID_PATTERN.match(q)})
+    labels = wikidata.labels_and_aliases(qids) if qids else {}
+    for key, qid in enrich.items():
         entry = labels.get(qid)
         if entry is not None:
-            names_stage._merge(places_by_id[qid], entry)
+            names_stage._merge(places_by_id[key], entry)
 
     return {
         "feeds_scanned": len(crawled),

@@ -104,7 +104,15 @@ def _join_member(by_id, metros, qid, make_row, city, code=None, subtype=None):
         )
     metro = metros.get(qid) or existing or _by_code(by_id, code, subtype)
     if metro is None:
+        # A new row is keyed by the key the lookup used — the survivor's
+        # canonical key when the source named a merged alias — so a later
+        # record for the same place finds it whatever the source order; the
+        # QID the source named stays a concordance.
         metro = make_row()
+        source_qid = metro["place_id"]
+        metro["place_id"] = qid
+        if source_qid != qid:
+            metro.setdefault("discovered_qids", []).append(source_qid)
     elif overture.QID_PATTERN.match(qid):
         # Every QID a source names for the row: enriched onto it, or a
         # conflict, at identification.
@@ -162,6 +170,13 @@ def _take_cbsa(metro, qid, cbsa):
     metro["statistical_area_id"] = cbsa
 
 
+def _canonical_key(registry, qid):
+    """The key a QID a source names stands for inside the stage: the QID
+    the registry keys that place by — a merged alias resolving to its
+    survivor — or, without a registry or a row, the QID itself."""
+    return qid if registry is None else registry.key_for(qid, internal=True)
+
+
 def _take_msa(metro, record):
     """The discovered MSA identity: its CBSA code, and the country and
     subtype every US metro carries."""
@@ -172,7 +187,7 @@ def _take_msa(metro, record):
     )
 
 
-def _attach_us(places, by_id, metros, report, wikidata):
+def _attach_us(places, by_id, metros, report, wikidata, registry=None):
     """The US branch: each US city's MSA from Wikidata; an MSA without a CBSA
     code is reported for a later pass rather than published. Returns the
     branch summary."""
@@ -207,7 +222,7 @@ def _attach_us(places, by_id, metros, report, wikidata):
             metro = _join_member(
                 by_id,
                 metros,
-                record["qid"],
+                _canonical_key(registry, record["qid"]),
                 functools.partial(_metro_place, record),
                 city,
                 code=record["cbsa"],
@@ -551,7 +566,7 @@ def attach_metros(
             metros = {}
             report = []
             override_report = []
-            us_summary = _attach_us(places, by_id, metros, report, wikidata)
+            us_summary = _attach_us(places, by_id, metros, report, wikidata, registry)
             assignments, derived_inventory, eurostat_summary, crosswalked = (
                 _attach_eurostat(
                     places,

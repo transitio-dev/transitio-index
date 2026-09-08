@@ -154,7 +154,7 @@ def _write_crawl(cache, feed_id, stops_rows):
     log_path.write_text(existing + json.dumps(log) + "\n")
 
 
-def _expand(tmp_path, cache, registry=None):
+def _expand(tmp_path, cache, registry=None, labels=None):
     divisions = fx.write_dataset(tmp_path / "divisions.parquet", DIVISIONS)
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
     lookup = boundaries.BoundaryLookup(
@@ -172,6 +172,7 @@ def _expand(tmp_path, cache, registry=None):
                 "labels": {"fi": "Springfieldin metropolialue"},
                 "aliases": ["Greater Springfield"],
             },
+            **(labels or {}),
         },
     )
     try:
@@ -569,3 +570,88 @@ def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
     metro = places["Q912579"]
     assert metro["place_id"] == curated and metro["name"] == "Curated MSA"
     assert sum(1 for p in places.values() if p["kind"] == "metro") == 1
+
+
+@pytest.mark.parametrize("seeded", [False, True], ids=["new", "survivor seeded"])
+def test_a_discovered_alias_qid_is_its_survivor(tmp_path, seeded):
+    from index_build import registry
+
+    cache = tmp_path / "cache"
+    survivor = {
+        "place_id": "tp_2",
+        "tp_id": "tp_2",
+        "wikidata_id": "Q77777",
+        "kind": "city",
+        "name": "Tampere",
+        "country_code": "FI",
+        "overture_id": "fi-tre-old",
+        "metro_ids": [],
+        "member_ids": [],
+    }
+    _publish_names(cache, SEED_PLACES + ([survivor] if seeded else []))
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    _write_crawl(cache, "f-us", ["s2,39.8,-89.65\n"])
+    path = tmp_path / "places_registry.jsonl"
+    # Tampere's QID is a merged alias: the registry keys the place by Q77777.
+    path.write_text(
+        '{"next_id": 4, "registry": 1}\n'
+        '{"place_id": "tp_1", "kind": "country", "concordances": {"wikidata": ["Q33"], '
+        '"overture": ["fi"]}, "name": "Finland", "country_code": "FI", '
+        '"minted_from": "t", "minted_in": "t 1"}\n'
+        '{"place_id": "tp_2", "kind": "city", "concordances": {"wikidata": ["Q77777"]}, '
+        '"name": "Tampere", "country_code": "FI", "minted_from": "t", "minted_in": "t 1"}\n'
+        '{"place_id": "tp_3", "status": "merged", "into": "tp_2", '
+        '"concordances": {"wikidata": ["Q40840"]}, "at": "2026-09-08", "reason": "dup"}\n'
+    )
+    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    canonical = {"Q77777": {"labels": {"sv": "Tammerfors"}, "aliases": []}}
+    with registry.session(path) as reg:
+        manifest, places, _ = _expand(tmp_path, cache, registry=reg, labels=canonical)
+        # The survivor's registry row takes the crawled division's Overture
+        # id as a concordance; seeded, the row is not added again.
+        assert reg.enriched == 1
+    tampere = places["Q77777"]
+    assert tampere["place_id"] == "tp_2"
+    assert sum(1 for p in places.values() if p["place_id"] == "tp_2") == 1
+    # Tampere (unless seeded), Pirkanmaa, Springfield and its MSA.
+    assert manifest["places_added"] == (3 if seeded else 4)
+    if seeded:
+        assert tampere["overture_id"] == "fi-tre-old"
+    else:
+        assert tampere["names"]["sv"] == "Tammerfors"
+        assert "Manse" not in tampere["aliases"]
+
+
+def test_a_crawled_qid_for_a_place_known_by_its_division_joins_it(tmp_path):
+    from index_build import registry
+
+    # Tampere was seeded without a QID, identified by its Overture division;
+    # the crawl resolves that division with a QID: the seeded row gains the
+    # QID as a concordance and is not added again.
+    cache = tmp_path / "cache"
+    path = tmp_path / "places_registry.jsonl"
+    _seeded_registry(path, {"overture": ["fi-tre"]})
+    tampere = {
+        "place_id": "tp_2",
+        "tp_id": "tp_2",
+        "wikidata_id": None,
+        "kind": "city",
+        "name": "Tampere",
+        "country_code": "FI",
+        "overture_id": "fi-tre",
+        "metro_ids": [],
+        "member_ids": [],
+    }
+    _publish_names(cache, SEED_PLACES + [tampere])
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    with registry.session(path) as reg:
+        manifest, places, _ = _expand(tmp_path, cache, registry=reg)
+        assert (manifest["places_added"], reg.minted, reg.enriched) == (1, 1, 1)
+    assert sum(1 for p in places.values() if p.get("overture_id") == "fi-tre") == 1
+    assert registry.load(path).resolve("Q40840") == "tp_2"
+    # The published row carries the QID it gained, and its labels.
+    assert (
+        places["Q40840"]["place_id"] == "tp_2"
+        and "Manse" in places["Q40840"]["aliases"]
+    )
