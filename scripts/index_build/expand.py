@@ -18,6 +18,7 @@ import datetime
 
 import shapely
 
+from index_build import registry as _registry
 from index_build import (
     boundaries,
     crawl,
@@ -33,6 +34,57 @@ from index_build import names as names_stage
 EXPANDED_POINTER = "expanded.json"
 PLACES_ARTIFACT = "places_expanded.jsonl"
 REPORT_ARTIFACT = "expansion_report.jsonl"
+
+
+def expected_registry_digest(gazetteer, path):
+    """The digest the registry must have for the gazetteer's outputs to be
+    consumed: the run's saved digest, or the expand stage's when it ran on
+    that registry afterwards — the newest registry-writing stage — or None
+    when no run manifest exists. A manifest that records no valid digest is
+    refused; it never means no check."""
+    return _registry_chain(gazetteer, path)[1]
+
+
+def _registry_chain(gazetteer, path, *, replacing=False):
+    """``(run_digest, head, run_generation)``: the digest the gazetteer run
+    saved, which every expansion anchors on, the chain's newest digest, and
+    the run's generation. An expansion built on another run — by registry
+    or by generation — is refused to consumers; the expand stage itself
+    (``replacing``) passes over it, since its own output replaces it."""
+    run = store.run_manifest(gazetteer)
+    if run is None:
+        return None, None, None
+    run_digest = expected = run.get("registry_digest")
+    if not _digest(expected):
+        raise _registry.RegistryError(
+            f"{path}: the gazetteer run records no registry digest; "
+            "rerun the gazetteer"
+        )
+    generation = run.get("generation")
+    expanded = store.pointer_manifest(gazetteer, EXPANDED_POINTER)
+    if expanded is not None and (
+        expanded.get("registry_base") != expected
+        or expanded.get("run_generation") != generation
+    ):
+        # Expanded places prove they were built on this run by its digest
+        # and its generation; ones from before, or without the proof, are
+        # rerun.
+        if replacing:
+            return run_digest, expected, generation
+        raise _registry.RegistryError(
+            f"{path}: the expanded places predate the gazetteer run; rerun expand"
+        )
+    if expanded is not None:
+        expected = expanded.get("registry_digest")
+        if not _digest(expected):
+            raise _registry.RegistryError(
+                f"{path}: the expanded places record no registry digest; rerun expand"
+            )
+    return run_digest, expected, generation
+
+
+def _digest(value):
+    return isinstance(value, str) and bool(store.DIGEST_PATTERN.match(value))
 
 
 def _stop_points(feed_dir, state):
@@ -80,11 +132,14 @@ def _attach_boundary(place, rows):
 
 
 def _attach_metros(places_by_id, new_cities, wikidata, report):
-    """US metro membership for the discovered cities, like the metros stage."""
+    """US metro membership for the discovered cities, like the metros stage;
+    ``(added, touched)`` — the metros minted, and every metro a discovered
+    CBSA pair names, a seeded one included."""
     us_cities = [
         qid for qid in new_cities if places_by_id[qid].get("country_code") == "US"
     ]
     added = []
+    touched = []
     membership = wikidata.statistical_metros(us_cities) if us_cities else {}
     for city_qid, found in membership.items():
         city = places_by_id.get(city_qid)
@@ -111,6 +166,9 @@ def _attach_metros(places_by_id, new_cities, wikidata, report):
                     f"metro {record['qid']!r} is already seeded as the "
                     f"{metro['kind']} {metro.get('name')!r}"
                 )
+            metros._take_cbsa(metro, record["qid"], record["cbsa"])
+            if metro["place_id"] not in touched:
+                touched.append(metro["place_id"])
             if metro.get("members_curated"):
                 # A curator's member list is authoritative: never added to.
                 continue
@@ -121,11 +179,14 @@ def _attach_metros(places_by_id, new_cities, wikidata, report):
             city.setdefault("metro_ids", [])
             if metro["place_id"] not in city["metro_ids"]:
                 city["metro_ids"].append(metro["place_id"])
-    return added
+    return added, touched
 
 
-def _discover(cache_dir, places_by_id, lookup, wikidata, area_dataset, report):
-    """Resolve crawled stops and fold the missing places in; returns counts."""
+def _discover(
+    cache_dir, places_by_id, lookup, wikidata, area_dataset, report, registry, digest
+):
+    """Resolve crawled stops and fold the missing places in; returns counts.
+    With ``registry``, every discovered place is identified through it."""
     # Two passes, one feed's stops in memory at a time — never every crawled
     # feed's stops at once: first the lookup boxes, then, with the boxes
     # ensured, the per-point division resolution.
@@ -198,7 +259,16 @@ def _discover(cache_dir, places_by_id, lookup, wikidata, area_dataset, report):
         places_by_id[qid] = place
 
     new_cities = [qid for qid in new_ids if places_by_id[qid].get("kind") == "city"]
-    new_metros = _attach_metros(places_by_id, new_cities, wikidata, report)
+    new_metros, metro_pairs = _attach_metros(places_by_id, new_cities, wikidata, report)
+    identified = 0
+    if registry is not None:
+        # Every resolved signal, a seeded place reached through a new
+        # division and a seeded metro named by a CBSA pair included: the
+        # concordance enriches the row, or conflicts, and read-only refuses.
+        identified = seed._identify_places(discovered, registry, digest)
+        identified += metros._identify_metros(
+            {qid: places_by_id[qid] for qid in metro_pairs}, registry, None
+        )
 
     # Enrichment covers the minted metros too, so every new place carries the
     # same multilingual labels the names stage gives seeded ones.
@@ -216,11 +286,21 @@ def _discover(cache_dir, places_by_id, lookup, wikidata, area_dataset, report):
         "divisions_hit": len(divisions),
         "places_added": len(new_ids) + len(new_metros),
         "metros_added": len(new_metros),
+        "identified": identified,
     }
 
 
 def _expanded(
-    cache_dir, places_by_id, report, counts, lookup, wikidata, area_dataset, release
+    cache_dir,
+    places_by_id,
+    report,
+    counts,
+    lookup,
+    wikidata,
+    area_dataset,
+    release,
+    registry,
+    digest,
 ):
     """Discovery under the crawl lock; ``(crawl_digest, counts, mode)``.
 
@@ -245,7 +325,14 @@ def _expanded(
                 )
                 lookup = opened_lookup
             counts = _discover(
-                cache_dir, places_by_id, lookup, wikidata, area_dataset, report
+                cache_dir,
+                places_by_id,
+                lookup,
+                wikidata,
+                area_dataset,
+                report,
+                registry,
+                digest,
             )
     finally:
         if opened_lookup is not None:
@@ -254,13 +341,23 @@ def _expanded(
 
 
 def expand(
-    cache_dir, *, lookup=None, wikidata=None, area_dataset=None, overrides_dir=None
+    cache_dir,
+    *,
+    lookup=None,
+    wikidata=None,
+    area_dataset=None,
+    overrides_dir=None,
+    registry=None,
 ):
     """Publish ``places_expanded``: the seed plus crawl-discovered places.
 
     Reads the enriched seed places, discovers what the crawled stops reach
     that the seed missed, and republishes the union, carrying the Overture
-    release forward. Returns the generation manifest.
+    release forward. With ``registry`` — a session over the registry the
+    gazetteer ran with — every discovered place is identified through it,
+    the registry is saved before the generation is published, and the
+    manifest records the digests loaded and saved. Returns the generation
+    manifest.
     """
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
@@ -275,6 +372,28 @@ def expand(
                 "places.yaml",
                 "gazetteer",
             )
+            digest = names_manifest.get("places_overrides_sha256")
+            anchor = run_generation = None
+            if registry is not None:
+                # Ids are minted only on a committed gazetteer run, against
+                # the registry it left or the one a previous expand saved on
+                # it: any other file is a change to rerun from — a crash
+                # between the save below and the publish included, which the
+                # gazetteer rerun re-anchors on. The manifest anchors on the
+                # run's digest and generation, so the chain stays
+                # run -> expand across reruns.
+                anchor, expected, run_generation = _registry_chain(
+                    cache_dir / "gazetteer", registry.path, replacing=True
+                )
+                if anchor is None:
+                    raise overture.GazetteerError(
+                        "no gazetteer run to expand; rerun the gazetteer"
+                    )
+                if expected != registry.base:
+                    raise overture.GazetteerError(
+                        "the registry changed since the gazetteer ran; "
+                        "rerun the gazetteer"
+                    )
             places_by_id = {place["place_id"]: place for place in places}
             report = []
             counts = {
@@ -283,6 +402,7 @@ def expand(
                 "divisions_hit": 0,
                 "places_added": 0,
                 "metros_added": 0,
+                "identified": 0,
             }
             with crawl.reading(cache_dir):
                 crawl_digest, counts, mode = _expanded(
@@ -294,9 +414,19 @@ def expand(
                     wikidata,
                     area_dataset,
                     release,
+                    registry,
+                    digest,
                 )
+            # Saved before the generation is visible, as the gazetteer run
+            # does: a crash between the two leaves rows a rerun reproduces.
+            registry_digest = registry.save() if registry is not None else None
             manifest = {
                 "source": "expand",
+                "registry_base": anchor,
+                "registry_digest": registry_digest,
+                "run_generation": run_generation,
+                "minted": registry.minted if registry is not None else 0,
+                "enriched": registry.enriched if registry is not None else 0,
                 "sources": names_manifest.get("sources"),
                 "seed_generation": names_manifest.get("seed_generation"),
                 "names_generation": names_manifest.get("generation"),

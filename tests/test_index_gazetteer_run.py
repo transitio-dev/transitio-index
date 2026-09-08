@@ -14,7 +14,7 @@ from index_build import registry, store  # noqa: E402
 HEADER = '{"next_id": 1, "registry": 1}\n'
 
 
-def _stage(cache, pointer, text, identify=None, pointer_publish=False):
+def _stage(cache, pointer, text, identify=None, pointer_publish=False, manifest=None):
     """A stub stage: one staged generation, and an identification when asked."""
 
     def run_stage(places, run):
@@ -29,7 +29,7 @@ def _stage(cache, pointer, text, identify=None, pointer_publish=False):
                     cache / "gazetteer",
                     pointer,
                     {"places.jsonl": store.jsonl_chunks([{"place_id": text}])},
-                    {"stage": pointer},
+                    {"stage": pointer, **(manifest or {})},
                     held=directory,
                     staged=not pointer_publish,
                 )
@@ -231,3 +231,56 @@ def test_a_consumer_holds_the_registry_while_it_reads_the_run(tmp_path):
             build_index.commit_run(
                 cache, path, read_only=False, stages=[_stage(cache, "seed.json", "s")]
             )
+
+
+def test_consumers_follow_the_registry_the_expand_stage_saved(tmp_path):
+    cache, path = tmp_path / "cache", _registry(tmp_path)
+    _committed(cache, path)
+    run_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    # Expand identified a discovery on that registry and saved it.
+    with registry.session(path) as reg:
+        reg.identify(
+            {"wikidata": ["Q2"]}, kind="city", minted_from="t", minted_in="t 1"
+        )
+        saved = reg.save()
+
+    run_generation = store.run_manifest(cache / "gazetteer")["generation"]
+
+    def expanded(base, generation=run_generation):
+        _stage(
+            cache,
+            "expanded.json",
+            "x",
+            pointer_publish=True,
+            manifest={
+                "registry_base": base,
+                "registry_digest": saved,
+                "run_generation": generation,
+            },
+        )(None, {})
+
+    expanded(run_digest)
+    _consume(cache, path)
+    # A registry changed after expand, and expanded places built on another
+    # registry than the run's, are both refused.
+    path.write_text(path.read_text().replace('"next_id": 3', '"next_id": 4'))
+    with pytest.raises(registry.RegistryError, match="rerun the gazetteer"):
+        _consume(cache, path)
+    path.write_text(path.read_text().replace('"next_id": 4', '"next_id": 3'))
+    for base, generation in (
+        (run_digest, "gen-00000000-0000000000000000"),
+        ("0" * 64, run_generation),
+    ):
+        expanded(base, generation)
+        with pytest.raises(registry.RegistryError, match="rerun expand"):
+            _consume(cache, path)
+    # A run manifest that records no digest is refused, never skipped.
+    _stage(
+        cache,
+        store.RUN_POINTER,
+        "r",
+        pointer_publish=True,
+        manifest={"generations": {}},
+    )(None, {})
+    with pytest.raises(registry.RegistryError, match="no registry digest"):
+        _consume(cache, path)

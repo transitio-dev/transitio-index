@@ -1011,15 +1011,24 @@ def _pointer_text(directory, pointer):
         raise StoreError(f"{directory / pointer}: {error}") from None
 
 
+def pointer_manifest(directory, pointer):
+    """The verified manifest of the generation ``pointer`` names, or
+    ``None`` when there is no such pointer. A pointer that is present but
+    unverifiable is an error, never an absence."""
+    if _pointer_text(directory, pointer) is None:
+        return None
+    generation, manifest = _resolve_once(directory, pointer)
+    generation.close()
+    return manifest
+
+
 def run_manifest(directory):
     """The directory's current run manifest — the set a transactional run
     made visible together, which takes precedence over any per-stage
-    pointer — or ``None`` without one. A manifest that is present but
-    unverifiable is an error, never an absence."""
-    if _pointer_text(directory, RUN_POINTER) is None:
+    pointer — or ``None`` without one."""
+    manifest = pointer_manifest(directory, RUN_POINTER)
+    if manifest is None:
         return None
-    generation, manifest = _resolve_once(directory, RUN_POINTER)
-    generation.close()
     listed = manifest.get("generations")
     if not isinstance(listed, dict) or not all(
         isinstance(pointer, str) and isinstance(name, str)

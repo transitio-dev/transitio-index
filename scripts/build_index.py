@@ -156,21 +156,25 @@ def check_registry_state(cache_dir, path):
     yields it for resolving override references."""
     gazetteer = cache_dir / "gazetteer"
     if not path.is_file():
-        if store.run_manifest(gazetteer) is not None:
-            raise registry.RegistryError(
-                f"{path}: changed since the gazetteer ran; rerun the gazetteer"
-            )
+        _refuse_missing_registry(gazetteer, path)
         yield None
         return
-    # The manifest is read under the registry lock, so the two are one
-    # consistent view: no run can commit between them.
+    # The manifests are read under the registry lock, so they and the file
+    # are one consistent view: no run can commit between them.
     with registry.session(path, read_only=True) as places:
-        manifest = store.run_manifest(gazetteer)
-        if manifest is not None and manifest.get("registry_digest") != places.digest:
+        expected = expand.expected_registry_digest(gazetteer, path)
+        if expected is not None and expected != places.digest:
             raise registry.RegistryError(
                 f"{path}: changed since the gazetteer ran; rerun the gazetteer"
             )
         yield places
+
+
+def _refuse_missing_registry(gazetteer, path):
+    if store.run_manifest(gazetteer) is not None:
+        raise registry.RegistryError(
+            f"{path}: changed since the gazetteer ran; rerun the gazetteer"
+        )
 
 
 def consumes_run(command):
@@ -221,9 +225,24 @@ def run_resolve(arguments):
     return [resolve.resolve(arguments.cache_dir, overrides_dir=arguments.overrides_dir)]
 
 
-@consumes_run
-def run_expand(arguments, places):
-    return [expand.expand(arguments.cache_dir, overrides_dir=arguments.overrides_dir)]
+def run_expand(arguments):
+    """Expand under its own registry session: it identifies what it discovers,
+    so it writes the registry the gazetteer run left, as a second transaction."""
+    path = registry_path(arguments)
+    gazetteer = arguments.cache_dir / "gazetteer"
+    if not path.is_file():
+        _refuse_missing_registry(gazetteer, path)
+        return [
+            expand.expand(arguments.cache_dir, overrides_dir=arguments.overrides_dir)
+        ]
+    with registry.session(path, read_only=arguments.registry_read_only) as places:
+        return [
+            expand.expand(
+                arguments.cache_dir,
+                overrides_dir=arguments.overrides_dir,
+                registry=places,
+            )
+        ]
 
 
 def run_crawl(arguments):

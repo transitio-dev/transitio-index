@@ -154,7 +154,7 @@ def _write_crawl(cache, feed_id, stops_rows):
     log_path.write_text(existing + json.dumps(log) + "\n")
 
 
-def _expand(tmp_path, cache):
+def _expand(tmp_path, cache, registry=None):
     divisions = fx.write_dataset(tmp_path / "divisions.parquet", DIVISIONS)
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
     lookup = boundaries.BoundaryLookup(
@@ -176,7 +176,11 @@ def _expand(tmp_path, cache):
     )
     try:
         manifest = expand.expand(
-            cache, lookup=lookup, wikidata=wikidata, area_dataset=areas
+            cache,
+            lookup=lookup,
+            wikidata=wikidata,
+            area_dataset=areas,
+            registry=registry,
         )
     finally:
         lookup.close()
@@ -351,3 +355,179 @@ def test_a_crawled_city_whose_qid_is_a_curated_metro_is_a_collision(tmp_path):
     _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
     with pytest.raises(overture.GazetteerError, match="is both the seeded metro"):
         _expand(tmp_path, cache)
+
+
+HEADER = '{"next_id": 1, "registry": 1}\n'
+
+
+def _crawled_cache(tmp_path):
+    """Seed places plus crawled stops in Tampere and Springfield."""
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES)
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    _write_crawl(cache, "f-us", ["s2,39.8,-89.65\n"])
+    return cache
+
+
+def _publish_run(cache, registry_digest):
+    """A gazetteer run manifest naming no stage, for the registry chain."""
+    directory = store.open_subdir(cache, "gazetteer")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "gazetteer",
+                store.RUN_POINTER,
+                {"generations.jsonl": store.jsonl_chunks([])},
+                {"generations": {}, "registry_digest": registry_digest},
+                held=directory,
+            )
+    finally:
+        directory.close()
+
+
+def _seeded_registry(path, *seeded):
+    """The registry the seed left: a row per seeded place, saved."""
+    from index_build import registry
+
+    path.write_text(HEADER)
+    rows = [("country", {"wikidata": ["Q33"], "overture": ["fi"]})]
+    rows.extend(("city", concordances) for concordances in seeded)
+    with registry.session(path) as reg:
+        for kind, concordances in rows:
+            reg.identify(concordances, kind=kind, minted_from="t", minted_in="t 1")
+        reg.save()
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_discoveries_are_identified_through_the_registry(tmp_path):
+    from index_build import registry
+
+    cache = _crawled_cache(tmp_path)
+    path = tmp_path / "places_registry.jsonl"
+    run_digest = _seeded_registry(path)
+    _publish_run(cache, run_digest)
+    with registry.session(path) as reg:
+        manifest, places, _ = _expand(tmp_path, cache, registry=reg)
+        # Tampere, Pirkanmaa, Springfield and its MSA minted; Finland, the
+        # seeded place the stops also reach, found.
+        assert reg.minted == manifest["minted"] == 4
+        assert manifest["identified"] == 5
+    assert manifest["registry_base"] == run_digest
+    assert manifest["registry_digest"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    saved = registry.load(path)
+    assert places["Q40840"]["tp_id"] == saved.resolve("overture:fi-tre")
+    assert places["Q912579"]["tp_id"] == saved.resolve("cbsa:44100")
+    # A rerun opens on the registry the first expand saved — the run's
+    # successor in the chain — finds every place again and mints nothing,
+    # and still anchors on the run's digest, so consumers and a further
+    # expansion accept the chain.
+    for _ in range(2):
+        with registry.session(path) as again:
+            manifest, _, _ = _expand(tmp_path, cache, registry=again)
+            assert (again.minted, manifest["minted"]) == (0, 0)
+        assert manifest["registry_base"] == run_digest
+        assert (
+            expand.expected_registry_digest(cache / "gazetteer", path)
+            == hashlib.sha256(path.read_bytes()).hexdigest()
+        )
+    # A new gazetteer run on the registry expand saved: the stale expansion
+    # blocks consumers until expand replaces it, anchored on the new run.
+    new_run = hashlib.sha256(path.read_bytes()).hexdigest()
+    _publish_run(cache, new_run)
+    with pytest.raises(registry.RegistryError, match="rerun expand"):
+        expand.expected_registry_digest(cache / "gazetteer", path)
+    with registry.session(path) as after:
+        manifest, _, _ = _expand(tmp_path, cache, registry=after)
+    assert manifest["registry_base"] == new_run
+    assert expand.expected_registry_digest(cache / "gazetteer", path) == new_run
+
+
+def test_expand_refuses_a_read_only_mint_and_a_stale_registry(tmp_path):
+    from index_build import registry
+
+    cache = _crawled_cache(tmp_path)
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text(HEADER)
+    # Ids are minted only on a committed gazetteer run.
+    with registry.session(path) as reg:
+        with pytest.raises(overture.GazetteerError, match="no gazetteer run"):
+            _expand(tmp_path, cache, registry=reg)
+    _publish_run(cache, hashlib.sha256(HEADER.encode()).hexdigest())
+    with registry.session(path, read_only=True) as reg:
+        with pytest.raises(registry.RegistryError, match="read-only"):
+            _expand(tmp_path, cache, registry=reg)
+    assert store.current_generation(cache / "gazetteer", "expanded.json") is None
+    # The gazetteer ran on another registry: expand must not build on it.
+    _publish_run(cache, "0" * 64)
+    with registry.session(path) as reg:
+        with pytest.raises(overture.GazetteerError, match="rerun the gazetteer"):
+            _expand(tmp_path, cache, registry=reg)
+
+
+def test_a_seeded_place_reached_through_a_new_division_is_enriched(tmp_path):
+    from index_build import registry
+
+    cache = tmp_path / "cache"
+    tampere = {
+        "place_id": "Q40840",
+        "kind": "city",
+        "name": "Tampere",
+        "country_code": "FI",
+        "overture_id": "fi-tre-old",
+        "metro_ids": [],
+        "member_ids": [],
+    }
+    _publish_names(cache, SEED_PLACES + [tampere])
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    path = tmp_path / "places_registry.jsonl"
+    _publish_run(
+        cache,
+        _seeded_registry(path, {"wikidata": ["Q40840"], "overture": ["fi-tre-old"]}),
+    )
+    # Read-only, the new concordance is refused; writable, it enriches the
+    # seeded place's row while the seeded row itself stays.
+    with registry.session(path, read_only=True) as reg:
+        with pytest.raises(registry.RegistryError, match="read-only"):
+            _expand(tmp_path, cache, registry=reg)
+    with registry.session(path) as reg:
+        manifest, places, _ = _expand(tmp_path, cache, registry=reg)
+        assert (reg.minted, reg.enriched, manifest["enriched"]) == (1, 1, 1)
+    saved = registry.load(path)
+    assert saved.effective(saved.resolve("Q40840"))["overture"] == [
+        "fi-tre-old",
+        "fi-tre",
+    ]
+    assert places["Q40840"]["overture_id"] == "fi-tre-old"
+
+
+def test_a_crash_after_the_registry_save_is_recovered_by_a_gazetteer_rerun(
+    tmp_path, monkeypatch
+):
+    from index_build import registry
+
+    cache = _crawled_cache(tmp_path)
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text(HEADER)
+    _publish_run(cache, hashlib.sha256(HEADER.encode()).hexdigest())
+    real = store.publish
+
+    def crash(directory, pointer, *args, **kwargs):
+        if pointer == expand.EXPANDED_POINTER:
+            raise RuntimeError("crash")
+        return real(directory, pointer, *args, **kwargs)
+
+    monkeypatch.setattr(store, "publish", crash)
+    with registry.session(path) as reg:
+        with pytest.raises(RuntimeError, match="crash"):
+            _expand(tmp_path, cache, registry=reg)
+    monkeypatch.undo()
+    # The registry holds the mints, valid rows; expand cannot tell the file
+    # from an edit until the gazetteer re-anchors on it, then reproduces.
+    assert registry.load(path).resolve("overture:fi-tre")
+    with registry.session(path) as reg:
+        with pytest.raises(overture.GazetteerError, match="rerun the gazetteer"):
+            _expand(tmp_path, cache, registry=reg)
+    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    with registry.session(path) as reg:
+        manifest, _, _ = _expand(tmp_path, cache, registry=reg)
+        assert manifest["minted"] == 0

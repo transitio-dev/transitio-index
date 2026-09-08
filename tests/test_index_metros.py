@@ -488,7 +488,7 @@ def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
     assert metro["member_ids"] == ["Q1297"]
     assert "Q1754965" not in places["Q28515"]["metro_ids"]
     wikidata = fx.StubWikidata(metros={"Q28515": [CHICAGO_METRO]})
-    assert expand._attach_metros(places, ["Q28515"], wikidata, []) == []
+    assert expand._attach_metros(places, ["Q28515"], wikidata, []) == ([], ["Q1754965"])
     assert metro["member_ids"] == ["Q1297"]
     assert manifest["places"] == len(places)
     # places.yaml edited between the seed and metros stages: refused.

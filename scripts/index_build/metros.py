@@ -126,6 +126,17 @@ def _set_members(by_id, entries, report):
     return applied
 
 
+def _take_cbsa(metro, qid, cbsa):
+    """A metro takes the discovered CBSA code it lacks; a different code
+    already on it is a conflict."""
+    code_now = metro.get("statistical_area_id")
+    if code_now not in (None, cbsa):
+        raise overture.GazetteerError(
+            f"metro {qid!r} carries statistical code {code_now!r}, not CBSA {cbsa!r}"
+        )
+    metro["statistical_area_id"] = cbsa
+
+
 def _attach_us(places, by_id, metros, report, wikidata):
     """The US branch: each US city's MSA from Wikidata; an MSA without a CBSA
     code is reported for a later pass rather than published. Returns the
@@ -162,15 +173,7 @@ def _attach_us(places, by_id, metros, report, wikidata):
                 functools.partial(_metro_place, record),
                 city,
             )
-            # A curated metro of this QID takes the discovered identity it
-            # lacks; a different code already on it is a conflict.
-            code_now = metro.get("statistical_area_id")
-            if code_now not in (None, record["cbsa"]):
-                raise overture.GazetteerError(
-                    f"metro {record['qid']!r} carries statistical code "
-                    f"{code_now!r}, not CBSA {record['cbsa']!r}"
-                )
-            metro["statistical_area_id"] = record["cbsa"]
+            _take_cbsa(metro, record["qid"], record["cbsa"])
             metro["country_code"] = metro.get("country_code") or "US"
             metro["source_subtype"] = (
                 metro.get("source_subtype") or "metropolitan statistical area"
