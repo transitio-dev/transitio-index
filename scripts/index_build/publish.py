@@ -29,9 +29,11 @@ import json
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from index_build import overture
+from index_build import registry as _registry
 from index_build import store
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
@@ -124,10 +126,111 @@ def _wkb(value):
     return None if value is None else bytes.fromhex(value)
 
 
-def _place_row(record, snapshot_id, service=None):
+def _identity(record, registry):
+    """The schema-6 identity columns: the QID beside the id, every id the
+    place carries per namespace (the registry's effective view, or the QID
+    alone without a registry), and the ids merged into it.
+
+    With a registry the identity is the registry's: the row must be keyed
+    by a live own id, and its QID is the canonical one — a stage value that
+    disagrees is a generation built on another registry.
+    """
+    place_id = record["place_id"]
+    qid = record.get("wikidata_id")
+    if registry is None:
+        # Without a registry only a row keyed by its QID states an identity;
+        # a row keyed by an own id was built with one, and needs it here.
+        if _registry.ID_PATTERN.match(place_id):
+            raise PublishError(
+                f"{place_id}: an own id needs the registry the gazetteer ran with"
+            )
+        if overture.QID_PATTERN.match(place_id):
+            if qid not in (None, place_id):
+                raise PublishError(
+                    f"{place_id}: the stage names {qid!r} beside its QID key"
+                )
+            qid = place_id
+        # Any other key is a fixture's: no identity to state.
+        concordances = {"wikidata": [qid]} if qid else {}
+        return {
+            "wikidata_id": qid,
+            "concordances": json.dumps(concordances, sort_keys=True),
+            "former_ids": [],
+        }
+    try:
+        live = _registry.ID_PATTERN.match(place_id) and registry.survivor(place_id)
+    except _registry.RegistryError as error:
+        raise PublishError(f"{place_id}: {error}; rerun the gazetteer") from None
+    if live != place_id:
+        raise PublishError(
+            f"{place_id}: schema 6 keys places by live own ids; rerun the gazetteer"
+        )
+    canonical = registry.canonical_qid(place_id)
+    if qid is not None and qid != canonical:
+        raise PublishError(
+            f"{place_id}: the stage names {qid!r}, the registry {canonical!r}; "
+            "rerun the gazetteer"
+        )
+    # The union over the place and every row merged into it: a QID a
+    # merged row carried still names the place.
+    former = registry.former_ids(place_id)
+    concordances = {}
+    for row_id in (place_id, *former):
+        for ns, values in registry.effective(row_id).items():
+            merged = concordances.setdefault(ns, [])
+            merged.extend(v for v in values if v not in merged)
+    return {
+        "wikidata_id": canonical,
+        "concordances": json.dumps(concordances, sort_keys=True),
+        "former_ids": former,
+    }
+
+
+def _check_registry(cache_dir, registry):
+    """The registry the identity is drawn from must be the one the
+    gazetteer's outputs were built on — the digest its run, or the expand
+    stage after it, recorded — whatever the caller handed in."""
+    if registry is None:
+        return
+    if not registry.read_only:
+        # A writable session may hold changes its digest does not cover;
+        # the identity is drawn only from what the file holds.
+        raise PublishError("the publisher takes a read-only registry")
+    from index_build import expand
+
+    try:
+        expected = expand.expected_registry_digest(
+            cache_dir / "gazetteer", registry.path
+        )
+    except _registry.RegistryError as error:
+        raise PublishError(str(error)) from None
+    if expected is None:
+        raise PublishError("no gazetteer run to publish from; rerun the gazetteer")
+    if expected != registry.digest:
+        raise PublishError(
+            f"{registry.path}: not the registry the gazetteer ran with; "
+            "rerun the gazetteer"
+        )
+
+
+def _identities(places, registry):
+    """``{place_id: identity}`` for every place, computed once: the parquet
+    rows and the snapshot id both draw on it."""
+    return {place["place_id"]: _identity(place, registry) for place in places}
+
+
+def _identity_digest(identities):
+    """A digest of the registry-derived identity, so a registry-only change
+    — a merge, a new concordance — is a new snapshot."""
+    payload = json.dumps(identities, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _place_row(record, snapshot_id, service=None, identity=None):
     metro_ids = record.get("metro_ids") or []
     return {
         "service": _json_block(service),
+        **(identity or _identity(record, None)),
         "place_id": record["place_id"],
         "kind": record["kind"],
         "source_subtype": record.get("source_subtype"),
@@ -225,6 +328,10 @@ _PLACES_SCHEMA = pa.schema(
         ("geometry_source", pa.string()),
         ("service", pa.string()),
         ("snapshot", pa.string()),
+        # Schema 6: the place's identity beside its own id.
+        ("wikidata_id", pa.string()),
+        ("concordances", pa.string()),
+        ("former_ids", pa.list_(pa.string())),
         ("geometry", pa.binary()),
     ]
 )
@@ -271,7 +378,7 @@ def _service_by_place(edges):
     return totals
 
 
-def _places_parquet_bytes(places, snapshot_id, service_by_place=None):
+def _places_parquet_bytes(places, snapshot_id, service_by_place=None, identities=None):
     """The places as GeoParquet bytes: declared columns plus the WKB boundary.
 
     The schema is declared, not inferred, so an all-null column (``geonames_id``,
@@ -281,7 +388,10 @@ def _places_parquet_bytes(places, snapshot_id, service_by_place=None):
     rows = []
     for place in places:
         row = _place_row(
-            place, snapshot_id, (service_by_place or {}).get(place["place_id"])
+            place,
+            snapshot_id,
+            (service_by_place or {}).get(place["place_id"]),
+            identity=(identities or {}).get(place["place_id"]),
         )
         wkb = place.get("geometry")
         row["geometry"] = bytes.fromhex(wkb) if wkb else None
@@ -923,8 +1033,12 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
                 cache_dir, golden_path, edges, coverage, registry=registry
             )
         digests = []
+        identities = None
         if places is not None:
+            _check_registry(cache_dir, registry)
+            identities = _identities(places, registry)
             digests.append(_content_digest(places))
+            digests.append(_identity_digest(identities))
         if resolved is not None or edges is not None or licensed is not None:
             # Resolved, covered and licensed feeds fold in, and edges: the
             # override files and the licensing policy shape them, and no
@@ -975,7 +1089,7 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
         places_data = None
         if places is not None:
             places_data = _places_parquet_bytes(
-                places, snapshot_id, _service_by_place(edges)
+                places, snapshot_id, _service_by_place(edges), identities=identities
             )
             manifest["places_sha256"] = hashlib.sha256(places_data).hexdigest()
             manifest["overture_release"] = overture_release

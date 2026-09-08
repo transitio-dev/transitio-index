@@ -246,10 +246,14 @@ def test_the_seed_identifies_every_place_in_the_registry(tmp_path):
     assert concordances["wikidata"] == ["Q1757"]
     assert concordances["overture"] == [places["Q1757"]["overture_id"]]
     assert saved.rows[ids["Q1757"]]["minted_in"].startswith("overture ")
-    # A rebuild finds every place again and mints nothing; the ids hold.
+    # A rebuild finds every place again and mints nothing; the ids hold and
+    # the registry file is byte-identical.
+    before = path.read_bytes()
     with registry.session(path) as again:
         _, places_again, _ = _seed(tmp_path, registry=again)
         assert (again.minted, again.enriched) == (0, 0)
+        again.save()
+    assert path.read_bytes() == before
     assert {qid: p["place_id"] for qid, p in places_again.items()} == ids
     # Links between places are own ids too, the placements included.
     assert places["Q1757"]["parent_id"] == ids["Q1508"]

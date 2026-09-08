@@ -282,6 +282,16 @@ def _survivor(rows, place_id):
     return row["into"] if row.get("status") == "merged" else place_id
 
 
+def _former_index(rows):
+    """``{survivor: [merged ids]}`` over the merged rows, each list in
+    numeric order of the ids."""
+    former = {}
+    for place_id, row in rows.items():
+        if row.get("status") == "merged":
+            former.setdefault(_survivor(rows, place_id), []).append(place_id)
+    return {k: sorted(v, key=lambda i: int(i[3:])) for k, v in former.items()}
+
+
 def _index(rows, where):
     """``{(namespace, value): live id}`` over effective values, merged rows
     resolving to their successor; a value on two places is an error."""
@@ -341,6 +351,8 @@ class Registry:
         self.minted = 0
         self.enriched = 0
         self._index = _index(rows, str(path))
+        # Merges arrive only with the file, so the index is built once.
+        self._former = _former_index(rows)
 
     @property
     def next_id(self):
@@ -363,6 +375,11 @@ class Registry:
         """The first effective QID of the live place ``place_id`` stands for
         (a merged id's survivor; a retired one refused), or None."""
         return (self.effective(self.survivor(place_id)).get("wikidata") or [None])[0]
+
+    def former_ids(self, place_id):
+        """The ids merged into the live place ``place_id``, each of which
+        still resolves to it, in numeric order."""
+        return list(self._former.get(self.survivor(place_id), []))
 
     def lookup(self, namespace, value):
         return self._index.get((namespace, value))
