@@ -31,10 +31,8 @@ POINTER = "fao.json"
 CONVERTED_POINTER = "fao-patches.json"
 PATCHES_PARQUET = "patches.parquet"
 LICENCE = "CC-BY-4.0"
-CREDIT = (
-    "Girgin, Cattaneo, de By, McMenomy, Nelson and Vaz (2024), Worldwide "
-    "Delineation of Multi-Tier City-Regions (Zenodo), CC BY 4.0"
-)
+DERIVED = geometry.FAO_DERIVED
+CREDIT = geometry.DERIVED_SOURCES[DERIVED]["credit"]
 
 # The bytes verified live on 2026-09-06; a fetch that differs is refused.
 PINS = {
@@ -312,20 +310,13 @@ def _patch_of(footprint, containment, geoms, region_by_patch):
     return eurostat._pick(hits, footprint, geoms, region_by_patch)
 
 
-def suggest(
-    places, areas, regions, patches, assignments, metro_report, provenance, names=None
-):
-    """``(entries, unplaced)``: one report entry per city-region holding an
-    eligible city — a city with no metro and no known official assignment —
-    with the cities already in a metro there as context; and every city, eligible
-    or not, that could not be placed (no usable land area, or a footprint on a
-    boundary between regions) with the reason. ``provenance`` (DOI, cutoff,
-    licence, credit, input digests) is copied into every entry so each stands
-    on its own. ``names`` maps a centre id to its matched UCDB name row; a
-    region is named after its centre (a region's id is its centre's), the
-    match's ambiguity and candidates carried along, and the pasteable
-    ``add_place`` prefilled with the name — a region without one keeps the
-    placeholder."""
+def place_cities(places, areas, regions, patches, assignments, metro_report):
+    """Every city placed in its FAO region by its representative point:
+    ``(grouped, context, countries, unplaced, qid_of)`` — the eligible cities
+    per region (no metro, no known official assignment), the cities already
+    in a metro there, the gazetteer countries per region, the cities that
+    could not be placed with the reason, and each city's QID. The one
+    derivation the suggestion report and a curated FAO metro both use."""
     known = {
         row["city_id"]
         for row in assignments
@@ -374,6 +365,26 @@ def suggest(
             continue
         (grouped if eligible else context).setdefault(region_id, []).append(city)
         countries.setdefault(region_id, set()).add(place.get("country_code"))
+    return grouped, context, countries, unplaced, qid_of
+
+
+def suggest(
+    places, areas, regions, patches, assignments, metro_report, provenance, names=None
+):
+    """``(entries, unplaced)``: one report entry per city-region holding an
+    eligible city — a city with no metro and no known official assignment —
+    with the cities already in a metro there as context; and every city, eligible
+    or not, that could not be placed (no usable land area, or a footprint on a
+    boundary between regions) with the reason. ``provenance`` (DOI, cutoff,
+    licence, credit, input digests) is copied into every entry so each stands
+    on its own. ``names`` maps a centre id to its matched UCDB name row; a
+    region is named after its centre (a region's id is its centre's), the
+    match's ambiguity and candidates carried along, and the pasteable
+    ``add_place`` prefilled with the name — a region without one keeps the
+    placeholder."""
+    grouped, context, countries, unplaced, qid_of = place_cities(
+        places, areas, regions, patches, assignments, metro_report
+    )
     entries = []
     for region_id, cities in sorted(grouped.items()):
         region = regions[region_id]
@@ -403,8 +414,9 @@ def suggest(
                 "evidence_hash": overrides.canonical_digest(cities),
                 # The pair a curator pastes into places.yaml, keyed by the
                 # region's own concordance — the metro is minted from it and
-                # needs no QID — with the name filled in; refused until the
-                # scheme is registered (PR D).
+                # needs no QID — with the name filled in; the metros stage
+                # derives the members again and publishes the metro under
+                # the FAO derived gate.
                 "override": [
                     {"place": f"fao_city_region:{region_id}", "add_place": add_place},
                     {

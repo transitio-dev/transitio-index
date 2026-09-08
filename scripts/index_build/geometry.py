@@ -82,6 +82,15 @@ DERIVED_SOURCES = {
         "url": "https://ec.europa.eu/eurostat/help/copyright-notice",
         "share_alike": False,
     },
+    ("FAO city-regions 2024", "CC-BY-4.0"): {
+        "credit": (
+            "Girgin, Cattaneo, de By, McMenomy, Nelson and Vaz (2024), Worldwide "
+            "Delineation of Multi-Tier City-Regions (Zenodo), CC BY 4.0"
+        ),
+        "licence": "CC-BY-4.0",
+        "url": "https://doi.org/10.5281/zenodo.11187634",
+        "share_alike": False,
+    },
     # Non-commercial terms: used for point-in-polygon at build time only,
     # never shipped; the credit is the one the terms require.
     ("GISCO NUTS 2021", "EuroGeographics-NC"): {
@@ -114,8 +123,13 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
         ("Eurostat metropolitan regions", "Eurostat-2011/833/EU"),
         ("GISCO NUTS 2021", "EuroGeographics-NC"),
         ("GHS-UCDB R2024A", "CC-BY-4.0"),
+        ("FAO city-regions 2024", "CC-BY-4.0"),
     }
 )
+
+# The FAO city-regions as a derived input: a curated FAO metro publishes
+# only with this row and Overture's allowlisted.
+FAO_DERIVED = ("FAO city-regions 2024", "CC-BY-4.0")
 
 # ~100 m near the equator; the deviation in metres shrinks toward the poles, so
 # this never over-simplifies much beyond that. Point-in-polygon runs against the

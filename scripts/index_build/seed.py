@@ -345,7 +345,7 @@ def _resolve_place_overrides(candidates, entries, report):
     return applied
 
 
-def _add_place_overrides(places, entries, report):
+def _add_place_overrides(places, entries, report, statistical=frozenset()):
     """Curated places upserted into the seed: a place reference — a QID, or
     a concordance the place is minted from — a kind, a name, and either a
     boundary (attached by the geometry stage) or a member list (a metro's
@@ -356,7 +356,11 @@ def _add_place_overrides(places, entries, report):
         place_id = entry["place"]
         overrides.judge(entry, places.get(place_id), report, "seed")
         existing = places.get(place_id)
-        if existing is None and not ("boundary" in spec or "member_ids" in spec):
+        # A metro whose statistical area the same file names gets its
+        # members from that derivation, in the metros stage.
+        if existing is None and not (
+            "boundary" in spec or "member_ids" in spec or place_id in statistical
+        ):
             raise overrides.OverrideError(
                 f"place {place_id!r}: add_place needs a boundary or member_ids"
             )
@@ -674,7 +678,11 @@ def resolve_seed(
         )
         _add_place(places, skeleton, division)
     added = overrides.by_operation(place_overrides, "add_place")
-    _add_place_overrides(places, added, override_report)
+    statistical = {
+        e["place"]
+        for e in overrides.by_operation(place_overrides, "set_statistical_area")
+    }
+    _add_place_overrides(places, added, override_report, statistical)
     identified = _identify_places(places, registry, places_digest)
     if registry is not None:
         places = rekey_by_own_id(places, registry, records=placements)

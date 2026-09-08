@@ -1,6 +1,6 @@
 """Attach metropolitan-area membership to the seeded places.
 
-Two branches, each gated on a city's country. US cities: Wikidata links a
+Three branches. Two are gated on a city's country. US cities: Wikidata links a
 city to the metropolitan statistical area it belongs to (P8138, class
 ``US_MSA_CLASS``), keyed by the metro's CBSA code (P882), and each such metro
 is emitted as a ``metro`` place. Cities of the countries Eurostat's pinned
@@ -11,7 +11,12 @@ metro is published only through a curated ``set_statistical_area`` crosswalk
 naming its QID, and only while every derived input is allowlisted — otherwise
 it is reported with the Wikidata candidates a curator can pick from. Every
 member city carries its metros in ``metro_ids`` — a city can belong to more
-than one. Metro geometry is later work; this stage adds membership only.
+than one. The third branch, gated on the FAO derived inputs, publishes a
+curated FAO city-region: the metro a metadata-only ``add_place`` seeded takes
+the members this stage derives from the pinned FAO inputs once a
+``set_statistical_area`` of the ``fao_city_region`` scheme confirms them.
+This stage adds membership only; the geometry stage draws a metro from its
+members' shipped polygons.
 """
 
 import collections
@@ -29,6 +34,13 @@ EUROSTAT_DERIVED = (
     ("Eurostat metropolitan regions", "Eurostat-2011/833/EU"),
     ("GISCO NUTS 2021", "EuroGeographics-NC"),
 )
+# A curated FAO city-region: its members were placed by Overture land areas
+# in FAO regions, so both are derived inputs of the published membership.
+FAO_DERIVED = (
+    ("Overture Maps divisions", "CDLA-Permissive-2.0"),
+    geometry.FAO_DERIVED,
+)
+FAO_SUBTYPE = "city-region (FAO)"
 
 
 def _metro_place(metro):
@@ -365,6 +377,182 @@ def _derived_inventory(inputs_manifest, memberships):
     return rows
 
 
+def _fao_entries(place_overrides):
+    return [
+        e
+        for e in overrides.by_operation(place_overrides, "set_statistical_area")
+        if e["set_statistical_area"]["scheme"] == "fao_city_region"
+    ]
+
+
+def _fao_version(inputs_manifest):
+    """The version the FAO derived row records: both pinned inputs and the
+    cutoff, since a membership depends on all three."""
+    from index_build import fao
+
+    digests = inputs_manifest["digests"]
+    return overrides.canonical_digest(
+        {
+            "patches": digests[fao.PATCHES_FILE],
+            "regions": digests[fao.REGIONS_FILE],
+            "cutoff_hours": fao.CUTOFF_HOURS,
+        }
+    )
+
+
+def _apply_fao(
+    place_overrides,
+    places,
+    by_id,
+    metros,
+    report,
+    override_report,
+    *,
+    cache_dir,
+    dataset,
+    fao_files,
+    fao_pins,
+    assignments,
+    registry=None,
+):
+    """Curated FAO city-regions: every ``set_statistical_area`` entry of the
+    ``fao_city_region`` scheme names a region of the pinned regions table
+    and a seeded metro (the pair's metadata-only ``add_place`` made it); the
+    members are derived again here exactly as the suggestion report derives
+    them — the eligible cities whose representative points fall in the
+    region — and the entry is judged against that list: stale, or either
+    derived input not allowlisted, means reported and not applied; else the
+    metro takes the members and the region as its statistical identity. A
+    metro whose entry is not applied is dropped from the output: the
+    curated FAO metro stays report-only. Returns ``((published,
+    memberships), derived inventory rows, dropped keys)``."""
+    entries = _fao_entries(place_overrides)
+    if not entries:
+        return (0, 0), [], set()
+    from index_build import fao
+
+    regions, patches, inputs_manifest = fao.load_inputs(cache_dir, expected=fao_pins)
+    wanted = {
+        p["overture_id"] for p in places if p["kind"] == "city" and p.get("overture_id")
+    }
+    if wanted and dataset is None:
+        dataset = geometry.division_area_dataset()
+    areas = geometry.read_areas(dataset, wanted) if wanted else {}
+    grouped, _, countries, _, _ = fao.place_cities(
+        places, areas, regions, patches, assignments, report
+    )
+    allowed = all(key in geometry.DERIVED_SOURCE_ALLOWLIST for key in FAO_DERIVED)
+    published = 0
+    memberships = 0
+    codes = set()
+    dropped = set()
+    for entry in entries:
+        key, code = entry["place"], entry["set_statistical_area"]["code"]
+        if code not in regions:
+            raise overrides.OverrideError(
+                f"place {key!r}: set_statistical_area code {code!r} is not in the "
+                "pinned FAO regions table"
+            )
+        if code in codes:
+            raise overrides.OverrideError(
+                f"place {key!r}: set_statistical_area {code} is named twice"
+            )
+        codes.add(code)
+        metro = metros.get(key) or by_id.get(key)
+        if metro is None or metro.get("kind") != "metro":
+            raise overrides.OverrideError(
+                f"place {key!r}: set_statistical_area needs a seeded metro"
+            )
+        # The metro must be the region's own: keyed by its concordance, or
+        # the registry's row for that concordance.
+        registry_id = registry.lookup("fao_city_region", code) if registry else None
+        if key != f"fao_city_region:{code}" and not (
+            registry_id is not None and registry_id == metro.get("tp_id")
+        ):
+            raise overrides.OverrideError(
+                f"place {key!r}: set_statistical_area {code} names a metro that is "
+                "not the region's"
+            )
+        if metro.get("members_curated"):
+            raise overrides.OverrideError(
+                f"place {key!r}: an FAO city-region's members are derived; drop "
+                "the member list or the statistical area"
+            )
+        code_now = metro.get("statistical_area_id")
+        if code_now not in (None, code) or metro.get("source_subtype") not in (
+            None,
+            FAO_SUBTYPE,
+        ):
+            raise overrides.OverrideError(
+                f"place {key!r}: set_statistical_area {code} conflicts with the "
+                f"metro's identity ({code_now!r}, {metro.get('source_subtype')!r})"
+            )
+        # The metro's country is the region's cities' one shared country; a
+        # cross-border or indeterminate region carries none.
+        shared = countries.get(code, set())
+        country = (
+            next(iter(shared)) if len(shared) == 1 and None not in shared else None
+        )
+        if metro.get("country_code") not in (None, country):
+            raise overrides.OverrideError(
+                f"place {key!r}: set_statistical_area {code} names a region of "
+                f"{country!r}, not {metro.get('country_code')!r}"
+            )
+        derived = sorted(grouped.get(code, []))
+        # Judged under the ids the suggestion report hashes: the own ids.
+        evidence = sorted(by_id[c].get("tp_id") or c for c in derived)
+        if overrides.judge(entry, evidence, override_report, "metros"):
+            reason = "stale confirmation"
+        elif not allowed:
+            reason = "a derived input is not allowlisted"
+        else:
+            reason = None
+        if reason is not None:
+            report.append(
+                {"branch": "fao", "metro_id": key, "code": code, "reason": reason}
+            )
+            dropped.add(metro["place_id"])
+            continue
+        for city_id in derived:
+            _join_member(
+                by_id,
+                metros,
+                key,
+                lambda metro=metro: metro,
+                by_id[city_id],
+                code=code,
+                subtype=FAO_SUBTYPE,
+            )
+        metro.update(
+            statistical_area_id=code,
+            source_subtype=FAO_SUBTYPE,
+            resolution_method="curated_from_fao",
+            country_code=country,
+        )
+        published += 1
+        memberships += len(derived)
+    # One row per source: Overture's derived row is the Eurostat branch's
+    # already, so only the FAO source is added here.
+    dataset_name, licence = geometry.FAO_DERIVED
+    meta = geometry.DERIVED_SOURCES[geometry.FAO_DERIVED]
+    rows = [
+        {
+            "role": "derived_input",
+            "use": "derived",
+            "branch": "fao",
+            "dataset": dataset_name,
+            "license": licence,
+            "credit": meta["credit"],
+            "terms": meta["licence"],
+            "url": meta["url"],
+            "version": _fao_version(inputs_manifest),
+            "allowed": geometry.FAO_DERIVED in geometry.DERIVED_SOURCE_ALLOWLIST,
+            "memberships": memberships,
+        }
+    ]
+    return (published, memberships), rows, dropped
+
+
 def _attach_eurostat(
     places,
     by_id,
@@ -463,10 +651,10 @@ def _attach_eurostat(
     return assignments, inventory, summary, len(published)
 
 
-def _identify_metros(metros, registry, pins):
+def _identify_metros(metros, registry, pins, fao_pins=None):
     """Give every metro row its registry id: found by its QID (a curated
     metro the seed identified) or minted, and enriched with its statistical
-    code as a concordance."""
+    code as a concordance of its scheme."""
     if registry is None:
         return 0
     for qid in sorted(metros):
@@ -475,6 +663,11 @@ def _identify_metros(metros, registry, pins):
         if row.get("source_subtype") == "metropolitan region":
             namespace = "eurostat_metro"
             minted_in = f"eurostat {pins[eurostat.COMPOSITION_FILE]}"
+        elif row.get("source_subtype") == FAO_SUBTYPE:
+            from index_build import fao
+
+            namespace = "fao_city_region"
+            minted_in = f"fao {(fao_pins or fao.PINS)[fao.REGIONS_FILE]}"
         else:
             # Wikidata is live, so the provenance is a digest of the exact
             # identity this row was minted from, not a version.
@@ -512,6 +705,8 @@ def attach_metros(
     pins=None,
     registry=None,
     run=None,
+    fao_files=None,
+    fao_pins=None,
 ):
     """Add metro places and memberships to the seed places.
 
@@ -524,14 +719,30 @@ def attach_metros(
     (the module's pins by default). One writer lock spans the seed read, the
     live queries and the publish, so a concurrent gazetteer run cannot shift
     the seed under it. With a ``registry`` session every metro row gets its
-    registry id and ``wikidata_id``. Returns the generation manifest.
+    registry id and ``wikidata_id``. ``fao_files`` and ``fao_pins`` name the FAO
+    inputs a curated FAO city-region is derived from (the module's pins by
+    default; prepared only when an override asks for one). Returns the
+    generation manifest.
     """
     if wikidata is None:
         wikidata = overture.WikidataClient()
     pins = dict(pins or eurostat.PINS)
+    if fao_pins is None:
+        from index_build import fao
+
+        fao_pins = fao.PINS
     # Prepared under the raw store's own lock, before the gazetteer lock below,
-    # so the two are never held together.
+    # so the two are never held together; the FAO inputs only when a curated
+    # FAO metro asks for them.
     eurostat.prepare_inputs(cache_dir, expected=pins)
+    early, _ = overrides.load_place_overrides(
+        overrides_dir, registry=registry, internal=True
+    )
+    if _fao_entries(early):
+        from index_build import fao
+
+        fao.prepare_inputs(cache_dir, files=fao_files, expected=fao_pins)
+        fao.convert_patches(cache_dir, expected=fao_pins)
 
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
@@ -593,9 +804,27 @@ def attach_metros(
                 overrides.by_operation(place_overrides, "set_place_members"),
                 override_report,
             )
+            (fao_published, fao_memberships), fao_inventory, fao_dropped = _apply_fao(
+                place_overrides,
+                places,
+                by_id,
+                metros,
+                report,
+                override_report,
+                cache_dir=cache_dir,
+                dataset=dataset,
+                fao_files=fao_files,
+                fao_pins=fao_pins,
+                assignments=assignments,
+                registry=registry,
+            )
+            applied += fao_published
+            derived_inventory = list(derived_inventory) + fao_inventory
+            # A curated FAO metro that did not publish stays report-only.
+            output = [p for p in output if p["place_id"] not in fao_dropped]
             for place in output:
                 place["metro_ids"] = sorted(place["metro_ids"])
-            identified = _identify_metros(metros, registry, pins)
+            identified = _identify_metros(metros, registry, pins, fao_pins)
             if registry is not None:
                 output = list(
                     seed.rekey_by_own_id(
@@ -621,6 +850,7 @@ def attach_metros(
                 "reported": len(report),
                 "us": us_summary,
                 "eurostat": eurostat_summary,
+                "fao": {"published": fao_published, "memberships": fao_memberships},
                 "derived_inventory": derived_inventory,
                 "places_overrides_sha256": places_digest,
                 "overrides_applied": applied,

@@ -185,6 +185,7 @@ OSM = {"dataset": "OpenStreetMap", "license": "ODbL-1.0", "record_id": "relation
 AREAS = [
     fx.area("fi-hel", shapely.to_wkb(shapely.box(24.4, 60.1, 24.6, 60.3)), [OSM]),
     fx.area("fi-esp", shapely.to_wkb(shapely.box(25.1, 60.1, 25.3, 60.3)), [OSM]),
+    fx.area("us-chi", shapely.to_wkb(shapely.box(-87.9, 41.6, -87.5, 42.0)), [OSM]),
 ]
 MEMBERS = ["Q1757", "Q7"]
 
@@ -243,7 +244,9 @@ def _inputs(tmp_path, cache):
     return pins
 
 
-def _run(tmp_path, metro_map, overrides_dir=None, candidates=None, registry=None):
+def _run(
+    tmp_path, metro_map, overrides_dir=None, candidates=None, registry=None, fao=None
+):
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
@@ -264,6 +267,8 @@ def _run(tmp_path, metro_map, overrides_dir=None, candidates=None, registry=None
         dataset=areas,
         pins=pins,
         registry=registry,
+        fao_files=fao[0] if fao else None,
+        fao_pins=fao[1] if fao else None,
     )
     places, _ = store.read_jsonl(
         cache / "gazetteer", "metros.json", "places_seed.jsonl"
@@ -866,3 +871,191 @@ def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, co
     assert sorted(metro["member_ids"]) == sorted(
         places[q]["place_id"] for q in ("Q1297", "Q28515")
     )
+
+
+def _fao_inputs(tmp_path):
+    """One FAO region, 50, whose single patch holds Chicago's land area."""
+    import hashlib
+
+    import fao_fixture as ffx
+    from index_build import fao
+
+    payloads = {
+        fao.PATCHES_FILE: ffx.patches_zip(
+            [(7, (50, 0, 0, 0), shapely.box(-89.0, 41.0, -86.0, 43.0))]
+        ),
+        fao.REGIONS_FILE: ffx.regions_csv([("50", "USA", 1, ["7"], "S")]),
+    }
+    files = {}
+    for name, data in payloads.items():
+        files[name] = tmp_path / name
+        files[name].write_bytes(data)
+    expected = {n: hashlib.sha256(p.read_bytes()).hexdigest() for n, p in files.items()}
+    return files, expected
+
+
+def _fao_pair(code="50", digest=None):
+    return [
+        {
+            "place": f"fao_city_region:{code}",
+            "add_place": {"kind": "metro", "name": "Chicagoland", "country_code": "US"},
+        },
+        {
+            "place": f"fao_city_region:{code}",
+            "set_statistical_area": {"scheme": "fao_city_region", "code": code},
+            "evidence_hash": digest or overrides.canonical_digest(["Q1297"]),
+        },
+    ]
+
+
+def _fao_run(tmp_path, entries, **kw):
+    from test_index_place_overrides import write_overrides
+
+    return _run(
+        tmp_path,
+        {},
+        overrides_dir=write_overrides(tmp_path, places=entries),
+        fao=_fao_inputs(tmp_path),
+        **kw,
+    )
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [None, metros.FAO_DERIVED[0], geometry.FAO_DERIVED],
+    ids=["allowed", "no overture", "no fao"],
+)
+def test_a_curated_fao_metro_publishes_under_the_derived_gate(
+    tmp_path, monkeypatch, missing
+):
+    if missing is not None:
+        allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {missing}
+        monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
+    manifest, places = _fao_run(tmp_path, _fao_pair())
+    fao_rows = [r for r in manifest["derived_inventory"] if r.get("branch") == "fao"]
+    assert [r["dataset"] for r in fao_rows] == [geometry.FAO_DERIVED[0]]
+    datasets = [r["dataset"] for r in manifest["derived_inventory"]]
+    assert datasets.count("Overture Maps divisions") == 1
+    report = _artefact(tmp_path, "metro_report.jsonl")
+    if missing is None:
+        # The members are derived here, not taken from the curator: Chicago's
+        # land area lies in the region's patch; the metro takes the identity.
+        metro = places["fao_city_region:50"]
+        assert metro["member_ids"] == ["Q1297"]
+        assert "fao_city_region:50" in places["Q1297"]["metro_ids"]
+        assert metro["statistical_area_id"] == "50"
+        assert metro["source_subtype"] == metros.FAO_SUBTYPE
+        assert metro["resolution_method"] == "curated_from_fao"
+        assert metro["country_code"] == "US"
+        assert manifest["fao"] == {"published": 1, "memberships": 1}
+        assert all(r["allowed"] for r in fao_rows)
+        assert not any(r.get("branch") == "fao" for r in report)
+        # Downstream, the derived rows and the FAO credit reach the licence
+        # inventory and the NOTICE.
+        areas = fx.write_area_dataset(tmp_path / "areas-again.parquet", AREAS)
+        geometry.attach_geometry(
+            tmp_path / "cache", dataset=areas, overrides_dir=tmp_path / "overrides"
+        )
+        inventory, _ = store.read_jsonl(
+            tmp_path / "cache" / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+        )
+        fao_inventory = [
+            r for r in inventory if r.get("dataset") == geometry.FAO_DERIVED[0]
+        ]
+        assert fao_inventory and all(r["allowed"] for r in fao_inventory)
+        generation, _ = store.resolve(tmp_path / "cache" / "gazetteer", "geometry.json")
+        with generation:
+            notice = generation.read_bytes("NOTICE").decode("utf-8")
+        assert "Multi-Tier City-Regions" in notice
+    else:
+        # A closed gate ships nothing FAO-derived: the metro stays report-only.
+        assert "fao_city_region:50" not in places
+        assert manifest["fao"] == {"published": 0, "memberships": 0}
+        assert [r["allowed"] for r in fao_rows] == [
+            missing == geometry.FAO_DERIVED and False or missing != geometry.FAO_DERIVED
+        ]
+        assert [r["reason"] for r in report if r.get("branch") == "fao"] == [
+            "a derived input is not allowlisted"
+        ]
+
+
+def test_a_stale_or_orphan_fao_area_is_not_applied(tmp_path):
+    # A stale confirmation is reported, never applied: the metro stays
+    # report-only.
+    manifest, places = _fao_run(tmp_path, _fao_pair(digest="0" * 64))
+    assert "fao_city_region:50" not in places
+    assert manifest["stale_overrides"] == 1
+    assert manifest["fao"] == {"published": 0, "memberships": 0}
+    report = _artefact(tmp_path, "metro_report.jsonl")
+    assert [r["reason"] for r in report if r.get("branch") == "fao"] == [
+        "stale confirmation"
+    ]
+    # An area without its metro, and a code the regions table lacks, are
+    # override errors.
+    with pytest.raises(overrides.OverrideError, match="needs a seeded metro"):
+        _fao_run(tmp_path / "orphan", _fao_pair()[1:])
+    with pytest.raises(overrides.OverrideError, match="pinned FAO regions table"):
+        _fao_run(tmp_path / "unknown", _fao_pair(code="99"))
+    # A curated member list and an FAO claim do not mix: the members are derived.
+    curated = _fao_pair()
+    curated[0]["add_place"]["member_ids"] = ["Q1297"]
+    with pytest.raises(overrides.OverrideError, match="members are derived"):
+        _fao_run(tmp_path / "curated", curated)
+    # The metro's country is the region's cities' country.
+    wrong = _fao_pair()
+    wrong[0]["add_place"]["country_code"] = "FI"
+    with pytest.raises(overrides.OverrideError, match="names a region of 'US'"):
+        _fao_run(tmp_path / "country", wrong)
+
+
+def test_a_registry_backed_fao_metro_carries_its_region_not_a_cbsa(tmp_path):
+    # The metadata-only add_place mints the metro; the confirmation is hashed
+    # over the own ids the suggestion report lists, so a pasted pair applies
+    # on the next build, and the registry carries the region as its scheme.
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    # The first build mints the metro from the pair; its confirmation, hashed
+    # over ids that do not exist yet, is reported as stale and not applied.
+    with registry.session(path) as reg:
+        _fao_run(tmp_path, _fao_pair(digest="0" * 64), registry=reg)
+        reg.save()
+    saved = registry.load(path)
+    digest = overrides.canonical_digest([saved.resolve("Q1297")])
+    with registry.session(path) as reg:
+        manifest, places = _fao_run(
+            tmp_path / "again", _fao_pair(digest=digest), registry=reg
+        )
+        assert reg.minted == 0
+        reg.save()
+    metro = (
+        places["fao_city_region:50"]
+        if "fao_city_region:50" in places
+        else next(p for p in places.values() if p.get("statistical_area_id") == "50")
+    )
+    assert manifest["fao"] == {"published": 1, "memberships": 1}
+    identity = registry.load(path).effective(metro["place_id"])
+    assert identity.get("fao_city_region") == ["50"] and "cbsa" not in identity
+    # A region can only be attached to its own metro.
+    with pytest.raises(overrides.OverrideError, match="not the region's"):
+        _fao_run(
+            tmp_path / "other",
+            [
+                {
+                    "place": "Q1754965",
+                    "add_place": {
+                        "kind": "metro",
+                        "name": "X",
+                        "member_ids": ["Q1297"],
+                    },
+                },
+                {**_fao_pair()[1], "place": "Q1754965"},
+            ],
+        )
+
+
+def test_the_fao_derived_version_covers_both_inputs():
+    from index_build import fao
+
+    base = {"digests": {fao.PATCHES_FILE: "a" * 64, fao.REGIONS_FILE: "b" * 64}}
+    other = {"digests": {fao.PATCHES_FILE: "c" * 64, fao.REGIONS_FILE: "b" * 64}}
+    assert metros._fao_version(base) != metros._fao_version(other)
