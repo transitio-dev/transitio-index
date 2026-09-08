@@ -1,15 +1,10 @@
 import hashlib
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
+from transitio_index import build as build_index  # noqa: E402
 
-import build_index  # noqa: E402
-
-from index_build import registry, store  # noqa: E402
+from transitio_index import registry, store  # noqa: E402
 
 HEADER = '{"next_id": 1, "registry": 1}\n'
 

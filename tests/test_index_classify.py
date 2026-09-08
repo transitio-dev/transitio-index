@@ -1,15 +1,10 @@
 import hashlib
 import json
 import os
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import classify, coverage, crawl, publish, store  # noqa: E402
+from transitio_index import classify, coverage, crawl, publish, store  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -263,7 +258,7 @@ def test_a_classify_generation_without_coverage_is_corruption(tmp_path):
 
 
 def test_the_cli_refuses_to_lose_the_golden_gate(tmp_path):
-    import build_index
+    from transitio_index import build as build_index
 
     arguments = build_index.parse_args(
         ["--stage", "publish", "--golden", str(tmp_path / "missing.jsonl")]
@@ -1136,7 +1131,7 @@ def test_a_corrupt_expanded_generation_is_refused_by_publish(tmp_path):
 def test_feeds_yaml_edited_after_the_resolve_stage_refuses_to_classify(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     cache = tmp_path / "cache"
     _coverage(cache, [], [])

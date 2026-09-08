@@ -1,17 +1,12 @@
 import hashlib
 import io
-import sys
 import threading
 import zipfile
-from pathlib import Path
 
 import httpx
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import fetch, store, ziprange  # noqa: E402
+from transitio_index import fetch, store, ziprange  # noqa: E402
 
 BODY = b"stop_id,stop_name\n" + b"1,Central\n" * 2000
 

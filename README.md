@@ -15,33 +15,38 @@ from a checkout.
 ## Layout
 
 ```
-scripts/index_build/   the build stages (ingest, crosswalk, gazetteer,
-                       crawl, coverage, classify, curate, prune, license,
-                       publish) and the registry
-scripts/build_index.py the pipeline entry point
-scripts/publish_index.py       release the built snapshot
-scripts/check_registry_history.py  the CI registry-history guard
+transitio_index/       the build package: the stages (ingest, crosswalk,
+                       gazetteer, crawl, coverage, classify, curate, prune,
+                       license, publish) and the registry
+transitio_index/build.py              the pipeline entry point
+transitio_index/publish_cli.py        release the built snapshot
+transitio_index/registry_history.py   the CI registry-history guard
 overrides/             the place registry and curated override files
 golden/                the golden feed set the publish stage diffs against
 tests/                 the build's pytest suite and its fixtures
 ```
 
+The entry points are modules, run with `python -m`:
+`python -m transitio_index.build`, `python -m transitio_index.publish_cli`
+and `python -m transitio_index.registry_history`.
+
 ## Develop
 
 Requires Python >= 3.10. The build reads transitio's release contract, schema
 floors and fingerprint, so it depends on the released reader alongside its own
-libraries:
+libraries. Install it editable — its dependencies pull those in — and run the
+suite:
 
 ```
-pip install "transitio>=0.11" geopandas httpx openpyxl pandas pyarrow pyyaml shapely pytest
-PYTHONPATH=scripts pytest
+pip install -e ".[test]"
+pytest
 ```
 
 The publisher test imports the shared index fixture from transitio; point
 `TRANSITIO_TESTS` at a transitio checkout's `tests` directory to run it.
 
 - Format with black and lint with flake8 (config in `.flake8`), over
-  `scripts` and `tests`.
+  `transitio_index` and `tests`.
 - Small, staged pull requests against `main`; each describes what it does and
   how it was verified.
 - Regression tests are consolidated in `tests/test_regressions.py` — one test

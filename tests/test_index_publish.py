@@ -2,25 +2,23 @@ import io
 import hashlib
 import json
 import os
-import sys
 import tarfile
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
 
-from index_build import atlas, crosswalk, gbfs, mdb, store  # noqa: E402
+from transitio_index import atlas, crosswalk, gbfs, mdb, store  # noqa: E402
 
 # Skip only if pyarrow is genuinely absent; then import publish directly, so an
 # internal ImportError in the publish code fails loudly rather than skipping.
 pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
-from index_build import publish  # noqa: E402
-from index_build import classify  # noqa: E402
-from index_build import overrides  # noqa: E402
+from transitio_index import publish  # noqa: E402
+from transitio_index import classify  # noqa: E402
+from transitio_index import overrides  # noqa: E402
 
 # Import the read layer directly too, so an old installed transitio shadowing
 # the source (which would lack it) fails loudly rather than skipping the module.
@@ -701,7 +699,7 @@ def test_a_duplicate_column_label_is_refused_even_when_correctly_hashed(tmp_path
     cache, _ = _edges_index(tmp_path, [_edge("Q1757", "f-a")])
     # Every expected edge column plus a second "tier": a set comparison alone
     # would accept it; the load itself refuses it, as a controlled error.
-    from index_build.publish import _EDGES_SCHEMA
+    from transitio_index.publish import _EDGES_SCHEMA
 
     fields = list(_EDGES_SCHEMA) + [pa.field("tier", pa.string())]
     table = pa.Table.from_arrays(
@@ -1237,7 +1235,7 @@ def test_the_reader_reads_schema_6_places_and_refuses_a_mismatch(tmp_path):
 
 
 def test_the_publisher_writes_the_identity_beside_every_place(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     # Without a registry — the fixture path — a QID-keyed row is its own
     # identity: schema 6 with the QID beside the id and nothing merged.
@@ -1303,7 +1301,7 @@ def test_the_publisher_writes_the_identity_beside_every_place(tmp_path):
 
 
 def test_a_registry_backed_index_reads_back_its_identity(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     # Helsinki keyed by its own id, with a QID the registry merged into it,
     # and a QID-less metro: published and read back as schema 6.
@@ -1350,7 +1348,7 @@ def test_a_registry_backed_index_reads_back_its_identity(tmp_path):
 
 
 def test_the_publisher_refuses_a_registry_the_gazetteer_did_not_run_with(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     path = tmp_path / "places_registry.jsonl"
     path.write_text('{"next_id": 1, "registry": 1}\n')
@@ -1368,7 +1366,7 @@ def test_the_publisher_refuses_a_registry_the_gazetteer_did_not_run_with(tmp_pat
 
 
 def test_a_place_without_a_qid_publishes_and_reads_back(tmp_path):
-    from index_build import registry
+    from transitio_index import registry
 
     # Seeded by its Overture division and identified by it: published under
     # its own id with a null QID, found by name.

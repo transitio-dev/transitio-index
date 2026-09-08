@@ -1,14 +1,8 @@
 """Gazetteer pass B2: pruning the expanded places against the final edges."""
 
-import sys
-from pathlib import Path
-
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import classify, curate, prune, publish, store  # noqa: E402
+from transitio_index import classify, curate, prune, publish, store  # noqa: E402
 from test_index_classify import (  # noqa: E402
     LOOKUP,
     PLACES,

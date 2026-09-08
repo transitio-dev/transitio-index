@@ -1,18 +1,13 @@
 import io
 import json
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 pytest.importorskip("pyarrow")
 import overture_fixture as fx  # noqa: E402
 
-from index_build import names, overture, store  # noqa: E402
+from transitio_index import names, overture, store  # noqa: E402
 
 
 def _place(place_id, *, name, names=None, aliases=None):
@@ -44,7 +39,7 @@ LABELS = {
 
 
 def _run(tmp_path, overrides_dir=None, strict=False):
-    from index_build import overrides
+    from transitio_index import overrides
 
     cache = tmp_path / "cache"
     directory = store.open_subdir(cache, "gazetteer")
@@ -150,7 +145,7 @@ def test_set_aliases_adds_the_curators_names(tmp_path):
 def test_a_stale_alias_override_fails_strict_after_publishing_its_report(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     entries = [
         {"place": "Q2000", "set_aliases": ["Nowheresville"], "evidence_hash": "0" * 64}

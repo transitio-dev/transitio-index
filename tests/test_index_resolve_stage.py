@@ -1,15 +1,11 @@
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
 
 pytest.importorskip("yaml")
 import yaml  # noqa: E402
 
-from index_build import overrides, resolve, store  # noqa: E402
+from transitio_index import overrides, resolve, store  # noqa: E402
 
 
 def _feed(feed_id, **kw):

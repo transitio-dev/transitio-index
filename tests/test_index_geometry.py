@@ -1,18 +1,13 @@
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
 
-from index_build import geometry, overture, store  # noqa: E402
+from transitio_index import geometry, overture, store  # noqa: E402
 
 
 def _place(place_id, kind, *, overture_id=None, country="FI", members=()):
@@ -102,7 +97,7 @@ AREAS = [
 
 
 def _publish(cache, records, overrides_dir=None, derived=()):
-    from index_build import overrides
+    from transitio_index import overrides
 
     directory = store.open_subdir(cache, "gazetteer")
     try:
@@ -248,7 +243,7 @@ def test_only_the_land_area_is_used(tmp_path):
 def test_set_boundary_attaches_a_curated_polygon(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     wkt = "POLYGON((24.5 60.0, 25.5 60.0, 25.5 60.6, 24.5 60.6, 24.5 60.0))"
     manifest, places, _ = _run(

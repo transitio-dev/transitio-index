@@ -1,14 +1,9 @@
 import hashlib
 import json
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import registry  # noqa: E402
+from transitio_index import registry  # noqa: E402
 
 HEADER = {"registry": 1, "next_id": 5}
 HELSINKI = {
@@ -408,7 +403,7 @@ def test_read_only_refuses_every_change_at_the_point_of_discovery(tmp_path):
 def test_the_build_defaults_the_registry_to_the_overrides_directory():
     import pathlib
 
-    import build_index
+    from transitio_index import build as build_index
 
     arguments = build_index.parse_args(
         ["--stage", "gazetteer", "--overrides-dir", "ov"]
@@ -501,7 +496,7 @@ def test_the_build_defaults_the_registry_to_the_overrides_directory():
     ],
 )
 def test_the_history_check_enforces_the_contract(tmp_path, head_rows, next_id, message):
-    import check_registry_history
+    from transitio_index import registry_history as check_registry_history
 
     base = _write(tmp_path / "base.jsonl")
     head = _write(

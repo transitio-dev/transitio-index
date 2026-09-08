@@ -1,17 +1,12 @@
 import json
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 pytest.importorskip("pyarrow")
 import overture_fixture as fx  # noqa: E402
 
-from index_build import overture, store  # noqa: E402
+from transitio_index import overture, store  # noqa: E402
 
 US = ("ov-us", "country", "United States")
 NY = ("ov-ny", "region", "New York")

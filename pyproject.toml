@@ -1,8 +1,11 @@
-# The feed index build tool. For now it is run from a checkout rather than
-# installed: this file declares the project's metadata and the dependencies
-# its stages and their tests need. The package layout under `transitio_index`
-# comes in a later change; until then the suite runs from `scripts/` on
-# `sys.path`.
+# The feed index build tool. It runs from a checkout rather than being
+# published to PyPI: this file declares the project's metadata, its
+# dependencies and the `transitio_index` package, installed editable so the
+# build modules and their `python -m` entry points are importable.
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "transitio-index"
 description = "The feed index build for transitio"
@@ -40,8 +43,11 @@ classifiers = [
 [project.optional-dependencies]
 test = ["pytest", "pytest-cov"]
 
+[tool.setuptools]
+packages = ["transitio_index"]
+
 [tool.black]
-include = '(scripts|tests)/.*\.py$'
+include = '(transitio_index|tests)/.*\.py$'
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

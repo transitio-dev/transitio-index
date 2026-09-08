@@ -1,16 +1,11 @@
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 pytest.importorskip("pyarrow")
 import overture_fixture as fx  # noqa: E402
 
-from index_build import overture, registry, seed, store  # noqa: E402
+from transitio_index import overture, registry, seed, store  # noqa: E402
 
 # Skeleton (resolved by the 5a stage) + localities (resolved by the seed stage).
 ROWS = [
@@ -449,7 +444,7 @@ def test_a_locality_wins_over_a_localadmin_of_one_qid_in_either_order():
 def test_add_place_upserts_curated_places(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     entries = [
         {
@@ -524,7 +519,7 @@ def test_resolve_place_assigns_a_qid_to_an_unresolved_candidate(tmp_path):
 def test_add_place_on_an_existing_place_rewrites_its_provenance(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     entries = [
         {

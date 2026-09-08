@@ -4,16 +4,10 @@ import os
 import subprocess
 import sys
 import tarfile
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "scripts" / "build_index.py"
-
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import crosswalk, gbfs, mdb, store  # noqa: E402
+from transitio_index import crosswalk, gbfs, mdb, store  # noqa: E402
 
 
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
@@ -1102,7 +1096,7 @@ def atlas_archive(tmp_path, feeds, operators=None):
 
 
 def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
-    from index_build import atlas
+    from transitio_index import atlas
 
     cache = tmp_path / "cache"
     url = "https://example.org/gtfs.zip"
@@ -1146,7 +1140,7 @@ def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
 
 
 def test_crosswalk_stage_publishes_provisional_links(tmp_path):
-    from index_build import atlas
+    from transitio_index import atlas
 
     cache = tmp_path / "cache"
     # One Atlas name agrees with two MDB feeds on the same host -> ambiguous.
@@ -1203,7 +1197,7 @@ def test_crosswalk_stage_publishes_provisional_links(tmp_path):
 
 
 def test_read_atlas_reads_feeds_and_operators_from_one_generation(tmp_path):
-    from index_build import atlas
+    from transitio_index import atlas
 
     cache = tmp_path / "cache"
     atlas.ingest(
@@ -1231,7 +1225,7 @@ def test_read_atlas_reads_feeds_and_operators_from_one_generation(tmp_path):
 
 
 def test_a_line_separator_in_a_name_survives_the_read(tmp_path):
-    from index_build import atlas
+    from transitio_index import atlas
 
     cache = tmp_path / "cache"
     # U+2028/U+2029 are written raw by ensure_ascii=False; splitting on them
@@ -1274,7 +1268,7 @@ def test_a_line_separator_in_a_name_survives_the_read(tmp_path):
 
 
 def test_cli_runs_the_crosswalk_stage(tmp_path):
-    from index_build import atlas
+    from transitio_index import atlas
 
     cache = tmp_path / "cache"
     url = "https://example.org/gtfs.zip"
@@ -1297,7 +1291,8 @@ def test_cli_runs_the_crosswalk_stage(tmp_path):
     completed = subprocess.run(
         [
             sys.executable,
-            str(SCRIPT),
+            "-m",
+            "transitio_index.build",
             "--stage",
             "crosswalk",
             "--cache-dir",

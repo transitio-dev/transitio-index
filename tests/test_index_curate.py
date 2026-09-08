@@ -2,15 +2,10 @@
 
 import json
 import os
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import (  # noqa: E402
+from transitio_index import (  # noqa: E402
     classify,
     curate,
     golden,
@@ -1009,7 +1004,7 @@ def test_a_wildcard_place_with_an_exact_tier_addresses_the_pairs_that_fit(tmp_pa
 
 
 def test_the_cli_runs_a_stage_and_everything_downstream(monkeypatch):
-    import build_index
+    from transitio_index import build as build_index
 
     calls = []
     fake = {
@@ -1178,7 +1173,7 @@ def test_an_override_file_is_read_once_and_never_through_a_symlink(
 def test_feeds_yaml_edited_after_the_resolve_stage_refuses_to_curate(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from index_build import overrides
+    from transitio_index import overrides
 
     cache, _, _ = _build(tmp_path)
     directory = write_overrides(

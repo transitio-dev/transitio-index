@@ -5,16 +5,10 @@ import os
 import subprocess
 import sys
 import tarfile
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "scripts" / "build_index.py"
-
-sys.path.insert(0, str(REPO / "scripts"))
-
-from index_build import atlas, store  # noqa: E402
+from transitio_index import atlas, store  # noqa: E402
 
 MTA = {
     "$schema": "https://dmfr.transit.land/json-schema/dmfr.schema-v0.6.0.json",
@@ -764,7 +758,8 @@ def test_cli_ingest_runs_offline(tmp_path):
     completed = subprocess.run(
         [
             sys.executable,
-            str(SCRIPT),
+            "-m",
+            "transitio_index.build",
             "--stage",
             "ingest",
             "--source",
@@ -789,7 +784,8 @@ def test_cli_rejects_a_commit_that_is_not_a_full_sha(tmp_path):
     completed = subprocess.run(
         [
             sys.executable,
-            str(SCRIPT),
+            "-m",
+            "transitio_index.build",
             "--stage",
             "ingest",
             "--cache-dir",
@@ -809,7 +805,8 @@ def test_cli_reports_a_missing_archive(tmp_path):
     completed = subprocess.run(
         [
             sys.executable,
-            str(SCRIPT),
+            "-m",
+            "transitio_index.build",
             "--stage",
             "ingest",
             "--cache-dir",

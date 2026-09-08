@@ -1,15 +1,10 @@
 import hashlib
 import json
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
 import transitio.index as transitio_index  # noqa: E402
-from index_build import classify, licensing, prune, publish, store  # noqa: E402
+from transitio_index import classify, licensing, prune, publish, store  # noqa: E402
 from test_index_publish import (  # noqa: E402
     PLACES,
     _build_index,
@@ -198,7 +193,7 @@ def test_a_stale_license_generation_is_refused_and_none_means_unlicensed(tmp_pat
 
 
 def test_the_cli_runs_the_stage_between_prune_and_publish():
-    import build_index
+    from transitio_index import build as build_index
 
     order = list(build_index.STAGES)
     assert order.index("prune") < order.index("license") < order.index("publish")
@@ -206,7 +201,7 @@ def test_the_cli_runs_the_stage_between_prune_and_publish():
 
 
 def test_only_a_licensed_snapshot_is_released(tmp_path):
-    from index_build import publisher
+    from transitio_index import publisher
 
     cache = _cache(tmp_path)
     publish.publish(cache)
