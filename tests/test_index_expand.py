@@ -452,7 +452,7 @@ def test_expand_refuses_a_read_only_mint_and_a_stale_registry(tmp_path):
     with registry.session(path) as reg:
         with pytest.raises(overture.GazetteerError, match="no gazetteer run"):
             _expand(tmp_path, cache, registry=reg)
-    _publish_run(cache, hashlib.sha256(HEADER.encode()).hexdigest())
+    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
     with registry.session(path, read_only=True) as reg:
         with pytest.raises(registry.RegistryError, match="read-only"):
             _expand(tmp_path, cache, registry=reg)
@@ -508,7 +508,7 @@ def test_a_crash_after_the_registry_save_is_recovered_by_a_gazetteer_rerun(
     cache = _crawled_cache(tmp_path)
     path = tmp_path / "places_registry.jsonl"
     path.write_text(HEADER)
-    _publish_run(cache, hashlib.sha256(HEADER.encode()).hexdigest())
+    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
     real = store.publish
 
     def crash(directory, pointer, *args, **kwargs):
