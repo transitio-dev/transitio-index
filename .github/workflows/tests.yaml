@@ -1,0 +1,79 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install black flake8 flake8-bugbear
+      - run: black --check scripts tests
+      - run: flake8 scripts tests
+
+  test:
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      # The publisher test imports the shared index fixture, whose home is
+      # transitio; check the released tag out so tests/conftest.py can put it
+      # on the path.
+      - uses: actions/checkout@v4
+        with:
+          repository: cafein-py/transitio
+          ref: v0.11.0
+          path: transitio-src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The build runs from the checkout: install the released reader it
+      # writes for and the build's own libraries, then run the suite from
+      # scripts/ on the path (set up by conftest). There is no package to
+      # install yet.
+      - run: >
+          pip install "transitio>=0.11" geopandas httpx openpyxl pandas
+          pyarrow pyyaml shapely pytest
+      - run: pytest
+        env:
+          TRANSITIO_TESTS: ${{ github.workspace }}/transitio-src/tests
+
+  registry:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compare the place registry with the base branch
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          git cat-file -e "$base^{commit}"
+          if git cat-file -e "$base:overrides/places_registry.jsonl" 2>/dev/null; then
+            git show "$base:overrides/places_registry.jsonl" > "$RUNNER_TEMP/base_registry.jsonl"
+            echo "base registry from $base"
+          else
+            rm -f "$RUNNER_TEMP/base_registry.jsonl"
+            echo "no registry on the base commit: comparing against the header-only registry"
+          fi
+          python scripts/check_registry_history.py "$RUNNER_TEMP/base_registry.jsonl" overrides/places_registry.jsonl

@@ -1,0 +1,47 @@
+# The feed index build tool. For now it is run from a checkout rather than
+# installed: this file declares the project's metadata and the dependencies
+# its stages and their tests need. The package layout under `transitio_index`
+# comes in a later change; until then the suite runs from `scripts/` on
+# `sys.path`.
+[project]
+name = "transitio-index"
+description = "The feed index build for transitio"
+authors = [{ name = "Henrikki Tenkanen" }]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+version = "0.1.0"
+dependencies = [
+    # The reader the build writes for: its release contract, schema floors
+    # and fingerprint. Released to PyPI; schema 6 ships from 0.11.
+    "transitio>=0.11",
+    # The build's own libraries, owned here rather than through transitio's
+    # extra: GeoParquet and geometry, the crawl's HTTP, the Eurostat workbook
+    # and the override YAML. Floors match transitio's.
+    "geopandas>=0.14",
+    "httpx>=0.27",
+    "openpyxl>=3.1",
+    "pandas>=2.0",
+    "pyarrow>=14",
+    "pyyaml>=6",
+    "shapely>=2.0",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-cov"]
+
+[tool.black]
+include = '(scripts|tests)/.*\.py$'
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

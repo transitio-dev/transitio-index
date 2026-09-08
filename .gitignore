@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+.venv/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build caches and the run lock the registry takes
+cache/
+overrides/*.lock
+
+# Fixture data downloaded on demand
+tests/data/
+
+# Local planning and assistant files (not part of the build)
+plans/
+.claude/
+CLAUDE.md
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
