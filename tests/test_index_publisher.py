@@ -11,6 +11,14 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
+from index_fixture import (  # noqa: E402
+    API,
+    FakeGitHub,
+    manifest_bytes as _manifest_bytes,
+    pack as _fixture_pack,
+    write_index,
+)
+
 import publish_index  # noqa: E402
 from index_build import publisher  # noqa: E402
 from index_build import atlas, classify, licensing, publish  # noqa: E402
@@ -24,152 +32,6 @@ from test_index_publish import (  # noqa: E402
     _publish_gen,
 )
 from transitio.index import release as contract  # noqa: E402
-
-API = "https://api.example"
-UPLOADS = "https://uploads.example"
-DOWNLOADS = "https://objects.example"
-
-
-class FakeGitHub:
-    """The slice of the Releases API the publisher and a client touch, with
-    GitHub's visibility rules: drafts and their assets need the token."""
-
-    def __init__(self, *, corrupt=None, lose_publish_response=False, on_upload=None):
-        self.releases = {}
-        self.assets = {}
-        self.blobs = {}
-        self.corrupt = corrupt
-        self.lose_publish_response = lose_publish_response
-        self.on_upload = on_upload
-        self.clock = 0
-        self.published = 0
-        self.latest = None
-
-    def transport(self):
-        return httpx.MockTransport(self.handle)
-
-    def seed(self, tag, assets, *, draft=False):
-        """A release that exists before the publisher runs; index releases
-        were published the way the publisher does, never as latest."""
-        make_latest = "false" if tag.startswith(contract.TAG_PREFIX) else "true"
-        release = self._create(tag, draft, make_latest)
-        for name, data in assets.items():
-            self._upload(release, name, data)
-        return release
-
-    def _create(self, tag, draft, make_latest="true"):
-        self.clock += 1
-        release_id = 100 + self.clock
-        if not draft and make_latest != "false":
-            self.latest = release_id
-        if not draft:
-            self.published += 1
-        release = {
-            "id": release_id,
-            "tag_name": tag,
-            "draft": draft,
-            "prerelease": False,
-            "created_at": f"2026-09-{self.clock:02d}T00:00:00Z",
-            "published_at": (
-                None if draft else f"2026-10-{self.published:02d}T00:00:00Z"
-            ),
-            "upload_url": f"{UPLOADS}/repos/o/r/releases/{release_id}/assets{{?name,label}}",
-            "assets": [],
-        }
-        self.releases[release_id] = release
-        return release
-
-    def _upload(self, release, name, data):
-        asset_id = 1000 + len(self.assets) + 1
-        stored = data[:-1] + b"?" if self.corrupt == name else data
-        self.blobs[asset_id] = stored
-        asset = {
-            "id": asset_id,
-            "name": name,
-            "size": len(stored),
-            "url": f"{API}/repos/o/r/releases/assets/{asset_id}",
-            "browser_download_url": f"{DOWNLOADS}/{release['tag_name']}/{name}",
-        }
-        self.assets[asset_id] = (release["id"], asset)
-        release["assets"].append(asset)
-        return asset
-
-    def handle(self, request):
-        authed = "Authorization" in request.headers
-        path = request.url.path
-        if path.startswith("/repos/old/r/"):
-            # A transferred repository: GitHub answers with its new home.
-            location = f"{API}/repos/o/r/" + path[len("/repos/old/r/") :]
-            return httpx.Response(301, headers={"Location": location})
-        # The token reaches the API and upload hosts only: never the object
-        # store the asset redirects lead to.
-        assert authed == (request.url.host != "objects.example") or (
-            request.url.host == "api.example" and not authed
-        )
-        if request.url.host == "objects.example":
-            # The API redirect is a signed capability URL; the browser URL
-            # of a draft's asset is not served to anyone.
-            if path.startswith("/signed/"):
-                return httpx.Response(
-                    200, content=self.blobs[int(path.rsplit("/", 1)[1])]
-                )
-            _, tag, name = path.split("/", 2)
-            for release_id, asset in self.assets.values():
-                release = self.releases[release_id]
-                if release["tag_name"] == tag and asset["name"] == name:
-                    if release["draft"]:
-                        return httpx.Response(404)
-                    return httpx.Response(200, content=self.blobs[asset["id"]])
-            return httpx.Response(404)
-        if request.url.host == "uploads.example" and request.method == "POST":
-            assert authed
-            if self.on_upload is not None:
-                self.on_upload()
-            release_id = int(path.split("/")[-2])
-            name = request.url.params["name"]
-            asset = self._upload(self.releases[release_id], name, request.content)
-            return httpx.Response(201, json=asset)
-        if request.method == "GET" and path.startswith("/repos/o/r/releases/tags/"):
-            tag = path.rsplit("/", 1)[1]
-            for release in self.releases.values():
-                if release["tag_name"] == tag and (authed or not release["draft"]):
-                    return httpx.Response(200, json=release)
-            return httpx.Response(404)
-        if request.method == "GET" and path.startswith("/repos/o/r/releases/assets/"):
-            asset_id = int(path.rsplit("/", 1)[1])
-            release_id, asset = self.assets[asset_id]
-            if self.releases[release_id]["draft"] and not authed:
-                return httpx.Response(404)
-            return httpx.Response(
-                302, headers={"Location": f"{DOWNLOADS}/signed/{asset_id}"}
-            )
-        if request.method == "POST" and path == "/repos/o/r/releases":
-            body = json.loads(request.content)
-            release = self._create(body["tag_name"], body["draft"])
-            return httpx.Response(201, json=release)
-        if request.method == "PATCH" and path.startswith("/repos/o/r/releases/"):
-            release = self.releases[int(path.rsplit("/", 1)[1])]
-            body = json.loads(request.content)
-            release["draft"] = body["draft"]
-            if not release["draft"] and body.get("make_latest") != "false":
-                self.latest = release["id"]
-            if not release["draft"] and release.get("published_at") is None:
-                self.published += 1
-                release["published_at"] = f"2026-10-{self.published:02d}T00:00:00Z"
-            if self.lose_publish_response:
-                # Applied, but the response never arrived.
-                return httpx.Response(502)
-            return httpx.Response(200, json=release)
-        if request.method == "GET" and path.startswith("/repos/o/r/releases/"):
-            release = self.releases.get(int(path.rsplit("/", 1)[1]))
-            if release is None or (release["draft"] and not authed):
-                return httpx.Response(404)
-            return httpx.Response(200, json=release)
-        if request.method == "GET" and path == "/repos/o/r/releases":
-            listing = [r for r in self.releases.values() if authed or not r["draft"]]
-            listing.sort(key=lambda r: r["created_at"], reverse=True)
-            return httpx.Response(200, json=listing)
-        return httpx.Response(404)
 
 
 def _index(tmp_path):
@@ -201,16 +63,6 @@ def _index(tmp_path):
     licensing.license_index(cache)
     publish.publish(cache)
     return cache / "index"
-
-
-def _manifest_bytes(**fields):
-    manifest = {
-        "snapshot_id": "0123456789abcdef",
-        "schema_version": 4,
-        "min_reader_version": "0.11.0",
-        **fields,
-    }
-    return json.dumps(manifest).encode()
 
 
 def test_pack_is_deterministic_and_lists_only_index_members(tmp_path):
@@ -578,3 +430,17 @@ def test_an_altered_notice_is_not_released(tmp_path):
     (index_dir / "NOTICE").write_text("someone else's attribution\n")
     with pytest.raises(publisher.PublishIndexError, match="notice_sha256"):
         publisher.pack(index_dir, cache_dir=index_dir.parent)
+
+
+def test_the_reader_fixture_packs_the_way_the_publisher_does(tmp_path):
+    """The reader tests' index fixture writes an index the real publisher
+    reads, verifies and packs into a compatible release whose archive holds
+    the same members the fixture's own packer produces -- the guard that the
+    two cannot drift apart. It moves to transitio-index with the build."""
+    directory = write_index(tmp_path / "index")
+    assets, manifest = publisher.pack(directory)
+    ok, reason = contract.compatible(manifest)
+    assert ok, reason
+    fixture_manifest = json.loads(_fixture_pack(directory)["manifest.json"])
+    assert manifest["members"] == fixture_manifest["members"]
+    assert manifest["archive"]["sha256"] == fixture_manifest["archive"]["sha256"]
