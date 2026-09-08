@@ -7,7 +7,8 @@ QID-bearing admin unit the seed missed — running the same ancestor-and-metro
 expansion the seed uses, so a crawl-discovered city arrives with its region,
 country and any US metro that contains it, its boundary licence-audited and
 simplified like every other place, and its names enriched from Wikidata.
-Divisions that resolve to no QID are reported, never minted.
+A named division that resolves to no QID is a place of its own, keyed by
+its Overture id; a nameless one, or one whose signals conflict, is reported.
 
 With no crawl artifacts the stage is a pass-through: the seed places republish
 unchanged as ``places_expanded.jsonl``, so the declared path keeps running end
@@ -257,7 +258,9 @@ def _discover(
     seed._resolve_candidates(candidates, wikidata)
     skeleton = {}
     for record in candidates:
-        if record["qid"]:
+        if record["qid"] or overture.qidless_place(record):
+            # A named division no QID names is a place of its own, keyed
+            # by its Overture id.
             skeleton[record["overture_id"]] = record
         else:
             report.append(
@@ -265,7 +268,7 @@ def _discover(
                     "kind": "division",
                     "overture_id": record["overture_id"],
                     "name": record.get("name"),
-                    "reason": record.get("resolution_method") or "no QID",
+                    "reason": record.get("resolution_reason") or "no name",
                 }
             )
 

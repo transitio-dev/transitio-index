@@ -241,14 +241,16 @@ def test_an_already_seeded_place_is_not_re_added(tmp_path):
     assert set(places) == {"Q33"}
 
 
-def test_a_qidless_division_is_reported_not_minted(tmp_path):
+def test_a_named_qidless_division_is_a_place_of_its_own(tmp_path):
     cache = tmp_path / "cache"
     _publish_names(cache, SEED_PLACES)
     _write_crawl(cache, "f-noqid", ["s1,62.1,26.2\n"])
     manifest, places, report = _expand(tmp_path, cache)
-    assert "Q" not in "".join(p for p in places if p != "Q33")
-    assert any(r["overture_id"] == "fi-noqid" for r in report)
-    assert manifest["reported"] >= 1
+    nowhere = places["overture:fi-noqid"]
+    assert nowhere["kind"] == "city" and nowhere["name"] == "Nowhere"
+    assert nowhere["resolution_method"] == "overture_id"
+    assert not any(r.get("overture_id") == "fi-noqid" for r in report)
+    assert manifest["places_added"] == 1
 
 
 def test_a_discovered_us_city_gains_its_metro(tmp_path):

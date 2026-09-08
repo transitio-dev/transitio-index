@@ -238,10 +238,16 @@ def test_the_seed_identifies_every_place_in_the_registry(tmp_path):
     ids = {qid: place["place_id"] for qid, place in places.items()}
     assert all(registry.ID_PATTERN.match(tp) for tp in ids.values())
     assert len(set(ids.values())) == len(ids)
-    assert all(place["wikidata_id"] == qid for qid, place in places.items())
+    assert all(
+        place["wikidata_id"] == (qid if overture.QID_PATTERN.match(qid) else None)
+        for qid, place in places.items()
+    )
     assert manifest["identified"] == len(places)
     saved = registry.load(path)
     assert saved.resolve("Q1757") == ids["Q1757"]
+    saved_nowhere = saved.resolve("overture:us-noqid")
+    nowhere = next(p for p in places.values() if p["name"] == "Nowheresville")
+    assert nowhere["place_id"] == saved_nowhere and nowhere["wikidata_id"] is None
     concordances = saved.effective(ids["Q1757"])
     assert concordances["wikidata"] == ["Q1757"]
     assert concordances["overture"] == [places["Q1757"]["overture_id"]]
@@ -319,8 +325,8 @@ def test_the_feed_to_place_link_is_persisted_with_its_level(tmp_path):
     assert by_feed["f-subdiv"]["place_id"] == "Q1508"
     assert by_feed["f-subdiv"]["level"] == "subdivision"
     assert by_feed["f-country"]["level"] == "country"
-    # Reported (unplaced) feeds have no link.
-    assert "f-nowhere" not in by_feed
+    # The QID-less city is placed by its Overture key.
+    assert by_feed["f-nowhere"]["place_id"] == "overture:us-noqid"
     assert "f-spring-amb" not in by_feed
     assert manifest["feeds_placed"] == len(placements)
 
@@ -338,10 +344,19 @@ def test_an_ambiguous_city_name_is_reported_not_minted(tmp_path):
     assert "conflicting QIDs" in entry["reason"]
 
 
-def test_a_city_without_a_qid_is_reported(tmp_path):
-    _, _, report = _seed(tmp_path)
-    entry = next(r for r in report if r["feed_id"] == "f-nowhere")
-    assert entry["reason"] == "the matched division has no QID"
+def test_a_city_without_a_qid_is_seeded_by_its_division(tmp_path):
+    _, places, report = _seed(tmp_path)
+    nowhere = places["overture:us-noqid"]
+    assert nowhere["kind"] == "city" and nowhere["name"] == "Nowheresville"
+    assert nowhere["resolution_method"] == "overture_id"
+    assert places[nowhere["parent_id"]]["name"] == "Illinois"
+    assert not any(r["feed_id"] == "f-nowhere" for r in report)
+    placements, _ = store.read_jsonl(
+        tmp_path / "cache" / "gazetteer", "seed.json", "feed_places.jsonl"
+    )
+    assert {p["feed_id"]: p["place_id"] for p in placements}["f-nowhere"] == (
+        "overture:us-noqid"
+    )
 
 
 def test_a_qidless_same_name_sibling_makes_the_match_ambiguous(tmp_path):
@@ -677,3 +692,17 @@ def test_rekey_folds_the_links_of_rows_the_registry_merged():
     # The survivor keeps both metros; each metro's member list names it.
     assert out["tp_1"]["metro_ids"] == ["tp_8", "tp_9"]
     assert out["tp_8"]["member_ids"] == out["tp_9"]["member_ids"] == ["tp_1"]
+
+
+def test_only_a_plainly_unresolved_division_is_a_place_without_a_qid():
+    plain = {
+        "qid": None,
+        "overture_id": "x",
+        "subtype": "locality",
+        "name": "X",
+        "resolution_reason": overture.UNRESOLVED,
+    }
+    conflicting = {**plain, "resolution_reason": "conflicting P402 identities"}
+    assert seed._unique_identity([plain]) == (plain, None)
+    division, reason = seed._unique_identity([conflicting])
+    assert division is None and "conflict" in reason

@@ -5,8 +5,9 @@ to an Overture locality/localadmin by name within its country — disambiguated 
 the declared subdivision — resolves that division to a QID with the same rules as
 the skeleton stage, and emits the city place plus its administrative ancestors as
 ``places_seed.jsonl``. A feed that declares only a subdivision resolves to that
-region instead. A feed whose location does not resolve to a single QID-bearing
-place is reported, never minted.
+region instead. A feed whose location does not resolve to a single place — a
+QID-bearing division, or a named one no QID names, identified by its Overture
+id — is reported, never minted.
 
 Matching folds accents and case and considers every language label a division
 carries, so a feed naming a place in a local language still resolves. Only feeds
@@ -143,8 +144,13 @@ def _resolve_candidates(candidates, wikidata):
     }
     p402_map = wikidata.p402(pending) if pending else {}
     for record in candidates:
-        qid, method, _ = overture.resolve_qid(record, p402_map)
+        qid, method, reason = overture.resolve_qid(record, p402_map)
         record["qid"] = qid
+        record["resolution_reason"] = reason
+        # Resolved like the skeleton stage resolves it: a named division no
+        # QID names is identified by its Overture id.
+        if qid is None and overture.qidless_place(record):
+            method = "overture_id"
         record["resolution_method"] = method
 
 
@@ -168,11 +174,13 @@ def _unique_identity(candidates):
     qids = {c["qid"] for c in candidates if c["qid"]}
     if len(qids) > 1:
         return None, "the name matches divisions with conflicting QIDs"
-    if not qids:
-        return None, "the matched division has no QID"
-    if any(not c["qid"] for c in candidates):
+    if not qids and len({c["overture_id"] for c in candidates}) > 1:
+        return None, "the name matches several divisions without a QID"
+    if not qids and not all(overture.qidless_place(c) for c in candidates):
+        return None, "the matched division's identity signals conflict"
+    if qids and any(not c["qid"] for c in candidates):
         return None, "the name also matches a division without a QID"
-    qid = qids.pop()
+    qid = qids.pop() if qids else None
     best = min(
         (c for c in candidates if c["qid"] == qid),
         key=lambda c: (
@@ -193,7 +201,8 @@ def _lookup(index, country, name):
 
 
 def match(index, country, subdivision, municipality, skeleton):
-    """The single QID-bearing city for a declared location, or ``(None, why)``.
+    """The single city for a declared location — QID-bearing, or a named
+    division no QID names — or ``(None, why)``.
 
     A declared subdivision must corroborate the match: it is required to name
     one of the candidate's region/county ancestors, so a lone same-name city in
@@ -211,11 +220,18 @@ def match(index, country, subdivision, municipality, skeleton):
     return _unique_identity(candidates)
 
 
+def place_key(record):
+    """The key a resolved division has inside the stages: its QID, or
+    ``overture:<id>`` for a division no QID names — the concordance the
+    registry identifies it by."""
+    return record["qid"] or f"overture:{record['overture_id']}"
+
+
 def _place(record, *, parent_id):
     """A places_seed row from a resolved division (geometry added later)."""
     relations = record.get("osm_relation_ids") or []
     return {
-        "place_id": record["qid"],
+        "place_id": place_key(record),
         "kind": record["kind"],
         "source_subtype": record["source_subtype"],
         "name": record["name"],
@@ -232,10 +248,11 @@ def _place(record, *, parent_id):
 
 
 def _ancestor_places(division, skeleton):
-    """The division's admin ancestors as places, and its parent QID.
+    """The division's admin ancestors as places, and its parent key.
 
     Ancestors come from the division's Overture hierarchy; each is emitted as a
-    place using the QID the skeleton stage already resolved for it. An ancestor
+    place under the key the skeleton stage gives it — its QID, or its Overture
+    id for a named division no QID names. An ancestor
     the skeleton could not resolve is skipped, and ``parent_id`` links only
     resolved rungs, so the chain never points at an id that was never minted.
     """
@@ -246,7 +263,7 @@ def _ancestor_places(division, skeleton):
         if resolved is None:
             continue
         places.append(_place(resolved, parent_id=parent_id))
-        parent_id = resolved["qid"]
+        parent_id = place_key(resolved)
     return places, parent_id
 
 
@@ -651,7 +668,7 @@ def resolve_seed(
         placements.append(
             {
                 "feed_id": location["feed_id"],
-                "place_id": division["qid"],
+                "place_id": place_key(division),
                 "level": level,
             }
         )

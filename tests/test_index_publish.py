@@ -1365,3 +1365,35 @@ def test_the_publisher_refuses_a_registry_the_gazetteer_did_not_run_with(tmp_pat
     _publish_run_manifest(cache, "0" * 64)
     with pytest.raises(publish.PublishError, match="rerun the gazetteer"):
         publish.publish(cache, registry=registry.load(path))
+
+
+def test_a_place_without_a_qid_publishes_and_reads_back(tmp_path):
+    from index_build import registry
+
+    # Seeded by its Overture division and identified by it: published under
+    # its own id with a null QID, found by name.
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text(
+        '{"next_id": 2, "registry": 1}\n'
+        '{"place_id": "tp_1", "kind": "city", "concordances": {"overture": ["fi-tre"]}, '
+        '"name": "Tampere", "country_code": "FI", "minted_from": "t", "minted_in": "t 1"}\n'
+    )
+    places = [
+        {
+            **_place(
+                "tp_1", "city", geometry=GEOM_HEX, name="Tampere", country_code="FI"
+            ),
+            "wikidata_id": None,
+            "overture_id": "fi-tre",
+        }
+    ]
+    cache, _ = _build_index(
+        tmp_path,
+        places=places,
+        registry=registry.load(path),
+        run_digest=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    index = transitio_index.read_index(cache / "index")
+    tampere = transitio_index.place("Tampere", index=index)
+    assert tampere.id == "tp_1" and tampere.wikidata_id is None
+    assert tampere.concordances == {"overture": ["fi-tre"]} and tampere.former_ids == []
