@@ -11,8 +11,9 @@ The stages are described in the README's "Run a build" section. ``ingest`` reads
 Transitland Atlas, the Mobility Database catalogue and the GBFS systems
 catalogue; ``crosswalk`` resolves the same feed across them into one table;
 ``gazetteer`` resolves the Overture administrative divisions to Wikidata QIDs and
-seeds the feed cities from their declared locations; ``publish`` writes the feed
-table as the shippable ``index/`` (Parquet + manifest).
+seeds the feed cities from their declared locations; ``publish`` writes the
+shippable ``index/`` in the cache — the Parquet tables and manifest the reader
+installs.
 """
 
 import argparse

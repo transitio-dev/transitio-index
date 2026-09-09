@@ -16,8 +16,8 @@ from a checkout.
 
 ```
 transitio_index/       the build package: the stages (ingest, crosswalk,
-                       gazetteer, crawl, coverage, classify, curate, prune,
-                       license, publish) and the registry
+                       gazetteer, resolve, crawl, expand, coverage, classify,
+                       curate, prune, license, publish) and the registry
 transitio_index/build.py              the pipeline entry point
 transitio_index/publish_cli.py        release the built snapshot
 transitio_index/registry_history.py   the CI registry-history guard
@@ -64,9 +64,16 @@ The publisher test imports the shared index fixture from transitio; point
 A build is a fixed sequence of stages, run through `python -m
 transitio_index.build`. Every stage reads the previous stages' output from a
 build cache — `cache/` by default, gitignored — and writes its own output back
-into it. The cache is the only hand-off between stages: nothing is passed in
-memory, so each stage needs the output its predecessors already left in the
-cache, and a build can stop after any stage and pick up later from the next.
+into it, so nothing is passed between stages in memory and a build can stop
+after any stage and pick up later from the next. Each stage therefore needs the
+output its predecessors already left in the cache.
+
+One piece of state lives outside the cache: the place registry
+(`overrides/places_registry.jsonl` by default, or `--registry`), which the
+`gazetteer` and `expand` stages write and the later stages read. The later
+stages refuse to run against a registry that no longer matches the cached
+gazetteer run, so resuming or moving a build means keeping the cache and its
+matching registry together.
 
 ### The stages, in order
 
