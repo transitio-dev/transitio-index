@@ -55,6 +55,7 @@ import json
 
 from transitio.index import fingerprint
 from transitio_index import classify, coverage, crawl, overrides, store
+from transitio_index.progress import progress
 
 CURATE_POINTER = classify.CURATE_POINTER
 EDGES_ARTIFACT = classify.CURATED_EDGES_ARTIFACT
@@ -679,7 +680,7 @@ def curate(cache_dir, *, overrides_dir=None, strict=False, registry=None):
             candidates = store.parse_jsonl(covered.read_bytes(coverage.EDGES_ARTIFACT))
         canonical = coverage._canonical_ids(feeds)
         crawled = {}
-        for feed_dir, state in crawl.crawled_feeds(cache_dir):
+        for feed_dir, state in progress(crawl.crawled_feeds(cache_dir), "curate"):
             state_id = state.get("feed_id")
             feed_id = canonical.get(state_id) if isinstance(state_id, str) else None
             if feed_id is not None:

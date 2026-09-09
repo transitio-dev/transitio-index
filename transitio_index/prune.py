@@ -26,6 +26,7 @@ import copy
 import datetime
 
 from transitio_index import classify, store
+from transitio_index.progress import progress
 
 PRUNE_POINTER = "places_pruned.json"
 PLACES_ARTIFACT = "places_pruned.jsonl"
@@ -81,7 +82,7 @@ def prune_places(places, edges):
     kept = keep_set(by_id, edges)
     report = collections.Counter({metric: 0 for metric in METRICS})
     survivors = []
-    for pid in sorted(by_id):
+    for pid in progress(sorted(by_id), "prune"):
         place = by_id[pid]
         if pid not in kept:
             report[f"dropped_{place.get('kind')}"] += 1

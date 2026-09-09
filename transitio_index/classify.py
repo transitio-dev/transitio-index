@@ -45,6 +45,7 @@ import statistics
 
 from transitio.index import fingerprint
 from transitio_index import coverage, crawl, overrides, store
+from transitio_index.progress import progress
 
 CLASSIFY_POINTER = "edges.json"
 EDGES_ARTIFACT = "edges.jsonl"
@@ -1245,7 +1246,7 @@ def classify(
             edges_dropped = 0
             join_gaps = collections.Counter()
             stale_skips = []
-            for feed_id in sorted(by_feed):
+            for feed_id in progress(sorted(by_feed), "classify"):
                 feed_candidates = by_feed[feed_id]
                 if sources.get(feed_id) == "crawl" and feed_id in crawled:
                     feed_dir, state = crawled[feed_id]
