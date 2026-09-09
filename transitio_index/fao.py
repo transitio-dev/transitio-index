@@ -21,6 +21,7 @@ import pyarrow.parquet as pq
 import shapely
 
 from transitio_index import csv_source, eurostat, geometry, overrides, pinned, store
+from transitio_index.progress import progress
 
 CUTOFF_HOURS = 1
 DOI = "10.5281/zenodo.11187634"
@@ -335,7 +336,7 @@ def place_cities(places, areas, regions, patches, assignments, metro_report):
     countries = {}
     unplaced = []
     qid_of = {}
-    for place in places:
+    for place in progress(places, "fao cities"):
         if place.get("kind") != "city":
             continue
         city = place["place_id"]
@@ -386,7 +387,7 @@ def suggest(
         places, areas, regions, patches, assignments, metro_report
     )
     entries = []
-    for region_id, cities in sorted(grouped.items()):
+    for region_id, cities in progress(sorted(grouped.items()), "fao"):
         region = regions[region_id]
         cities = sorted(cities)
         # FAO's country is ISO-3; the pasteable code is the gazetteer code every

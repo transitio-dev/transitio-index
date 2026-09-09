@@ -26,6 +26,7 @@ import json
 import hashlib
 
 from transitio_index import eurostat, geometry, overrides, overture, seed, store
+from transitio_index.progress import progress
 
 # The derived inputs the Eurostat branch needs approved, as allowlist keys;
 # any one missing runs the branch report-only.
@@ -214,7 +215,7 @@ def _attach_us(places, by_id, metros, report, wikidata, registry=None):
     membership = wikidata.statistical_metros(us_cities) if us_cities else {}
     published = set()
     reported_metros = set()
-    for city_qid, found in membership.items():
+    for city_qid, found in progress(membership.items(), "metros"):
         city = by_id.get(city_qid)
         if city is None:
             continue
