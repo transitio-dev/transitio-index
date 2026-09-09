@@ -9,7 +9,7 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
-from transitio_index import boundaries, overture  # noqa: E402
+from transitio_index import boundaries, overture, registry  # noqa: E402
 
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
 
@@ -69,3 +69,25 @@ def test_a_qidless_division_reloaded_from_the_memo_keeps_a_none_wikidata(tmp_pat
         assert hel["wikidata"] == "Q1757"
     finally:
         reopened.close()
+
+
+def test_a_crawled_qidless_division_is_minted_through_the_registry(tmp_path):
+    """A crawl-discovered division no QID names, keyed by an ``overture:``
+    concordance the registry does not yet carry, is minted rather than
+    aborting expand with "no place carries it"."""
+    import test_index_expand as ex
+
+    cache = tmp_path / "cache"
+    ex._publish_names(cache, ex.SEED_PLACES)
+    ex._write_crawl(cache, "f-noqid", ["s1,62.1,26.2\n"])
+    path = tmp_path / "places_registry.jsonl"
+    ex._publish_run(cache, ex._seeded_registry(path))
+    with registry.session(path) as reg:
+        manifest, places, report = ex._expand(tmp_path, cache, registry=reg)
+        assert (reg.minted, manifest["minted"], manifest["places_added"]) == (1, 1, 1)
+    saved = registry.load(path)
+    minted_id = saved.resolve("overture:fi-noqid")
+    nowhere = places[minted_id]
+    assert nowhere["kind"] == "city" and nowhere["name"] == "Nowhere"
+    assert nowhere["resolution_method"] == "overture_id"
+    assert not any(r.get("overture_id") == "fi-noqid" for r in report)

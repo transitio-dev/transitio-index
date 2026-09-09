@@ -92,10 +92,16 @@ def _digest(value):
 def _canonical_place_key(registry, qid, row):
     """The key a discovered division stands for inside the stage: the key
     the registry gives its QID, or — when the QID names no row — the one it
-    gives the division's Overture or OSM id, else the QID itself."""
-    key = metros._canonical_key(registry, qid)
-    if registry is None or key != qid:
-        return key
+    gives the division's Overture or OSM id, else its own key. A first-seen
+    QID-less division, keyed by an ``overture:`` concordance the registry does
+    not yet carry, keeps that key and is minted downstream rather than aborting
+    the run."""
+    if registry is None:
+        return qid
+    if overture.QID_PATTERN.match(qid):
+        key = metros._canonical_key(registry, qid)
+        if key != qid:
+            return key
     for namespace, value in (
         ("overture", row.get("overture_id")),
         ("osm_relation", row.get("osm_relation_id")),
@@ -105,7 +111,7 @@ def _canonical_place_key(registry, qid, row):
                 return registry.key_for(f"{namespace}:{value}", internal=True)
             except _registry.RegistryError:
                 continue
-    return key
+    return qid
 
 
 def _stop_points(feed_dir, state):
