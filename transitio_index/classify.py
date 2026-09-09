@@ -698,7 +698,7 @@ def _stops_inside(route, place_id, place):
 
 
 def _classify_feed(
-    candidates, feed_dir, state, lookup, places, by_overture, route_min_stops
+    candidates, feed_dir, state, lookup, places, by_qid, by_overture, route_min_stops
 ):
     """The classified edges for one crawled feed; ``(edges, status, routes,
     dropped, join_gaps)`` — ``dropped`` counting candidate places no route
@@ -732,7 +732,7 @@ def _classify_feed(
     stale = set()
     for stop_id, (x, y) in coords.items():
         hit, countries, stale_here = coverage.stop_places(
-            lookup, x, y, places, by_overture
+            lookup, x, y, by_overture, by_qid
         )
         stop_places[stop_id] = hit
         stop_countries[stop_id] = countries
@@ -1211,6 +1211,7 @@ def classify(
                 )
             places = {place["place_id"]: place for place in place_rows}
             by_overture = coverage.place_index(places)
+            by_qid = coverage.place_qids(places)
             canonical = coverage._canonical_ids(feeds)
             crawl_lock = crawl.reading(cache_dir)
             crawl_lock.__enter__()
@@ -1256,6 +1257,7 @@ def classify(
                         state,
                         lookup,
                         places,
+                        by_qid,
                         by_overture,
                         route_min_stops,
                     )

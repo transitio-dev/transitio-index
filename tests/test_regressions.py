@@ -11,7 +11,7 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
-from transitio_index import boundaries, overture, registry  # noqa: E402
+from transitio_index import boundaries, coverage, overture, registry  # noqa: E402
 
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
 
@@ -141,3 +141,34 @@ def test_wikidata_get_json_retries_a_transient_disconnect(monkeypatch):
     client = overture.WikidataClient()
     assert client._get_json("https://example.invalid") == {"ok": 1}
     assert calls["n"] == 2
+
+
+def test_a_stop_on_another_division_of_a_known_qid_is_not_stale():
+    """A QID names several Overture divisions but a place records only one
+    overture_id; a stop on another of its divisions is matched by QID, not
+    flagged stale — including a registry build keyed by tp_ ids."""
+
+    class FakeLookup:
+        def divisions_at(self, x, y):
+            return [
+                {
+                    "overture_id": "ov-B",  # not the id the place recorded
+                    "wikidata": "Q100",
+                    "kind": "city",
+                    "country": "FI",
+                }
+            ]
+
+    places = {
+        "tp_5": {
+            "place_id": "tp_5",
+            "wikidata_id": "Q100",
+            "overture_id": "ov-A",
+            "kind": "city",
+        }
+    }
+    by_overture = coverage.place_index(places)
+    by_qid = coverage.place_qids(places)
+    hit, _, stale = coverage.stop_places(FakeLookup(), 0.0, 0.0, by_overture, by_qid)
+    assert hit == {"tp_5"}
+    assert stale == set()

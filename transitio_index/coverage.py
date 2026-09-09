@@ -262,7 +262,8 @@ def place_index(places):
     """``{overture_id: place_id}``: how division hits map onto places.
 
     Overture id first — a P402-resolved place has no wikidata on the division
-    record — with the QID as the fallback in :func:`stop_places`.
+    record — with the QID (see :func:`place_qids`) as the fallback in
+    :func:`stop_places`.
     """
     return {
         place.get("overture_id"): place_id
@@ -271,11 +272,32 @@ def place_index(places):
     }
 
 
-def stop_places(lookup, x, y, places, by_overture):
+def place_qids(places):
+    """``{id: place_id}`` mapping each QID a place answers to onto it — the
+    place's own key (a QID on the registry-less path) and its registry
+    ``wikidata_id``.
+
+    A single QID can name several Overture divisions while a place records only
+    one ``overture_id``, so a stop landing on another division of a known QID is
+    matched by QID here rather than read as an unknown, stale division. A
+    registry build keys places by their minted ``tp_`` id, so the QID must be
+    indexed explicitly, not assumed to be the key.
+    """
+    index = {}
+    for place_id, place in places.items():
+        index.setdefault(place_id, place_id)
+        qid = place.get("wikidata_id")
+        if qid:
+            index.setdefault(qid, place_id)
+    return index
+
+
+def stop_places(lookup, x, y, by_overture, by_qid):
     """``(place_ids, countries, stale)`` for one stop coordinate.
 
-    ``stale`` holds QID-bearing divisions the gazetteer does not know, which
-    can only mean ``places_expanded`` predates the crawl.
+    A division is known when its Overture id or its QID maps to a place;
+    ``stale`` holds QID-bearing divisions neither names, which can only mean
+    ``places_expanded`` predates the crawl.
     """
     from transitio_index import overture
 
@@ -286,8 +308,8 @@ def stop_places(lookup, x, y, places, by_overture):
         if record.get("country"):
             countries.add(record["country"])
         place_id = by_overture.get(record.get("overture_id"))
-        if place_id is None and record.get("wikidata") in places:
-            place_id = record["wikidata"]
+        if place_id is None:
+            place_id = by_qid.get(record.get("wikidata"))
         if place_id is not None:
             hit.add(place_id)
             continue
@@ -317,6 +339,7 @@ def crawled_edges(cache_dir, feeds, places, lookup):
 
     canonical = _canonical_ids(feeds)
     by_overture = place_index(places)
+    by_qid = place_qids(places)
     # Minted metros have no geometry: a stop is inside a metro when it is
     # inside ANY member city — counted once however many members it hits.
     metro_members = {
@@ -364,7 +387,7 @@ def crawled_edges(cache_dir, feeds, places, lookup):
         lookup.ensure(crawl.cluster_boxes(points))
         counts = collections.Counter()
         for x, y in points:
-            hit, _, stale_here = stop_places(lookup, x, y, places, by_overture)
+            hit, _, stale_here = stop_places(lookup, x, y, by_overture, by_qid)
             stale.update(stale_here)
             # A metro counts a stop once, whether its own polygon, a member
             # city, or both placed it there.
