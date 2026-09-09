@@ -22,6 +22,7 @@ transitio_index/build.py              the pipeline entry point
 transitio_index/publish_cli.py        release the built snapshot
 transitio_index/registry_history.py   the CI registry-history guard
 scripts/sample_catalogues.py  cut a small multi-place catalogue sample
+scripts/export_divisions.py   export the Overture division hierarchy to inspect
 overrides/             the place registry and curated override files
 golden/                the golden feed set the publish stage diffs against
 tests/                 the build's pytest suite and its fixtures
