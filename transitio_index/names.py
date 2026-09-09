@@ -11,6 +11,7 @@ queried once per build via the ``wbgetentities`` API; a curator's
 import datetime
 
 from transitio_index import overrides, overture, store
+from transitio_index.progress import progress
 
 
 def _merge(place, entry):
@@ -81,7 +82,7 @@ def merge_names(
             data = wikidata.labels_and_aliases(sorted(set(qid_of.values())))
 
             enriched = 0
-            for place in places:
+            for place in progress(places, "names"):
                 place.setdefault("aliases", [])
                 entry = data.get(qid_of.get(place.get("place_id")))
                 if entry is None:

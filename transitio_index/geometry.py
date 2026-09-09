@@ -20,6 +20,7 @@ import pyarrow.dataset as ds
 import shapely
 
 from transitio_index import overrides, overture, store
+from transitio_index.progress import progress
 
 DIVISION_AREA_PATH = "release/{release}/theme=divisions/type=division_area"
 AREA_PROJECT = ["division_id", "geometry", "sources", "is_land"]
@@ -159,7 +160,9 @@ def read_areas(dataset, division_ids):
         return {}
     predicate = ds.field("division_id").isin(sorted(division_ids))
     areas = {}
-    for batch in dataset.to_batches(columns=AREA_PROJECT, filter=predicate):
+    for batch in progress(
+        dataset.to_batches(columns=AREA_PROJECT, filter=predicate), "areas"
+    ):
         for row in batch.to_pylist():
             if not row.get("is_land"):
                 continue
@@ -347,7 +350,7 @@ def attach_geometry(
             with_geometry = 0
             omitted = 0
             invalid = 0
-            for place in places:
+            for place in progress(places, "geometry"):
                 place.setdefault("geometry", None)
                 place.setdefault("geometry_source", None)
                 rows = areas.get(place.get("overture_id"))

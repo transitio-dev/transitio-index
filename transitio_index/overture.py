@@ -24,6 +24,7 @@ import urllib.request
 import pyarrow.dataset as ds
 
 from transitio_index import store
+from transitio_index.progress import progress
 
 OVERTURE_RELEASE = "2026-08-19.0"
 OVERTURE_BUCKET = "overturemaps-us-west-2"
@@ -220,7 +221,7 @@ class WikidataClient:
         """
         ids = sorted({str(rid) for rid in osm_relation_ids if rid})
         found = {}
-        for start in range(0, len(ids), self.batch_size):
+        for start in progress(range(0, len(ids), self.batch_size), "wikidata p402"):
             self._query_batch(ids[start : start + self.batch_size], found)
         return found
 
@@ -273,7 +274,7 @@ class WikidataClient:
         if invalid:
             raise GazetteerError(f"not Wikidata QIDs: {invalid[:5]}")
         raw = {}
-        for start in range(0, len(ids), self.batch_size):
+        for start in progress(range(0, len(ids), self.batch_size), "wikidata p8138"):
             self._p8138_batch(
                 ids[start : start + self.batch_size], raw, classes, code_property
             )
@@ -335,7 +336,7 @@ class WikidataClient:
         """
         ids = sorted({str(q) for q in qids if q and QID_PATTERN.match(str(q))})
         out = {}
-        for start in range(0, len(ids), 50):
+        for start in progress(range(0, len(ids), 50), "wikidata labels"):
             self._entities_batch(ids[start : start + 50], out)
         return out
 
@@ -467,7 +468,7 @@ def resolve(cache_dir, *, dataset=None, wikidata=None, run=None):
     resolved = []
     report = []
     by_method = {"overture_wikidata": 0, "osm_p402": 0, "overture_id": 0}
-    for record in records:
+    for record in progress(records, "overture"):
         qid, method, reason = resolve_qid(record, p402_map)
         record["resolution_reason"] = reason
         if qid is None and qidless_place(record):

@@ -24,6 +24,7 @@ import pyarrow.dataset as ds
 
 from transitio_index import overrides, overture, store
 from transitio_index import registry as _registry
+from transitio_index.progress import progress
 
 # The Overture subtypes that stand in for a city, most specific first: a name
 # resolving to both prefers the locality (decision in the plan's subtype table).
@@ -124,7 +125,10 @@ def read_city_candidates(dataset, countries, wanted):
         "country"
     ).isin(sorted(countries))
     kept = []
-    for batch in dataset.to_batches(columns=overture.PROJECT, filter=predicate):
+    for batch in progress(
+        dataset.to_batches(columns=overture.PROJECT, filter=predicate),
+        "seed localities",
+    ):
         for row in batch.to_pylist():
             record = overture.normalize_division(row)
             if any(
@@ -630,7 +634,7 @@ def resolve_seed(
     places = {}
     report = []
     placements = []
-    for location in locations:
+    for location in progress(locations, "seed"):
         if location["municipality"]:
             level = "municipality"
             division, reason = match(
