@@ -58,6 +58,13 @@ def test_progress_without_a_total_reports_the_count(capturing_logger):
     assert messages[-1] == "scan: 2 done"
 
 
+def test_progress_auto_detects_total_for_a_sized_iterable(capturing_logger):
+    logger, messages = capturing_logger
+    # A list is sized, so the denominator appears without an explicit total.
+    list(progress.progress([1, 2, 3], "cut", interval=1e9, logger=logger))
+    assert messages[-1] == "cut: 3/3 done"
+
+
 def test_progress_with_a_zero_total_reports_zero_over_zero(capturing_logger):
     logger, messages = capturing_logger
     list(progress.progress([], "empty", total=0, interval=1e9, logger=logger))

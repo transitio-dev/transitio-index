@@ -31,6 +31,7 @@ from transitio_index import (
     store,
 )
 from transitio_index import names as names_stage
+from transitio_index.progress import progress
 
 EXPANDED_POINTER = "expanded.json"
 PLACES_ARTIFACT = "places_expanded.jsonl"
@@ -231,7 +232,7 @@ def _discover(
     state_mismatches = 0
     boxes = []
     usable = []
-    for feed_dir, state in crawled:
+    for feed_dir, state in progress(crawled, "expand scan"):
         read = _stop_points(feed_dir, state)
         if read is None:
             state_mismatches += 1
@@ -243,7 +244,7 @@ def _discover(
     lookup.ensure(boxes)
 
     divisions = {}
-    for feed_dir, state in usable:
+    for feed_dir, state in progress(usable, "expand resolve"):
         read = _stop_points(feed_dir, state)
         if read is None:
             # Changed between the passes: no longer trustworthy evidence.

@@ -45,6 +45,7 @@ import zipfile
 import zlib
 
 from transitio_index import fetch, store, ziprange
+from transitio_index.progress import progress
 
 MEMBERS = (
     "agency.txt",
@@ -919,7 +920,7 @@ def crawl(
                             range_threshold=range_threshold,
                             lookup=lookup,
                         )
-                        for feed, force in eligible
+                        for feed, force in progress(eligible, "crawl")
                     ]
                 else:
                     log = [None] * len(eligible)
@@ -938,7 +939,11 @@ def crawl(
                             ): ordinal
                             for ordinal, (feed, force) in enumerate(eligible)
                         }
-                        for future in concurrent.futures.as_completed(futures):
+                        for future in progress(
+                            concurrent.futures.as_completed(futures),
+                            "crawl",
+                            total=len(eligible),
+                        ):
                             log[futures[future]] = future.result()
                 store.write_file(
                     directory,

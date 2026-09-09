@@ -9,6 +9,7 @@ never crawled; normalization happens here, placement is a later stage.
 import collections
 
 from transitio_index import csv_source
+from transitio_index.progress import progress
 
 CSV_URL = "https://raw.githubusercontent.com/MobilityData/gbfs/master/systems.csv"
 # A human tag for the fetch; the manifest's csv_sha256 is the real identity
@@ -67,7 +68,8 @@ def parse_rows(rows, source_file):
     — and the collision is counted so a later minting stage can disambiguate.
     """
     records = [
-        normalize_row(row, source_file, position) for position, row in enumerate(rows)
+        normalize_row(row, source_file, position)
+        for position, row in enumerate(progress(rows, "gbfs"))
     ]
     counts = collections.Counter(record["system_id"] for record in records)
     collisions = sorted(name for name, count in counts.items() if count > 1)
