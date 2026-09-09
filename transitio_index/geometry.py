@@ -7,15 +7,15 @@ hex-encoded WKB) only when every source that built it is on the allowlist, and
 its attribution goes into ``NOTICE``; geometry with any unaudited or unlicensed
 source is omitted and recorded in the licence inventory. A metro's geometry is
 the union of its member cities' shipped polygons, so it never carries what a
-member may not. Only the simplified
-geometry is meant to ship; the full-resolution boundary lookup used for
-point-in-polygon is built by the coverage stage that consumes it.
+member may not. The shipped geometry is simplified to a tolerance; the boundary
+lookup used for point-in-polygon (the expand and coverage stages) memoizes
+geometry at that same tolerance.
 """
 
 import collections
 import datetime
-import math
 
+import numpy as np
 import pyarrow.dataset as ds
 import shapely
 
@@ -133,9 +133,9 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
 FAO_DERIVED = ("FAO city-regions 2024", "CC-BY-4.0")
 
 # ~100 m near the equator; the deviation in metres shrinks toward the poles, so
-# this never over-simplifies much beyond that. Point-in-polygon runs against the
-# full-resolution geometry in the coverage stage, so shipped geometry can be this
-# coarse.
+# this never over-simplifies much beyond that. The boundary lookup used for
+# point-in-polygon memoizes geometry at this same tolerance — ample for locating
+# transit stops, which never sit on a border to the metre.
 SIMPLIFY_TOLERANCE_DEG = 0.001
 
 
@@ -195,6 +195,23 @@ def _is_shippable(sources):
     return bool(sources) and all(_source_key(s) in SOURCE_ALLOWLIST for s in sources)
 
 
+def _valid_polygons(geoms):
+    """A boolean mask over a geometry array: which are shippable boundaries.
+
+    True where a geometry is a non-empty, valid, finite (multi)polygon; ``None``
+    and other-typed entries are False. Vectorized over the shapely array API so
+    a batch of geometries is checked in one pass rather than one at a time;
+    ``_valid_polygon`` is the scalar form.
+    """
+    bounds = shapely.bounds(geoms)
+    return (
+        np.isin(shapely.get_type_id(geoms), (3, 6))  # Polygon / MultiPolygon
+        & ~shapely.is_empty(geoms)
+        & np.isfinite(bounds).all(axis=1)
+        & shapely.is_valid(geoms)
+    )
+
+
 def _valid_polygon(geom):
     """True for a non-empty, valid, finite (multi)polygon; a shippable boundary.
 
@@ -202,13 +219,7 @@ def _valid_polygon(geom):
     non-finite coordinates; none of those may ship, so each is rejected rather
     than committed as a place's geometry.
     """
-    if geom is None or geom.is_empty:
-        return False
-    if geom.geom_type not in ("Polygon", "MultiPolygon"):
-        return False
-    if not all(math.isfinite(bound) for bound in geom.bounds):
-        return False
-    return geom.is_valid
+    return bool(_valid_polygons(np.asarray([geom], dtype=object))[0])
 
 
 def _repaired_polygon(geom):

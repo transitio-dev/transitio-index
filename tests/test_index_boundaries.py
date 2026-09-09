@@ -1,5 +1,3 @@
-import json
-
 import pytest
 
 pytest.importorskip("pyarrow")
@@ -189,7 +187,6 @@ def test_geometries_never_duplicate_across_boxes(tmp_path):
         lookup.ensure([HEL_BOX])
         lookup.ensure([(28.0, 68.0, 28.1, 68.1)])
         record = lookup._records["fi"]
-        assert len(record["geometries"]) == 1
         assert len(record["geoms"]) == 1
 
 
@@ -208,16 +205,20 @@ def test_a_point_outside_everything_finds_nothing(tmp_path):
 def test_a_stale_memo_entry_is_not_trusted(tmp_path):
     # A memo written before geometry validation existed (or corrupted on
     # disk) must be filtered on load, not fed to the containment index.
+    import geopandas as gpd
+
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
         lookup.ensure([HEL_BOX])
-    memo = cache / "boundary_lookup" / "test-release" / "divisions.jsonl"
-    rows = [json.loads(line) for line in memo.read_text().splitlines()]
-    line_hex = shapely.to_wkb(shapely.LineString([(24.9, 60.12), (25.0, 60.18)])).hex()
-    for row in rows:
-        if row["division_id"] == "fi-hel":
-            row["geometries"] = [line_hex, "not hex"]
-    memo.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    memo = cache / "boundary_lookup" / "test-release" / "divisions.parquet"
+    frame = gpd.read_parquet(memo)
+    line = shapely.LineString([(24.9, 60.12), (25.0, 60.18)])
+    geoms = [
+        line if division_id == "fi-hel" else geom
+        for division_id, geom in zip(frame["division_id"], frame.geometry)
+    ]
+    frame = frame.set_geometry(gpd.GeoSeries(geoms, crs=frame.crs))
+    frame.to_parquet(memo)
     reopened = boundaries.BoundaryLookup(cache, release="test-release")
     try:
         found = reopened.divisions_at(24.94, 60.17)
@@ -236,5 +237,35 @@ def test_the_memo_is_keyed_by_release(tmp_path):
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
         lookup.ensure([HEL_BOX])
-    assert (cache / "boundary_lookup" / "test-release" / "divisions.jsonl").is_file()
+    assert (cache / "boundary_lookup" / "test-release" / "divisions.parquet").is_file()
     assert (cache / "boundary_lookup" / "test-release" / "covered.jsonl").is_file()
+
+
+def test_memoized_geometry_is_simplified(tmp_path):
+    # A boundary carrying a vertex that deviates less than the shipping
+    # tolerance is memoized simplified: the sub-tolerance vertex is dropped,
+    # so the lookup does not keep full-resolution coastline.
+    dense = shapely.Polygon(
+        [
+            (24.90, 60.15),
+            (24.95, 60.1503),  # ~0.0003 deg off the edge (< 0.001 tolerance)
+            (25.00, 60.15),
+            (25.00, 60.20),
+            (24.90, 60.20),
+        ]
+    )
+    divisions = fx.write_dataset(tmp_path / "d.parquet", [DIVISIONS[2]])  # fi-hel
+    areas = fx.write_area_dataset(
+        tmp_path / "a.parquet",
+        [fx.area("fi-hel", shapely.to_wkb(dense), CC0, country="FI")],
+    )
+    with boundaries.BoundaryLookup(
+        tmp_path / "cache",
+        release="test-release",
+        area_dataset=areas,
+        division_dataset=divisions,
+    ) as lookup:
+        lookup.ensure([HEL_BOX])
+        stored = lookup._records["fi-hel"]["geoms"][0]
+        assert len(stored.exterior.coords) < len(dense.exterior.coords)
+        assert lookup.divisions_at(24.94, 60.17)[0]["division_id"] == "fi-hel"
