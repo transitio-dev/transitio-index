@@ -11,6 +11,7 @@ import math
 
 from transitio_index import csv_source
 from transitio_index.csv_source import IngestError
+from transitio_index.progress import progress
 
 CSV_URL = "https://files.mobilitydatabase.org/feeds_v2.csv"
 # A human tag for the fetch; the manifest's csv_sha256 is the real identity
@@ -159,7 +160,7 @@ def parse_rows(rows, source_file):
     """
     records = []
     seen = {}
-    for position, row in enumerate(rows):
+    for position, row in enumerate(progress(rows, "mdb")):
         record = normalize_row(row, source_file, position)
         mdb_id = record["mdb_id"]
         first = seen.get(mdb_id)

@@ -37,6 +37,7 @@ import collections
 import datetime
 
 from transitio_index import overrides, store
+from transitio_index.progress import progress
 
 COVERAGE_POINTER = "coverage.json"
 FEEDS_ARTIFACT = "feeds_covered.jsonl"
@@ -329,7 +330,7 @@ def crawled_edges(cache_dir, feeds, places, lookup):
     stale = set()
     mismatches = 0
     unmatched = set()
-    for feed_dir, state in crawl.crawled_feeds(cache_dir):
+    for feed_dir, state in progress(crawl.crawled_feeds(cache_dir), "coverage"):
         state_id = state.get("feed_id")
         feed_id = canonical.get(state_id) if isinstance(state_id, str) else None
         if feed_id is None:

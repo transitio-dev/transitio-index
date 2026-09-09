@@ -26,6 +26,7 @@ import unicodedata
 import urllib.parse
 
 from transitio_index import store
+from transitio_index.progress import progress
 
 FEEDS_POINTER = "feeds.json"
 FEEDS_ARTIFACT = "feeds.jsonl"
@@ -885,7 +886,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         _both_record(a, m, method="geohash", confidence=GEOHASH_CONFIDENCE)
         for a, m in geohash_pairs
     )
-    for feed in atlas_feeds:
+    for feed in progress(atlas_feeds, "crosswalk"):
         if feed["onestop_id"] in matched_onestop:
             continue
         system = system_by_onestop.get(feed["onestop_id"])

@@ -18,6 +18,7 @@ import tarfile
 import urllib.request
 
 from transitio_index import store
+from transitio_index.progress import progress
 
 
 class IngestError(RuntimeError):
@@ -540,7 +541,7 @@ def parse(archive):
     operators = {}
     collisions = 0
     file_count = 0
-    for source_file, payload in iter_dmfr(archive):
+    for source_file, payload in progress(iter_dmfr(archive), "atlas"):
         file_count += 1
         _require(payload, "file", source_file, 0, "payload", dict)
         for field in ("feeds", "operators"):

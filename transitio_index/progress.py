@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Sized
 
 LOGGER_NAME = "transitio_index"
 
@@ -119,10 +120,14 @@ def configure(level=logging.INFO, *, log_file=None, console=True):
 def progress(iterable, label, *, total=None, interval=2.0, logger=None):
     """Yield from ``iterable``, logging progress at most once per ``interval``.
 
-    ``label`` names the work (e.g. ``"crawl"``) and ``total`` gives the
-    denominator when it is known. A final line always reports the count, so a
-    loop shorter than ``interval`` still logs once.
+    ``label`` names the work (e.g. ``"crawl"``). ``total`` gives the denominator;
+    when it is omitted it is taken from ``len(iterable)`` for a sized iterable
+    (a list) and left absent for a generator, so a caller never has to size an
+    arbitrary iterable itself. A final line always reports the count, so a loop
+    shorter than ``interval`` still logs once.
     """
+    if total is None and isinstance(iterable, Sized):
+        total = len(iterable)
     log = logger or logging.getLogger(LOGGER_NAME)
     done = 0
     last = time.monotonic()
