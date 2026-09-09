@@ -20,9 +20,10 @@ import contextlib
 import datetime
 import functools
 import json
+import logging
 import os
 import pathlib
-import sys
+import time
 
 DEFAULT_GOLDEN = (
     pathlib.Path(__file__).resolve().parent.parent / "golden" / "feeds.jsonl"
@@ -44,6 +45,7 @@ from transitio_index import (  # noqa: E402
     metros,
     names,
     overture,
+    progress,
     prune,
     publish,
     registry,
@@ -51,6 +53,8 @@ from transitio_index import (  # noqa: E402
     seed,
     store,
 )
+
+log = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = pathlib.Path("cache")
 
@@ -422,6 +426,31 @@ def parse_args(argv=None):
         "may buffer one feed's largest member, so lower the cap for feeds with "
         "very large stop_times.txt",
     )
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="log DEBUG-level detail",
+    )
+    verbosity.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="log warnings and errors only",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=pathlib.Path,
+        default=None,
+        help="also write the log to this file (its directory is created and it "
+        "is appended to); with --no-console, log only to the file",
+    )
+    parser.add_argument(
+        "--no-console",
+        action="store_true",
+        help="do not log to the screen (use with --log-file)",
+    )
     arguments = parser.parse_args(argv)
     if arguments.workers < 1:
         parser.error("--workers must be at least 1")
@@ -438,23 +467,63 @@ def stages_from(stage, downstream):
     return order[order.index(stage) :] if downstream else [stage]
 
 
+def _highlights(summaries):
+    """A compact ``key=count`` tail for a stage's numeric summary values."""
+    parts = [
+        f"{key}={value}"
+        for summary in summaries
+        for key, value in summary.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+    return " - " + ", ".join(parts) if parts else ""
+
+
 def main(argv=None):
     arguments = parse_args(argv)
-    summaries = []
     stage = arguments.stage
     try:
+        progress.configure(
+            progress.resolve_level(arguments.verbose, arguments.quiet),
+            log_file=arguments.log_file,
+            console=not arguments.no_console,
+        )
+    except OSError as error:
+        progress.fatal(f"{stage}: cannot open log file {arguments.log_file}: {error}")
+        return 1
+    summaries = []
+    try:
         for stage in stages_from(arguments.stage, arguments.downstream):
-            summaries.extend(STAGES[stage](arguments))
+            log.info("%s: starting", stage)
+            started = time.perf_counter()
+            stage_summaries = STAGES[stage](arguments)
+            summaries.extend(stage_summaries)
+            log.info(
+                "%s: done in %.1fs%s",
+                stage,
+                time.perf_counter() - started,
+                _highlights(stage_summaries),
+            )
+    except SystemExit as error:
+        # A stage that exits (e.g. a missing golden file) is a fatal build
+        # error like any other; report it with the stage prefix and exit 1.
+        progress.fatal(f"{stage}: {error}")
+        return 1
     except Exception as error:  # noqa: B902
         # Broad on purpose: this is the CLI boundary, where any stage
         # failure should read as one line rather than a traceback. Set
         # TRANSITIO_TRACEBACK to see the original instead.
         if os.environ.get("TRANSITIO_TRACEBACK"):
             raise
-        print(f"{stage}: {error}", file=sys.stderr)
+        progress.fatal(f"{stage}: {error}")
         return 1
-    for summary in summaries:
-        print(json.dumps(summary, indent=2, sort_keys=True))
+    try:
+        for summary in summaries:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+    except (TypeError, ValueError, OSError) as error:
+        # A non-serialisable summary or a broken stdout (e.g. a closed pipe)
+        # is a fatal build error too, reported the same controlled way.
+        progress.fatal(f"writing the build summary failed: {error}")
+        return 1
     return 0
 
 
