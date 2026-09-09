@@ -203,11 +203,23 @@ def test_the_composition_contract_is_enforced(kwargs, message):
         ([("FI1B1", b"\x01\x02")], 3, "geometry"),
         ([("FI1B1", shapely.Point(24.5, 60.5))], 3, "valid polygon"),
         ([("FI1B1", shapely.Polygon())], 3, "valid polygon"),
+        (
+            [("FI1B1", shapely.GeometryCollection([WEST, shapely.Point(24.5, 60.5)]))],
+            3,
+            "valid polygon",
+        ),
     ],
 )
 def test_the_boundary_contract_is_enforced(regions, level, message):
     with pytest.raises(eurostat.EurostatError, match=message):
         eurostat.read_boundaries(parquet(regions, level))
+
+
+def test_a_self_intersecting_boundary_is_repaired():
+    bowtie = shapely.Polygon([(24.0, 60.0), (25.0, 61.0), (25.0, 60.0), (24.0, 61.0)])
+    assert not bowtie.is_valid
+    boundaries = eurostat.read_boundaries(parquet([("FI1B1", bowtie)]))
+    assert boundaries["FI1B1"].is_valid and not boundaries["FI1B1"].is_empty
 
 
 @pytest.mark.parametrize(
