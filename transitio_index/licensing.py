@@ -32,6 +32,7 @@ import contextlib
 import datetime
 
 from transitio_index import crawl, store
+from transitio_index.progress import progress
 
 POINTER = "licensed.json"
 FEEDS_ARTIFACT = "feeds_licensed.jsonl"
@@ -101,7 +102,7 @@ def _sanitise_feeds(records):
     hull of each feed whose licence disallows redistribution; returns the
     number of hulls nulled."""
     nulled = 0
-    for record in records:
+    for record in progress(records, "license"):
         allowed = redistribution_allowed(record)
         record["redistribution_allowed"] = allowed
         if allowed is False and record.get("coverage") is not None:
