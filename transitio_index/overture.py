@@ -16,8 +16,13 @@ stage runs offline with no network and no live counts.
 """
 
 import datetime
+import http.client
 import json
+import logging
 import re
+import socket
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -25,6 +30,21 @@ import pyarrow.dataset as ds
 
 from transitio_index import store
 from transitio_index.progress import progress
+
+log = logging.getLogger(__name__)
+
+# Transient transport failures worth retrying: a dropped connection, a reset, a
+# read timeout, or one of those wrapped in ``URLError`` (how urllib surfaces a
+# connect-phase socket error). An HTTP status error (``HTTPError``, a URLError
+# subclass) is caught first and re-raised — a 4xx/5xx is not retried. A
+# truncated body (``IncompleteRead``) is not here either: it signals an
+# oversized response the batch loop bisects rather than re-reads whole.
+_TRANSIENT_ERRORS = (
+    http.client.RemoteDisconnected,
+    ConnectionError,
+    socket.timeout,
+    urllib.error.URLError,
+)
 
 OVERTURE_RELEASE = "2026-08-19.0"
 OVERTURE_BUCKET = "overturemaps-us-west-2"
@@ -207,10 +227,14 @@ class WikidataClient:
     network.
     """
 
-    def __init__(self, endpoint=WIKIDATA_SPARQL, *, timeout=60, batch_size=200):
+    def __init__(
+        self, endpoint=WIKIDATA_SPARQL, *, timeout=60, batch_size=200, attempts=4
+    ):
         self.endpoint = endpoint
         self.timeout = timeout
         self.batch_size = batch_size
+        # Total tries per request (>=1), not retries-after-the-first.
+        self.attempts = max(1, attempts)
 
     def p402(self, osm_relation_ids):
         """``{osm_relation_id: qid}``; an ambiguous id maps to ``None``.
@@ -337,8 +361,31 @@ class WikidataClient:
         ids = sorted({str(q) for q in qids if q and QID_PATTERN.match(str(q))})
         out = {}
         for start in progress(range(0, len(ids), 50), "wikidata labels"):
-            self._entities_batch(ids[start : start + 50], out)
+            self._fetch_bisecting(
+                ids[start : start + 50],
+                lambda batch: self._entities_batch(batch, out),
+                "wikidata labels",
+            )
         return out
+
+    def _fetch_bisecting(self, batch, apply, what):
+        """Run ``apply(batch)``, halving the batch when the transport truncates
+        the response, so one oversized reply the connection cannot deliver whole
+        degrades to smaller reads instead of aborting the build. A single id
+        whose response still truncates is logged and skipped."""
+        try:
+            apply(batch)
+        except http.client.IncompleteRead:
+            if len(batch) <= 1:
+                log.warning(
+                    "%s: %s response truncated; skipped",
+                    what,
+                    ",".join(batch) or "(empty)",
+                )
+                return
+            mid = len(batch) // 2
+            self._fetch_bisecting(batch[:mid], apply, what)
+            self._fetch_bisecting(batch[mid:], apply, what)
 
     def _entities_batch(self, batch, out):
         url = (
@@ -391,12 +438,32 @@ class WikidataClient:
         return results["bindings"]
 
     def _get_json(self, url, *, accept="application/json"):
-        """The parsed JSON body of ``url`` (GET), with the descriptive agent."""
+        """The parsed JSON body of ``url`` (GET), with the descriptive agent.
+
+        A transient transport failure (a dropped connection, reset or read
+        timeout) is retried with a short back-off, so one network hiccup does
+        not abort a build; the last failure is raised once the attempts run out.
+        An HTTP status error is not retried, and a truncated body
+        (``IncompleteRead``) is left to the caller's batch bisection."""
         request = urllib.request.Request(
             url, headers={"Accept": accept, "User-Agent": USER_AGENT}
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+        for attempt in range(self.attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError:
+                raise
+            except _TRANSIENT_ERRORS as error:
+                if attempt + 1 >= self.attempts:
+                    raise
+                log.warning(
+                    "wikidata: %s (attempt %d/%d); retrying",
+                    type(error).__name__,
+                    attempt + 1,
+                    self.attempts,
+                )
+                time.sleep(min(2**attempt, 8))
 
 
 def resolve_qid(record, p402_map):

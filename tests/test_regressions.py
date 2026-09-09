@@ -3,6 +3,8 @@
 Fixtures are imported from the stage test modules rather than duplicated.
 """
 
+import http.client
+
 import pytest
 
 pytest.importorskip("pyarrow")
@@ -91,3 +93,51 @@ def test_a_crawled_qidless_division_is_minted_through_the_registry(tmp_path):
     assert nowhere["kind"] == "city" and nowhere["name"] == "Nowhere"
     assert nowhere["resolution_method"] == "overture_id"
     assert not any(r.get("overture_id") == "fi-noqid" for r in report)
+
+
+def test_wikidata_labels_bisect_a_truncated_batch_and_skip_a_bad_entity():
+    """A wbgetentities response the transport truncates is not fatal: the batch
+    is halved until each reply fits, and a single id that always truncates is
+    skipped rather than aborting the build."""
+
+    class Flaky(overture.WikidataClient):
+        def _entities_batch(self, batch, out):
+            # An oversized batch or any batch holding the always-bad id
+            # truncates; a small good batch succeeds.
+            if len(batch) > 3 or "Q666" in batch:
+                raise http.client.IncompleteRead(b"partial")
+            for qid in batch:
+                out[qid] = {"labels": {"en": qid}, "aliases": []}
+
+    client = Flaky()
+    qids = [f"Q{n}" for n in range(1, 11)] + ["Q666"]
+    result = client.labels_and_aliases(qids)
+    assert "Q666" not in result
+    assert set(result) == {f"Q{n}" for n in range(1, 11)}
+
+
+def test_wikidata_get_json_retries_a_transient_disconnect(monkeypatch):
+    """A dropped Wikidata connection is retried, not fatal."""
+    calls = {"n": 0}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"ok": 1}'
+
+    def fake_urlopen(request, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise http.client.RemoteDisconnected("boom")
+        return FakeResponse()
+
+    monkeypatch.setattr(overture.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(overture.time, "sleep", lambda seconds: None)
+    client = overture.WikidataClient()
+    assert client._get_json("https://example.invalid") == {"ok": 1}
+    assert calls["n"] == 2
