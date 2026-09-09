@@ -61,38 +61,76 @@ The publisher test imports the shared index fixture from transitio; point
 
 ## Run a build
 
-The build runs as ordered stages that read and write a build cache (`cache/`
-by default, gitignored). Each stage consumes the earlier stages' cache files,
-so a stage can be rerun on its own once its inputs exist. In build order:
+A build is a fixed sequence of stages, run through `python -m
+transitio_index.build`. Every stage reads the previous stages' output from a
+build cache — `cache/` by default, gitignored — and writes its own output back
+into it. The cache is the only hand-off between stages: nothing is passed in
+memory, so each stage needs the output its predecessors already left in the
+cache, and a build can stop after any stage and pick up later from the next.
 
-1. `ingest` — read the three catalogues (the Transitland Atlas archive, the
-   Mobility Database `feeds_v2.csv`, the GBFS `systems.csv`).
-2. `crosswalk` — resolve the same feed across the three into one table.
-3. `gazetteer` — resolve Overture divisions to Wikidata QIDs, seed the feed
-   cities, attach metros, geometry and names, and mint the place registry.
-4. `resolve` — settle each feed's identity and crawlability from the
-   overrides, before any crawl.
-5. `crawl` — fetch each crawlable feed.
-6. `expand` — add the places a feed's crawled stops fall in that the seed
-   missed.
+### The stages, in order
+
+1. `ingest` — download and read the three source catalogues: the Transitland
+   Atlas archive, the Mobility Database `feeds_v2.csv` and the GBFS
+   `systems.csv`.
+2. `crosswalk` — match the same feed across the three catalogues into one
+   de-duplicated table.
+3. `gazetteer` — resolve Overture administrative divisions to Wikidata QIDs,
+   seed the cities the feeds declare, attach metros, boundary geometry and
+   names, and mint the place registry.
+4. `resolve` — settle each feed's identity and whether it is crawlable (from
+   the overrides), before anything is fetched.
+5. `crawl` — fetch every crawlable feed.
+6. `expand` — add the places a feed's crawled stops actually fall in that the
+   declared seed missed.
 7. `coverage` — derive the membership edges: which places each feed serves.
-8. `classify` — assign each edge's tier.
-9. `curate` — apply the curated edge overrides.
-10. `prune` — drop the places no kept edge needs.
-11. `license` — record each shipped feed's licence and lineage, and the NOTICE.
-12. `publish` — write the shippable `cache/index/` (the GeoParquet tables and
-    manifest the reader consumes).
+8. `classify` — give each candidate edge a tier (the feed's service level for
+   that place).
+9. `curate` — apply the curated edge overrides on top of the classified edges.
+10. `prune` — drop the places that no kept edge needs.
+11. `license` — record each shipped feed's licence and lineage, and write the
+    NOTICE.
+12. `publish` — write the shippable `cache/index/`: the GeoParquet tables and
+    manifest the reader installs.
 
-Run one stage, or a stage and every later one, with `--stage` and
-`--downstream`; pin the Atlas revision with `--commit`:
+### Running the stages
+
+`--stage` names the stage to run. What matters is how much it runs alongside
+that stage — and, in particular, that it never runs the stages *before* it:
+
+- **On its own, `--stage X` runs only X**, not its predecessors. The earlier
+  stages are prerequisites: their output must already be in the cache. Running a
+  stage against a cache that is missing an earlier stage's output fails — it
+  does not quietly rebuild the missing input.
+- **`--downstream` runs X and every stage after it**, in build order (never the
+  ones before it). This carries a build forward from a chosen stage to the end.
+
+So a full build from an empty cache starts at the first stage and runs the whole
+pipeline through to `publish`:
 
 ```
-python -m transitio_index.build --stage gazetteer            # one stage
-python -m transitio_index.build --stage ingest --downstream  # ingest -> publish
+python -m transitio_index.build --stage ingest --downstream   # ingest -> publish
 ```
 
-`--help` lists every flag. The build logs its progress to the screen by
-default; `--verbose`/`--quiet`, `--log-file` and `--no-console` control it.
+To redo only part of a build, run the earliest stage you need to change with
+`--downstream`, reusing the cache the earlier stages already left. For example,
+after editing a curated override, re-apply it and rebuild the shipped index
+without re-crawling:
+
+```
+python -m transitio_index.build --stage curate --downstream   # curate -> publish
+```
+
+Running a single stage (no `--downstream`) is for iterating on that one stage
+once its inputs are built:
+
+```
+python -m transitio_index.build --stage gazetteer
+```
+
+Pin the Atlas revision with `--commit <sha>` so the ingest is reproducible.
+`--help` lists every flag. The build logs its progress to the screen by default;
+`--verbose` / `--quiet`, `--log-file` and `--no-console` control the log.
 
 ### A small sample end to end
 
