@@ -37,13 +37,24 @@ and `python -m transitio_index.registry_history`.
 
 Requires Python >= 3.10. The build reads transitio's release contract, schema
 floors and fingerprint, so it depends on the released reader alongside its own
-libraries. Install it editable — its dependencies pull those in — and run the
-suite:
+libraries.
 
-```
-pip install -e ".[test]"
-pytest
-```
+This build tool is not published to PyPI: users install transitio's reader, and
+maintainers install this to produce the snapshots it reads. Get it either way:
+
+- From a clone, editable, to work on the build. Its dependencies pull in the
+  reader and the build's own libraries; then run the suite:
+
+  ```
+  pip install -e ".[test]"
+  pytest
+  ```
+
+- Pinned, to run a released build without a working copy:
+
+  ```
+  pip install "git+https://github.com/transitio-dev/transitio-index@<tag>"
+  ```
 
 The publisher test imports the shared index fixture from transitio; point
 `TRANSITIO_TESTS` at a transitio checkout's `tests` directory to run it.
