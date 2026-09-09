@@ -20,8 +20,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install black flake8 flake8-bugbear
-      - run: black --check transitio_index tests
-      - run: flake8 transitio_index tests
+      - run: black --check transitio_index tests scripts
+      - run: flake8 transitio_index tests scripts
 
   test:
     needs: lint
