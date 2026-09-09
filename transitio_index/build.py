@@ -7,7 +7,7 @@ its own once its inputs exist:
 
     python -m transitio_index.build --stage ingest
 
-The stages are described in plans/place-index.md. ``ingest`` reads the
+The stages are described in the README's "Run a build" section. ``ingest`` reads the
 Transitland Atlas, the Mobility Database catalogue and the GBFS systems
 catalogue; ``crosswalk`` resolves the same feed across them into one table;
 ``gazetteer`` resolves the Overture administrative divisions to Wikidata QIDs and
