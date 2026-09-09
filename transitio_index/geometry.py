@@ -211,6 +211,33 @@ def _valid_polygon(geom):
     return geom.is_valid
 
 
+def _repaired_polygon(geom):
+    """A valid, non-empty (multi)polygon for ``geom``, or None.
+
+    An already-valid geometry is returned unchanged. A self-intersecting
+    (multi)polygon (generalised boundaries occasionally are) is repaired with
+    ``make_valid``, keeping only the polygonal part of the result. Returns None
+    when ``geom`` is empty, not a (multi)polygon, or cannot be made into a valid
+    polygon — so a non-polygonal input is rejected, not silently reduced.
+    """
+    if _valid_polygon(geom):
+        return geom
+    if geom is None or geom.is_empty:
+        return None
+    if geom.geom_type not in ("Polygon", "MultiPolygon"):
+        return None
+    try:
+        parts = [
+            part
+            for part in shapely.get_parts(shapely.make_valid(geom))
+            if part.geom_type in ("Polygon", "MultiPolygon")
+        ]
+        merged = shapely.unary_union(parts) if parts else None
+    except Exception:  # noqa: B902 - shapely raises its own hierarchy
+        return None
+    return merged if merged is not None and _valid_polygon(merged) else None
+
+
 def _simplify(geom):
     """The geometry simplified to the shipping tolerance."""
     return shapely.simplify(geom, SIMPLIFY_TOLERANCE_DEG, preserve_topology=True)

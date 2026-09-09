@@ -188,11 +188,12 @@ def read_boundaries(data):
             geom = shapely.force_2d(shapely.from_wkb(row["Shape"]))
         except Exception:  # noqa: B902 - shapely raises its own hierarchy
             raise EurostatError(f"{BOUNDARIES_FILE}: {nuts_id!r} geometry") from None
-        if not geometry._valid_polygon(geom):
+        repaired = geometry._repaired_polygon(geom)
+        if repaired is None:
             raise EurostatError(
                 f"{BOUNDARIES_FILE}: {nuts_id!r} is not a valid polygon"
             )
-        boundaries[nuts_id] = geom
+        boundaries[nuts_id] = repaired
     if not boundaries:
         raise EurostatError(f"{BOUNDARIES_FILE}: no regions")
     return boundaries
