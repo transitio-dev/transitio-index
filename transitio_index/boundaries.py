@@ -8,29 +8,100 @@ groups carry ``bbox`` statistics, so a spatial query reads the file footers and
 only the row groups whose boxes intersect the query — the COG access pattern —
 and the divisions theme supplies the matching subtype/hierarchy metadata.
 
-What a query touches is memoized under ``cache/boundary_lookup/<release>/``
-(full-resolution WKB plus division metadata, keyed by the release), so repeated
-queries within and across builds read locally and both consumers see
-byte-identical geometry. Exact containment always runs locally over the
-memoized polygons; the cloud filter only selects candidates by bounding box.
+What a query touches is memoized under ``cache/boundary_lookup/<release>/`` as a
+GeoParquet of the division polygons (simplified to the shipping tolerance) plus
+their metadata, keyed by the release, so repeated queries within and across
+builds read locally and both consumers see the same geometry. Containment runs
+locally over the memoized polygons; the cloud filter only selects candidates by
+bounding box.
 """
 
+import io
 import json
 import math
 
+import numpy as np
 import pyarrow.dataset as ds
 import shapely
 from shapely.strtree import STRtree
 
 from transitio_index import geometry, overture, store
 
-DIVISIONS_FILE = "divisions.jsonl"
+DIVISIONS_FILE = "divisions.parquet"
 COVERED_FILE = "covered.jsonl"
+MEMO_CRS = "EPSG:4326"
+
+# The memo's non-geometry columns: plain scalars, and the nested fields as JSON
+# strings (light supportive data beside the GeoParquet geometry column).
+_SCALAR_FIELDS = (
+    "overture_id",
+    "subtype",
+    "source_subtype",
+    "kind",
+    "admin_level",
+    "country",
+    "name",
+    "wikidata",
+)
+_JSON_FIELDS = ("names", "ancestors", "osm_relation_ids", "sources")
+_MEMO_COLUMNS = ["division_id", *_SCALAR_FIELDS, *_JSON_FIELDS]
 
 AREA_COLUMNS = ["division_id", "geometry", "country", "is_land"]
 
 # Most specific first: the order ``divisions_at`` returns containing divisions.
 _SPECIFICITY = {"locality": 0, "localadmin": 1, "county": 2, "region": 3, "country": 4}
+
+
+def _memo_fields(record):
+    """The memo's non-geometry columns for a division record."""
+    fields = {"division_id": record["division_id"]}
+    for name in _SCALAR_FIELDS:
+        fields[name] = record.get(name)
+    for name in _JSON_FIELDS:
+        fields[name] = json.dumps(record.get(name), ensure_ascii=False)
+    return fields
+
+
+def _record_from_row(attrs):
+    """A division record's metadata rebuilt from a memo row's columns."""
+    record = {"division_id": attrs["division_id"]}
+    for name in _SCALAR_FIELDS:
+        record[name] = attrs.get(name)
+    for name in _JSON_FIELDS:
+        record[name] = json.loads(attrs[name])
+    record["geoms"] = []
+    return record
+
+
+def _read_memo(path):
+    """``(records, damaged)`` from the GeoParquet memo at ``path``.
+
+    A row with a missing id or a geometry that is not a valid polygon is
+    dropped and flags the memo damaged, the same validation the fresh scan
+    applies, so a memo written before validation existed cannot seed the index.
+    """
+    import geopandas as gpd
+
+    frame = gpd.read_parquet(path)
+    geoms = list(frame.geometry)
+    attrs = frame.drop(columns=frame.geometry.name).to_dict(orient="records")
+    records = {}
+    damaged = False
+    for row_attrs, geom in zip(attrs, geoms):
+        division_id = row_attrs.get("division_id")
+        if not division_id or geom is None or not geometry._valid_polygon(geom):
+            damaged = True
+            continue
+        record = records.get(division_id)
+        if record is None:
+            try:
+                record = _record_from_row(row_attrs)
+            except (TypeError, ValueError):
+                damaged = True
+                continue
+            records[division_id] = record
+        record["geoms"].append(geom)
+    return records, damaged
 
 
 def _box_contains(outer, inner):
@@ -112,36 +183,30 @@ class BoundaryLookup:
         self.close()
 
     def _load(self):
+        # Read under the writer lock so the divisions and coverage files (which
+        # a writer replaces one after the other) are always observed as a
+        # coherent pair, never an old-divisions / new-coverage mix.
+        with store.exclusive_writer(self._dir):
+            self._read_state()
+
+    def _read_state(self):
+        """Read the memo from disk into ``_records`` / ``_covered``.
+
+        Resets the in-memory state first, so it doubles as a reload. Must be
+        called while holding the writer lock (see :meth:`_load`, :meth:`ensure`).
+        """
+        self._records = {}
+        self._covered = []
         damaged = False
         path = self._dir.path / DIVISIONS_FILE
         divisions_present = path.is_file()
         if divisions_present:
-            # The memo gets the same validation as fresh rows: an entry
-            # written before validation existed, or corrupted on disk, must
-            # not seed the containment index.
-            for record in store.parse_jsonl(path.read_bytes()):
-                if not isinstance(record, dict) or not record.get("division_id"):
-                    damaged = True
-                    continue
-                kept, geoms = [], []
-                for entry in record.get("geometries") or []:
-                    try:
-                        geom = shapely.from_wkb(bytes.fromhex(entry))
-                    except Exception:
-                        damaged = True
-                        continue
-                    if not geometry._valid_polygon(geom):
-                        damaged = True
-                        continue
-                    kept.append(entry)
-                    geoms.append(geom)
-                if not kept:
-                    # A record ensure() wrote always carries geometry; none
-                    # left means damage.
-                    damaged = True
-                record["geometries"] = kept
-                record["geoms"] = geoms
-                self._records[record["division_id"]] = record
+            # An unreadable memo (a corrupt or partial parquet) is damage, not
+            # fatal: coverage is cleared below and the next ensure() refetches.
+            try:
+                self._records, damaged = _read_memo(path)
+            except Exception:  # noqa: B902 - geopandas/pyarrow raise their own
+                self._records, damaged = {}, True
         path = self._dir.path / COVERED_FILE
         if path.is_file():
             for row in store.parse_jsonl(path.read_bytes()):
@@ -168,13 +233,29 @@ class BoundaryLookup:
             self._covered = []
         self._tree = None
 
-    def _persist(self):
-        def division_lines():
-            for record in self._records.values():
-                row = {k: v for k, v in record.items() if k != "geoms"}
-                yield json.dumps(row, ensure_ascii=False) + "\n"
+    def _uncovered(self, boxes):
+        """The boxes not already inside a covered box."""
+        return [
+            box
+            for box in boxes
+            if not any(_box_contains(done, box) for done in self._covered)
+        ]
 
-        store.write_file(self._dir, DIVISIONS_FILE, division_lines)
+    def _persist(self):
+        import geopandas as gpd
+        import pandas as pd
+
+        rows, geoms = [], []
+        for record in self._records.values():
+            fields = _memo_fields(record)
+            for geom in record["geoms"]:
+                rows.append(fields)
+                geoms.append(geom)
+        frame = pd.DataFrame(rows, columns=_MEMO_COLUMNS)
+        gdf = gpd.GeoDataFrame(frame, geometry=gpd.GeoSeries(geoms, crs=MEMO_CRS))
+        sink = io.BytesIO()
+        gdf.to_parquet(sink)
+        store.write_bytes(self._dir, DIVISIONS_FILE, sink.getvalue())
         store.write_file(
             self._dir,
             COVERED_FILE,
@@ -189,22 +270,26 @@ class BoundaryLookup:
         polygons parsed (malformed WKB skipped) and their divisions' metadata
         resolved, then memoized.
         """
-        needed = [
-            tuple(box)
-            for box in boxes
-            if not any(_box_contains(done, tuple(box)) for done in self._covered)
-        ]
-        if not needed:
+        boxes = [tuple(box) for box in boxes]
+        if not self._uncovered(boxes):
             return 0
         if self._area_dataset is None or self._division_dataset is None:
             raise store.StoreError(
                 "boundary lookup needs its datasets to fetch uncovered boxes"
             )
-        merged = _merge_boxes(needed)
         with store.exclusive_writer(self._dir):
+            # Reload under the lock so a concurrent writer's additions are seen
+            # and never overwritten, then recompute what is still uncovered.
+            self._read_state()
+            needed = self._uncovered(boxes)
+            if not needed:
+                return 0
+            merged = _merge_boxes(needed)
             # Deduplicated by canonical WKB: disjoint boxes each return the
-            # same country polygon, and a division already cached may surface
-            # a further component in a later box — merged in, never discarded.
+            # same country polygon, and a division already cached may surface a
+            # further component in a later box — merged in, never discarded.
+            # Geometry is processed per batch with the vectorized shapely API,
+            # not one polygon at a time.
             polygons = {}
             for xmin, ymin, xmax, ymax in merged:
                 predicate = (
@@ -212,23 +297,31 @@ class BoundaryLookup:
                     & (ds.field(("bbox", "xmax")) >= xmin)
                     & (ds.field(("bbox", "ymin")) <= ymax)
                     & (ds.field(("bbox", "ymax")) >= ymin)
+                    & ds.field("is_land")
                 )
                 for batch in self._area_dataset.to_batches(
                     columns=AREA_COLUMNS, filter=predicate
                 ):
-                    for row in batch.to_pylist():
-                        if not row.get("is_land"):
-                            continue
-                        try:
-                            geom = shapely.force_2d(shapely.from_wkb(row["geometry"]))
-                        except Exception:
-                            continue
-                        if not geometry._valid_polygon(geom):
-                            # Empty, invalid or non-polygon geometry must not
-                            # enter the containment index as division evidence.
-                            continue
-                        key = shapely.to_wkb(geom).hex()
-                        polygons.setdefault(row["division_id"], {})[key] = geom
+                    if batch.num_rows == 0:
+                        continue
+                    division_ids = batch.column("division_id").to_pylist()
+                    wkb = batch.column("geometry").to_numpy(zero_copy_only=False)
+                    geoms = shapely.force_2d(shapely.from_wkb(wkb, on_invalid="ignore"))
+                    # Empty, invalid or non-polygon geometry must not enter the
+                    # containment index as division evidence.
+                    index = np.nonzero(geometry._valid_polygons(geoms))[0]
+                    if index.size == 0:
+                        continue
+                    # Memoize the simplified boundaries (the shipping tolerance):
+                    # exact coastline detail is needless for stop containment and
+                    # would bloat the memo.
+                    simplified = geometry._simplify(geoms[index])
+                    good = geometry._valid_polygons(simplified)
+                    kept = simplified[good]
+                    for row, geom, key in zip(
+                        index[good].tolist(), kept, shapely.to_wkb(kept)
+                    ):
+                        polygons.setdefault(division_ids[row], {})[key] = geom
             new_ids = sorted(set(polygons) - set(self._records))
             metadata = self._division_metadata(new_ids)
             for division_id, found in polygons.items():
@@ -246,13 +339,17 @@ class BoundaryLookup:
                         "ancestors": [],
                     }
                     record["division_id"] = division_id
-                    record["geometries"] = []
                     record["geoms"] = []
                     self._records[division_id] = record
+                existing = (
+                    set(shapely.to_wkb(np.asarray(record["geoms"], dtype=object)))
+                    if record["geoms"]
+                    else set()
+                )
                 for key, geom in found.items():
-                    if key not in record["geometries"]:
-                        record["geometries"].append(key)
+                    if key not in existing:
                         record["geoms"].append(geom)
+                        existing.add(key)
             self._covered.extend(merged)
             self._persist()
         self._tree = None
@@ -285,9 +382,9 @@ class BoundaryLookup:
     def divisions_at(self, x, y):
         """The divisions whose polygons contain the point, most specific first.
 
-        Exact containment (``covered_by``, so boundary points count) over the
-        memoized full-resolution polygons; call :meth:`ensure` for the area
-        first.
+        Containment (``covered_by``, so boundary points count) over the
+        memoized polygons (simplified to the shipping tolerance); call
+        :meth:`ensure` for the area first.
         """
         if self._tree is None:
             self._build_tree()
