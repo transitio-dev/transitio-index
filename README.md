@@ -21,6 +21,7 @@ transitio_index/       the build package: the stages (ingest, crosswalk,
 transitio_index/build.py              the pipeline entry point
 transitio_index/publish_cli.py        release the built snapshot
 transitio_index/registry_history.py   the CI registry-history guard
+scripts/sample_catalogues.py  cut a small multi-place catalogue sample
 overrides/             the place registry and curated override files
 golden/                the golden feed set the publish stage diffs against
 tests/                 the build's pytest suite and its fixtures
@@ -46,7 +47,7 @@ The publisher test imports the shared index fixture from transitio; point
 `TRANSITIO_TESTS` at a transitio checkout's `tests` directory to run it.
 
 - Format with black and lint with flake8 (config in `.flake8`), over
-  `transitio_index` and `tests`.
+  `transitio_index`, `tests` and `scripts`.
 - Small, staged pull requests against `main`; each describes what it does and
   how it was verified.
 - Regression tests are consolidated in `tests/test_regressions.py` — one test
