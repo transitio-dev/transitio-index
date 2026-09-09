@@ -84,7 +84,12 @@ def _read_memo(path):
 
     frame = gpd.read_parquet(path)
     geoms = list(frame.geometry)
-    attrs = frame.drop(columns=frame.geometry.name).to_dict(orient="records")
+    non_geom = frame.drop(columns=frame.geometry.name)
+    # A null scalar column reads back as NaN, and a NaN wikidata or name is
+    # truthy — it would be minted as identity rather than falling to the
+    # Overture-id path. Restore the None the memo was written with.
+    non_geom = non_geom.astype(object).where(non_geom.notna(), None)
+    attrs = non_geom.to_dict(orient="records")
     records = {}
     damaged = False
     for row_attrs, geom in zip(attrs, geoms):
