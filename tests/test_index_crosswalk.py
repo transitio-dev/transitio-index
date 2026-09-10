@@ -734,29 +734,36 @@ def test_an_ambiguous_linked_system_id_gets_no_alias(tmp_path):
     assert found["f-b"]["aliases"] == []
 
 
-def test_an_ambiguous_orphan_system_id_is_refused(tmp_path):
+def test_an_ambiguous_orphan_system_id_is_skipped(tmp_path):
     # One "seville" system links to an Atlas feed, another is an orphan; both
-    # mint the same id, so the orphan cannot claim a well-defined identity.
+    # mint the same id, so the orphan cannot claim a well-defined identity and
+    # is skipped with a warning rather than aborting the crosswalk.
     url = "https://gbfs.example/g"
-    with pytest.raises(crosswalk.CrosswalkError, match="no unambiguous id"):
-        crosswalk.build_records(
-            [atlas_feed("f-a", spec="gbfs", urls={"gbfs_auto_discovery": url})],
-            [],
-            systems=[
-                gbfs_system("seville", url=url, country_code="ES"),
-                gbfs_system("seville", country_code="ES"),
-            ],
-        )
+    records, summary = crosswalk.build_records(
+        [atlas_feed("f-a", spec="gbfs", urls={"gbfs_auto_discovery": url})],
+        [],
+        systems=[
+            gbfs_system("seville", url=url, country_code="ES"),
+            gbfs_system("seville", country_code="ES"),
+        ],
+    )
+    assert summary["gbfs_skipped"] == 1
+    assert summary["gbfs_minted"] == 0
+    # The linked Atlas feed still publishes; no orphan systems_csv record does.
+    assert [r["feed_id"] for r in records] == ["f-a"]
 
 
-def test_a_duplicate_orphan_without_a_country_code_is_refused(tmp_path):
-    # A duplicated system id with no country code cannot be disambiguated.
-    with pytest.raises(crosswalk.CrosswalkError, match="no unambiguous id"):
-        crosswalk.build_records(
-            [],
-            [],
-            systems=[gbfs_system("seville"), gbfs_system("seville", country_code="FR")],
-        )
+def test_a_duplicate_orphan_without_a_country_code_is_skipped(tmp_path):
+    # A duplicated system id with no country code cannot be disambiguated: that
+    # orphan is skipped, while its country-coded sibling still mints an id.
+    records, summary = crosswalk.build_records(
+        [],
+        [],
+        systems=[gbfs_system("seville"), gbfs_system("seville", country_code="FR")],
+    )
+    assert summary["gbfs_skipped"] == 1
+    assert summary["gbfs_minted"] == 1
+    assert [r["feed_id"] for r in records] == ["f-gbfs-seville-fr"]
 
 
 def test_a_gbfs_alias_colliding_with_an_onestop_id_is_omitted_not_raised(tmp_path):
