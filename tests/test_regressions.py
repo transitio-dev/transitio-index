@@ -125,23 +125,49 @@ def test_wikidata_labels_bisect_a_failing_batch_and_skip_a_bad_entity(boom):
     assert set(result) == {f"Q{n}" for n in range(1, 11)}
 
 
-def test_wikidata_labels_do_not_bisect_a_hard_http_error():
-    """A 4xx/5xx during a label batch stays fatal — not bisected and skipped —
-    even though HTTPError is a urllib.error.URLError subclass."""
+@pytest.mark.parametrize("code, fatal", [(404, True), (502, False)], ids=["4xx", "5xx"])
+def test_wikidata_labels_treat_a_4xx_as_fatal_and_a_5xx_as_transient(code, fatal):
+    """A 4xx during a label batch is our request's fault and stays fatal — not
+    bisected and skipped — even though HTTPError is a urllib.error.URLError
+    subclass; a 5xx (a proxy's 502 on a dropped tunnel included) is the
+    transport's and degrades like one: bisected, then the ids skipped."""
 
     class Failing(overture.WikidataClient):
         def _entities_batch(self, batch, out):
             raise overture.urllib.error.HTTPError(
-                overture.WIKIDATA_API, 500, "boom", None, None
+                overture.WIKIDATA_API, code, "boom", None, None
             )
 
     client = Failing()
-    with pytest.raises(overture.urllib.error.HTTPError):
-        client.labels_and_aliases([f"Q{n}" for n in range(1, 6)])
+    qids = [f"Q{n}" for n in range(1, 6)]
+    if fatal:
+        with pytest.raises(overture.urllib.error.HTTPError):
+            client.labels_and_aliases(qids)
+    else:
+        assert client.labels_and_aliases(qids) == {}
 
 
-def test_wikidata_get_json_retries_a_transient_disconnect(monkeypatch):
-    """A dropped Wikidata connection is retried, not fatal."""
+@pytest.mark.parametrize(
+    "boom, retried",
+    [
+        (lambda: http.client.RemoteDisconnected("boom"), True),
+        (
+            lambda: overture.urllib.error.HTTPError("u", 502, "gateway", None, None),
+            True,
+        ),
+        (
+            lambda: overture.urllib.error.HTTPError("u", 404, "missing", None, None),
+            False,
+        ),
+    ],
+    ids=["disconnect", "5xx", "4xx"],
+)
+def test_wikidata_get_json_retries_transport_failures_not_bad_requests(
+    monkeypatch, boom, retried
+):
+    """A dropped Wikidata connection, or a 5xx from the server or a gateway, is
+    retried rather than fatal; a 4xx is our request's fault and is raised at
+    once."""
     calls = {"n": 0}
 
     class FakeResponse:
@@ -157,14 +183,19 @@ def test_wikidata_get_json_retries_a_transient_disconnect(monkeypatch):
     def fake_urlopen(request, timeout=None):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise http.client.RemoteDisconnected("boom")
+            raise boom()
         return FakeResponse()
 
     monkeypatch.setattr(overture.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(overture.time, "sleep", lambda seconds: None)
     client = overture.WikidataClient()
-    assert client._get_json("https://example.invalid") == {"ok": 1}
-    assert calls["n"] == 2
+    if retried:
+        assert client._get_json("https://example.invalid") == {"ok": 1}
+        assert calls["n"] == 2
+    else:
+        with pytest.raises(overture.urllib.error.HTTPError):
+            client._get_json("https://example.invalid")
+        assert calls["n"] == 1
 
 
 def test_a_stop_on_another_division_of_a_known_qid_is_not_stale():
