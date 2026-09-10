@@ -172,3 +172,70 @@ def test_a_stop_on_another_division_of_a_known_qid_is_not_stale():
     hit, _, stale = coverage.stop_places(FakeLookup(), 0.0, 0.0, by_overture, by_qid)
     assert hit == {"tp_5"}
     assert stale == set()
+
+
+def test_a_crawled_division_conflicting_in_kind_with_a_seed_is_reported(
+    tmp_path, monkeypatch
+):
+    """A QID that names Overture divisions of different kinds (a seeded city and
+    a crawled region) is reported and the seeded place kept, not an abort."""
+    import test_index_expand as ex
+
+    divisions = [
+        fx.division(
+            "at",
+            "AT",
+            "country",
+            wikidata="Q40",
+            name="Austria",
+            hierarchies=fx.chain(("at", "country", "Austria")),
+        ),
+        fx.division(
+            "at-graz-region",
+            "AT",
+            "region",
+            wikidata="Q13298",
+            name="Graz",
+            hierarchies=fx.chain(
+                ("at", "country", "Austria"),
+                ("at-graz-region", "region", "Graz"),
+            ),
+        ),
+    ]
+    areas = [
+        fx.area("at", _wkb(9.0, 46.0, 17.0, 49.0), GOOD, country="AT"),
+        fx.area("at-graz-region", _wkb(15.3, 47.0, 15.5, 47.15), GOOD, country="AT"),
+    ]
+    monkeypatch.setattr(ex, "DIVISIONS", divisions)
+    monkeypatch.setattr(ex, "AREAS", areas)
+    cache = tmp_path / "cache"
+    ex._publish_names(
+        cache,
+        [
+            {
+                "place_id": "Q40",
+                "kind": "country",
+                "name": "Austria",
+                "country_code": "AT",
+                "overture_id": "at",
+                "metro_ids": [],
+                "member_ids": [],
+            },
+            {
+                "place_id": "Q13298",
+                "kind": "city",
+                "name": "Graz",
+                "country_code": "AT",
+                "overture_id": "at-graz-city",
+                "metro_ids": [],
+                "member_ids": [],
+            },
+        ],
+    )
+    ex._write_crawl(cache, "f-graz", ["s1,47.07,15.44\n"])
+    manifest, places, report = ex._expand(tmp_path, cache)
+    assert places["Q13298"]["kind"] == "city"  # the seeded city stands
+    assert manifest["places_added"] == 0
+    assert any(
+        r.get("kind") == "conflict" and r.get("place_id") == "Q13298" for r in report
+    )

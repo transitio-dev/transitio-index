@@ -289,14 +289,40 @@ def _discover(
     canonical = {
         qid: _canonical_place_key(registry, qid, row) for qid, row in discovered.items()
     }
+    conflicts = []
     for qid, place in discovered.items():
         existing = places_by_id.get(canonical[qid])
-        if existing is not None and existing.get("kind") != place.get("kind"):
+        if existing is None or existing.get("kind") == place.get("kind"):
+            continue
+        if existing.get("curated"):
+            # A curator defined this place; a crawled row of another kind under
+            # its key is a curation mistake, not messy source data — fail loudly.
             raise overture.GazetteerError(
                 f"{qid!r} is both the seeded {existing['kind']} "
                 f"{existing.get('name')!r} and the crawled {place['kind']} "
                 f"{place.get('name')!r}"
             )
+        # The same QID names Overture divisions of different kinds (a locality
+        # and a region both tagged it): the seeded place stands and the crawled
+        # one is reported, never an abort. A child that named the dropped place
+        # as its parent still resolves to the survivor, which shares its key.
+        report.append(
+            {
+                "kind": "conflict",
+                "place_id": qid,
+                "overture_id": place.get("overture_id"),
+                "name": place.get("name"),
+                "reason": (
+                    f"crawled {place.get('kind')} conflicts with the "
+                    f"{existing.get('kind')} {existing.get('name')!r} already "
+                    f"keyed by {canonical[qid]}"
+                ),
+            }
+        )
+        conflicts.append(qid)
+    for qid in conflicts:
+        del discovered[qid]
+        del canonical[qid]
     new_ids = []
     taken = set()
     for qid in discovered:
