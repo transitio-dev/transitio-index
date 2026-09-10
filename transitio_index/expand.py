@@ -359,6 +359,7 @@ def _discover(
         simplify=geometry.SIMPLIFY_TOLERANCE_DEG,
         cache=(cache_dir, release),
         reopen=reopen,
+        countries={discovered[qid].get("country_code") for qid in new_ids} - {None},
     )
     for qid in new_ids:
         place = discovered[qid]

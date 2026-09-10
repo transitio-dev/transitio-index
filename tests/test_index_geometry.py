@@ -537,3 +537,31 @@ def test_an_abandoned_scan_stops_pumping_instead_of_blocking_forever():
     with pytest.raises(geometry.AreaReadStalled):
         list(geometry.with_deadline(scan, 0.1))
     assert released.wait(5)
+
+
+def test_the_area_scan_is_narrowed_to_the_places_countries(tmp_path):
+    """With ``countries`` the S3 scan's predicate adds a country clause — so row
+    groups elsewhere in the world are skipped by their statistics — that also
+    admits a row without a country, so it only ever narrows the read."""
+    import pyarrow.dataset as ds
+
+    dataset = fx.write_area_dataset(
+        tmp_path / "a.parquet",
+        [fx.area("A", BOX, [_osm()], country="FI"), fx.area("B", OTHER, [_osm()])],
+    )
+    seen = {}
+
+    class Capturing:
+        def to_batches(self, **kwargs):
+            seen.update(kwargs)
+            return dataset.to_batches(**kwargs)
+
+    areas = geometry.read_areas(
+        Capturing(), {"A", "B"}, cache=(tmp_path / "cache", "r"), countries={"FI"}
+    )
+    country = ds.field("country")
+    expected = geometry._area_predicate(["A", "B"]) & (
+        country.isin(["FI"]) | country.is_null()
+    )
+    assert seen["filter"].equals(expected)
+    assert set(areas) == {"A", "B"}  # B has no country and is still read

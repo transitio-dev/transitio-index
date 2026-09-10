@@ -169,7 +169,9 @@ def division_area_dataset(release=overture.OVERTURE_RELEASE):
     return ds.dataset(path, filesystem=overture.s3_filesystem(), format="parquet")
 
 
-def read_areas(dataset, division_ids, *, simplify=None, cache=None, reopen=None):
+def read_areas(
+    dataset, division_ids, *, simplify=None, cache=None, reopen=None, countries=None
+):
     """``{division_id: [{"geom", "sources"}, ...]}`` land-area rows for the ids.
 
     One row per land area is kept with its own sources — never flattened across a
@@ -192,6 +194,10 @@ def read_areas(dataset, division_ids, *, simplify=None, cache=None, reopen=None)
     ``reopen`` — a callable returning a freshly opened ``dataset`` — lets a
     cached S3 scan that stalls be retried on a new connection; with it
     ``dataset`` may be None, and is then opened under the read's deadline.
+
+    ``countries`` — the ISO codes the divisions belong to — narrows the S3 scan
+    to the row groups that can hold them (see ``_scan``); the local cache is
+    read by id alone.
     """
     if not division_ids:
         return {}
@@ -199,7 +205,7 @@ def read_areas(dataset, division_ids, *, simplify=None, cache=None, reopen=None)
         raise ValueError("read_areas: a dataset, or a cache with reopen, is needed")
     ids = sorted(set(division_ids))
     areas = {}
-    for batch in _area_batches(dataset, ids, cache, reopen):
+    for batch in _area_batches(dataset, ids, cache, reopen, countries):
         for row in batch.to_pylist():
             if not row.get("is_land"):
                 continue
@@ -222,11 +228,28 @@ def read_areas(dataset, division_ids, *, simplify=None, cache=None, reopen=None)
     return areas
 
 
+def place_areas(cache_dir, dataset, places, wanted):
+    """The raw land areas of the ``wanted`` division ids among ``places`` — the
+    metros and fao stages' read: served from the release-keyed cache, the scan
+    narrowed to the places' countries, and the S3 dataset opened (under the
+    read's deadline) only when ``dataset`` is None and an id is missing. ``{}``
+    when nothing is wanted."""
+    if not wanted:
+        return {}
+    return read_areas(
+        dataset,
+        wanted,
+        cache=(cache_dir, overture.OVERTURE_RELEASE),
+        reopen=division_area_dataset if dataset is None else None,
+        countries={p.get("country_code") for p in places} - {None},
+    )
+
+
 def _area_predicate(ids):
     return ds.field("division_id").isin(ids)
 
 
-def _area_batches(dataset, ids, cache, reopen=None):
+def _area_batches(dataset, ids, cache, reopen=None, countries=None):
     """Yield projected ``division_area`` record-batches for ``ids``, one batch in
     memory at a time (never the whole set at once). With ``cache`` a
     ``(cache_dir, release)`` pair the rows are memoized under a release-keyed
@@ -235,14 +258,14 @@ def _area_batches(dataset, ids, cache, reopen=None):
     cache stays valid until it is bumped. Builds run one at a time, so the
     unique per-fetch filenames need no lock."""
     if cache is None:
-        yield from progress(_scan(dataset, ids), "areas")
+        yield from progress(_scan(dataset, ids, countries), "areas")
         return
     cache_dir, release = cache
     rows_dir = _cache_rows_dir(cache_dir, release)
     cached = _cached_area_ids(rows_dir)
     missing = [i for i in ids if i not in cached]
     if missing:
-        _fetch_into_cache(dataset, missing, rows_dir, reopen)
+        _fetch_into_cache(dataset, missing, rows_dir, reopen, countries)
     if _has_cache(rows_dir):
         yield from ds.dataset(rows_dir, format="parquet").to_batches(
             filter=_area_predicate(ids)
@@ -279,10 +302,17 @@ class AreaReadStalled(overture.GazetteerError):
 SCAN_OPTIONS = {"use_threads": False, "batch_readahead": 0, "fragment_readahead": 1}
 
 
-def _scan(dataset, ids):
-    return dataset.to_batches(
-        columns=AREA_PROJECT, filter=_area_predicate(ids), **SCAN_OPTIONS
-    )
+def _scan(dataset, ids, countries=None):
+    # An id filter alone cannot prune by row-group statistics (ids are unordered
+    # hashes), so every row group's geometry would be read; the divisions'
+    # countries can — the theme is spatially clustered — and a division's areas
+    # share its country, so the extra clause never drops a wanted row. A row
+    # without a country is kept too, so the clause only ever narrows the read.
+    predicate = _area_predicate(ids)
+    if countries:
+        country = ds.field("country")
+        predicate = predicate & (country.isin(sorted(countries)) | country.is_null())
+    return dataset.to_batches(columns=AREA_PROJECT, filter=predicate, **SCAN_OPTIONS)
 
 
 def retrying(open_dataset, reopen, attempt):
@@ -358,7 +388,7 @@ def with_deadline(scan, seconds):
         abandoned.set()
 
 
-def _fetch_into_cache(dataset, ids, rows_dir, reopen=None):
+def _fetch_into_cache(dataset, ids, rows_dir, reopen=None, countries=None):
     """Stream the S3 area rows for ``ids`` into one new parquet file in the cache
     — written to a hidden temp then atomically renamed, one batch at a time, so
     the whole set is never materialised and a crash leaves no partial file the
@@ -374,10 +404,12 @@ def _fetch_into_cache(dataset, ids, rows_dir, reopen=None):
     # each attempt's open runs under the deadline too: the given dataset on the
     # first attempt (or ``reopen`` when none was given), ``reopen`` afterwards.
     open_dataset = reopen if dataset is None else opened
-    retrying(open_dataset, reopen, lambda o: _stream_into_cache(o, ids, rows_dir))
+    retrying(
+        open_dataset, reopen, lambda o: _stream_into_cache(o, ids, rows_dir, countries)
+    )
 
 
-def _stream_into_cache(open_dataset, ids, rows_dir):
+def _stream_into_cache(open_dataset, ids, rows_dir, countries=None):
     """One scan of ``ids`` — over the dataset ``open_dataset()`` returns — into
     a new cache file; the hidden temp is unlinked unless the rename completed,
     whatever raised — a scan that stalls, or a close or rename that fails,
@@ -386,7 +418,9 @@ def _stream_into_cache(open_dataset, ids, rows_dir):
     writer = None
     published = False
     try:
-        batches = with_deadline(lambda: _scan(open_dataset(), ids), AREA_READ_DEADLINE)
+        batches = with_deadline(
+            lambda: _scan(open_dataset(), ids, countries), AREA_READ_DEADLINE
+        )
         for batch in progress(batches, "areas"):
             if writer is None:
                 writer = pq.ParquetWriter(tmp, batch.schema)
@@ -648,6 +682,7 @@ def attach_geometry(
             # set's polygons are never held at once (that peak OOMs a feed-dense
             # country's build on a memory-tight host). The accumulators below are
             # chunk-order independent, so the result matches a single-pass read.
+            countries = {p.get("country_code") for p in places} - {None}
             chunk = area_chunk if area_chunk is not None else AREA_CHUNK
             if not chunk or chunk <= 0:
                 chunk = len(wanted) or 1
@@ -659,6 +694,7 @@ def attach_geometry(
                     simplify=SIMPLIFY_TOLERANCE_DEG,
                     cache=(cache_dir, overture.OVERTURE_RELEASE),
                     reopen=reopen,
+                    countries=countries,
                 )
                 for overture_id in batch_ids:
                     rows = areas.get(overture_id)
