@@ -18,6 +18,7 @@ declare, so the 3.5M-row locality universe is never materialised.
 """
 
 import datetime
+import logging
 import unicodedata
 
 import pyarrow.dataset as ds
@@ -25,6 +26,8 @@ import pyarrow.dataset as ds
 from transitio_index import overrides, overture, store
 from transitio_index import registry as _registry
 from transitio_index.progress import progress
+
+log = logging.getLogger(__name__)
 
 # The Overture subtypes that stand in for a city, most specific first: a name
 # resolving to both prefers the locality (decision in the plan's subtype table).
@@ -463,9 +466,14 @@ def _key_concordance(key, registry):
 def _identify_places(places, registry, places_digest):
     """Give every place its registry id — found by its concordances or
     minted — and the QID the registry keys it by; ``rekey_by_own_id`` then
-    makes the id the key."""
+    makes the id the key. A place whose concordances conflict with an
+    existing registry place — a name shared across administrative levels,
+    e.g. a city that shares its QID with a like-named region — cannot be
+    identified; it is logged and dropped from ``places`` so one collision no
+    longer aborts the gazetteer. Returns the number identified."""
     if registry is None:
         return 0
+    skipped = []
     for place_id in sorted(places):
         row = places[place_id]
         concordances = _key_concordance(place_id, registry)
@@ -478,18 +486,51 @@ def _identify_places(places, registry, places_digest):
             minted_in = f"places.yaml {places_digest}"
         if row.get("osm_relation_id"):
             concordances["osm_relation"] = [str(row["osm_relation_id"])]
-        row["tp_id"] = registry.identify(
-            concordances,
-            kind=row["kind"],
-            name=row.get("name"),
-            country_code=row.get("country_code"),
-            minted_from=minted_from,
-            minted_in=minted_in,
-        )
+        try:
+            row["tp_id"] = registry.identify(
+                concordances,
+                kind=row["kind"],
+                name=row.get("name"),
+                country_code=row.get("country_code"),
+                minted_from=minted_from,
+                minted_in=minted_in,
+            )
+        except _registry.RegistryError as exc:
+            # A read-only session refuses every change loudly; only a writable
+            # build treats an identity conflict as a per-item miss.
+            if registry.read_only:
+                raise
+            log.warning("seed: %s not identified (%s); skipped", place_id, exc)
+            skipped.append(place_id)
+            continue
         row["wikidata_id"] = registry.canonical_qid(row["tp_id"])
         if row["kind"] == "metro" and not row.get("statistical_area_id"):
             _restore_statistical_identity(row, registry.effective(row["tp_id"]))
+    if skipped:
+        _drop_places(places, skipped)
     return len(places)
+
+
+def _drop_places(places, keys):
+    """Remove ``keys`` from ``places`` and mend the links that named them: a
+    child of a dropped place moves up to its nearest surviving ancestor, a
+    dangling default metro is cleared, and dropped members leave every metro."""
+    gone = {key: places.pop(key) for key in keys}
+    for row in places.values():
+        parent = row.get("parent_id")
+        seen = set()
+        while parent in gone and parent not in seen:
+            seen.add(parent)
+            parent = gone[parent].get("parent_id")
+        if parent in gone:
+            parent = None  # the dropped rows loop: no surviving ancestor
+        if parent != row.get("parent_id"):
+            row["parent_id"] = parent
+        if row.get("default_metro_id") in gone:
+            row["default_metro_id"] = None
+        for field in ("metro_ids", "member_ids"):
+            if row.get(field):
+                row[field] = [v for v in row[field] if v not in gone]
 
 
 STATISTICAL_SUBTYPES = {
@@ -687,13 +728,17 @@ def resolve_seed(
         for e in overrides.by_operation(place_overrides, "set_statistical_area")
     }
     _add_place_overrides(places, added, override_report, statistical)
+    before = set(places)
     identified = _identify_places(places, registry, places_digest)
+    conflicts = before - set(places)
     if registry is not None:
+        placements = [p for p in placements if p["place_id"] in places]
         places = rekey_by_own_id(places, registry, records=placements)
 
     manifest = {
         "source": "seed",
         "identified": identified,
+        "seed_conflicts": len(conflicts),
         # The digest loaded, never the one to be saved: the run saves the
         # registry only after its last stage.
         "registry_base": registry.base if registry is not None else None,

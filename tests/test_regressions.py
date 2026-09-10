@@ -4,6 +4,7 @@ Fixtures are imported from the stage test modules rather than duplicated.
 """
 
 import http.client
+import logging
 
 import pytest
 
@@ -11,7 +12,7 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
-from transitio_index import boundaries, coverage, overture, registry  # noqa: E402
+from transitio_index import boundaries, coverage, overture, registry, seed  # noqa: E402
 
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
 
@@ -302,3 +303,45 @@ def test_overture_s3_filesystem_widens_the_timeout_and_retries(monkeypatch):
     assert kw["connect_timeout"] >= 10
     assert kw["request_timeout"] >= 30
     assert kw["retry_strategy"] is not None
+
+
+def test_a_seed_place_conflicting_with_a_registry_place_is_skipped_not_fatal(
+    tmp_path, caplog
+):
+    """A seeded place that shares its QID with a registry place of another kind
+    (CA's Saskatoon: a region in the registry, a city from a feed) cannot be
+    identified; it is logged and dropped — a child of a dropped place moves up
+    to its nearest surviving ancestor — so one cross-level clash no longer
+    aborts the gazetteer."""
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        for qid, kind in (("Q10566", "region"), ("Q77", "city"), ("Q88", "city")):
+            reg.identify(
+                {"wikidata": [qid]},
+                kind=kind,
+                country_code="CA",
+                minted_from=f"overture:{qid}",
+                minted_in="overture test",
+            )
+        ca = {"country_code": "CA"}
+        places = {
+            "Q1": {"kind": "country", **ca},
+            "Q77": {"kind": "region", "parent_id": "Q1", **ca},
+            "Q5": {"kind": "city", "parent_id": "Q77", "metro_ids": ["Q77"], **ca},
+            # A dropped region that names itself as its parent: its child has
+            # no surviving ancestor, and the walk must not spin.
+            "Q88": {"kind": "region", "parent_id": "Q88", **ca},
+            "Q6": {"kind": "city", "parent_id": "Q88", **ca},
+            "Q10566": {"kind": "city", "parent_id": "Q1", **ca},
+            "Q2": {"kind": "city", "parent_id": "Q1", **ca},
+        }
+        with caplog.at_level(logging.WARNING):
+            identified = seed._identify_places(places, reg, "digest")
+    assert identified == 4 and set(places) == {"Q1", "Q5", "Q6", "Q2"}
+    assert all(registry.ID_PATTERN.match(places[k]["tp_id"]) for k in places)
+    # The city under the dropped region is re-parented past it, and no longer
+    # names it as a metro; the one under the self-parenting region is orphaned.
+    assert places["Q5"]["parent_id"] == "Q1" and places["Q5"]["metro_ids"] == []
+    assert places["Q6"]["parent_id"] is None
+    assert sum("not identified" in m and "skipped" in m for m in caplog.messages) == 3

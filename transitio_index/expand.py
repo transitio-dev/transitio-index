@@ -331,6 +331,16 @@ def _discover(
     for qid in conflicts:
         del discovered[qid]
         del canonical[qid]
+    identified = 0
+    if registry is not None:
+        # Every resolved signal, a seeded place reached through a new
+        # division included: the concordance enriches the row, or conflicts,
+        # and read-only refuses. A discovery the registry refuses is dropped
+        # here, before it can stand in for its aliases, read a boundary, or
+        # seed a metro's membership.
+        identified = seed._identify_places(discovered, registry, digest)
+        for qid in set(canonical) - set(discovered):
+            del canonical[qid]
     new_ids = []
     taken = set()
     for qid in discovered:
@@ -357,12 +367,8 @@ def _discover(
     new_metros, metro_pairs = _attach_metros(
         places_by_id, new_cities, wikidata, report, registry
     )
-    identified = 0
     if registry is not None:
-        # Every resolved signal, a seeded place reached through a new
-        # division and a seeded metro named by a CBSA pair included: the
-        # concordance enriches the row, or conflicts, and read-only refuses.
-        identified = seed._identify_places(discovered, registry, digest)
+        # A seeded metro a discovered CBSA pair names is enriched too.
         identified += metros._identify_metros(
             {qid: places_by_id[qid] for qid in metro_pairs}, registry, None
         )
