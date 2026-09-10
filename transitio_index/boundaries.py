@@ -16,6 +16,7 @@ locally over the memoized polygons; the cloud filter only selects candidates by
 bounding box.
 """
 
+import functools
 import io
 import json
 import math
@@ -319,7 +320,7 @@ class BoundaryLookup:
                 self._area_dataset, found = geometry.retrying(
                     self._open_area,
                     self._reopen_area,
-                    lambda open_dataset: self._box_polygons(open_dataset, predicate),
+                    functools.partial(self._box_polygons, predicate=predicate),
                 )
                 for division_id, geoms in found.items():
                     polygons.setdefault(division_id, {}).update(geoms)
