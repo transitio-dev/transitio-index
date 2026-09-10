@@ -435,3 +435,28 @@ def test_a_self_intersecting_area_is_not_repaired_by_simplify(tmp_path):
     )
     assert {p["place_id"]: p for p in places}["Qbow"]["geometry"] is None
     assert manifest["invalid_geometry"] >= 1
+
+
+def test_read_areas_caches_fetched_divisions(tmp_path):
+    # With a cache, a division's areas are read from S3 once; a later read of the
+    # same ids is served from the local release-keyed cache with no more scans.
+    dataset = fx.write_area_dataset(
+        tmp_path / "a.parquet",
+        [
+            fx.area("A", BOX, [_osm()]),
+            fx.area("B", OTHER, [_osm()]),
+        ],
+    )
+    scans = {"n": 0}
+
+    class Counting:
+        def to_batches(self, **kwargs):
+            scans["n"] += 1
+            return dataset.to_batches(**kwargs)
+
+    cache = (tmp_path / "cache", "2026-08-19.0")
+    first = geometry.read_areas(Counting(), {"A", "B"}, cache=cache)
+    assert scans["n"] == 1  # one scan populated the cache
+    second = geometry.read_areas(Counting(), {"A", "B"}, cache=cache)
+    assert scans["n"] == 1  # the second read added no scans — served from cache
+    assert set(first) == set(second) == {"A", "B"}

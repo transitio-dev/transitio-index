@@ -15,9 +15,11 @@ geometry at that same tolerance.
 import collections
 import datetime
 import os
+import uuid
 
 import numpy as np
 import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 import shapely
 
 from transitio_index import overrides, overture, store
@@ -154,7 +156,7 @@ def division_area_dataset(release=overture.OVERTURE_RELEASE):
     return ds.dataset(path, filesystem=overture.s3_filesystem(), format="parquet")
 
 
-def read_areas(dataset, division_ids, *, simplify=None):
+def read_areas(dataset, division_ids, *, simplify=None, cache=None):
     """``{division_id: [{"geom", "sources"}, ...]}`` land-area rows for the ids.
 
     One row per land area is kept with its own sources — never flattened across a
@@ -168,14 +170,17 @@ def read_areas(dataset, division_ids, *, simplify=None):
     held or unioned, instead of materialising every seeded division's raw
     geometry at once (the peak that OOMs a feed-dense build). The caller ships
     at this same tolerance anyway, so the result is unchanged within it.
+
+    ``cache`` — a ``(cache_dir, release)`` pair — memoizes the fetched rows under
+    ``cache_dir/overture_areas/<release>/`` so each division's raw geometry is
+    read from S3 at most once; the release is immutable, so the cache is valid
+    until it is bumped. With ``None`` the areas are read straight from S3.
     """
     if not division_ids:
         return {}
-    predicate = ds.field("division_id").isin(sorted(division_ids))
+    ids = sorted(set(division_ids))
     areas = {}
-    for batch in progress(
-        dataset.to_batches(columns=AREA_PROJECT, filter=predicate), "areas"
-    ):
+    for batch in _area_batches(dataset, ids, cache):
         for row in batch.to_pylist():
             if not row.get("is_land"):
                 continue
@@ -186,8 +191,8 @@ def read_areas(dataset, division_ids, *, simplify=None):
             if geom is not None:
                 geom = shapely.force_2d(geom)
                 # Only simplify an already-valid boundary: an empty,
-                # self-intersecting, non-polygonal or non-finite area is left raw
-                # so the caller's own validity check still rejects it, and
+                # self-intersecting, non-polygonal or non-finite area is left
+                # raw so the caller's own validity check still rejects it, and
                 # ``simplify`` never runs on geometry it could turn into an
                 # apparently-valid shape or raise on.
                 if simplify is not None and _valid_polygon(geom):
@@ -196,6 +201,98 @@ def read_areas(dataset, division_ids, *, simplify=None):
                 {"geom": geom, "sources": row.get("sources") or []}
             )
     return areas
+
+
+def _area_predicate(ids):
+    return ds.field("division_id").isin(ids)
+
+
+def _area_batches(dataset, ids, cache):
+    """Yield projected ``division_area`` record-batches for ``ids``, one batch in
+    memory at a time (never the whole set at once). With ``cache`` a
+    ``(cache_dir, release)`` pair the rows are memoized under a release-keyed
+    local parquet — ids not already stored are streamed in from S3 first — so
+    each division is read from S3 at most once; the release is immutable, so the
+    cache stays valid until it is bumped. Builds run one at a time, so the
+    unique per-fetch filenames need no lock."""
+    if cache is None:
+        yield from progress(
+            dataset.to_batches(columns=AREA_PROJECT, filter=_area_predicate(ids)),
+            "areas",
+        )
+        return
+    cache_dir, release = cache
+    rows_dir = _cache_rows_dir(cache_dir, release)
+    cached = _cached_area_ids(rows_dir)
+    missing = [i for i in ids if i not in cached]
+    if missing:
+        _fetch_into_cache(dataset, missing, rows_dir)
+    if _has_cache(rows_dir):
+        yield from ds.dataset(rows_dir, format="parquet").to_batches(
+            filter=_area_predicate(ids)
+        )
+
+
+def _cache_rows_dir(cache_dir, release):
+    """The release's cache rows directory, refusing a release that is not a safe
+    path component and a path a symlink has redirected outside the cache root.
+
+    The cache lives under the build's own ``cache_dir`` (maintainer-owned, not
+    attacker input); this rejects a statically planted symlink escape. A
+    concurrent symlink race is out of scope — pyarrow reads and writes by path,
+    not by directory descriptor, so an ``openat``-relative implementation is not
+    available here.
+    """
+    if not store.safe_component(str(release)):
+        raise ValueError(f"unsafe Overture release for the area cache: {release!r}")
+    rows_dir = cache_dir / "overture_areas" / str(release) / "rows"
+    root = os.path.realpath(cache_dir)
+    resolved = os.path.realpath(rows_dir)
+    if os.path.commonpath([root, resolved]) != root:
+        raise ValueError(f"area cache path escapes the cache root: {rows_dir}")
+    return rows_dir
+
+
+def _fetch_into_cache(dataset, ids, rows_dir):
+    """Stream the S3 area rows for ``ids`` into one new parquet file in the cache
+    — written to a hidden temp then atomically renamed, one batch at a time, so
+    the whole set is never materialised and a crash leaves no partial file the
+    reader chokes on (pyarrow skips dotfiles during discovery)."""
+    rows_dir.mkdir(parents=True, exist_ok=True)
+    tmp = rows_dir / f".{uuid.uuid4().hex}.parquet.tmp"
+    writer = None
+    try:
+        for batch in progress(
+            dataset.to_batches(columns=AREA_PROJECT, filter=_area_predicate(ids)),
+            "areas",
+        ):
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, batch.schema)
+            writer.write_batch(batch)
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is not None:
+        os.replace(tmp, rows_dir / f"{uuid.uuid4().hex}.parquet")
+
+
+def _has_cache(rows_dir):
+    return rows_dir.exists() and any(rows_dir.glob("*.parquet"))
+
+
+def _cached_area_ids(rows_dir):
+    """Division ids already fetched into the local area cache — those with any
+    stored row, land or maritime. A division absent from the theme entirely (no
+    rows at all) is not recorded, so it is re-scanned next time (a cheap empty
+    S3 read) rather than complicating the cache with negative entries."""
+    if not _has_cache(rows_dir):
+        return set()
+    column = (
+        ds.dataset(rows_dir, format="parquet")
+        .to_table(columns=["division_id"])
+        .column("division_id")
+    )
+    return set(column.to_pylist())
 
 
 def _source_key(source):
@@ -426,7 +523,10 @@ def attach_geometry(
             for start in progress(range(0, len(wanted) or 1, chunk), "geometry"):
                 batch_ids = wanted[start : start + chunk]
                 areas = read_areas(
-                    dataset, set(batch_ids), simplify=SIMPLIFY_TOLERANCE_DEG
+                    dataset,
+                    set(batch_ids),
+                    simplify=SIMPLIFY_TOLERANCE_DEG,
+                    cache=(cache_dir, overture.OVERTURE_RELEASE),
                 )
                 for overture_id in batch_ids:
                     rows = areas.get(overture_id)

@@ -226,7 +226,15 @@ def _attach_metros(places_by_id, new_cities, wikidata, report, registry=None):
 
 
 def _discover(
-    cache_dir, places_by_id, lookup, wikidata, area_dataset, report, registry, digest
+    cache_dir,
+    places_by_id,
+    lookup,
+    wikidata,
+    area_dataset,
+    report,
+    registry,
+    digest,
+    release,
 ):
     """Resolve crawled stops and fold the missing places in; returns counts.
     With ``registry``, every discovered place is identified through it."""
@@ -336,6 +344,7 @@ def _discover(
         area_dataset,
         {discovered[qid]["overture_id"] for qid in new_ids},
         simplify=geometry.SIMPLIFY_TOLERANCE_DEG,
+        cache=(cache_dir, release),
     )
     for qid in new_ids:
         place = discovered[qid]
@@ -435,6 +444,7 @@ def _expanded(
                 report,
                 registry,
                 digest,
+                release,
             )
     finally:
         if opened_lookup is not None:
