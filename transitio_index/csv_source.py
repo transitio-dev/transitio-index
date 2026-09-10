@@ -10,9 +10,12 @@ import csv
 import datetime
 import hashlib
 import io
+import logging
 import os
 
 from transitio_index import download, store
+
+log = logging.getLogger(__name__)
 
 
 class IngestError(RuntimeError):
@@ -163,12 +166,15 @@ def ingest_csv(
     required_headers,
     csv_path=None,
     expected_sha256=None,
+    allow_empty=False,
 ):
     """Fetch (or reuse) the source CSV, normalize it, and publish a generation.
 
     ``parse_rows`` takes ``(rows, source_file)`` and returns
     ``(records, summary_extra)``. With ``csv_path`` the local CSV is used and
-    nothing is downloaded, which is how the tests run offline.
+    nothing is downloaded, which is how the tests run offline. A CSV with a
+    valid header but no rows is an error unless ``allow_empty`` — set for an
+    optional source — in which case an empty generation is published.
 
     The export at ``url`` is always-latest — it carries no immutable version
     — so the content SHA-256 is the real identity: ``csv_sha256`` records the
@@ -207,7 +213,12 @@ def ingest_csv(
             rows = read_rows(text, required_headers)
             records, extra = parse_rows(rows, source)
             if not records:
-                raise IngestError(f"{source}: no rows found")
+                # A required source with nothing in it is a broken export; an
+                # optional one (the GBFS systems of a country that has none)
+                # legitimately publishes an empty generation.
+                if not allow_empty:
+                    raise IngestError(f"{source}: no rows found")
+                log.warning("%s: no rows found; publishing an empty catalogue", source)
 
             manifest = {
                 "source": source,
