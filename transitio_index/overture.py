@@ -113,10 +113,20 @@ def s3_filesystem(region=OVERTURE_REGION):
     the read works behind an HTTP proxy; with none set it connects directly, as
     before. The AWS SDK behind ``S3FileSystem`` does not read those variables on
     its own, unlike ``urllib``.
-    """
-    from pyarrow.fs import S3FileSystem
 
-    options = {"anonymous": True, "region": region}
+    The timeouts and retry budget are widened well past the SDK's ~3s default:
+    a proxied connection is slower, and many small reads (a chunked area scan)
+    would otherwise let one transient slow response abort the whole gazetteer.
+    """
+    from pyarrow.fs import AwsStandardS3RetryStrategy, S3FileSystem
+
+    options = {
+        "anonymous": True,
+        "region": region,
+        "connect_timeout": 30.0,
+        "request_timeout": 120.0,
+        "retry_strategy": AwsStandardS3RetryStrategy(max_attempts=8),
+    }
     proxy = (
         os.environ.get("HTTPS_PROXY")
         or os.environ.get("https_proxy")

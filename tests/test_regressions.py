@@ -284,3 +284,21 @@ def test_overture_s3_filesystem_passes_the_env_proxy(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
     overture.s3_filesystem()
     assert captured[-1]["proxy_options"] == "http://proxy.example:8080"
+
+
+def test_overture_s3_filesystem_widens_the_timeout_and_retries(monkeypatch):
+    """S3 reads get a generous timeout and retry budget, so a transient slow
+    response over a proxy does not abort the gazetteer at the AWS SDK's ~3s
+    default request timeout.
+    """
+    import pyarrow.fs
+
+    captured = []
+    monkeypatch.setattr(
+        pyarrow.fs, "S3FileSystem", lambda **kw: captured.append(kw) or "fs"
+    )
+    overture.s3_filesystem()
+    kw = captured[-1]
+    assert kw["connect_timeout"] >= 10
+    assert kw["request_timeout"] >= 30
+    assert kw["retry_strategy"] is not None
