@@ -14,7 +14,10 @@ geometry at that same tolerance.
 
 import collections
 import datetime
+import logging
 import os
+import queue
+import threading
 import uuid
 
 import numpy as np
@@ -24,6 +27,8 @@ import shapely
 
 from transitio_index import overrides, overture, store
 from transitio_index.progress import progress
+
+log = logging.getLogger(__name__)
 
 DIVISION_AREA_PATH = "release/{release}/theme=divisions/type=division_area"
 AREA_PROJECT = ["division_id", "geometry", "sources", "is_land"]
@@ -35,6 +40,10 @@ AREA_PROJECT = ["division_id", "geometry", "sources", "is_land"]
 # scans. Unset or non-positive resolves them in a single pass (no overhead),
 # which is the default for a normally-resourced build.
 AREA_CHUNK = int(os.environ.get("TRANSITIO_AREA_CHUNK", "0") or "0")
+# An S3 area scan that yields nothing for this long is a hung connection, not a
+# slow one: it is abandoned and retried on a fresh connection, up to the attempts.
+AREA_READ_DEADLINE = float(os.environ.get("TRANSITIO_AREA_DEADLINE", "600") or "600")
+AREA_READ_ATTEMPTS = 3
 
 # Explicit allowlist of AUDITED geometry sources, keyed by ``(dataset, licence)``
 # so a new upstream dataset is not shipped on a familiar licence until it is
@@ -156,7 +165,7 @@ def division_area_dataset(release=overture.OVERTURE_RELEASE):
     return ds.dataset(path, filesystem=overture.s3_filesystem(), format="parquet")
 
 
-def read_areas(dataset, division_ids, *, simplify=None, cache=None):
+def read_areas(dataset, division_ids, *, simplify=None, cache=None, reopen=None):
     """``{division_id: [{"geom", "sources"}, ...]}`` land-area rows for the ids.
 
     One row per land area is kept with its own sources — never flattened across a
@@ -175,12 +184,15 @@ def read_areas(dataset, division_ids, *, simplify=None, cache=None):
     ``cache_dir/overture_areas/<release>/`` so each division's raw geometry is
     read from S3 at most once; the release is immutable, so the cache is valid
     until it is bumped. With ``None`` the areas are read straight from S3.
+
+    ``reopen`` — a callable returning a freshly opened ``dataset`` — lets a
+    cached S3 scan that stalls be retried on a new connection.
     """
     if not division_ids:
         return {}
     ids = sorted(set(division_ids))
     areas = {}
-    for batch in _area_batches(dataset, ids, cache):
+    for batch in _area_batches(dataset, ids, cache, reopen):
         for row in batch.to_pylist():
             if not row.get("is_land"):
                 continue
@@ -207,7 +219,7 @@ def _area_predicate(ids):
     return ds.field("division_id").isin(ids)
 
 
-def _area_batches(dataset, ids, cache):
+def _area_batches(dataset, ids, cache, reopen=None):
     """Yield projected ``division_area`` record-batches for ``ids``, one batch in
     memory at a time (never the whole set at once). With ``cache`` a
     ``(cache_dir, release)`` pair the rows are memoized under a release-keyed
@@ -216,17 +228,14 @@ def _area_batches(dataset, ids, cache):
     cache stays valid until it is bumped. Builds run one at a time, so the
     unique per-fetch filenames need no lock."""
     if cache is None:
-        yield from progress(
-            dataset.to_batches(columns=AREA_PROJECT, filter=_area_predicate(ids)),
-            "areas",
-        )
+        yield from progress(_scan(dataset, ids), "areas")
         return
     cache_dir, release = cache
     rows_dir = _cache_rows_dir(cache_dir, release)
     cached = _cached_area_ids(rows_dir)
     missing = [i for i in ids if i not in cached]
     if missing:
-        _fetch_into_cache(dataset, missing, rows_dir)
+        _fetch_into_cache(dataset, missing, rows_dir, reopen)
     if _has_cache(rows_dir):
         yield from ds.dataset(rows_dir, format="parquet").to_batches(
             filter=_area_predicate(ids)
@@ -253,27 +262,106 @@ def _cache_rows_dir(cache_dir, release):
     return rows_dir
 
 
-def _fetch_into_cache(dataset, ids, rows_dir):
+class AreaReadStalled(overture.GazetteerError):
+    """An S3 area scan yielded nothing for the deadline: a hung connection."""
+
+
+def _scan(dataset, ids):
+    # One fragment in flight and no batch readahead: a proxied S3 read survives
+    # on a couple of connections where eight concurrent ones get dropped and the
+    # SDK then waits on them forever.
+    return dataset.to_batches(
+        columns=AREA_PROJECT,
+        filter=_area_predicate(ids),
+        use_threads=False,
+        batch_readahead=0,
+        fragment_readahead=1,
+    )
+
+
+def _with_deadline(scan, seconds):
+    """Yield the batches ``scan()`` returns, opened and consumed in a daemon
+    thread, raising ``AreaReadStalled`` when none arrives within ``seconds``.
+    pyarrow blocks in C++ and cannot be interrupted, so on a stall the thread is
+    left behind — a daemon, it never holds the build — and the caller retries
+    on a fresh connection."""
+    out = queue.Queue(maxsize=1)
+    done = object()
+
+    def pump():
+        try:
+            for batch in scan():
+                out.put(batch)
+        except BaseException as error:  # noqa: B902 - relayed to the consumer
+            out.put(error)
+        else:
+            out.put(done)
+
+    threading.Thread(target=pump, daemon=True).start()
+    while True:
+        try:
+            item = out.get(timeout=seconds)
+        except queue.Empty:
+            raise AreaReadStalled(
+                f"no area rows for {seconds:.0f}s: the S3 read stalled"
+            )
+        if item is done:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
+def _fetch_into_cache(dataset, ids, rows_dir, reopen=None):
     """Stream the S3 area rows for ``ids`` into one new parquet file in the cache
     — written to a hidden temp then atomically renamed, one batch at a time, so
     the whole set is never materialised and a crash leaves no partial file the
-    reader chokes on (pyarrow skips dotfiles during discovery)."""
+    reader chokes on (pyarrow skips dotfiles during discovery). A scan that
+    stalls past ``AREA_READ_DEADLINE`` is abandoned and retried on the dataset
+    ``reopen()`` returns — a fresh connection — up to ``AREA_READ_ATTEMPTS``."""
     rows_dir.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, AREA_READ_ATTEMPTS + 1):
+        try:
+            _stream_into_cache(dataset, ids, rows_dir)
+            return
+        except AreaReadStalled as error:
+            if reopen is None or attempt == AREA_READ_ATTEMPTS:
+                raise
+            log.warning(
+                "areas: %s; retrying on a fresh connection (%d/%d)",
+                error,
+                attempt,
+                AREA_READ_ATTEMPTS,
+            )
+            dataset = reopen()
+
+
+def _stream_into_cache(dataset, ids, rows_dir):
+    """One scan of ``ids`` into a new cache file; the hidden temp is unlinked
+    unless the rename completed, whatever raised — a scan that stalls, or a
+    close or rename that fails, never leaves a partial file behind."""
     tmp = rows_dir / f".{uuid.uuid4().hex}.parquet.tmp"
     writer = None
+    published = False
     try:
-        for batch in progress(
-            dataset.to_batches(columns=AREA_PROJECT, filter=_area_predicate(ids)),
-            "areas",
-        ):
+        batches = _with_deadline(lambda: _scan(dataset, ids), AREA_READ_DEADLINE)
+        for batch in progress(batches, "areas"):
             if writer is None:
                 writer = pq.ParquetWriter(tmp, batch.schema)
             writer.write_batch(batch)
-    finally:
         if writer is not None:
             writer.close()
-    if writer is not None:
-        os.replace(tmp, rows_dir / f"{uuid.uuid4().hex}.parquet")
+            writer = None
+            os.replace(tmp, rows_dir / f"{uuid.uuid4().hex}.parquet")
+        published = True
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: B902 - the error in flight is the one to report
+                pass
+        if not published:
+            tmp.unlink(missing_ok=True)
 
 
 def _has_cache(rows_dir):
@@ -497,8 +585,10 @@ def attach_geometry(
                 generations=run,
             )
             wanted = sorted({p["overture_id"] for p in places if p.get("overture_id")})
+            reopen = None
             if dataset is None:
                 dataset = division_area_dataset()
+                reopen = division_area_dataset  # a fresh connection on a stall
 
             for place in places:
                 place.setdefault("geometry", None)
@@ -527,6 +617,7 @@ def attach_geometry(
                     set(batch_ids),
                     simplify=SIMPLIFY_TOLERANCE_DEG,
                     cache=(cache_dir, overture.OVERTURE_RELEASE),
+                    reopen=reopen,
                 )
                 for overture_id in batch_ids:
                     rows = areas.get(overture_id)

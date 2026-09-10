@@ -16,6 +16,7 @@ to end.
 """
 
 import datetime
+import functools
 
 import shapely
 
@@ -235,9 +236,11 @@ def _discover(
     registry,
     digest,
     release,
+    reopen=None,
 ):
     """Resolve crawled stops and fold the missing places in; returns counts.
-    With ``registry``, every discovered place is identified through it."""
+    With ``registry``, every discovered place is identified through it;
+    ``reopen`` reopens ``area_dataset`` when its S3 scan stalls."""
     # Two passes, one feed's stops in memory at a time — never every crawled
     # feed's stops at once: first the lookup boxes, then, with the boxes
     # ensured, the per-point division resolution.
@@ -355,6 +358,7 @@ def _discover(
         {discovered[qid]["overture_id"] for qid in new_ids},
         simplify=geometry.SIMPLIFY_TOLERANCE_DEG,
         cache=(cache_dir, release),
+        reopen=reopen,
     )
     for qid in new_ids:
         place = discovered[qid]
@@ -431,8 +435,11 @@ def _expanded(
             mode = "expanded"
             if wikidata is None:
                 wikidata = overture.WikidataClient()
+            reopen = None
             if area_dataset is None:
                 area_dataset = geometry.division_area_dataset(release)
+                # A fresh connection when the S3 area scan stalls.
+                reopen = functools.partial(geometry.division_area_dataset, release)
             if lookup is None:
                 opened_lookup = boundaries.BoundaryLookup(
                     cache_dir,
@@ -451,6 +458,7 @@ def _expanded(
                 registry,
                 digest,
                 release,
+                reopen,
             )
     finally:
         if opened_lookup is not None:

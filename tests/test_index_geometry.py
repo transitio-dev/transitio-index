@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 pytest.importorskip("pyarrow")
@@ -460,3 +462,44 @@ def test_read_areas_caches_fetched_divisions(tmp_path):
     second = geometry.read_areas(Counting(), {"A", "B"}, cache=cache)
     assert scans["n"] == 1  # the second read added no scans — served from cache
     assert set(first) == set(second) == {"A", "B"}
+
+
+@pytest.mark.parametrize(
+    "recovers, partial",
+    [(True, False), (True, True), (False, False)],
+    ids=["fresh-connection-succeeds", "one-batch-then-silence", "attempts-exhausted"],
+)
+def test_a_stalled_area_scan_is_retried_on_a_fresh_connection(
+    tmp_path, monkeypatch, recovers, partial
+):
+    """An S3 scan that yields nothing for the deadline — from the start, or after
+    a first batch has already been written — is abandoned, its partial file
+    discarded, and retried on the dataset ``reopen`` returns; when no attempt
+    recovers the read fails loudly after the attempts instead of hanging."""
+    dataset = fx.write_area_dataset(
+        tmp_path / "a.parquet", [fx.area("A", BOX, [_osm()])]
+    )
+    monkeypatch.setattr(geometry, "AREA_READ_DEADLINE", 0.2)
+    monkeypatch.setattr(geometry, "AREA_READ_ATTEMPTS", 2)
+
+    class Hanging:  # a connection the proxy dropped: nothing (more) ever arrives
+        def to_batches(self, **kwargs):
+            if partial:
+                yield next(dataset.to_batches(**kwargs))
+            threading.Event().wait(3)
+
+    opened = []
+
+    def reopen():
+        opened.append(1)
+        return dataset if recovers else Hanging()
+
+    cache = (tmp_path / "cache", "2026-08-19.0")
+    if recovers:
+        areas = geometry.read_areas(Hanging(), {"A"}, cache=cache, reopen=reopen)
+        assert set(areas) == {"A"}
+    else:
+        with pytest.raises(geometry.AreaReadStalled, match="stalled"):
+            geometry.read_areas(Hanging(), {"A"}, cache=cache, reopen=reopen)
+    assert opened == [1]  # one fresh connection, then success or give up
+    assert not list((tmp_path / "cache").rglob("*.tmp"))  # no partial file left
