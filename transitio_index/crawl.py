@@ -18,9 +18,11 @@ members verify against their recorded digests — is skipped, except when
 requested complete read cannot be starved by an unchanged ETag. One feed's
 failure of any kind is logged, never fatal to the run.
 
-``crawl_log.jsonl`` records, per feed, the method taken, the bytes fetched, the
-bytes a range read saved and the reason any fallback happened — the plan's
-first-run instrumentation for judging whether the range machinery pays.
+``crawl_log.jsonl`` records, per feed, its catalogue source (mdb, atlas, both
+or systems_csv), the method taken, the bytes fetched, the bytes a range read
+saved and the reason any fallback happened — the plan's first-run
+instrumentation for judging whether the range machinery pays, and for tracing a
+crawled feed back to the catalogue it came from.
 
 The stop_times predicate: the complete ``stop_times.txt`` is read for every
 feed except one whose routes are all settled by a geography-free tier rule AND
@@ -616,6 +618,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
     url = _feed_url(feed)
     record = {
         "feed_id": feed_id,
+        "source": feed.get("source"),
         "url": url,
         "directory": _dir_name(feed_id),
         "method": None,
@@ -837,6 +840,7 @@ def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup)
     except Exception as error:  # noqa: B902 — containment at any worker count
         return {
             "feed_id": feed["feed_id"],
+            "source": feed.get("source"),
             "url": _feed_url(feed),
             "directory": _dir_name(feed["feed_id"]),
             "method": "skipped",
