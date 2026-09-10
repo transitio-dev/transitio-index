@@ -95,17 +95,25 @@ def test_a_crawled_qidless_division_is_minted_through_the_registry(tmp_path):
     assert not any(r.get("overture_id") == "fi-noqid" for r in report)
 
 
-def test_wikidata_labels_bisect_a_truncated_batch_and_skip_a_bad_entity():
-    """A wbgetentities response the transport truncates is not fatal: the batch
-    is halved until each reply fits, and a single id that always truncates is
+@pytest.mark.parametrize(
+    "boom",
+    [
+        lambda: http.client.IncompleteRead(b"partial"),
+        lambda: http.client.RemoteDisconnected("dropped"),
+    ],
+    ids=["truncated", "disconnected"],
+)
+def test_wikidata_labels_bisect_a_failing_batch_and_skip_a_bad_entity(boom):
+    """A wbgetentities reply the transport truncates OR drops is not fatal: the
+    batch is halved until each reply lands, and a single id that always fails is
     skipped rather than aborting the build."""
 
     class Flaky(overture.WikidataClient):
         def _entities_batch(self, batch, out):
-            # An oversized batch or any batch holding the always-bad id
-            # truncates; a small good batch succeeds.
+            # An oversized batch or any batch holding the always-bad id fails;
+            # a small good batch succeeds.
             if len(batch) > 3 or "Q666" in batch:
-                raise http.client.IncompleteRead(b"partial")
+                raise boom()
             for qid in batch:
                 out[qid] = {"labels": {"en": qid}, "aliases": []}
 
@@ -114,6 +122,21 @@ def test_wikidata_labels_bisect_a_truncated_batch_and_skip_a_bad_entity():
     result = client.labels_and_aliases(qids)
     assert "Q666" not in result
     assert set(result) == {f"Q{n}" for n in range(1, 11)}
+
+
+def test_wikidata_labels_do_not_bisect_a_hard_http_error():
+    """A 4xx/5xx during a label batch stays fatal — not bisected and skipped —
+    even though HTTPError is a urllib.error.URLError subclass."""
+
+    class Failing(overture.WikidataClient):
+        def _entities_batch(self, batch, out):
+            raise overture.urllib.error.HTTPError(
+                overture.WIKIDATA_API, 500, "boom", None, None
+            )
+
+    client = Failing()
+    with pytest.raises(overture.urllib.error.HTTPError):
+        client.labels_and_aliases([f"Q{n}" for n in range(1, 6)])
 
 
 def test_wikidata_get_json_retries_a_transient_disconnect(monkeypatch):
@@ -239,3 +262,25 @@ def test_a_crawled_division_conflicting_in_kind_with_a_seed_is_reported(
     assert any(
         r.get("kind") == "conflict" and r.get("place_id") == "Q13298" for r in report
     )
+
+
+def test_overture_s3_filesystem_passes_the_env_proxy(monkeypatch):
+    """s3_filesystem routes S3 through HTTPS_PROXY/HTTP_PROXY when one is set:
+    the AWS SDK behind S3FileSystem ignores those variables on its own, so a
+    proxy-only environment could not read Overture without this.
+    """
+    import pyarrow.fs
+
+    captured = []
+    monkeypatch.setattr(
+        pyarrow.fs, "S3FileSystem", lambda **kw: captured.append(kw) or "fs"
+    )
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        monkeypatch.delenv(var, raising=False)
+
+    overture.s3_filesystem()
+    assert "proxy_options" not in captured[-1]
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
+    overture.s3_filesystem()
+    assert captured[-1]["proxy_options"] == "http://proxy.example:8080"

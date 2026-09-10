@@ -19,6 +19,7 @@ import datetime
 import http.client
 import json
 import logging
+import os
 import re
 import socket
 import time
@@ -105,13 +106,32 @@ class GazetteerError(RuntimeError):
     """The gazetteer stage could not resolve its inputs."""
 
 
-def overture_dataset(release=OVERTURE_RELEASE):
-    """The pinned Overture ``division`` theme as a pyarrow dataset over S3."""
+def s3_filesystem(region=OVERTURE_REGION):
+    """An anonymous S3 filesystem for the public Overture bucket.
+
+    Honours the standard ``HTTPS_PROXY``/``HTTP_PROXY`` environment variables so
+    the read works behind an HTTP proxy; with none set it connects directly, as
+    before. The AWS SDK behind ``S3FileSystem`` does not read those variables on
+    its own, unlike ``urllib``.
+    """
     from pyarrow.fs import S3FileSystem
 
-    filesystem = S3FileSystem(anonymous=True, region=OVERTURE_REGION)
+    options = {"anonymous": True, "region": region}
+    proxy = (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+    if proxy:
+        options["proxy_options"] = proxy
+    return S3FileSystem(**options)
+
+
+def overture_dataset(release=OVERTURE_RELEASE):
+    """The pinned Overture ``division`` theme as a pyarrow dataset over S3."""
     path = f"{OVERTURE_BUCKET}/{DIVISION_PATH.format(release=release)}"
-    return ds.dataset(path, filesystem=filesystem, format="parquet")
+    return ds.dataset(path, filesystem=s3_filesystem(), format="parquet")
 
 
 def read_divisions(dataset, *, subtypes=SKELETON_SUBTYPES):
@@ -370,17 +390,24 @@ class WikidataClient:
 
     def _fetch_bisecting(self, batch, apply, what):
         """Run ``apply(batch)``, halving the batch when the transport truncates
-        the response, so one oversized reply the connection cannot deliver whole
-        degrades to smaller reads instead of aborting the build. A single id
-        whose response still truncates is logged and skipped."""
+        or drops the response — even after ``_get_json``'s own retries — so one
+        oversized or repeatedly-dropped reply degrades to smaller reads instead
+        of aborting the build. A single id that still fails is logged and
+        skipped: its labels stay un-enriched, never fatal, since this is an
+        optional enrichment."""
         try:
             apply(batch)
-        except http.client.IncompleteRead:
+        except urllib.error.HTTPError:
+            # A 4xx/5xx is a hard error, not a transport hiccup, and stays fatal
+            # even though HTTPError is a urllib.error.URLError subclass.
+            raise
+        except (http.client.IncompleteRead, *_TRANSIENT_ERRORS) as error:
             if len(batch) <= 1:
                 log.warning(
-                    "%s: %s response truncated; skipped",
+                    "%s: %s failed (%s); labels skipped",
                     what,
                     ",".join(batch) or "(empty)",
+                    type(error).__name__,
                 )
                 return
             mid = len(batch) // 2

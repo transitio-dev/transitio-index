@@ -141,11 +141,8 @@ SIMPLIFY_TOLERANCE_DEG = 0.001
 
 def division_area_dataset(release=overture.OVERTURE_RELEASE):
     """The pinned Overture ``division_area`` theme as a dataset over S3."""
-    from pyarrow.fs import S3FileSystem
-
-    filesystem = S3FileSystem(anonymous=True, region=overture.OVERTURE_REGION)
     path = f"{overture.OVERTURE_BUCKET}/{DIVISION_AREA_PATH.format(release=release)}"
-    return ds.dataset(path, filesystem=filesystem, format="parquet")
+    return ds.dataset(path, filesystem=overture.s3_filesystem(), format="parquet")
 
 
 def read_areas(dataset, division_ids):
