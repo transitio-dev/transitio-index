@@ -13,13 +13,15 @@ Atlas revision the sample was cut at — for the outputs; releasing the snapshot
 with ``transitio_index.publish_cli`` and reading it back with the reader are
 the operator's separate acceptance steps.
 
-MDB and GBFS rows carry an ISO ``country_code``, so those are filtered exactly;
-a missing or renamed column stops the cut rather than silently matching
+MDB and GBFS rows carry a country field — usually an ISO ``country_code``,
+sometimes a full country name — so a requested country is matched on either
+form; a missing or renamed column stops the cut rather than silently matching
 nothing. Atlas feed records carry no country — the crosswalk places an Atlas
 feed by matching its GTFS download URL (exactly, then by host) against MDB — so
 the archive is trimmed to the DMFR files that share a download URL or host with
-a kept MDB feed, the same signal the crosswalk uses, which keeps real
-Atlas↔MDB overlap in the sample. Downloads and matching reuse the build's own
+a kept MDB feed, the same signal the crosswalk uses. That Atlas↔MDB overlap is
+kept when it exists; a country served by a single national feed with no Atlas
+match yields an MDB-only sample. Downloads and matching reuse the build's own
 modules, so the cut sees the catalogues exactly as the build would.
 
 Each run fetches the full catalogues into a fresh temporary directory (not
@@ -27,8 +29,9 @@ kept), selects and validates all three before publishing anything, then writes
 the outputs into a uniquely named subdirectory of ``--out-dir`` (default
 ``cache/sample``, gitignored) — so concurrent runs never collide and an
 interrupted run leaves no half-written set anything would consume. Nothing
-here is committed. The cut stops before publishing if the MDB selection or the
-Atlas overlap is empty.
+here is committed. The cut requires at least one MDB feed for each requested
+country; GBFS systems and Atlas overlap are optional, so a country served by a
+single national feed with no Atlas crosswalk still yields an MDB-only sample.
 """
 
 import argparse
@@ -37,6 +40,7 @@ import io
 import json
 import re
 import shlex
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
@@ -50,6 +54,90 @@ DEFAULT_COUNTRIES = ("FI", "EE")
 MDB_COUNTRY = "location.country_code"
 MDB_DOWNLOAD = "urls.direct_download"
 GBFS_COUNTRY = "Country Code"
+
+# Some catalogue rows record a place by its full country name rather than its
+# ISO code, so each requested country matches either form. Names are matched
+# upper-cased, like the codes.
+COUNTRY_NAMES = {
+    "FI": "FINLAND",
+    "EE": "ESTONIA",
+    "NL": "NETHERLANDS",
+    "AT": "AUSTRIA",
+    "ES": "SPAIN",
+    "CA": "CANADA",
+    "MX": "MEXICO",
+    "BR": "BRAZIL",
+}
+_NAME_TO_CODE = {name: code for code, name in COUNTRY_NAMES.items()}
+
+
+def _country_code(token):
+    """The ISO code a requested token names — the token itself if already a
+    code, or the code its full name maps to."""
+    return _NAME_TO_CODE.get(token, token)
+
+
+def _match_values(code):
+    """Every country-field value that names the country ``code``: the code and,
+    when known, its full name — so a catalogue recording either form matches."""
+    values = {code}
+    if code in COUNTRY_NAMES:
+        values.add(COUNTRY_NAMES[code])
+    return values
+
+
+def _is_iso_code(token):
+    """Whether ``token`` looks like an ISO 3166-1 alpha-2 country code — two
+    ASCII letters (validity against the actual code set is judged later, against
+    the downloaded catalogue rows)."""
+    return len(token) == 2 and token.isascii() and token.isalpha()
+
+
+def _unrecognized_countries(requested):
+    """Raw requested tokens that are neither an ISO alpha-2 code nor a curated
+    full name — a typo or an unsupported name. The check is on the raw token, so
+    a non-ASCII character cannot case-fold into a code (e.g. ``ß`` -> ``SS``).
+    Refusing these up front stops a literal like ``FRANCE`` being passed through
+    as a match value that only the data's shape would (fail to) reject."""
+    return sorted(
+        token
+        for token in requested
+        if not _is_iso_code(token) and token.upper() not in _NAME_TO_CODE
+    )
+
+
+def _limit_per_country(rows, field, limit):
+    """At most ``limit`` rows per country, in input order — a small, deterministic
+    sample so a large country's full catalogue does not overwhelm the build. With
+    ``limit`` None the rows pass through unchanged."""
+    if limit is None:
+        return rows
+    kept, counts = [], {}
+    for row in rows:
+        code = _country_code((row.get(field) or "").strip().upper())
+        if counts.get(code, 0) < limit:
+            kept.append(row)
+            counts[code] = counts.get(code, 0) + 1
+    return kept
+
+
+def _chunks(rows, size):
+    """``rows`` in consecutive lists of at most ``size``."""
+    return [rows[start : start + size] for start in range(0, len(rows), size)] or [[]]
+
+
+def _even_split(rows, parts):
+    """``rows`` shared across ``parts`` groups, as evenly as possible, in order."""
+    if parts <= 1:
+        return [rows]
+    base, extra = divmod(len(rows), parts)
+    out, start = [], 0
+    for i in range(parts):
+        take = base + (1 if i < extra else 0)
+        out.append(rows[start : start + take])
+        start += take
+    return out
+
 
 # Multi-tenant endpoints where the URL path, not the host, identifies a feed: a
 # shared-host match there is no evidence a feed belongs to a sampled place, so
@@ -137,13 +225,29 @@ def _feed_matches(feed, urls, hosts):
     return False
 
 
-def _select_atlas(archive, urls, hosts):
-    """``(member name, payload)`` for every DMFR file with a matching feed."""
+def _select_atlas(archive, urls, hosts, limit=None):
+    """``(member name, payload)`` for the DMFR files with a matching feed.
+
+    With ``limit`` the sample is trimmed to only the feeds that match a kept MDB
+    feed, capped to ``limit`` in total: a feed-dense file's other agencies would
+    otherwise dominate the crawl and overwhelm the expand stage. Without a limit
+    each matching file is kept whole (the crosswalk sees the full Atlas layout).
+    """
     kept = []
+    total = 0
     for source_file, payload in atlas.iter_dmfr(archive):
         feeds = payload.get("feeds") or []
-        if any(_feed_matches(feed, urls, hosts) for feed in feeds):
+        matching = [feed for feed in feeds if _feed_matches(feed, urls, hosts)]
+        if not matching:
+            continue
+        if limit is None:
             kept.append((source_file, payload))
+            continue
+        if total >= limit:
+            break
+        matching = matching[: limit - total]
+        kept.append((source_file, {**payload, "feeds": matching}))
+        total += len(matching)
     return kept
 
 
@@ -184,11 +288,12 @@ def _by_country(rows, field):
 def _missing(rows, field, countries):
     """Requested countries with no row in ``rows`` — a typo or unsupported code.
 
-    A multi-country request must not silently drop a country that matched
-    nothing just because another matched.
+    A country is present when a row carries its ISO code or its full name; a
+    multi-country request must not silently drop one that matched nothing just
+    because another matched.
     """
     present = {(row.get(field) or "").strip().upper() for row in rows}
-    return sorted(countries - present)
+    return sorted(code for code in countries if not (_match_values(code) & present))
 
 
 def _build_command(atlas_out, mdb_out, gbfs_out, commit):
@@ -218,6 +323,35 @@ def _build_command(atlas_out, mdb_out, gbfs_out, commit):
     )
 
 
+def _emit(out_dir, mdb_fields, gbfs_fields, sample, countries, commit):
+    """Write one sample set (``(mdb_rows, gbfs_rows, atlas_files)``) to
+    ``out_dir`` and print its counts and build command."""
+    mdb_rows, gbfs_rows, atlas_files = sample
+    mdb_out = out_dir / "mdb_sample.csv"
+    gbfs_out = out_dir / "gbfs_sample.csv"
+    atlas_out = out_dir / "atlas_sample.tar.gz"
+    _write_csv(mdb_out, mdb_fields, mdb_rows)
+    _write_csv(gbfs_out, gbfs_fields, gbfs_rows)
+    _write_atlas(atlas_out, atlas_files)
+    if not gbfs_rows:
+        print(f"note: no GBFS systems for {sorted(countries)}", file=sys.stderr)
+    if not atlas_files:
+        print(
+            f"note: no Atlas DMFR files overlap the {len(mdb_rows)} MDB feed(s); "
+            "the sample is MDB-only",
+            file=sys.stderr,
+        )
+    print(
+        f"mdb feeds: {len(mdb_rows)} {_by_country(mdb_rows, MDB_COUNTRY)} -> {mdb_out}"
+    )
+    print(
+        f"gbfs systems: {len(gbfs_rows)} {_by_country(gbfs_rows, GBFS_COUNTRY)} "
+        f"-> {gbfs_out}"
+    )
+    print(f"atlas dmfr files: {len(atlas_files)} -> {atlas_out}")
+    print(f"run: {_build_command(atlas_out, mdb_out, gbfs_out, commit)}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="python scripts/sample_catalogues.py",
@@ -243,8 +377,42 @@ def main(argv=None):
         default=atlas.ATLAS_COMMIT,
         help="Atlas commit to fetch (default: the commit the build is pinned to)",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="keep at most this many MDB feeds and GBFS systems per country — a "
+        "small sample for a large country (default: no cap)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="split the sample into consecutive batches of this many MDB feeds "
+        "(GBFS systems split evenly, Atlas trimmed to each batch's matching "
+        "feeds), each a self-contained set built on its own — process a large "
+        "country in memory-safe pieces rather than all at once",
+    )
     args = parser.parse_args(argv)
-    countries = {c.strip().upper() for c in (args.countries or DEFAULT_COUNTRIES)}
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be at least 1")
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    raw = [c.strip() for c in (args.countries or DEFAULT_COUNTRIES)]
+    # Requests may be ISO codes or full names; a token that is neither an ASCII
+    # alpha-2 code nor a curated full name is refused before any download,
+    # rather than passed through as a literal match value. Checked on the raw
+    # input so a non-ASCII character cannot case-fold into a code.
+    unknown = _unrecognized_countries(raw)
+    if unknown:
+        supported = ", ".join(sorted(COUNTRY_NAMES.values()))
+        raise SystemExit(
+            f"unrecognized --country {unknown}: use an ISO alpha-2 code or a "
+            f"full name ({supported})"
+        )
+    # Canonicalise to codes, and match rows carrying either form.
+    countries = {_country_code(token.upper()) for token in raw}
+    match_values = set().union(*(_match_values(code) for code in countries))
 
     # Fetch and validate everything before publishing any output, so a schema
     # drift or an unsupported country fails loudly instead of leaving a
@@ -252,45 +420,53 @@ def main(argv=None):
     with tempfile.TemporaryDirectory(prefix="sample-catalogues-") as tmp:
         atlas_full, mdb_full, gbfs_full = _download(Path(tmp), args.commit)
         mdb_fields, mdb_rows = _select_csv(
-            mdb_full, MDB_COUNTRY, (MDB_COUNTRY, MDB_DOWNLOAD), countries
+            mdb_full, MDB_COUNTRY, (MDB_COUNTRY, MDB_DOWNLOAD), match_values
         )
         gbfs_fields, gbfs_rows = _select_csv(
-            gbfs_full, GBFS_COUNTRY, (GBFS_COUNTRY,), countries
+            gbfs_full, GBFS_COUNTRY, (GBFS_COUNTRY,), match_values
         )
         missing = _missing(mdb_rows, MDB_COUNTRY, countries)
         if missing:
             raise SystemExit(f"no MDB feeds for {missing}")
-        if not gbfs_rows:
-            raise SystemExit(f"no GBFS systems for {sorted(countries)}")
-        urls, hosts = _mdb_targets(mdb_rows)
-        atlas_files = _select_atlas(atlas_full, urls, hosts)
-        if not atlas_files:
-            raise SystemExit(
-                f"no Atlas DMFR files overlap the {len(mdb_rows)} MDB feeds; "
-                "the crosswalk would have nothing to match"
-            )
+        mdb_rows = _limit_per_country(mdb_rows, MDB_COUNTRY, args.limit)
+        gbfs_rows = _limit_per_country(gbfs_rows, GBFS_COUNTRY, args.limit)
+        # Plan the sets while the downloaded catalogues still exist: one set, or
+        # consecutive MDB slices, each with a proportional GBFS share and the
+        # Atlas trimmed to that slice's matching feeds.
+        if args.batch_size is None:
+            urls, hosts = _mdb_targets(mdb_rows)
+            planned = [
+                (
+                    mdb_rows,
+                    gbfs_rows,
+                    _select_atlas(atlas_full, urls, hosts, limit=args.limit),
+                )
+            ]
+        else:
+            mdb_batches = _chunks(mdb_rows, args.batch_size)
+            gbfs_batches = _even_split(gbfs_rows, len(mdb_batches))
+            planned = []
+            for mdb_chunk, gbfs_chunk in zip(mdb_batches, gbfs_batches):
+                urls, hosts = _mdb_targets(mdb_chunk)
+                atlas_chunk = _select_atlas(
+                    atlas_full, urls, hosts, limit=args.batch_size
+                )
+                planned.append((mdb_chunk, gbfs_chunk, atlas_chunk))
 
-    # A fresh per-run directory: concurrent runs never collide, and the set is
+    # A fresh per-run directory: concurrent runs never collide, and a set is
     # only advertised once every file is written.
     args.out_dir.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=args.out_dir))
-    mdb_out = run_dir / "mdb_sample.csv"
-    gbfs_out = run_dir / "gbfs_sample.csv"
-    atlas_out = run_dir / "atlas_sample.tar.gz"
-    _write_csv(mdb_out, mdb_fields, mdb_rows)
-    _write_csv(gbfs_out, gbfs_fields, gbfs_rows)
-    _write_atlas(atlas_out, atlas_files)
-
     print(f"countries: {', '.join(sorted(countries))}")
-    print(
-        f"mdb feeds: {len(mdb_rows)} {_by_country(mdb_rows, MDB_COUNTRY)} -> {mdb_out}"
-    )
-    print(
-        f"gbfs systems: {len(gbfs_rows)} {_by_country(gbfs_rows, GBFS_COUNTRY)} "
-        f"-> {gbfs_out}"
-    )
-    print(f"atlas dmfr files: {len(atlas_files)} -> {atlas_out}")
-    print(f"run: {_build_command(atlas_out, mdb_out, gbfs_out, args.commit)}")
+    if args.batch_size is None:
+        _emit(run_dir, mdb_fields, gbfs_fields, planned[0], countries, args.commit)
+    else:
+        print(f"batches: {len(planned)} (up to {args.batch_size} MDB feeds each)")
+        for index, batch in enumerate(planned):
+            batch_dir = run_dir / f"batch-{index:03d}"
+            batch_dir.mkdir()
+            print(f"[batch {index}]")
+            _emit(batch_dir, mdb_fields, gbfs_fields, batch, countries, args.commit)
     return 0
 
 
