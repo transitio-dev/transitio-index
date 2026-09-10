@@ -133,6 +133,54 @@ def test_limit_per_country_caps_each_country_in_order():
     assert [r["id"] for r in sc._limit_per_country(mixed, "c", 2)] == ["a", "b"]
     # None passes the rows through unchanged.
     assert sc._limit_per_country(rows, "c", None) is rows
+    # With a subdivision column the cap is per country *and* subdivision, so a
+    # requested spread of states is sampled evenly, not from the first-listed.
+    states = [
+        {"c": "US", "s": "California", "id": "a"},
+        {"c": "US", "s": "California", "id": "b"},
+        {"c": "US", "s": "New York", "id": "c"},
+        {"c": "US", "s": "Puerto Rico", "id": "d"},
+    ]
+    capped = sc._limit_per_country(states, "c", 1, within="s")
+    assert [r["id"] for r in capped] == ["a", "c", "d"]
+
+
+@pytest.mark.parametrize(
+    "countries, subdivisions, outcome",
+    [
+        ({"US"}, {"PUERTO RICO", "CALIFORNIA"}, ["a", "c"]),
+        ({"US", "CA"}, {"PUERTO RICO"}, r"no MDB feeds for \['CA'\]"),
+        ({"US"}, {"PUERTO RICO", "GUAM"}, r"no MDB feeds in subdivisions \['GUAM'\]"),
+        ({"US", "CA"}, set(), ["a", "d"]),
+    ],
+    ids=["spread", "country-outside-subdivisions", "absent-subdivision", "no-filter"],
+)
+def test_narrow_spreads_the_cap_and_refuses_what_nothing_carries(
+    countries, subdivisions, outcome
+):
+    """With subdivisions the MDB cap is per subdivision (GBFS stays per country);
+    a requested country whose feeds all lie outside them, or a subdivision no row
+    carries, stops the cut instead of silently thinning the sample. Without
+    subdivisions the cap is per country, as before."""
+    rows = [
+        {sc.MDB_COUNTRY: "US", sc.MDB_SUBDIVISION: "California", "id": "a"},
+        {sc.MDB_COUNTRY: "US", sc.MDB_SUBDIVISION: "California", "id": "b"},
+        {sc.MDB_COUNTRY: "US", sc.MDB_SUBDIVISION: "Puerto Rico", "id": "c"},
+        {sc.MDB_COUNTRY: "CA", sc.MDB_SUBDIVISION: "Ontario", "id": "d"},
+    ]
+    gbfs = [{sc.GBFS_COUNTRY: "US"}] * 3
+    if isinstance(outcome, str):
+        with pytest.raises(SystemExit, match=outcome):
+            sc._narrow(rows, gbfs, countries, subdivisions, 1)
+        return
+    mdb, kept_gbfs = sc._narrow(rows, gbfs, countries, subdivisions, 1)
+    assert [r["id"] for r in mdb] == outcome and len(kept_gbfs) == 1
+
+
+def test_a_blank_subdivision_is_refused_before_any_download(monkeypatch):
+    monkeypatch.setattr(sc, "_download", lambda *a, **k: pytest.fail("downloaded"))
+    with pytest.raises(SystemExit):
+        sc.main(["--country", "US", "--subdivision", "  "])
 
 
 def test_atlas_limit_trims_to_matching_feeds_and_caps_the_total(tmp_path):
