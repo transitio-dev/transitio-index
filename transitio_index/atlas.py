@@ -15,9 +15,8 @@ import os
 import re
 import stat
 import tarfile
-import urllib.request
 
-from transitio_index import store
+from transitio_index import download, store
 from transitio_index.progress import progress
 
 
@@ -28,7 +27,7 @@ class IngestError(RuntimeError):
 ATLAS_REPO = "transitland/transitland-atlas"
 ATLAS_COMMIT = "a4d02044f59f954bf3d2fe13b52f7cd1b7e92846"
 
-DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_ATTEMPTS = 6
 DOWNLOAD_TIMEOUT = 60
 
 # The Atlas tarball is a few MB. These ceilings bound a hostile or
@@ -108,57 +107,45 @@ def _digest_of(directory, name):
 def download_archive(directory, name, commit=ATLAS_COMMIT):
     """Download the Atlas tarball at ``commit`` to ``name`` in ``directory``.
 
-    Each attempt owns its own exclusively created temporary file, and the
-    bytes only take the real name once they open as a tarball: an
-    interrupted run must not leave something a later run reads as cached.
-
-    Returns the SHA-256 of the bytes that arrived. Re-reading the cache
-    path for that digest would bless whatever is sitting there by then.
+    Resumable and completeness-checked (see :mod:`transitio_index.download`), so
+    a proxy that truncates the transfer resumes rather than accepting a short
+    body; the bytes only take the real name once they open as a tarball, so an
+    interrupted run never leaves something a later run reads as cached. Returns
+    the SHA-256 of the bytes that arrived.
     """
     require_commit(commit)
     url = archive_url(commit)
-    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
-        handle, partial = store.create_temporary(directory)
+
+    def _reject_non_tarball(opened_file):
+        # Read the whole archive, not just its first member, so a gzip/tar
+        # truncated after the header — complete by Content-Length yet cut short
+        # — is rejected here rather than installed and failing only when a later
+        # stage parses it.
+        members = 0
         try:
-            opened_url = urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT)
-            with opened_url as response, os.fdopen(handle, "wb") as opened_file:
-                handle = None
-                digest = _copy_bounded(response, opened_file, MAX_ARCHIVE_BYTES)
-                opened_file.flush()
-                os.fsync(opened_file.fileno())
-            check = store.open_regular(directory, partial)
-            with os.fdopen(check, "rb") as opened_file:
-                if not is_tarball(opened_file):
-                    raise IngestError(f"{url}: not a tarball")
-            directory.replace(partial, name)
-            return digest
-        except (OSError, EOFError, tarfile.TarError, IngestError):
-            # Only failures a retry can plausibly fix; a bug in this module
-            # should surface on the first attempt with its own traceback.
-            if attempt == DOWNLOAD_ATTEMPTS:
-                raise
-        finally:
-            if handle is not None:
-                os.close(handle)
-            store.unlink(directory, partial)
+            with _open_tarball(opened_file) as tar:
+                for member in tar:
+                    members += 1
+                    if member.isfile():
+                        extracted = tar.extractfile(member)
+                        if extracted is not None:
+                            while extracted.read(1024 * 1024):
+                                pass
+        except (tarfile.TarError, OSError, EOFError) as exc:
+            raise IngestError(f"{url}: truncated or invalid tarball") from exc
+        if not members:
+            raise IngestError(f"{url}: not a tarball")
 
-
-def _copy_bounded(response, opened_file, limit):
-    """Copy at most ``limit`` bytes, returning their digest.
-
-    ``Content-Length`` is the server's claim, so the ceiling is enforced on
-    what actually arrives; the digest is taken from the same bytes, so the
-    trusted value never depends on re-reading the file afterwards.
-    """
-    digest = hashlib.sha256()
-    written = 0
-    for chunk in iter(lambda: response.read(1024 * 1024), b""):
-        written += len(chunk)
-        if written > limit:
-            raise IngestError(f"download exceeds the {limit}-byte ceiling")
-        digest.update(chunk)
-        opened_file.write(chunk)
-    return digest.hexdigest()
+    return download.to_file(
+        directory,
+        name,
+        url,
+        limit=MAX_ARCHIVE_BYTES,
+        attempts=DOWNLOAD_ATTEMPTS,
+        timeout=DOWNLOAD_TIMEOUT,
+        error=IngestError,
+        validate=_reject_non_tarball,
+    )
 
 
 def _is_dmfr(member):
@@ -255,15 +242,6 @@ def _open_tarball(archive):
                 opened.close()
             except (OSError, tarfile.TarError):
                 pass
-
-
-def is_tarball(opened_file):
-    """Whether the stream opens as a gzipped tarball with a first member."""
-    try:
-        with _open_tarball(opened_file) as tar:
-            return tar.next() is not None
-    except (tarfile.TarError, OSError, EOFError, IngestError):
-        return False
 
 
 def iter_dmfr(archive):
@@ -579,11 +557,14 @@ def parse(archive):
                 )
             )
     operators = list(operators.values())
-    if not file_count or not feeds:
-        # An upstream layout change would otherwise look like a valid
-        # ingest and publish an empty catalogue over a good one.
+    if file_count and not feeds:
+        # DMFR files that parse to zero feeds mean an upstream layout change,
+        # which would otherwise look like a valid ingest and publish an empty
+        # catalogue over a good one. An archive with no DMFR files at all is
+        # simply an empty Atlas source (an MDB-only sample) and ingests as zero
+        # feeds, leaving the crosswalk to the MDB and GBFS catalogues.
         raise IngestError(
-            f"{archive}: no DMFR feeds found "
+            f"{archive}: DMFR files present but no feeds parsed "
             f"({file_count} DMFR files, {len(feeds)} feeds)"
         )
     return {

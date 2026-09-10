@@ -460,7 +460,7 @@ def test_failed_download_leaves_nothing_behind(tmp_path, monkeypatch):
         attempts.append(url)
         return FakeResponse(None)
 
-    monkeypatch.setattr(atlas.urllib.request, "urlopen", explode)
+    monkeypatch.setattr(atlas.download.urllib.request, "urlopen", explode)
     directory = store.open_directory(tmp_path)
 
     try:
@@ -528,19 +528,24 @@ def test_a_symlinked_archive_path_is_refused_by_ingest(tmp_path):
         atlas.ingest(tmp_path / "cache", archive=link, commit="a" * 40)
 
 
-def test_empty_archive_is_refused(tmp_path):
+def test_an_empty_archive_parses_to_no_feeds(tmp_path):
+    # An archive with no DMFR files at all is an empty Atlas source (an MDB-only
+    # sample), ingested as zero feeds rather than refused.
     archive = build_archive(tmp_path / "atlas.tar.gz", {})
 
-    with pytest.raises(atlas.IngestError, match="no DMFR feeds found"):
-        atlas.parse(archive)
+    parsed = atlas.parse(archive)
+    assert parsed["feeds"] == []
+    assert parsed["dmfr_files"] == 0
 
 
-def test_archive_with_no_feeds_is_refused(tmp_path):
+def test_archive_with_files_but_no_feeds_is_refused(tmp_path):
+    # DMFR files that parse to zero feeds signal an upstream layout change and
+    # are still refused, unlike an archive with no DMFR files at all.
     archive = build_archive(
         tmp_path / "atlas.tar.gz", {"empty.com.dmfr.json": {"feeds": []}}
     )
 
-    with pytest.raises(atlas.IngestError, match="no DMFR feeds found"):
+    with pytest.raises(atlas.IngestError, match="DMFR files present but no feeds"):
         atlas.parse(archive)
 
 
@@ -549,9 +554,11 @@ def test_a_refused_ingest_leaves_the_previous_generation_in_place(tmp_path):
     good = build_archive(tmp_path / "good.tar.gz", {"mta.info.dmfr.json": MTA})
     first = atlas.ingest(cache, archive=good, commit="abc123")
 
-    empty = build_archive(tmp_path / "empty.tar.gz", {})
+    nofeeds = build_archive(
+        tmp_path / "nofeeds.tar.gz", {"x.com.dmfr.json": {"feeds": []}}
+    )
     with pytest.raises(atlas.IngestError):
-        atlas.ingest(cache, archive=empty, commit="abc123")
+        atlas.ingest(cache, archive=nofeeds, commit="abc123")
 
     generation, manifest = store.resolve(cache / "raw", "atlas.json")
     assert manifest == first
@@ -563,7 +570,7 @@ def test_successful_download_is_stored_and_parsed(tmp_path, monkeypatch):
     payload = archive.read_bytes()
 
     monkeypatch.setattr(
-        atlas.urllib.request,
+        atlas.download.urllib.request,
         "urlopen",
         lambda url, timeout=None: FakeResponse(payload),
     )
@@ -594,12 +601,13 @@ def test_a_truncated_download_does_not_poison_the_cache(tmp_path, monkeypatch):
     def urlopen(url, timeout=None):
         return FakeResponse(bodies[0] if truncated[0] else bodies[1])
 
-    monkeypatch.setattr(atlas.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(atlas.download.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(atlas.download.time, "sleep", lambda *a, **k: None)
     cache = tmp_path / "cache"
     commit = "c" * 40
     cached = cache / "raw" / f"transitland-atlas-{commit}.tar.gz"
 
-    with pytest.raises(atlas.IngestError, match="not a tarball"):
+    with pytest.raises(atlas.IngestError, match="truncated or invalid tarball"):
         atlas.ingest(cache, commit=commit)
 
     # Nothing may survive that a later run would trust: a half archive
@@ -612,6 +620,28 @@ def test_a_truncated_download_does_not_poison_the_cache(tmp_path, monkeypatch):
 
     assert summary["feeds"] == 2
     assert cached.read_bytes() == payload
+
+
+def test_a_transient_truncated_archive_is_refetched_and_completes(
+    tmp_path, monkeypatch
+):
+    archive = build_archive(tmp_path / "source.tar.gz", {"mta.info.dmfr.json": MTA})
+    payload = archive.read_bytes()
+    calls = {"n": 0}
+
+    def urlopen(url, timeout=None):
+        # The first transfer arrives truncated (rejected by the tarball check);
+        # the refetch within the attempt budget serves the whole archive.
+        calls["n"] += 1
+        return FakeResponse(
+            payload[: len(payload) // 2] if calls["n"] == 1 else payload
+        )
+
+    monkeypatch.setattr(atlas.download.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(atlas.download.time, "sleep", lambda *a, **k: None)
+    summary = atlas.ingest(tmp_path / "cache", commit="d" * 40)
+    assert summary["feeds"] == 2
+    assert calls["n"] == 2  # one truncated fetch, then one clean refetch
 
 
 def test_expansion_beyond_the_ceiling_is_refused(tmp_path, monkeypatch):

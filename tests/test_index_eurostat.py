@@ -84,7 +84,9 @@ def test_downloaded_inputs_are_verified_against_the_pins(tmp_path, monkeypatch):
     monkeypatch.setattr(
         urllib.request,
         "urlopen",
-        lambda url, timeout=None: _Response(PAYLOADS[url.rsplit("/", 1)[-1]]),
+        lambda req, timeout=None: _Response(
+            PAYLOADS[getattr(req, "full_url", req).rsplit("/", 1)[-1]]
+        ),
     )
     cache = tmp_path / "cache"
     expected = {

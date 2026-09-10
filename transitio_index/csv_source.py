@@ -11,16 +11,15 @@ import datetime
 import hashlib
 import io
 import os
-import urllib.request
 
-from transitio_index import store
+from transitio_index import download, store
 
 
 class IngestError(RuntimeError):
     """A CSV source could not be ingested as specified."""
 
 
-DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_ATTEMPTS = 6
 DOWNLOAD_TIMEOUT = 120
 
 # The real catalogues are a few MB (MDB ~2.6 MB, GBFS ~0.2 MB). The ceilings
@@ -31,56 +30,22 @@ MAX_CSV_BYTES = 32 * 1024 * 1024
 MAX_ROWS = 500_000
 
 
-def _copy_bounded(response, opened_file, limit):
-    """Copy at most ``limit`` bytes, returning their digest.
-
-    ``Content-Length`` is the server's claim, so the ceiling is enforced on
-    what actually arrives; the digest is taken from the same bytes so the
-    trusted value never depends on re-reading the file afterwards.
-    """
-    digest = hashlib.sha256()
-    written = 0
-    for chunk in iter(lambda: response.read(1024 * 1024), b""):
-        written += len(chunk)
-        if written > limit:
-            raise IngestError(f"download exceeds the {limit}-byte ceiling")
-        digest.update(chunk)
-        opened_file.write(chunk)
-    return digest.hexdigest(), written
-
-
 def download_file(directory, name, url, limit=MAX_CSV_BYTES):
     """Download ``url`` to ``name`` in ``directory``; return its SHA-256.
 
-    Each attempt owns an exclusively created temporary file, replaced into
-    place only once the body is complete — an interrupted run must not leave
-    a truncated file a later run reads as cached.
+    Resumable and completeness-checked (see :mod:`transitio_index.download`), so
+    a proxy that truncates a transfer resumes rather than publishing a partial
+    catalogue.
     """
-    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
-        handle, partial = store.create_temporary(directory)
-        try:
-            opened = urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT)
-            with opened as response, os.fdopen(handle, "wb") as opened_file:
-                handle = None
-                declared = response.headers.get("Content-Length")
-                digest, written = _copy_bounded(response, opened_file, limit)
-                opened_file.flush()
-                os.fsync(opened_file.fileno())
-            if declared is not None and written != int(declared):
-                # A body that ended short of its Content-Length is truncated,
-                # not complete; raise so the attempt is retried rather than
-                # publishing a partial catalogue.
-                raise IngestError(f"{name}: got {written} bytes, expected {declared}")
-            directory.replace(partial, name)
-            return digest
-        except (OSError, IngestError):
-            if attempt == DOWNLOAD_ATTEMPTS:
-                raise
-        finally:
-            if handle is not None:
-                os.close(handle)
-            store.unlink(directory, partial)
-    return None
+    return download.to_file(
+        directory,
+        name,
+        url,
+        limit=limit,
+        attempts=DOWNLOAD_ATTEMPTS,
+        timeout=DOWNLOAD_TIMEOUT,
+        error=IngestError,
+    )
 
 
 def read_rows(text, required_headers):
