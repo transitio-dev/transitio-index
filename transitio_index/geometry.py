@@ -154,13 +154,20 @@ def division_area_dataset(release=overture.OVERTURE_RELEASE):
     return ds.dataset(path, filesystem=overture.s3_filesystem(), format="parquet")
 
 
-def read_areas(dataset, division_ids):
+def read_areas(dataset, division_ids, *, simplify=None):
     """``{division_id: [{"geom", "sources"}, ...]}`` land-area rows for the ids.
 
     One row per land area is kept with its own sources — never flattened across a
     division's areas — so each area is audited on its own provenance; maritime
     (non-land) areas are dropped. Geometry is forced to 2D and malformed WKB is
     skipped (stored as ``None``) rather than aborting the stage.
+
+    ``simplify`` (a tolerance in degrees) simplifies each area as it is read, so
+    a full-resolution country or region polygon — hundreds of thousands to
+    millions of vertices — is reduced to the shipping resolution before it is
+    held or unioned, instead of materialising every seeded division's raw
+    geometry at once (the peak that OOMs a feed-dense build). The caller ships
+    at this same tolerance anyway, so the result is unchanged within it.
     """
     if not division_ids:
         return {}
@@ -178,6 +185,13 @@ def read_areas(dataset, division_ids):
                 geom = None
             if geom is not None:
                 geom = shapely.force_2d(geom)
+                # Only simplify an already-valid boundary: an empty,
+                # self-intersecting, non-polygonal or non-finite area is left raw
+                # so the caller's own validity check still rejects it, and
+                # ``simplify`` never runs on geometry it could turn into an
+                # apparently-valid shape or raise on.
+                if simplify is not None and _valid_polygon(geom):
+                    geom = shapely.simplify(geom, simplify, preserve_topology=True)
             areas.setdefault(row["division_id"], []).append(
                 {"geom": geom, "sources": row.get("sources") or []}
             )
@@ -411,7 +425,9 @@ def attach_geometry(
                 chunk = len(wanted) or 1
             for start in progress(range(0, len(wanted) or 1, chunk), "geometry"):
                 batch_ids = wanted[start : start + chunk]
-                areas = read_areas(dataset, set(batch_ids))
+                areas = read_areas(
+                    dataset, set(batch_ids), simplify=SIMPLIFY_TOLERANCE_DEG
+                )
                 for overture_id in batch_ids:
                     rows = areas.get(overture_id)
                     if not rows:

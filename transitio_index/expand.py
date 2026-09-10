@@ -333,7 +333,9 @@ def _discover(
     # Boundaries come from a complete, id-filtered area read, so a multi-part
     # place ships whole even when its stops touched only one component.
     areas = geometry.read_areas(
-        area_dataset, {discovered[qid]["overture_id"] for qid in new_ids}
+        area_dataset,
+        {discovered[qid]["overture_id"] for qid in new_ids},
+        simplify=geometry.SIMPLIFY_TOLERANCE_DEG,
     )
     for qid in new_ids:
         place = discovered[qid]

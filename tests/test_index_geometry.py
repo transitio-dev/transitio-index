@@ -383,3 +383,56 @@ def test_area_chunking_matches_a_single_pass(tmp_path):
 
     assert chunked_geoms == single_geoms
     assert any(chunked_geoms.values())  # the fixture does attach some geometry
+
+
+def test_attach_geometry_ships_a_dense_area_simplified_within_tolerance(tmp_path):
+    # A many-vertex division area is simplified on read, so attach_geometry holds
+    # far fewer vertices yet ships a boundary within the shipping tolerance of the
+    # full-resolution result (simplify(union(raw))) — the memory fix must not move
+    # the shipped geometry beyond the tolerance the stage already ships at.
+    dense = shapely.Point(25.0, 60.0).buffer(0.5, quad_segs=2000)
+    cache = tmp_path / "cache"
+    _publish(cache, [_place("Qdense", "city", overture_id="dense")])
+    dataset = fx.write_area_dataset(
+        tmp_path / "dense.parquet", [fx.area("dense", shapely.to_wkb(dense), [_osm()])]
+    )
+    geometry.attach_geometry(cache, dataset=dataset)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    by_id = {p["place_id"]: p for p in places}
+    shipped = shapely.from_wkb(bytes.fromhex(by_id["Qdense"]["geometry"]))
+    expected = geometry._simplify(dense)  # what the stage shipped before the fix
+    assert shipped.is_valid
+    assert shipped.hausdorff_distance(expected) <= geometry.SIMPLIFY_TOLERANCE_DEG
+
+    # The reduction the change exists for: the area HELD during the read is
+    # simplified, not full resolution — so far fewer vertices are in memory
+    # before the union. This assertion fails if simplify-on-read is removed.
+    full_held = geometry.read_areas(dataset, {"dense"})["dense"][0]["geom"]
+    held = geometry.read_areas(
+        dataset, {"dense"}, simplify=geometry.SIMPLIFY_TOLERANCE_DEG
+    )["dense"][0]["geom"]
+    assert (
+        shapely.get_num_coordinates(held)
+        < shapely.get_num_coordinates(full_held) / 5
+    )
+
+
+def test_a_self_intersecting_area_is_not_repaired_by_simplify(tmp_path):
+    # simplify-on-read runs only on already-valid geometry, so a parseable but
+    # self-intersecting area is still rejected — not silently turned into a
+    # shippable boundary by the simplify step.
+    bowtie = shapely.Polygon([(24.9, 60.1), (25.1, 60.3), (25.1, 60.1), (24.9, 60.3)])
+    assert not bowtie.is_valid
+    cache = tmp_path / "cache"
+    _publish(cache, [_place("Qbow", "city", overture_id="bow")])
+    dataset = fx.write_area_dataset(
+        tmp_path / "bow.parquet", [fx.area("bow", shapely.to_wkb(bowtie), [_osm()])]
+    )
+    manifest = geometry.attach_geometry(cache, dataset=dataset)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    assert {p["place_id"]: p for p in places}["Qbow"]["geometry"] is None
+    assert manifest["invalid_geometry"] >= 1
