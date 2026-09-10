@@ -414,8 +414,7 @@ def test_attach_geometry_ships_a_dense_area_simplified_within_tolerance(tmp_path
         dataset, {"dense"}, simplify=geometry.SIMPLIFY_TOLERANCE_DEG
     )["dense"][0]["geom"]
     assert (
-        shapely.get_num_coordinates(held)
-        < shapely.get_num_coordinates(full_held) / 5
+        shapely.get_num_coordinates(held) < shapely.get_num_coordinates(full_held) / 5
     )
 
 
