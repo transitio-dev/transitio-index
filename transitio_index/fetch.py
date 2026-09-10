@@ -49,6 +49,9 @@ MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
 DOWNLOAD_ATTEMPTS = 3
 REDIRECT_LIMIT = 5
 TIMEOUT = 60.0
+# Consecutive transport failures after which a host is not asked again this
+# run: an unreachable host otherwise costs every later feed on it a full timeout.
+HOST_FAILURES = 3
 
 _REDIRECTS = (301, 302, 303, 307, 308)
 
@@ -204,6 +207,7 @@ class Fetcher:
         rate=1.0,
         burst=5,
         timeout=TIMEOUT,
+        host_failures=HOST_FAILURES,
         clock=time.monotonic,
         sleeper=time.sleep,
     ):
@@ -220,6 +224,11 @@ class Fetcher:
             },
         )
         self._buckets = HostBuckets(rate, burst, clock=clock, sleeper=sleeper)
+        # Consecutive transport failures per host, shared by every worker; a
+        # host at the threshold is refused up front rather than waited on.
+        self._host_failures = host_failures
+        self._failures = {}
+        self._failures_lock = threading.Lock()
         # Per-thread counters: one shared Fetcher serves every crawl worker, and
         # a feed's record reads these as a delta over its own crawl, so each
         # thread must count only the requests and bytes it made.
@@ -252,33 +261,58 @@ class Fetcher:
     def __exit__(self, *exc_info):
         self.close()
 
-    def _throttle(self, url):
+    def _throttle(self, host):
         # One bucket per real host: the single per-host rate authority, so
         # every scheme and port of one host share it and the aggregate rate to
         # that host cannot double. The key is the normalised host, so a spelling
         # variant (case, trailing dot, Unicode vs punycode, an IPv6 long form)
         # or any port never mints a fresh bucket.
-        _, host = check_url(url)
         self._buckets.acquire(host)
-        self.requests += 1
+
+    def _admit(self, method, url, host):
+        """Refuse a host that has failed ``host_failures`` times in a row."""
+        with self._failures_lock:
+            failures = self._failures.get(host, 0)
+        if failures >= self._host_failures:
+            raise FetchError(
+                f"{method} {url}: host {host} unreachable this run "
+                f"({failures} consecutive transport failures); not tried"
+            )
+
+    def _note(self, host, *, failed):
+        with self._failures_lock:
+            self._failures[host] = self._failures.get(host, 0) + 1 if failed else 0
 
     def _hops(self, method, url, headers, *, stream=False):
         """The final response, following redirects one checked hop at a time.
 
         A streamed response is returned unread (the caller closes it); every
-        hop is URL-checked, throttled and counted, and more than
-        ``REDIRECT_LIMIT`` hops is an error.
+        hop is URL-checked, admitted, throttled and counted, and more than
+        ``REDIRECT_LIMIT`` hops is an error. A transport failure counts against
+        the hop's host; an answer, whatever its status, clears the count — a
+        streamed one once its body has been read.
         """
         for _ in range(REDIRECT_LIMIT + 1):
-            self._throttle(url)
+            _, host = check_url(url)
+            # Admitted before throttling, so nobody waits in the bucket for a
+            # dead host, and again after: a worker queued behind the limiter
+            # must not contact a host that tripped while it waited.
+            self._admit(method, url, host)
+            self._throttle(host)
+            self._admit(method, url, host)
+            self.requests += 1  # counted only once a request is really made
             try:
                 request = self._client.build_request(method, url, headers=headers)
                 response = self._client.send(request, stream=stream)
+            except httpx.TransportError as error:
+                self._note(host, failed=True)
+                raise FetchError(f"{method} {url}: {error}")
             except (httpx.HTTPError, httpx.InvalidURL, ValueError) as error:
                 # ValueError covers malformed third-party URLs (a bad port,
                 # say) that httpx surfaces outside its own error tree.
                 raise FetchError(f"{method} {url}: {error}")
             if response.status_code in _REDIRECTS:
+                self._note(host, failed=False)
                 location = response.headers.get("Location")
                 if stream:
                     response.close()
@@ -291,6 +325,10 @@ class Fetcher:
                         f"{method} {url}: malformed redirect target ({error})"
                     )
                 continue
+            if not stream:
+                # A streamed answer is complete only once its body has been
+                # read; the consumer clears the count then.
+                self._note(host, failed=False)
             return url, response
         raise FetchError(f"{method} {url}: more than {REDIRECT_LIMIT} redirects")
 
@@ -333,8 +371,12 @@ class Fetcher:
         if validator:
             # Pins the representation across the archive's several reads.
             headers["If-Range"] = validator
-        _, response = self._hops("GET", url, headers, stream=True)
+        final, response = self._hops("GET", url, headers, stream=True)
+        _, host = check_url(final)
         try:
+            if response.status_code != 206:
+                # A status answer whose body is not read is still an answer.
+                self._note(host, failed=False)
             if response.status_code == 200:
                 raise RangeUnsupported(f"{url}: server ignored the range request")
             if response.status_code != 206:
@@ -363,8 +405,15 @@ class Fetcher:
                             f"{url}: range of {size} bytes answered with more"
                         )
                     chunks.append(chunk)
+            except httpx.TransportError as error:
+                # A host that answers but stalls mid-body counts like one that
+                # never answered.
+                self._note(host, failed=True)
+                raise FetchError(f"GET {url}: {error}")
             except httpx.HTTPError as error:
                 raise FetchError(f"GET {url}: {error}")
+            else:
+                self._note(host, failed=False)
         finally:
             response.close()
         body = b"".join(chunks)
@@ -505,8 +554,14 @@ class Fetcher:
         short body.
         """
         expected = None
-        _, response = self._hops("GET", url, headers, stream=True)
+        final, response = self._hops("GET", url, headers, stream=True)
+        _, host = check_url(final)
         try:
+            if response.status_code not in (200, 206) or (
+                written and response.status_code != 206
+            ):
+                # A status answer whose body is not read is still an answer.
+                self._note(host, failed=False)
             if response.status_code == 304:
                 return {"status": "not_modified"}
             if written and response.status_code != 206:
@@ -532,13 +587,22 @@ class Fetcher:
                 # representation is: a short segment must trigger another
                 # resume, never publish a truncated file.
                 expected = total
-            for chunk in response.iter_bytes(1024 * 1024):
-                written += len(chunk)
-                self.bytes_fetched += len(chunk)
-                if written > max_bytes:
-                    raise FetchError(f"download exceeds the {max_bytes}-byte ceiling")
-                digest.update(chunk)
-                opened_file.write(chunk)
+            try:
+                for chunk in response.iter_bytes(1024 * 1024):
+                    written += len(chunk)
+                    self.bytes_fetched += len(chunk)
+                    if written > max_bytes:
+                        raise FetchError(
+                            f"download exceeds the {max_bytes}-byte ceiling"
+                        )
+                    digest.update(chunk)
+                    opened_file.write(chunk)
+            except httpx.TransportError:
+                # Counted against the host; the caller's retry sees it unchanged.
+                self._note(host, failed=True)
+                raise
+            else:
+                self._note(host, failed=False)
             validators = {
                 "etag": response.headers.get("ETag"),
                 "last_modified": response.headers.get("Last-Modified"),
