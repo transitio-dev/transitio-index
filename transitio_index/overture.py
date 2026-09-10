@@ -135,7 +135,27 @@ def s3_filesystem(region=OVERTURE_REGION):
     )
     if proxy:
         options["proxy_options"] = proxy
+        _cap_io_threads()
     return S3FileSystem(**options)
+
+
+# pyarrow's IO pool (eight threads by default) opens as many tunnels through a
+# proxy at once; a proxy that drops several of them leaves the SDK waiting on
+# them forever. Two at a time survive. Capped once, on the first proxied open:
+# a stalled read's retry enlarges the pool (geometry.retrying) and reopens the
+# filesystem, and that reopen must never shrink it back.
+PROXY_IO_THREADS = 2
+_io_threads_capped = False
+
+
+def _cap_io_threads():
+    global _io_threads_capped
+    if _io_threads_capped:
+        return
+    import pyarrow as pa
+
+    pa.set_io_thread_count(min(pa.io_thread_count(), PROXY_IO_THREADS))
+    _io_threads_capped = True
 
 
 def overture_dataset(release=OVERTURE_RELEASE):

@@ -465,22 +465,35 @@ def test_read_areas_caches_fetched_divisions(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "recovers, partial",
-    [(True, False), (True, True), (False, False)],
-    ids=["fresh-connection-succeeds", "one-batch-then-silence", "attempts-exhausted"],
+    "recovers, partial, reopen_stalls",
+    [
+        (True, False, False),
+        (True, True, False),
+        (False, False, False),
+        (False, False, True),
+    ],
+    ids=[
+        "fresh-connection-succeeds",
+        "one-batch-then-silence",
+        "attempts-exhausted",
+        "reopen-itself-stalls",
+    ],
 )
 def test_a_stalled_area_scan_is_retried_on_a_fresh_connection(
-    tmp_path, monkeypatch, recovers, partial
+    tmp_path, monkeypatch, recovers, partial, reopen_stalls
 ):
     """An S3 scan that yields nothing for the deadline — from the start, or after
     a first batch has already been written — is abandoned, its partial file
-    discarded, and retried on the dataset ``reopen`` returns; when no attempt
-    recovers the read fails loudly after the attempts instead of hanging."""
+    discarded, and retried on the dataset ``reopen`` returns; opening that
+    dataset runs under the deadline too, so a reopen that hangs cannot wedge the
+    build; when no attempt recovers the read fails loudly after the attempts."""
     dataset = fx.write_area_dataset(
         tmp_path / "a.parquet", [fx.area("A", BOX, [_osm()])]
     )
     monkeypatch.setattr(geometry, "AREA_READ_DEADLINE", 0.2)
     monkeypatch.setattr(geometry, "AREA_READ_ATTEMPTS", 2)
+    grown = []  # IO workers added for each retry (the abandoned attempt keeps its own)
+    monkeypatch.setattr(geometry.pa, "set_io_thread_count", grown.append)
 
     class Hanging:  # a connection the proxy dropped: nothing (more) ever arrives
         def to_batches(self, **kwargs):
@@ -492,6 +505,8 @@ def test_a_stalled_area_scan_is_retried_on_a_fresh_connection(
 
     def reopen():
         opened.append(1)
+        if reopen_stalls:  # S3 discovery itself hangs: still under the deadline
+            threading.Event().wait(3)
         return dataset if recovers else Hanging()
 
     cache = (tmp_path / "cache", "2026-08-19.0")
@@ -502,4 +517,23 @@ def test_a_stalled_area_scan_is_retried_on_a_fresh_connection(
         with pytest.raises(geometry.AreaReadStalled, match="stalled"):
             geometry.read_areas(Hanging(), {"A"}, cache=cache, reopen=reopen)
     assert opened == [1]  # one fresh connection, then success or give up
+    assert grown == [geometry.pa.io_thread_count() + geometry.RETRY_IO_THREADS]
     assert not list((tmp_path / "cache").rglob("*.tmp"))  # no partial file left
+
+
+def test_an_abandoned_scan_stops_pumping_instead_of_blocking_forever():
+    """After the consumer gives up, a scan that resumes late must not block on
+    the full hand-over queue and leak its thread: the pump notices and exits,
+    releasing the scan."""
+    released = threading.Event()
+
+    def scan():
+        try:
+            threading.Event().wait(0.5)  # past the deadline, then several batches
+            yield from ("b1", "b2", "b3")
+        finally:
+            released.set()
+
+    with pytest.raises(geometry.AreaReadStalled):
+        list(geometry.with_deadline(scan, 0.1))
+    assert released.wait(5)

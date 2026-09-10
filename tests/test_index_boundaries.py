@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 pytest.importorskip("pyarrow")
@@ -154,6 +156,40 @@ def test_covered_boxes_are_not_rescanned(tmp_path):
         lookup.ensure([HEL_BOX])
         lookup.ensure([(24.92, 60.16, 24.96, 60.18)])  # inside the covered box
         assert counting.scans == first
+    finally:
+        lookup.close()
+
+
+def test_a_stalled_box_scan_is_retried_on_a_fresh_connection(tmp_path, monkeypatch):
+    """A tile scan that yields nothing for the deadline is abandoned and retried
+    on the dataset ``reopen_area`` returns, which then serves the boxes that
+    follow without another reopen."""
+    from transitio_index import geometry
+
+    monkeypatch.setattr(geometry, "AREA_READ_DEADLINE", 0.2)
+    divisions, areas = _datasets(tmp_path)
+    opened = []
+
+    class Hanging:  # a connection the proxy dropped: nothing ever arrives
+        def to_batches(self, **kw):
+            threading.Event().wait(3)
+            return iter(())
+
+    def reopen():
+        opened.append(1)
+        return areas
+
+    lookup = boundaries.BoundaryLookup(
+        tmp_path / "cache",
+        release="test-release",
+        area_dataset=Hanging(),
+        division_dataset=divisions,
+        reopen_area=reopen,
+    )
+    try:
+        assert lookup.ensure([HEL_BOX]) > 0  # served by the reopened dataset
+        lookup.ensure([(23.0, 60.0, 24.0, 61.0)])  # a further box: no second reopen
+        assert opened == [1]
     finally:
         lookup.close()
 

@@ -283,8 +283,17 @@ def test_overture_s3_filesystem_passes_the_env_proxy(monkeypatch):
     assert "proxy_options" not in captured[-1]
 
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
+    # Behind a proxy pyarrow's IO pool is capped once, on the first open; a
+    # reopen after a stall (whose retry enlarged the pool) must not shrink it.
+    import pyarrow
+
+    capped = []
+    monkeypatch.setattr(pyarrow, "set_io_thread_count", capped.append)
+    monkeypatch.setattr(overture, "_io_threads_capped", False)
     overture.s3_filesystem()
     assert captured[-1]["proxy_options"] == "http://proxy.example:8080"
+    overture.s3_filesystem()
+    assert capped == [min(pyarrow.io_thread_count(), overture.PROXY_IO_THREADS)]
 
 
 def test_overture_s3_filesystem_widens_the_timeout_and_retries(monkeypatch):

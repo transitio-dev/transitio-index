@@ -446,6 +446,10 @@ def _expanded(
                     release=release,
                     area_dataset=area_dataset,
                     division_dataset=overture.overture_dataset(release),
+                    reopen_area=reopen,
+                    reopen_division=functools.partial(
+                        overture.overture_dataset, release
+                    ),
                 )
                 lookup = opened_lookup
             counts = _discover(

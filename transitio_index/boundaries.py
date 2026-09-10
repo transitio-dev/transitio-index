@@ -163,10 +163,16 @@ class BoundaryLookup:
         release=overture.OVERTURE_RELEASE,
         area_dataset=None,
         division_dataset=None,
+        reopen_area=None,
+        reopen_division=None,
     ):
         self.release = release
         self._area_dataset = area_dataset
         self._division_dataset = division_dataset
+        # Fresh-connection openers for a scan that stalls (see geometry.retrying);
+        # a reopened dataset replaces the instance's for the boxes that follow.
+        self._reopen_area = reopen_area
+        self._reopen_division = reopen_division
         root = store.open_subdir(cache_dir, "boundary_lookup")
         try:
             self._dir = store.open_subdir(root.path, release)
@@ -304,29 +310,19 @@ class BoundaryLookup:
                     & (ds.field(("bbox", "ymax")) >= ymin)
                     & ds.field("is_land")
                 )
-                for batch in self._area_dataset.to_batches(
-                    columns=AREA_COLUMNS, filter=predicate
-                ):
-                    if batch.num_rows == 0:
-                        continue
-                    division_ids = batch.column("division_id").to_pylist()
-                    wkb = batch.column("geometry").to_numpy(zero_copy_only=False)
-                    geoms = shapely.force_2d(shapely.from_wkb(wkb, on_invalid="ignore"))
-                    # Empty, invalid or non-polygon geometry must not enter the
-                    # containment index as division evidence.
-                    index = np.nonzero(geometry._valid_polygons(geoms))[0]
-                    if index.size == 0:
-                        continue
-                    # Memoize the simplified boundaries (the shipping tolerance):
-                    # exact coastline detail is needless for stop containment and
-                    # would bloat the memo.
-                    simplified = geometry._simplify(geoms[index])
-                    good = geometry._valid_polygons(simplified)
-                    kept = simplified[good]
-                    for row, geom, key in zip(
-                        index[good].tolist(), kept, shapely.to_wkb(kept)
-                    ):
-                        polygons.setdefault(division_ids[row], {})[key] = geom
+                # One box per attempt, restartable: a stalled scan is retried
+                # on a fresh connection and its partial result discarded; the
+                # merge below is keyed by WKB, so a re-read adds nothing twice.
+                # The dataset the successful attempt opened serves the boxes
+                # that follow — adopted here, on this thread, never from inside
+                # an attempt a deadline may have abandoned.
+                self._area_dataset, found = geometry.retrying(
+                    self._open_area,
+                    self._reopen_area,
+                    lambda open_dataset: self._box_polygons(open_dataset, predicate),
+                )
+                for division_id, geoms in found.items():
+                    polygons.setdefault(division_id, {}).update(geoms)
             new_ids = sorted(set(polygons) - set(self._records))
             metadata = self._division_metadata(new_ids)
             for division_id, found in polygons.items():
@@ -360,17 +356,73 @@ class BoundaryLookup:
         self._tree = None
         return len(new_ids)
 
+    def _open_area(self):
+        return self._area_dataset
+
+    def _open_division(self):
+        return self._division_dataset
+
+    @staticmethod
+    def _box_polygons(open_dataset, predicate):
+        """``(dataset, {division_id: {wkb: simplified polygon}})`` for one box's
+        land areas — the dataset the attempt opened and scanned, both under the
+        stall deadline — so the caller can adopt that dataset once the whole
+        attempt has succeeded."""
+        opened = []
+
+        def scan():
+            opened.append(open_dataset())
+            return opened[0].to_batches(
+                columns=AREA_COLUMNS, filter=predicate, **geometry.SCAN_OPTIONS
+            )
+
+        polygons = {}
+        for batch in geometry.with_deadline(scan, geometry.AREA_READ_DEADLINE):
+            if batch.num_rows == 0:
+                continue
+            division_ids = batch.column("division_id").to_pylist()
+            wkb = batch.column("geometry").to_numpy(zero_copy_only=False)
+            geoms = shapely.force_2d(shapely.from_wkb(wkb, on_invalid="ignore"))
+            # Empty, invalid or non-polygon geometry must not enter the
+            # containment index as division evidence.
+            index = np.nonzero(geometry._valid_polygons(geoms))[0]
+            if index.size == 0:
+                continue
+            # Memoize the simplified boundaries (the shipping tolerance): exact
+            # coastline detail is needless for stop containment and would bloat
+            # the memo.
+            simplified = geometry._simplify(geoms[index])
+            good = geometry._valid_polygons(simplified)
+            kept = simplified[good]
+            for row, geom, key in zip(index[good].tolist(), kept, shapely.to_wkb(kept)):
+                polygons.setdefault(division_ids[row], {})[key] = geom
+        return opened[0], polygons
+
     def _division_metadata(self, division_ids):
         if not division_ids:
             return {}
         predicate = ds.field("id").isin(list(division_ids))
-        found = {}
-        for batch in self._division_dataset.to_batches(
-            columns=overture.PROJECT, filter=predicate
-        ):
-            for row in batch.to_pylist():
-                record = overture.normalize_division(row)
-                found[record["overture_id"]] = record
+
+        def read(open_dataset):
+            opened = []
+
+            def scan():
+                opened.append(open_dataset())
+                return opened[0].to_batches(
+                    columns=overture.PROJECT, filter=predicate, **geometry.SCAN_OPTIONS
+                )
+
+            found = {}
+            for batch in geometry.with_deadline(scan, geometry.AREA_READ_DEADLINE):
+                for row in batch.to_pylist():
+                    record = overture.normalize_division(row)
+                    found[record["overture_id"]] = record
+            return opened[0], found
+
+        # Adopted on this thread once the whole attempt succeeded (see ensure).
+        self._division_dataset, found = geometry.retrying(
+            self._open_division, self._reopen_division, read
+        )
         return found
 
     def _build_tree(self):

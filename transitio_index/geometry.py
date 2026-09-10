@@ -21,6 +21,7 @@ import threading
 import uuid
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import shapely
@@ -44,6 +45,9 @@ AREA_CHUNK = int(os.environ.get("TRANSITIO_AREA_CHUNK", "0") or "0")
 # slow one: it is abandoned and retried on a fresh connection, up to the attempts.
 AREA_READ_DEADLINE = float(os.environ.get("TRANSITIO_AREA_DEADLINE", "600") or "600")
 AREA_READ_ATTEMPTS = 3
+# IO workers added to pyarrow's pool before each retry: an abandoned attempt
+# keeps the ones it is blocked on (SCAN_OPTIONS lets it hold about two).
+RETRY_IO_THREADS = 2
 
 # Explicit allowlist of AUDITED geometry sources, keyed by ``(dataset, licence)``
 # so a new upstream dataset is not shipped on a familiar licence until it is
@@ -186,10 +190,13 @@ def read_areas(dataset, division_ids, *, simplify=None, cache=None, reopen=None)
     until it is bumped. With ``None`` the areas are read straight from S3.
 
     ``reopen`` — a callable returning a freshly opened ``dataset`` — lets a
-    cached S3 scan that stalls be retried on a new connection.
+    cached S3 scan that stalls be retried on a new connection; with it
+    ``dataset`` may be None, and is then opened under the read's deadline.
     """
     if not division_ids:
         return {}
+    if dataset is None and (cache is None or reopen is None):
+        raise ValueError("read_areas: a dataset, or a cache with reopen, is needed")
     ids = sorted(set(division_ids))
     areas = {}
     for batch in _area_batches(dataset, ids, cache, reopen):
@@ -266,20 +273,43 @@ class AreaReadStalled(overture.GazetteerError):
     """An S3 area scan yielded nothing for the deadline: a hung connection."""
 
 
+# One fragment in flight and no batch readahead for every scan over S3: a
+# proxied read survives on a couple of connections where eight concurrent ones
+# get dropped and the SDK then waits on them forever.
+SCAN_OPTIONS = {"use_threads": False, "batch_readahead": 0, "fragment_readahead": 1}
+
+
 def _scan(dataset, ids):
-    # One fragment in flight and no batch readahead: a proxied S3 read survives
-    # on a couple of connections where eight concurrent ones get dropped and the
-    # SDK then waits on them forever.
     return dataset.to_batches(
-        columns=AREA_PROJECT,
-        filter=_area_predicate(ids),
-        use_threads=False,
-        batch_readahead=0,
-        fragment_readahead=1,
+        columns=AREA_PROJECT, filter=_area_predicate(ids), **SCAN_OPTIONS
     )
 
 
-def _with_deadline(scan, seconds):
+def retrying(open_dataset, reopen, attempt):
+    """``attempt(open_dataset)`` — a read whose dataset the callable
+    ``open_dataset()`` provides — retried on ``AreaReadStalled`` with ``reopen``
+    as the opener (a fresh connection), up to ``AREA_READ_ATTEMPTS``; with no
+    ``reopen``, or after the last attempt, the stall propagates. An attempt must
+    be restartable from scratch: nothing it did before stalling is kept."""
+    for number in range(1, AREA_READ_ATTEMPTS + 1):
+        try:
+            return attempt(open_dataset)
+        except AreaReadStalled as error:
+            if reopen is None or number == AREA_READ_ATTEMPTS:
+                raise
+            log.warning(
+                "%s; retrying on a fresh connection (%d/%d)",
+                error,
+                number,
+                AREA_READ_ATTEMPTS,
+            )
+            # The abandoned attempt keeps the IO workers it is blocked on, so
+            # the retry gets fresh ones rather than queueing behind them.
+            pa.set_io_thread_count(pa.io_thread_count() + RETRY_IO_THREADS)
+            open_dataset = reopen
+
+
+def with_deadline(scan, seconds):
     """Yield the batches ``scan()`` returns, opened and consumed in a daemon
     thread, raising ``AreaReadStalled`` when none arrives within ``seconds``.
     pyarrow blocks in C++ and cannot be interrupted, so on a stall the thread is
@@ -287,29 +317,45 @@ def _with_deadline(scan, seconds):
     on a fresh connection."""
     out = queue.Queue(maxsize=1)
     done = object()
+    abandoned = threading.Event()
+
+    def deliver(item):
+        # A consumer that gave up never drains the queue: a scan that resumes
+        # late must stop pumping, not block on the full queue forever.
+        while not abandoned.is_set():
+            try:
+                out.put(item, timeout=1.0)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def pump():
         try:
             for batch in scan():
-                out.put(batch)
-        except BaseException as error:  # noqa: B902 - relayed to the consumer
-            out.put(error)
+                if not deliver(batch):
+                    return
+        except Exception as error:  # noqa: B902 - relayed to the consumer thread
+            deliver(error)
         else:
-            out.put(done)
+            deliver(done)
 
     threading.Thread(target=pump, daemon=True).start()
-    while True:
-        try:
-            item = out.get(timeout=seconds)
-        except queue.Empty:
-            raise AreaReadStalled(
-                f"no area rows for {seconds:.0f}s: the S3 read stalled"
-            )
-        if item is done:
-            return
-        if isinstance(item, BaseException):
-            raise item
-        yield item
+    try:
+        while True:
+            try:
+                item = out.get(timeout=seconds)
+            except queue.Empty:
+                raise AreaReadStalled(
+                    f"no area rows for {seconds:.0f}s: the S3 read stalled"
+                )
+            if item is done:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        abandoned.set()
 
 
 def _fetch_into_cache(dataset, ids, rows_dir, reopen=None):
@@ -320,31 +366,27 @@ def _fetch_into_cache(dataset, ids, rows_dir, reopen=None):
     stalls past ``AREA_READ_DEADLINE`` is abandoned and retried on the dataset
     ``reopen()`` returns — a fresh connection — up to ``AREA_READ_ATTEMPTS``."""
     rows_dir.mkdir(parents=True, exist_ok=True)
-    for attempt in range(1, AREA_READ_ATTEMPTS + 1):
-        try:
-            _stream_into_cache(dataset, ids, rows_dir)
-            return
-        except AreaReadStalled as error:
-            if reopen is None or attempt == AREA_READ_ATTEMPTS:
-                raise
-            log.warning(
-                "areas: %s; retrying on a fresh connection (%d/%d)",
-                error,
-                attempt,
-                AREA_READ_ATTEMPTS,
-            )
-            dataset = reopen()
+
+    def opened():
+        return dataset
+
+    # Opening a dataset over S3 lists the bucket and reads schemas eagerly, so
+    # each attempt's open runs under the deadline too: the given dataset on the
+    # first attempt (or ``reopen`` when none was given), ``reopen`` afterwards.
+    open_dataset = reopen if dataset is None else opened
+    retrying(open_dataset, reopen, lambda o: _stream_into_cache(o, ids, rows_dir))
 
 
-def _stream_into_cache(dataset, ids, rows_dir):
-    """One scan of ``ids`` into a new cache file; the hidden temp is unlinked
-    unless the rename completed, whatever raised — a scan that stalls, or a
-    close or rename that fails, never leaves a partial file behind."""
+def _stream_into_cache(open_dataset, ids, rows_dir):
+    """One scan of ``ids`` — over the dataset ``open_dataset()`` returns — into
+    a new cache file; the hidden temp is unlinked unless the rename completed,
+    whatever raised — a scan that stalls, or a close or rename that fails,
+    never leaves a partial file behind."""
     tmp = rows_dir / f".{uuid.uuid4().hex}.parquet.tmp"
     writer = None
     published = False
     try:
-        batches = _with_deadline(lambda: _scan(dataset, ids), AREA_READ_DEADLINE)
+        batches = with_deadline(lambda: _scan(open_dataset(), ids), AREA_READ_DEADLINE)
         for batch in progress(batches, "areas"):
             if writer is None:
                 writer = pq.ParquetWriter(tmp, batch.schema)
@@ -585,10 +627,9 @@ def attach_geometry(
                 generations=run,
             )
             wanted = sorted({p["overture_id"] for p in places if p.get("overture_id")})
-            reopen = None
-            if dataset is None:
-                dataset = division_area_dataset()
-                reopen = division_area_dataset  # a fresh connection on a stall
+            # Opened under the read's deadline on first need — a fully cached
+            # build never touches S3 — and reopened, fresh, after a stall.
+            reopen = division_area_dataset if dataset is None else None
 
             for place in places:
                 place.setdefault("geometry", None)
