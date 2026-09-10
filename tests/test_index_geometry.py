@@ -360,3 +360,26 @@ def test_a_metro_gets_the_union_of_its_members_shipped_polygons(tmp_path):
     assert places["Q_PARTIAL"]["geometry"] is None
     assert places["Q_METRO"]["geometry"] is None
     assert manifest["member_union_geometry"] == 1
+
+
+def test_area_chunking_matches_a_single_pass(tmp_path):
+    # Resolving the seeded areas in small chunks (a memory-tight host's setting)
+    # must produce exactly the same attached geometry as one full-set pass.
+    cache = tmp_path / "cache"
+    _publish(cache, PLACES)
+    dataset = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
+
+    geometry.attach_geometry(cache, dataset=dataset, area_chunk=1)
+    chunked, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    chunked_geoms = {p["place_id"]: p.get("geometry") for p in chunked}
+
+    geometry.attach_geometry(cache, dataset=dataset, area_chunk=1000)
+    single, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    single_geoms = {p["place_id"]: p.get("geometry") for p in single}
+
+    assert chunked_geoms == single_geoms
+    assert any(chunked_geoms.values())  # the fixture does attach some geometry

@@ -14,6 +14,7 @@ geometry at that same tolerance.
 
 import collections
 import datetime
+import os
 
 import numpy as np
 import pyarrow.dataset as ds
@@ -24,6 +25,14 @@ from transitio_index.progress import progress
 
 DIVISION_AREA_PATH = "release/{release}/theme=divisions/type=division_area"
 AREA_PROJECT = ["division_id", "geometry", "sources", "is_land"]
+
+# How many divisions' areas to resolve at once in ``attach_geometry``. Holding
+# every seeded division's polygons in memory at once peaks high enough to OOM a
+# feed-dense country's build on a memory-tight host; a positive value caps the
+# working set to that many divisions per read, at the cost of extra dataset
+# scans. Unset or non-positive resolves them in a single pass (no overhead),
+# which is the default for a normally-resourced build.
+AREA_CHUNK = int(os.environ.get("TRANSITIO_AREA_CHUNK", "0") or "0")
 
 # Explicit allowlist of AUDITED geometry sources, keyed by ``(dataset, licence)``
 # so a new upstream dataset is not shipped on a familiar licence until it is
@@ -355,6 +364,7 @@ def attach_geometry(
     strict=False,
     registry=None,
     run=None,
+    area_chunk=None,
 ):
     """Attach simplified geometry to the seeded places and write the NOTICE.
 
@@ -375,46 +385,66 @@ def attach_geometry(
                 "places_seed.jsonl",
                 generations=run,
             )
-            wanted = {p["overture_id"] for p in places if p.get("overture_id")}
+            wanted = sorted({p["overture_id"] for p in places if p.get("overture_id")})
             if dataset is None:
                 dataset = division_area_dataset()
-            areas = read_areas(dataset, wanted)
+
+            for place in places:
+                place.setdefault("geometry", None)
+                place.setdefault("geometry_source", None)
+            by_overture = collections.defaultdict(list)
+            for place in places:
+                if place.get("overture_id"):
+                    by_overture[place["overture_id"]].append(place)
 
             shipped = set()
             inventory = collections.Counter()
             with_geometry = 0
             omitted = 0
             invalid = 0
-            for place in progress(places, "geometry"):
-                place.setdefault("geometry", None)
-                place.setdefault("geometry_source", None)
-                rows = areas.get(place.get("overture_id"))
-                if not rows:
-                    continue
-                for row in rows:
-                    # A land area with no sources still records one row, keyed to
-                    # the null source, so its omission is auditable, not silent.
-                    for source in row["sources"] or [None]:
-                        key = _source_key(source)
-                        inventory[(*key, key in SOURCE_ALLOWLIST)] += 1
-                if not all(_is_shippable(row["sources"]) for row in rows):
-                    omitted += 1
-                    continue
-                geoms = [row["geom"] for row in rows]
-                if not all(_valid_polygon(geom) for geom in geoms):
-                    invalid += 1
-                    continue
-                merged = geoms[0] if len(geoms) == 1 else shapely.unary_union(geoms)
-                simplified = _simplify(merged)
-                if not _valid_polygon(simplified):
-                    invalid += 1
-                    continue
-                place["geometry"] = shapely.to_wkb(simplified).hex()
-                place["geometry_source"] = "overture"
-                with_geometry += 1
-                for row in rows:
-                    for source in row["sources"]:
-                        shipped.add(_source_key(source))
+            # Resolve the seeded places' areas in bounded chunks so the whole
+            # set's polygons are never held at once (that peak OOMs a feed-dense
+            # country's build on a memory-tight host). The accumulators below are
+            # chunk-order independent, so the result matches a single-pass read.
+            chunk = area_chunk if area_chunk is not None else AREA_CHUNK
+            if not chunk or chunk <= 0:
+                chunk = len(wanted) or 1
+            for start in progress(range(0, len(wanted) or 1, chunk), "geometry"):
+                batch_ids = wanted[start : start + chunk]
+                areas = read_areas(dataset, set(batch_ids))
+                for overture_id in batch_ids:
+                    rows = areas.get(overture_id)
+                    if not rows:
+                        continue
+                    for place in by_overture[overture_id]:
+                        for row in rows:
+                            # A land area with no sources still records one row,
+                            # keyed to the null source, so its omission is
+                            # auditable, not silent.
+                            for source in row["sources"] or [None]:
+                                key = _source_key(source)
+                                inventory[(*key, key in SOURCE_ALLOWLIST)] += 1
+                        if not all(_is_shippable(row["sources"]) for row in rows):
+                            omitted += 1
+                            continue
+                        geoms = [row["geom"] for row in rows]
+                        if not all(_valid_polygon(geom) for geom in geoms):
+                            invalid += 1
+                            continue
+                        merged = (
+                            geoms[0] if len(geoms) == 1 else shapely.unary_union(geoms)
+                        )
+                        simplified = _simplify(merged)
+                        if not _valid_polygon(simplified):
+                            invalid += 1
+                            continue
+                        place["geometry"] = shapely.to_wkb(simplified).hex()
+                        place["geometry_source"] = "overture"
+                        with_geometry += 1
+                        for row in rows:
+                            for source in row["sources"]:
+                                shipped.add(_source_key(source))
+                del areas
 
             by_id = {p["place_id"]: p for p in places}
             member_union = 0
