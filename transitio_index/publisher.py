@@ -57,23 +57,56 @@ def _sha256(data):
 
 
 def _members(index_dir):
-    """The index files to pack, in a fixed order, as ``(name, bytes)``, read
-    under the index's writer lock so a publish cannot interleave with the
-    capture."""
+    """The index files to pack, in a fixed order, as ``(name, bytes)``: the
+    snapshot, every partition table it lists and the NOTICE, read under the
+    index's writer lock so a publish cannot interleave with the capture."""
     directory = store.open_directory(pathlib.Path(index_dir))
     try:
         with store.exclusive_writer(directory):
-            found = []
-            for name in contract.MEMBERS:
-                try:
-                    found.append((name, store.read_bytes(directory, name)))
-                except (store.MissingEntry, FileNotFoundError):
+            found = [("snapshot.json", _member(directory, "snapshot.json"))]
+            snapshot = json.loads(found[0][1].decode("utf-8"))
+            partitions = snapshot.get("partitions") or {}
+            for table in ("places", "edges"):
+                if not any(table in listed for listed in partitions.values()):
                     raise PublishIndexError(
-                        f"{index_dir / name}: missing; a release ships every member"
-                    ) from None
+                        f"{table}.parquet: missing; a release ships every table"
+                    )
+            for part, tables in sorted(partitions.items()):
+                child = directory.subdirectory(part)
+                try:
+                    for table in sorted(tables):
+                        name = f"{table}.parquet"
+                        found.append((f"{part}/{name}", _member(child, name)))
+                finally:
+                    child.close()
+            found.append(("NOTICE", _member(directory, "NOTICE")))
             return found
     finally:
         directory.close()
+
+
+def _member(directory, name):
+    try:
+        return store.read_bytes(directory, name)
+    except (store.MissingEntry, FileNotFoundError):
+        raise PublishIndexError(
+            f"{directory.path / name}: missing; a release ships every member"
+        ) from None
+
+
+def _stage(directory, members):
+    """Write ``members`` under ``directory``, partition files in their
+    subdirectories."""
+    for name, data in members:
+        part, _, base = name.rpartition("/")
+        if part:
+            child = directory.child(part)
+            try:
+                store.write_bytes(child, base, data)
+            finally:
+                child.close()
+        else:
+            store.write_bytes(directory, name, data)
 
 
 def _archive(members):
@@ -130,11 +163,13 @@ def _current(cache_dir, snapshot, overrides_dir):
         raise PublishIndexError(
             "the index is not licensed; run the license stage before publishing"
         )
-    tables = {"feeds"}
-    if snapshot.get("edges_sha256"):
-        tables.add("edges")
-    if snapshot.get("places_sha256"):
-        tables.add("places")
+    partitions = snapshot.get("partitions") or {}
+    tables = {"feeds"} | {
+        table
+        for listed in partitions.values()
+        for table in listed
+        if table in ("edges", "places")
+    }
     for table in sorted(tables):
         leaf = leaves.get(table)
         if not isinstance(leaf, str) or leaf not in generations:
@@ -206,8 +241,7 @@ def pack(index_dir, out_dir=None, *, cache_dir=None, overrides_dir=None):
     try:
         directory = store.open_directory(staged)
         try:
-            for name, data in members:
-                store.write_bytes(directory, name, data)
+            _stage(directory, members)
         finally:
             directory.close()
         snapshot = read_index(staged).snapshot
@@ -235,8 +269,7 @@ def pack(index_dir, out_dir=None, *, cache_dir=None, overrides_dir=None):
             for key in (
                 "generations",
                 "leaves",
-                "edges_sha256",
-                "places_sha256",
+                "partitions",
                 "overrides_sha256",
                 "feeds_overrides_sha256",
                 "places_overrides_sha256",

@@ -26,7 +26,20 @@ from test_index_publish import (  # noqa: E402
     _publish_coverage,
     _publish_gen,
 )
+from transitio import index as reader  # noqa: E402
 from transitio.index import release as contract  # noqa: E402
+
+
+def _expected_members(index_dir):
+    """The release members a partitioned index packs: the snapshot, every
+    partition table it lists, the NOTICE."""
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    tables = [
+        f"{part}/{table}.parquet"
+        for part, listed in sorted(snapshot["partitions"].items())
+        for table in sorted(listed)
+    ]
+    return ["snapshot.json", *tables, "NOTICE"]
 
 
 def _index(tmp_path):
@@ -72,7 +85,7 @@ def test_pack_is_deterministic_and_lists_only_index_members(tmp_path):
     archive = assets[name]
     assert archive == again[name]
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
-        assert tar.getnames() == list(contract.MEMBERS)
+        assert tar.getnames() == _expected_members(index_dir)
         assert all(m.mtime == 0 and m.uid == 0 and m.isreg() for m in tar.getmembers())
     digest = hashlib.sha256(archive).hexdigest()
     assert assets[name + ".sha256"] == f"{digest}  {name}\n".encode()
@@ -81,7 +94,7 @@ def test_pack_is_deterministic_and_lists_only_index_members(tmp_path):
         "sha256": digest,
         "bytes": len(archive),
     }
-    assert set(manifest["members"]) == set(contract.MEMBERS)
+    assert set(manifest["members"]) == set(_expected_members(index_dir))
     assert json.loads(assets["manifest.json"]) == manifest
     assert contract.compatible(manifest) == (True, None)
     # Written through the store: the planted symlink is replaced, not followed.
@@ -427,6 +440,10 @@ def test_an_altered_notice_is_not_released(tmp_path):
         publisher.pack(index_dir, cache_dir=index_dir.parent)
 
 
+@pytest.mark.skipif(
+    publish.SCHEMA_VERSION not in reader.SUPPORTED_SCHEMA_VERSIONS,
+    reason="the reader fixture follows the released reader's layout",
+)
 def test_the_reader_fixture_packs_the_way_the_publisher_does(tmp_path):
     """The reader tests' index fixture writes an index the real publisher
     reads, verifies and packs into a compatible release whose archive holds

@@ -35,6 +35,57 @@ _SCHEMA_7_FEED_COLUMNS = (
 )
 
 
+def _table_file(index_dir, table):
+    """The first partition's ``table`` file and that partition's name."""
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    for part, tables in sorted(snapshot["partitions"].items()):
+        if table in tables:
+            return index_dir / part / f"{table}.parquet", part
+    raise AssertionError(f"no partition carries {table}")
+
+
+def _redigest(index_dir, table):
+    """Record the current bytes of the first partition's ``table`` file in
+    the snapshot, so a rewritten table is judged on its shape, not its digest."""
+    path, part = _table_file(index_dir, table)
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    snapshot["partitions"][part][table]["sha256"] = hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+    (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+
+
+def _has_table(manifest, table):
+    return any(table in tables for tables in manifest["partitions"].values())
+
+
+def _flatten(index_dir, version, drop=()):
+    """Recreate the flat layout of a schema before 7 from a partitioned
+    index: every partition's tables concatenated at the root, minus the
+    columns schema 7 added (and ``drop``), stamped to ``version``."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    for table in ("feeds", "places", "edges"):
+        parts = [p for p, t in sorted(snapshot["partitions"].items()) if table in t]
+        if not parts:
+            continue
+        joined = pa.concat_tables(
+            [pq.read_table(index_dir / p / f"{table}.parquet") for p in parts]
+        )
+        gone = [c for c in (*_SCHEMA_7_FEED_COLUMNS, *drop) if c in joined.column_names]
+        if table == "edges":
+            gone += ["relevance_category", "relevance", "cross_border"]
+        pq.write_table(joined.drop_columns(gone), index_dir / f"{table}.parquet")
+        snapshot[f"{table}_sha256"] = hashlib.sha256(
+            (index_dir / f"{table}.parquet").read_bytes()
+        ).hexdigest()
+    snapshot["schema_version"] = version
+    snapshot["min_reader_version"] = transitio_index.MIN_READER_VERSIONS[version]
+    (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+
+
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
 def addressing(request, monkeypatch, tmp_path):
     if request.param == "paths":
@@ -408,22 +459,9 @@ def test_the_reader_still_reads_a_schema_4_index(tmp_path):
     # must read it unchanged. No schema-4 index is committed (the index is
     # packaged at release), so recreate the exact schema-4 shape by dropping the
     # column and stamping the manifest back to schema 4.
-    import hashlib
-
-    import pandas
-
     cache, _ = _build_index(tmp_path)
     index_dir = cache / "index"
-    feeds = pandas.read_parquet(index_dir / "feeds.parquet")
-    feeds = feeds.drop(columns=["files", *_SCHEMA_7_FEED_COLUMNS])
-    feeds.to_parquet(index_dir / "feeds.parquet", index=False)
-    snapshot = json.loads((index_dir / "snapshot.json").read_text())
-    snapshot["schema_version"] = 4
-    snapshot["min_reader_version"] = transitio_index.MIN_READER_VERSIONS[4]
-    snapshot["feeds_sha256"] = hashlib.sha256(
-        (index_dir / "feeds.parquet").read_bytes()
-    ).hexdigest()
-    (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+    _flatten(index_dir, 4, drop=["files"])
     index = transitio_index.read_index(index_dir)
     assert index.schema_version == 4
     assert "files" not in index.feeds.columns
@@ -431,8 +469,8 @@ def test_the_reader_still_reads_a_schema_4_index(tmp_path):
 
 def test_the_reader_refuses_a_parquet_that_does_not_match_its_manifest(tmp_path):
     cache, _ = _build_index(tmp_path)
-    (cache / "index" / "feeds.parquet").write_bytes(b"not the published parquet")
-    with pytest.raises(IncompatibleIndexError, match="feeds_sha256"):
+    _table_file(cache / "index", "feeds")[0].write_bytes(b"not the published parquet")
+    with pytest.raises(IncompatibleIndexError, match="sha256"):
         transitio_index.read_index(cache / "index")
 
 
@@ -440,9 +478,10 @@ def test_the_reader_requires_a_feeds_sha256(tmp_path):
     # A supported-version manifest with no digest cannot bypass the check.
     cache, _ = _build_index(tmp_path)
     snapshot = json.loads((cache / "index" / "snapshot.json").read_text())
-    del snapshot["feeds_sha256"]
+    _, part = _table_file(cache / "index", "feeds")
+    del snapshot["partitions"][part]["feeds"]["sha256"]
     (cache / "index" / "snapshot.json").write_text(json.dumps(snapshot))
-    with pytest.raises(IncompatibleIndexError, match="feeds_sha256"):
+    with pytest.raises(IncompatibleIndexError, match="sha256"):
         transitio_index.read_index(cache / "index")
 
 
@@ -450,7 +489,7 @@ def test_the_reader_refuses_a_symlinked_index_file(tmp_path):
     if not getattr(os, "O_NOFOLLOW", 0):
         pytest.skip("platform lacks O_NOFOLLOW; a symlink is followed (documented)")
     cache, _ = _build_index(tmp_path)
-    parquet = cache / "index" / "feeds.parquet"
+    parquet, _ = _table_file(cache / "index", "feeds")
     real = parquet.rename(parquet.with_name("real.parquet"))
     try:
         parquet.symlink_to(real)
@@ -463,7 +502,7 @@ def test_the_reader_refuses_a_symlinked_index_file(tmp_path):
 def test_the_reader_refuses_a_fifo_index_file(tmp_path):
     # A FIFO in place of a file must be refused, not block the open forever.
     cache, _ = _build_index(tmp_path)
-    parquet = cache / "index" / "feeds.parquet"
+    parquet, _ = _table_file(cache / "index", "feeds")
     parquet.unlink()
     try:
         os.mkfifo(parquet)
@@ -485,7 +524,6 @@ def test_the_reader_requires_a_snapshot_id(tmp_path):
 
 def test_the_reader_refuses_a_parquet_with_the_wrong_columns(tmp_path):
     # A structurally wrong Parquet whose digest is made to match is still refused.
-    import hashlib
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -494,11 +532,8 @@ def test_the_reader_refuses_a_parquet_with_the_wrong_columns(tmp_path):
     sink = io.BytesIO()
     pq.write_table(pa.table({"unexpected": [1, 2]}), sink)
     data = sink.getvalue()
-    (cache / "index" / "feeds.parquet").write_bytes(data)
-    snap = cache / "index" / "snapshot.json"
-    manifest = json.loads(snap.read_text())
-    manifest["feeds_sha256"] = hashlib.sha256(data).hexdigest()
-    snap.write_text(json.dumps(manifest))
+    _table_file(cache / "index", "feeds")[0].write_bytes(data)
+    _redigest(cache / "index", "feeds")
     with pytest.raises(IncompatibleIndexError, match="columns"):
         transitio_index.read_index(cache / "index")
 
@@ -519,7 +554,7 @@ def test_places_round_trip_through_the_reader(tmp_path):
     assert helsinki["default_metro_id"] == "Q-metro"  # the sole metro
     # The metro has no geometry here.
     assert by_id["Q-metro"].geometry is None
-    assert manifest["places_sha256"]
+    assert _has_table(manifest, "places")
     assert manifest["overture_release"] == "2026-08-19.0"
     assert manifest["counts"]["places"] == 2
     assert manifest["counts"]["places_by_kind"] == {"city": 1, "metro": 1}
@@ -533,11 +568,11 @@ def test_a_feeds_only_index_has_no_places(tmp_path, monkeypatch):
     for stale in ("places.parquet", "edges.parquet"):
         (tmp_path / "cache" / "index" / stale).write_bytes(b"stale")
     cache, manifest = _build_index(tmp_path)  # no gazetteer
-    assert "places_sha256" not in manifest
-    index = transitio_index.read_index(cache / "index")
-    assert index.places is None and index.edges is None
+    assert not _has_table(manifest, "places") and not _has_table(manifest, "edges")
     assert not (cache / "index" / "places.parquet").exists()
     assert not (cache / "index" / "edges.parquet").exists()
+    index = transitio_index.read_index(cache / "index")
+    assert index.places is None and index.edges is None
     # A places.yaml that no gazetteer generation applied is a missing stage.
     directory = write_overrides(
         tmp_path, places=[{"place": "Q1", "set_aliases": ["x"]}]
@@ -576,8 +611,8 @@ def test_a_feeds_only_index_has_no_places(tmp_path, monkeypatch):
 def test_the_reader_refuses_a_places_parquet_that_does_not_match(tmp_path):
     pytest.importorskip("geopandas")
     cache, _ = _build_index(tmp_path, places=PLACES)
-    (cache / "index" / "places.parquet").write_bytes(b"not the published parquet")
-    with pytest.raises(IncompatibleIndexError, match="places_sha256"):
+    _table_file(cache / "index", "places")[0].write_bytes(b"not the published parquet")
+    with pytest.raises(IncompatibleIndexError, match="sha256"):
         transitio_index.read_index(cache / "index")
 
 
@@ -614,8 +649,7 @@ def test_an_empty_gazetteer_is_a_places_index_not_feeds_only(tmp_path):
     )
     _, feeds_only = _build_index(tmp_path / "a", archive=archive)
     cache, manifest = _build_index(tmp_path / "b", archive=archive, places=[])
-    assert manifest["places_sha256"]
-    assert manifest["counts"]["places"] == 0
+    assert manifest["overture_release"] and manifest["counts"]["places"] == 0
     assert manifest["snapshot_id"] != feeds_only["snapshot_id"]
     index = transitio_index.read_index(cache / "index")
     assert index.places is not None
@@ -666,7 +700,7 @@ def test_edges_round_trip_through_the_reader(tmp_path):
     by_id = {r["feed_id"]: r for _, r in index.feeds.iterrows()}
     assert by_id["f-a"]["coverage_source"] == "declared"
     assert pandas.isna(by_id["f-b"]["coverage_source"])  # null reads back as NaN
-    assert manifest["edges_sha256"]
+    assert _has_table(manifest, "edges")
     assert manifest["coverage_mode"] == "declared"
     assert manifest["counts"]["edges"] == 2
     assert manifest["counts"]["edges_by_tier"] == {"unknown": 2}
@@ -684,23 +718,21 @@ def test_a_manifest_snapshot_id_that_disagrees_with_the_rows_is_refused(tmp_path
 
 def test_a_feeds_only_index_has_no_edges(tmp_path):
     cache, manifest = _build_index(tmp_path)
-    assert "edges_sha256" not in manifest
+    assert not _has_table(manifest, "edges")
     index = transitio_index.read_index(cache / "index")
     assert index.edges is None
-    assert not (cache / "index" / "edges.parquet").exists()
 
 
 def test_the_reader_refuses_an_edges_parquet_that_does_not_match(tmp_path):
     pytest.importorskip("geopandas")
     cache, _ = _edges_index(tmp_path, [_edge("Q1757", "f-a")])
-    (cache / "index" / "edges.parquet").write_bytes(b"not the published parquet")
-    with pytest.raises(IncompatibleIndexError, match="edges_sha256"):
+    _table_file(cache / "index", "edges")[0].write_bytes(b"not the published parquet")
+    with pytest.raises(IncompatibleIndexError, match="sha256"):
         transitio_index.read_index(cache / "index")
 
 
 def test_a_duplicate_column_label_is_refused_even_when_correctly_hashed(tmp_path):
     pytest.importorskip("geopandas")
-    import hashlib
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -718,11 +750,8 @@ def test_a_duplicate_column_label_is_refused_even_when_correctly_hashed(tmp_path
     sink = io.BytesIO()
     pq.write_table(table, sink)
     data = sink.getvalue()
-    (cache / "index" / "edges.parquet").write_bytes(data)
-    snap_path = cache / "index" / "snapshot.json"
-    snapshot = json.loads(snap_path.read_text())
-    snapshot["edges_sha256"] = hashlib.sha256(data).hexdigest()
-    snap_path.write_text(json.dumps(snapshot))
+    _table_file(cache / "index", "edges")[0].write_bytes(data)
+    _redigest(cache / "index", "edges")
     with pytest.raises(IncompatibleIndexError, match="not a readable edges table"):
         transitio_index.read_index(cache / "index")
 
@@ -1155,14 +1184,11 @@ def test_a_null_snapshot_column_value_is_refused(tmp_path):
 
     cache, _ = _build_index(tmp_path)
     index_dir = cache / "index"
-    frame = pandas.read_parquet(index_dir / "feeds.parquet")
+    parquet, _ = _table_file(index_dir, "feeds")
+    frame = pandas.read_parquet(parquet)
     frame.loc[frame.index[0], "snapshot"] = None
-    frame.to_parquet(index_dir / "feeds.parquet", index=False)
-    manifest = json.loads((index_dir / "snapshot.json").read_text())
-    manifest["feeds_sha256"] = hashlib.sha256(
-        (index_dir / "feeds.parquet").read_bytes()
-    ).hexdigest()
-    (index_dir / "snapshot.json").write_text(json.dumps(manifest))
+    frame.to_parquet(parquet, index=False)
+    _redigest(index_dir, "feeds")
     with pytest.raises(IncompatibleIndexError, match="snapshot other than"):
         transitio_index.read_index(index_dir)
 
@@ -1172,15 +1198,10 @@ def test_a_duplicated_column_is_refused(tmp_path):
 
     cache, _ = _build_index(tmp_path)
     index_dir = cache / "index"
-    table = pq.read_table(index_dir / "feeds.parquet")
-    pq.write_table(
-        table.append_column("snapshot", table["snapshot"]), index_dir / "feeds.parquet"
-    )
-    manifest = json.loads((index_dir / "snapshot.json").read_text())
-    manifest["feeds_sha256"] = hashlib.sha256(
-        (index_dir / "feeds.parquet").read_bytes()
-    ).hexdigest()
-    (index_dir / "snapshot.json").write_text(json.dumps(manifest))
+    parquet, _ = _table_file(index_dir, "feeds")
+    table = pq.read_table(parquet)
+    pq.write_table(table.append_column("snapshot", table["snapshot"]), parquet)
+    _redigest(index_dir, "feeds")
     # Refused as a controlled error, by the Parquet reader or the column check.
     with pytest.raises(
         IncompatibleIndexError, match="not a readable feeds table|duplicate columns"
@@ -1196,22 +1217,14 @@ def test_a_table_declaring_more_than_the_reader_loads_is_refused(tmp_path, monke
 
 
 def _restamp(index_dir, version, places):
-    """Rewrite the places table and stamp the manifest to ``version``; a
-    version before 7 also loses the feeds columns schema 7 added."""
-    import pandas
-
+    """Recreate the flat layout at ``version`` with ``places`` as its places
+    table."""
+    _flatten(index_dir, version)
     places.to_parquet(index_dir / "places.parquet", index=False)
     snapshot = json.loads((index_dir / "snapshot.json").read_text())
-    snapshot["schema_version"] = version
-    snapshot["min_reader_version"] = transitio_index.MIN_READER_VERSIONS[version]
-    if version < 7:
-        feeds = pandas.read_parquet(index_dir / "feeds.parquet")
-        dropped = [c for c in _SCHEMA_7_FEED_COLUMNS if c in feeds.columns]
-        feeds.drop(columns=dropped).to_parquet(index_dir / "feeds.parquet", index=False)
-    for table in ("places", "feeds"):
-        snapshot[f"{table}_sha256"] = hashlib.sha256(
-            (index_dir / f"{table}.parquet").read_bytes()
-        ).hexdigest()
+    snapshot["places_sha256"] = hashlib.sha256(
+        (index_dir / "places.parquet").read_bytes()
+    ).hexdigest()
     (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
 
 
@@ -1222,7 +1235,7 @@ def test_the_reader_reads_schema_6_places_and_refuses_a_mismatch(tmp_path):
     geopandas = pytest.importorskip("geopandas")
     cache, _ = _build_index(tmp_path, places=PLACES)
     index_dir = cache / "index"
-    published = geopandas.read_parquet(index_dir / "places.parquet")
+    published = geopandas.read_parquet(_table_file(index_dir, "places")[0])
     qids = [str(q) for q in published["place_id"]]
     own = {qid: f"tp_{n}" for n, qid in enumerate(qids, start=1)}
     places = published.copy()
@@ -1431,18 +1444,73 @@ def test_schema_7_ships_the_country_and_relevance_columns(tmp_path):
         **_edge("Q1757", "f-a", tier="local"),
         "relevance_category": "primary",
         "relevance": 0.75,
-        "cross_border": False,
+        "cross_border": True,
     }
     cache, manifest = _edges_index(tmp_path, [edge], feeds=[feed])
     assert manifest["schema_version"] == 7 == publish.SCHEMA_VERSION
     assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
         7, publish.MIN_READER_VERSION
     )
-    feeds = pq.read_table(cache / "index" / "feeds.parquet").to_pylist()
-    (row,) = [r for r in feeds if r["feed_id"] == "f-a"]
+    # Without a home country the feed sits in the international partition and
+    # its edge in the links, naming that partition.
+    assert set(manifest["partitions"]) == {"FI", "international", "links"}
+    feeds = pq.read_table(cache / "index" / "international" / "feeds.parquet")
+    (row,) = [r for r in feeds.to_pylist() if r["feed_id"] == "f-a"]
     assert row["home_country"] is None and row["scope"] == "declared"
     assert json.loads(row["country_shares"]) == {}
     assert row["declared_countries"] == ["FI"]
-    (edge_row,) = pq.read_table(cache / "index" / "edges.parquet").to_pylist()
+    links = pq.read_table(cache / "index" / "links" / "edges.parquet").to_pylist()
+    (edge_row,) = links
     assert edge_row["relevance_category"] == "primary"
-    assert edge_row["relevance"] == 0.75 and edge_row["cross_border"] is False
+    assert edge_row["relevance"] == 0.75 and edge_row["cross_border"] is True
+    assert edge_row["feed_partition"] == "international"
+    assert manifest["partitions"]["links"]["edges"]["rows"] == 1
+    assert manifest["partitions"]["FI"]["places"]["rows"] == len(PLACES)
+    assert "edges" not in manifest["partitions"]["FI"]
+
+
+def test_partition_routes_by_home_country_and_place_country():
+    records = [
+        {"feed_id": "fi", "home_country": "FI"},
+        {"feed_id": "ee", "home_country": "EE"},
+        {"feed_id": "ferry", "home_country": None},
+    ]
+    places = [
+        _place("hel", "city", country_code="FI"),
+        _place("tll", "city", country_code="EE"),
+    ]
+    edges = [
+        _edge("hel", "fi"),  # domestic
+        _edge("tll", "fi"),  # a foreign place: links, feed under FI
+        _edge("tll", "ee"),  # domestic
+        _edge("hel", "ferry"),  # no home country: links, feed international
+    ]
+    parts = publish.partition(records, places, edges)
+    assert list(parts) == ["EE", "FI", "international", "links"]
+    assert [f["feed_id"] for f in parts["FI"]["feeds"]] == ["fi"]
+    assert [p["place_id"] for p in parts["FI"]["places"]] == ["hel"]
+    assert [(e["place_id"], e["feed_id"]) for e in parts["FI"]["edges"]] == [
+        ("hel", "fi")
+    ]
+    assert [(e["place_id"], e["feed_id"]) for e in parts["EE"]["edges"]] == [
+        ("tll", "ee")
+    ]
+    assert [f["feed_id"] for f in parts["international"]["feeds"]] == ["ferry"]
+    assert set(parts["international"]) == {"feeds"} and set(parts["links"]) == {"edges"}
+    links = parts["links"]["edges"]
+    assert [(e["feed_id"], e["feed_partition"]) for e in links] == [
+        ("fi", "FI"),
+        ("ferry", "international"),
+    ]
+    # Exhaustive: every edge lands in exactly one table.
+    routed = sum(len(t.get("edges", [])) for t in parts.values())
+    assert routed == len(edges)
+    # A place without a country, or an edge to an unknown place or feed, is
+    # an integrity error.
+    nowhere = _place("x", "city", country_code=None)
+    with pytest.raises(publish.PublishError, match="no country_code"):
+        publish.partition(records, [nowhere], [])
+    with pytest.raises(publish.PublishError, match="place the index lacks"):
+        publish.partition(records, places, [_edge("zz", "fi")])
+    with pytest.raises(publish.PublishError, match="feed the index lacks"):
+        publish.partition(records, places, [_edge("hel", "ghost")])
