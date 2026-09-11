@@ -17,6 +17,7 @@ import test_index_boundaries as bt  # noqa: E402
 from transitio_index import (  # noqa: E402
     boundaries,
     coverage,
+    fetch,
     geometry,
     overture,
     registry,
@@ -683,3 +684,14 @@ def test_a_discovered_district_that_is_also_a_city_is_the_city(tmp_path):
     assert places["Q999003"]["parent_id"] == "Q999004"
     # Nothing to look up means no scan: a memo-only lookup opens no dataset.
     assert seed.city_qids(None, set()) == set()
+
+
+def test_the_fetcher_gives_up_on_a_connect_sooner_than_on_a_read():
+    """One 60 s timeout covered the handshake too, so a host that never answers
+    cost a minute per resolved address per request — six silent minutes for a
+    deprecated feed whose host had a private address among its records. The
+    connect timeout is now bounded separately; reads keep the full budget."""
+    with fetch.Fetcher() as fetcher:
+        timeout = fetcher._client.timeout
+    assert timeout.connect == fetch.CONNECT_TIMEOUT < fetch.TIMEOUT
+    assert timeout.read == timeout.write == timeout.pool == fetch.TIMEOUT
