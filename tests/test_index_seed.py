@@ -27,6 +27,8 @@ ROWS = [
     fx.division(
         "us-mo", "US", "region", wikidata="Q1581", name="Missouri", admin_level=1
     ),
+    # Helsinki as Overture lists a city that is its own district: the locality's
+    # hierarchy passes through a same-QID county twin, which is the same place.
     fx.division(
         "fi-helsinki",
         "FI",
@@ -38,7 +40,21 @@ ROWS = [
         hierarchies=fx.chain(
             ("fi", "country", "Finland"),
             ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-helsinki-county", "county", "Helsinki"),
             ("fi-helsinki", "locality", "Helsinki"),
+        ),
+    ),
+    fx.division(
+        "fi-helsinki-county",
+        "FI",
+        "county",
+        wikidata="Q1757",
+        name="Helsinki",
+        admin_level=2,
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-helsinki-county", "county", "Helsinki"),
         ),
     ),
     # A localadmin sharing Helsinki's QID: the locality must win.
@@ -310,10 +326,13 @@ def test_the_seed_identifies_every_place_in_the_registry(tmp_path):
 
 def test_seed_places_a_city_with_its_ancestors(tmp_path):
     _, places, _ = _seed(tmp_path)
-    # Helsinki resolves to its QID and its admin parent is the region.
+    # Helsinki resolves to its QID and its admin parent is the region: the
+    # same-QID county rung in its hierarchy is Helsinki itself, never its
+    # parent, and the one place emitted for the QID is the locality.
     helsinki = places["Q1757"]
     assert helsinki["kind"] == "city"
     assert helsinki["parent_id"] == "Q1508"
+    assert helsinki["overture_id"] == "fi-helsinki"
     assert helsinki["country_code"] == "FI"
     # Its ancestors are emitted as places too.
     assert places["Q1508"]["kind"] == "region"

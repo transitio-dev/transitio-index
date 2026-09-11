@@ -265,15 +265,23 @@ def _ancestor_places(division, skeleton):
     id for a named division no QID names. An ancestor
     the skeleton could not resolve is skipped, and ``parent_id`` links only
     resolved rungs, so the chain never points at an id that was never minted.
+    A rung that is the division itself at another level — a city that is its
+    own district lists its county twin, under the same QID, as an ancestor —
+    or repeats the rung before it is one place, not a parent: it is skipped, so
+    no place is ever its own parent.
     """
     places = []
     parent_id = None
+    own = place_key(division)
     for ancestor in division.get("ancestors", []):
         resolved = skeleton.get(ancestor.get("overture_id"))
         if resolved is None:
             continue
+        key = place_key(resolved)
+        if key in (own, parent_id):
+            continue
         places.append(_place(resolved, parent_id=parent_id))
-        parent_id = place_key(resolved)
+        parent_id = key
     return places, parent_id
 
 
