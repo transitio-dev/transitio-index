@@ -32,7 +32,9 @@ STATS_POINTER = "stats.json"
 STATS_SCHEMA_VERSION = 1
 CATALOGUE_ARTIFACT = "catalogue.parquet"
 FEEDS_ARTIFACT = "feeds.parquet"
+PLACES_ARTIFACT = "places.parquet"
 SUMMARY_ARTIFACT = "summary.json"
+REPORT_ARTIFACT = "report.md"
 
 # The ingest pointers and artifacts the catalogue rows come from.
 RAW_SOURCES = {
@@ -413,32 +415,33 @@ def stats(cache_dir):
             "declared_places": declared_places(rows),
             "identity": identity(rows, feeds),
         }
-        feed_table = None
-        if snapshot.get("partitions"):
-            from transitio_index import crawl
+        from transitio_index import crawl
 
-            with crawl.reading(cache_dir):
-                # The crawl the published edges were measured against.
-                if crawl.states_digest(cache_dir) != snapshot.get("crawl_digest"):
-                    raise StatsError(
-                        "the crawl changed since the index was published; re-run "
-                        "the pipeline in stage order"
-                    )
-                published, edges, places = _index_tables(cache_dir, snapshot)
-                by_place = {place["place_id"]: place for place in places}
-                statuses = {
-                    r["source_id"]: r["status"] for r in rows if r["source"] == "mdb"
-                }
-                feed_table = feed_rows(
-                    published,
-                    edges,
-                    by_place,
-                    _crawl_log(cache_dir),
-                    _placements(cache_dir, snapshot),
-                    statuses,
-                    snapshot_id,
+        with crawl.reading(cache_dir):
+            # The crawl the published edges were measured against.
+            if crawl.states_digest(cache_dir) != snapshot.get("crawl_digest"):
+                raise StatsError(
+                    "the crawl changed since the index was published; re-run "
+                    "the pipeline in stage order"
                 )
-            summary.update(feed_sections(feed_table))
+            published, edges, places = _index_tables(cache_dir, snapshot)
+            by_place = {place["place_id"]: place for place in places}
+            statuses = {
+                r["source_id"]: r["status"] for r in rows if r["source"] == "mdb"
+            }
+            feed_table = feed_rows(
+                published,
+                edges,
+                by_place,
+                _crawl_log(cache_dir),
+                _placements(cache_dir, snapshot),
+                statuses,
+                snapshot_id,
+            )
+        summary.update(feed_sections(feed_table))
+        place_table = place_rows(places, edges, snapshot_id)
+        summary["duplicate_coverage"] = duplicate_coverage(edges, rows)
+        summary["distributions"] = distributions(edges, places)
         manifest = {
             "source": "stats",
             "stats_schema_version": STATS_SCHEMA_VERSION,
@@ -449,16 +452,21 @@ def stats(cache_dir):
             "sections": sorted(summary),
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
+        manifest["feeds"] = len(feed_table)
+        manifest["places"] = len(place_table)
+        manifest["sections"] = sorted(summary)
         data = _parquet(rows)
+        feed_data = _parquet(feed_table, FEED_SCHEMA)
+        place_data = _parquet(place_table, PLACE_SCHEMA)
         text = json.dumps(summary, indent=2, sort_keys=True)
+        report = render_report(summary)
         artifacts = {
             CATALOGUE_ARTIFACT: lambda: [data],
+            FEEDS_ARTIFACT: lambda: [feed_data],
+            PLACES_ARTIFACT: lambda: [place_data],
             SUMMARY_ARTIFACT: lambda: [text],
+            REPORT_ARTIFACT: lambda: [report],
         }
-        if feed_table is not None:
-            feed_data = _parquet(feed_table, FEED_SCHEMA)
-            artifacts[FEEDS_ARTIFACT] = lambda: [feed_data]
-            manifest["feeds"] = len(feed_table)
         return store.publish(
             cache_dir / "stats", STATS_POINTER, artifacts, manifest, held=directory
         )
@@ -561,8 +569,7 @@ def _municipality_outcome(placement, served, places):
         return "unplaceable"
     if declared in served:
         return "in_place"
-    region = places[declared].get("parent_id")
-    targets = {declared, region} - {None}
+    targets = {declared, _region_of(declared, places)} - {None}
     for place_id in served:
         seen = set()
         current = place_id
@@ -572,6 +579,19 @@ def _municipality_outcome(placement, served, places):
             seen.add(current)
             current = (places.get(current) or {}).get("parent_id")
     return "elsewhere"
+
+
+def _region_of(place_id, places):
+    """The first region in a place's ancestry (itself when it is one), else
+    its parent — a district's parent may be a city, a region's a country."""
+    seen, current = set(), place_id
+    while current is not None and current not in seen:
+        place = places.get(current) or {}
+        if place.get("kind") == "region":
+            return current
+        seen.add(current)
+        current = place.get("parent_id")
+    return (places.get(place_id) or {}).get("parent_id")
 
 
 def _licence_state(feed):
@@ -685,6 +705,25 @@ def feed_rows(
     return rows
 
 
+# The feed sources that belong to each catalogue (``both`` is in two).
+CATALOGUE_SOURCES = {
+    "mdb": ("mdb", "both"),
+    "atlas": ("atlas", "both"),
+    "gbfs": ("systems_csv", "gbfs"),
+}
+
+
+def _agreement_share(rows):
+    """Agreement counts for one catalogue's feeds and the share of the
+    judged feeds (declared and observed) whose declaration is wrong."""
+    counts = collections.Counter(r["country_agreement"] for r in rows)
+    judged = counts["agree"] + counts["disagree"]
+    return {
+        **dict(counts),
+        "disagreement_share": counts["disagree"] / judged if judged else None,
+    }
+
+
 def _quantiles(values):
     values = sorted(v for v in values if v is not None)
     if not values:
@@ -736,25 +775,19 @@ def feed_sections(rows):
             ),
         },
         "scale": {
+            # Stops over the crawled feeds; places and countries over every
+            # feed, a feed without published edges counting as zero.
             "stop_count": _quantiles([r["stop_count"] for r in rows]),
-            "places_served": _quantiles(
-                [r["places_served"] for r in rows if r["places_served"]]
-            ),
+            "places_served": _quantiles([r["places_served"] for r in rows]),
             "countries_served": dict(
-                collections.Counter(
-                    str(r["countries_served"]) for r in rows if r["places_served"]
-                )
+                collections.Counter(str(r["countries_served"]) for r in rows)
             ),
         },
         "country_agreement": {
             "by_agreement": counts("country_agreement"),
-            "by_source": {
-                source: dict(
-                    collections.Counter(
-                        r["country_agreement"] for r in rows if r["source"] == source
-                    )
-                )
-                for source in sorted({r["source"] for r in rows if r["source"]})
+            "by_catalogue": {
+                catalogue: _agreement_share([r for r in rows if r["source"] in sources])
+                for catalogue, sources in CATALOGUE_SOURCES.items()
             },
             "scope": counts("scope"),
         },
@@ -816,3 +849,256 @@ def _placements(cache_dir, snapshot):
             "re-run the pipeline in stage order"
         )
     return placements
+
+
+# ---- place level, duplicate coverage, distributions and the report ----
+
+PLACE_SCHEMA = pa.schema(
+    [
+        ("place_id", pa.string()),
+        ("kind", pa.string()),
+        ("country_code", pa.string()),
+        ("feeds", pa.int64()),
+        ("feeds_by_category", pa.string()),
+        ("departures_per_day", pa.float64()),
+        ("has_primary", pa.bool_()),
+        ("snapshot_id", pa.string()),
+    ]
+)
+# Two feeds whose served places overlap by at least this containment (the
+# shared places over the smaller set) cover the same ground.
+DUPLICATE_CONTAINMENT = 0.9
+# One line per section, rendered under its heading.
+DEFINITIONS = {
+    "build": "The snapshot the statistics describe and the catalogues it read.",
+    "declared_places": (
+        "What the catalogue rows say about where a feed is, counted over the "
+        "MDB rows the build ingested; boxes are the declared bounding boxes."
+    ),
+    "identity": (
+        "Catalogue ids, deprecated rows and their redirects, and what the "
+        "crosswalk made of the rows (feeds by source and match method)."
+    ),
+    "availability": (
+        "Crawl outcomes per feed, the failure classes from the fetcher's "
+        "recorded reason, and outcomes by the row's catalogue status."
+    ),
+    "licensing": "Licence declarations and the redistribution judgement per feed.",
+    "scale": (
+        "Stops per crawled feed and places per feed (count, median, 95th "
+        "percentile, maximum), and countries served per feed."
+    ),
+    "country_agreement": (
+        "The catalogues' declared country against the home country classify "
+        "found from the stops; the share is disagree over agree plus disagree."
+    ),
+    "declared_municipality": (
+        "Where a crawled feed's stops fall relative to the municipality the "
+        "catalogue declared: in the place, in its region, elsewhere, or "
+        "unplaceable when the declared place left the index."
+    ),
+    "duplicate_coverage": (
+        "Feed pairs whose served place sets overlap at the containment "
+        "threshold (shared places over the smaller set): a catalogue duplicate "
+        "when one row redirects to the other or they share a download URL."
+    ),
+    "distributions": (
+        "Edges by tier and relevance category, and relevance quantiles, per "
+        "country and per place kind."
+    ),
+}
+REPORT_SECTIONS = (
+    "build",
+    "declared_places",
+    "identity",
+    "availability",
+    "licensing",
+    "scale",
+    "country_agreement",
+    "declared_municipality",
+    "duplicate_coverage",
+    "distributions",
+)
+
+
+def _service(edge):
+    service = edge.get("service")
+    if isinstance(service, str):
+        service = json.loads(service)
+    return service or {}
+
+
+def place_rows(places, edges, snapshot_id=None):
+    """One row per published place: the feeds serving it (per relevance
+    category, counted once per feed), its departures per day summed over the
+    pairs that report them, and whether a primary feed serves it."""
+    by_place = collections.defaultdict(list)
+    for edge in edges:
+        by_place[edge["place_id"]].append(edge)
+    rows = []
+    for place in places:
+        mine = by_place.get(place["place_id"], [])
+        feeds = {e["feed_id"] for e in mine}
+        categories = collections.defaultdict(set)
+        for e in mine:
+            if e.get("relevance_category"):
+                categories[e["relevance_category"]].add(e["feed_id"])
+        per_feed = {}
+        for e in mine:
+            value = _service(e).get("departures_per_day")
+            if per_feed.get(e["feed_id"]) is None:
+                per_feed[e["feed_id"]] = value
+        reported = [d for d in per_feed.values() if d is not None]
+        rows.append(
+            {
+                "place_id": place["place_id"],
+                "kind": place.get("kind"),
+                "country_code": place.get("country_code"),
+                "feeds": len(feeds),
+                "feeds_by_category": json.dumps(
+                    {c: len(f) for c, f in sorted(categories.items())}
+                ),
+                "departures_per_day": sum(reported) if reported else None,
+                "has_primary": bool(categories.get("primary")),
+                "snapshot_id": snapshot_id,
+            }
+        )
+    return rows
+
+
+def duplicate_coverage(edges, catalogue):
+    """Pairs of feeds whose served place sets overlap by at least
+    ``DUPLICATE_CONTAINMENT``, each unordered pair once: a
+    ``catalogue_duplicate`` when one feed's MDB row redirects to the other's
+    or the two share a download URL, else a ``genuine_overlap``."""
+    served = collections.defaultdict(set)
+    for edge in edges:
+        served[edge["feed_id"]].add(edge["place_id"])
+    by_place = collections.defaultdict(list)
+    for feed_id, places in served.items():
+        for place_id in places:
+            by_place[place_id].append(feed_id)
+    shared = collections.Counter()
+    for feeds in by_place.values():
+        feeds = sorted(feeds)
+        for i, a in enumerate(feeds):
+            for b in feeds[i + 1 :]:
+                shared[(a, b)] += 1
+    feed_of_row = {
+        (row["source"], row["source_id"]): row["feed_id"] for row in catalogue
+    }
+    urls, redirects = collections.defaultdict(set), collections.defaultdict(set)
+    for row in catalogue:
+        if row["feed_id"] and row.get("download_url"):
+            urls[row["feed_id"]].add(row["download_url"])
+        for target in row.get("redirect_targets") or []:
+            other = feed_of_row.get(("mdb", target))
+            if row["feed_id"] and other:
+                redirects[row["feed_id"]].add(other)
+    pairs = []
+    for (a, b), common in sorted(shared.items()):
+        containment = common / min(len(served[a]), len(served[b]))
+        if containment < DUPLICATE_CONTAINMENT:
+            continue
+        linked = b in redirects[a] or a in redirects[b] or bool(urls[a] & urls[b])
+        pairs.append(
+            {
+                "feeds": [a, b],
+                "shared_places": common,
+                "containment": round(containment, 3),
+                "kind": "catalogue_duplicate" if linked else "genuine_overlap",
+            }
+        )
+    return {
+        "pairs": len(pairs),
+        "by_kind": dict(collections.Counter(p["kind"] for p in pairs)),
+        "containment": DUPLICATE_CONTAINMENT,
+        "list": pairs,
+    }
+
+
+def distributions(edges, places):
+    """Tier and relevance-category counts per country and per place kind,
+    and the relevance quantiles per place kind."""
+    by_id = {place["place_id"]: place for place in places}
+    tiers = {"country": collections.defaultdict(collections.Counter)}
+    tiers["kind"] = collections.defaultdict(collections.Counter)
+    categories = {key: collections.defaultdict(collections.Counter) for key in tiers}
+    relevance = {key: collections.defaultdict(list) for key in tiers}
+    for edge in edges:
+        place = by_id.get(edge["place_id"]) or {}
+        keys = {
+            "country": place.get("country_code") or "?",
+            "kind": place.get("kind") or "?",
+        }
+        for axis, key in keys.items():
+            tiers[axis][key][edge["tier"]] += 1
+            if edge.get("relevance_category"):
+                categories[axis][key][edge["relevance_category"]] += 1
+            if edge.get("relevance") is not None:
+                relevance[axis][key].append(edge["relevance"])
+    out = {}
+    for axis in ("country", "kind"):
+        out[f"tiers_by_{axis}"] = {k: dict(t) for k, t in sorted(tiers[axis].items())}
+        out[f"categories_by_{axis}"] = {
+            k: dict(c) for k, c in sorted(categories[axis].items())
+        }
+        out[f"relevance_by_{axis}"] = {
+            k: _quantiles(v) for k, v in sorted(relevance[axis].items())
+        }
+    return out
+
+
+def _cell(value):
+    if isinstance(value, float):
+        return f"{value:.3f}".rstrip("0").rstrip(".")
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return "" if value is None else str(value)
+
+
+def _table(rows, columns):
+    lines = ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
+    for row in rows:
+        lines.append("| " + " | ".join(_cell(row.get(c)) for c in columns) + " |")
+    return lines
+
+
+def render_report(summary):
+    """``report.md`` from the summary: one section per summary section, in
+    the report's order, scalars as a key/value table, nested counts as a
+    table per key, lists of records as a table."""
+    lines = ["# Build statistics", ""]
+    build = summary.get("build") or {}
+    lines.append(
+        f"Snapshot `{build.get('snapshot_id')}` ({build.get('sample')}); "
+        f"schema {build.get('schema_version')}, Overture "
+        f"{build.get('overture_release')}."
+    )
+    for section in REPORT_SECTIONS:
+        content = summary.get(section)
+        if not content:
+            continue
+        lines += ["", f"## {section.replace('_', ' ').capitalize()}", ""]
+        lines += [DEFINITIONS[section], ""]
+        scalars = [
+            {"metric": k, "value": v}
+            for k, v in content.items()
+            if not isinstance(v, (dict, list))
+        ]
+        if scalars:
+            lines += _table(scalars, ["metric", "value"])
+        for key, value in content.items():
+            if isinstance(value, dict) and value:
+                lines += ["", f"### {key.replace('_', ' ')}", ""]
+                if all(isinstance(v, dict) for v in value.values()):
+                    columns = sorted({c for v in value.values() for c in v})
+                    rows = [{"key": k, **v} for k, v in value.items()]
+                    lines += _table(rows, ["key", *columns])
+                else:
+                    rows = [{"key": k, "value": v} for k, v in value.items()]
+                    lines += _table(rows, ["key", "value"])
+            elif isinstance(value, list) and value and isinstance(value[0], dict):
+                lines += ["", f"### {key.replace('_', ' ')}", ""]
+                lines += _table(value, list(value[0]))
+    return "\n".join(lines) + "\n"

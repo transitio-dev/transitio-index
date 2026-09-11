@@ -1,6 +1,7 @@
 """The stats stage: catalogue-level rows and summary sections."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -258,12 +259,19 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
     )
     manifest = stats.stats(cache)
     assert manifest["catalogue_rows"] == 7 and manifest["snapshot_id"] == "abc"
-    assert manifest["sections"] == ["build", "declared_places", "identity"]
+    assert manifest["sections"] == sorted(stats.REPORT_SECTIONS)
+    assert manifest["feeds"] == 0 and manifest["places"] == 0
     generation, _ = store.resolve(cache / "stats", "stats.json")
     with generation:
         table = pq.read_table(pa_source(generation.read_bytes("catalogue.parquet")))
         summary = json.loads(generation.read_bytes("summary.json"))
     assert table.num_rows == 7 and table.schema.names == stats.CATALOGUE_SCHEMA.names
+    generation, _ = store.resolve(cache / "stats", "stats.json")
+    with generation:
+        empty = pq.read_table(pa_source(generation.read_bytes("places.parquet")))
+        report = generation.read_bytes("report.md").decode()
+    assert empty.num_rows == 0 and empty.schema.names == stats.PLACE_SCHEMA.names
+    assert report.startswith("# Build statistics") and "## Identity" in report
     assert summary["build"]["snapshot_id"] == "abc"
     assert summary["build"]["schema_version"] == 7
     assert summary["build"]["catalogue_rows"] == {"mdb": 4, "atlas": 1, "gbfs": 2}
@@ -513,13 +521,17 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
         "p95": 500,
         "max": 500,
     }
-    assert sections["scale"]["countries_served"] == {"2": 1, "1": 4}
+    assert sections["scale"]["countries_served"] == {"2": 1, "1": 4, "0": 1}
+    assert sections["scale"]["places_served"]["count"] == 6
     assert sections["country_agreement"]["by_agreement"] == {
         "agree": 1,
         "disagree": 1,
         "unobserved": 2,
         "undeclared": 2,
     }
+    by_catalogue = sections["country_agreement"]["by_catalogue"]
+    assert by_catalogue["mdb"]["disagreement_share"] == 0.5
+    assert by_catalogue["gbfs"] == {"unobserved": 1, "disagreement_share": None}
     assert sections["declared_municipality"]["outcome"] == {
         "in_place": 1,
         "in_region": 1,
@@ -530,3 +542,102 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
         "municipality": 3,
         "district": 1,
     }
+
+
+def test_place_rows_duplicates_and_distributions():
+    places = list(PLACES.values())
+    service = json.dumps({"stops": 3, "routes": 1, "departures_per_day": 10.0})
+    edges = [
+        {**_edge("hsl", "hel", "local", 0.9), "service": service},
+        {**_edge("hsl", "hel", "regional", 0.9), "service": service},
+        {**_edge("hsl", "uus", "regional", 0.4), "service": service},
+        {**_edge("dup", "hel", "local", 0.8), "service": None},
+        {**_edge("dup", "uus", "regional", 0.3), "service": None},
+        {**_edge("rail", "hel", "national", 0.5), "service": service},
+        {**_edge("rail", "esp", "national", 0.5), "service": service},
+        {**_edge("rail", "tll", "international", 0.1), "service": service},
+        {**_edge("rail", "uus", "national", 0.5), "service": service},
+        {**_edge("rail", "fi", "national", 0.5), "service": service},
+    ]
+    rows = {r["place_id"]: r for r in stats.place_rows(places, edges, "s")}
+    hel = rows["hel"]
+    # Three feeds; the hsl pair counts once per category; departures sum over
+    # the pairs that report them.
+    assert hel["feeds"] == 3 and hel["has_primary"] is True
+    assert json.loads(hel["feeds_by_category"]) == {"primary": 3}
+    assert hel["departures_per_day"] == 20.0 and hel["snapshot_id"] == "s"
+    assert rows["tll"]["has_primary"] is True and rows["esp"]["feeds"] == 1
+    assert rows["fi"]["departures_per_day"] == 10.0
+    # dup covers hsl's places entirely and redirects to it: a catalogue
+    # duplicate; rail overlaps hsl at 2 of 2 places: a genuine overlap.
+    catalogue = [
+        {
+            "source": "mdb",
+            "source_id": "mdb-1",
+            "feed_id": "hsl",
+            "download_url": "u1",
+            "redirect_targets": [],
+        },
+        {
+            "source": "mdb",
+            "source_id": "mdb-2",
+            "feed_id": "dup",
+            "download_url": "u2",
+            "redirect_targets": ["mdb-1"],
+        },
+        {
+            "source": "mdb",
+            "source_id": "mdb-3",
+            "feed_id": "rail",
+            "download_url": "u3",
+            "redirect_targets": [],
+        },
+    ]
+    duplicates = stats.duplicate_coverage(edges, catalogue)
+    assert duplicates["pairs"] == 3
+    assert duplicates["by_kind"] == {"catalogue_duplicate": 1, "genuine_overlap": 2}
+    assert [(p["feeds"], p["kind"], p["containment"]) for p in duplicates["list"]] == [
+        (["dup", "hsl"], "catalogue_duplicate", 1.0),
+        (["dup", "rail"], "genuine_overlap", 1.0),
+        (["hsl", "rail"], "genuine_overlap", 1.0),
+    ]
+    spread = stats.distributions(edges, places)
+    assert spread["tiers_by_country"]["EE"] == {"international": 1}
+    assert spread["categories_by_country"]["EE"] == {"primary": 1}
+    assert spread["relevance_by_country"]["FI"]["count"] == 9
+    assert spread["tiers_by_kind"]["city"] == {
+        "local": 2,
+        "regional": 1,
+        "national": 2,
+        "international": 1,
+    }
+    assert spread["categories_by_kind"]["country"] == {"primary": 1}
+    assert spread["relevance_by_kind"]["region"]["count"] == 3
+    report = stats.render_report(
+        {"build": {"snapshot_id": "s"}, "distributions": spread}
+    )
+    assert "## Distributions" in report and "| EE | 1 |" in report or "| EE |" in report
+
+
+GOLDEN_REPORT = Path(__file__).resolve().parent / "fixtures" / "stats_report.md"
+
+
+def fixture_report(tmp_path):
+    """The fixture build's report with its two build-time values — the
+    snapshot id and the fixture archive's digest, which the tarball's
+    timestamps change — replaced by placeholders."""
+    from test_index_publish import _build_index
+
+    cache, published = _build_index(tmp_path)
+    stats.stats(cache)
+    generation, _ = store.resolve(cache / "stats", "stats.json")
+    with generation:
+        report = generation.read_bytes("report.md").decode()
+    archive = published["sources"]["atlas"]["archive_sha256"]
+    return report.replace(published["snapshot_id"], "<snapshot>").replace(
+        archive, "<archive>"
+    )
+
+
+def test_the_report_of_the_fixture_build_matches_the_golden_file(tmp_path):
+    assert fixture_report(tmp_path) == GOLDEN_REPORT.read_text(encoding="utf-8")
