@@ -22,6 +22,7 @@ loader; ``python scripts/index_viewer.py --cache cache`` runs the app.
 
 import argparse
 import collections
+import datetime
 import hashlib
 import io
 import json
@@ -139,6 +140,29 @@ EDGE_COLUMNS = (
     "service",
 )
 EDGE_FEED_COLUMNS = ("name", "spec", "source", "crawl_status", "stop_count")
+TIERS = ("local", "regional", "national", "international", "unknown")
+# A feed record lists at most this many served places, and an edges reply at
+# most this many rows: Germany's busiest feed serves 23,126 places over
+# 33,668 edges (3.9 MB and 9.4 MB unbounded), which nobody reads as a list.
+FEED_PLACES_LIMIT = 2000
+EDGES_LIMIT = 2000
+FEED_TABLE_COLUMNS = ("feed_id", "name", "spec", "source", "crawl_status", "stop_count")
+# The descriptive columns a feed record carries when the build has them.
+FEED_RECORD_COLUMNS = (
+    "feed_id",
+    "onestop_id",
+    "mdb_id",
+    "name",
+    "spec",
+    "source",
+    "aliases",
+    "crawl_status",
+    "last_crawled",
+    "stop_count",
+    "coverage_source",
+    "redistribution_allowed",
+    "uncrawlable_reason",
+)
 
 
 def _is_regular_file(path):
@@ -222,6 +246,7 @@ class Build:
             else None
         )
         self.table = _place_table(self)
+        self.feed_table = _feed_table(self)
         children = self.places["parent_id"].value_counts()
         self.child_count = (
             self.places["place_id"].map(children).fillna(0).astype(int).to_numpy()
@@ -527,10 +552,14 @@ def _cell(value):
         if value and all(isinstance(item, tuple) and len(item) == 2 for item in value):
             return dict(value)
         return [_cell(item) for item in value]
+    if isinstance(value, np.datetime64):  # before .item(): ns precision gives an int
+        value = pd.Timestamp(value)
     if isinstance(value, np.generic):
         value = value.item()
     if value is pd.NA or value is pd.NaT:  # pandas' own missing scalars
         return None
+    if isinstance(value, (datetime.date, datetime.datetime)):  # incl. pd.Timestamp
+        return value.isoformat()
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
@@ -660,6 +689,112 @@ def tree_nodes(build, root=None, depth=1):
             node["children"] = by_parent.get(node["place_id"], [])
         level = children
     return {"root": root, "depth": depth, "nodes": nodes, "truncated": truncated}
+
+
+def _feed_table(build):
+    """The geometry-free table of a build's feeds, one row per feed, in feed order."""
+    feeds, edges = build.feeds, build.edges
+    table = feeds[[c for c in FEED_TABLE_COLUMNS if c in feeds.columns]].copy()
+    table["has_coverage"] = feeds["coverage"].notna().to_numpy()
+    served = edges.groupby("feed_id")["place_id"].nunique()
+    table["places_served"] = (
+        table["feed_id"].map(served).fillna(0).astype(int).to_numpy()
+    )
+    if "tier" in edges.columns and len(edges):
+        tiers = pd.crosstab(edges["feed_id"], edges["tier"])
+    else:
+        tiers = pd.DataFrame()
+    for tier in TIERS:
+        if tier in tiers.columns:
+            counts = table["feed_id"].map(tiers[tier]).fillna(0).astype(int)
+            table[f"tier_{tier}"] = counts.to_numpy()
+        else:
+            table[f"tier_{tier}"] = 0
+    return table.reset_index(drop=True)
+
+
+def feeds_table(build):
+    """``{"total", "rows"}``: every feed of the build, geometry-free."""
+    return {"total": int(len(build.feed_table)), "rows": _json_ready(build.feed_table)}
+
+
+def _hull_geojson(wkb):
+    if not isinstance(wkb, (bytes, bytearray)):
+        return None
+    try:
+        return shapely.to_geojson(shapely.from_wkb(wkb))
+    except shapely.errors.ShapelyError:
+        return None
+
+
+def feed_record(build, feed_id):
+    """One feed as a GeoJSON Feature in UTF-8 bytes (its hull as geometry), or None.
+
+    The properties carry the feed's descriptive columns present in this build,
+    the counts from the feed table, and the places it serves (one per place,
+    with the tier of its first edge) up to ``FEED_PLACES_LIMIT``.
+    """
+    feeds = build.feeds
+    matches = np.flatnonzero((feeds["feed_id"] == feed_id).to_numpy())
+    if not matches.size:
+        return None
+    row = int(matches[0])
+    feed = feeds.iloc[row]
+    props = {c: _cell(feed[c]) for c in FEED_RECORD_COLUMNS if c in feeds.columns}
+    counts = build.feed_table.iloc[row]
+    props["places_served"] = int(counts["places_served"])
+    props["tiers"] = {tier: int(counts[f"tier_{tier}"]) for tier in TIERS}
+    served = build.edges[(build.edges["feed_id"] == feed_id).to_numpy()].merge(
+        build.table[["place_id", "name", "kind"]], on="place_id", how="left"
+    )
+    # One row per place: a feed with several edges to one place contributes
+    # its first edge in table order, so the total counts places, not edges.
+    served = served.drop_duplicates("place_id")
+    columns = [
+        c
+        for c in ("place_id", "name", "kind", "tier", "tier_confidence")
+        if c in served
+    ]
+    props["places_total"] = int(len(served))
+    props["places_truncated"] = len(served) > FEED_PLACES_LIMIT
+    props["places"] = _json_ready(served[columns].iloc[:FEED_PLACES_LIMIT])
+    geometry = _hull_geojson(feed["coverage"])
+    body = '{"type":"Feature","id":%s,"geometry":%s,"properties":%s}' % (
+        json.dumps(feed_id),
+        geometry if geometry is not None else "null",
+        json.dumps(props, ensure_ascii=False),
+    )
+    return body.encode("utf-8")
+
+
+def edges_of(build, place_id=None, feed_id=None):
+    """``{"total", "truncated", "rows"}``: the edges of one place or one feed.
+
+    Exactly one of the two ids; rows carry the other side's name, and at most
+    ``EDGES_LIMIT`` of them are returned (the total says how many there are).
+    """
+    if (place_id is None) == (feed_id is None):
+        raise ValueError("give exactly one of place_id or feed_id")
+    edges = build.edges
+    column, value = (
+        ("place_id", place_id) if place_id is not None else ("feed_id", feed_id)
+    )
+    positions = np.flatnonzero((edges[column] == value).to_numpy())
+    total = int(positions.size)
+    positions = positions[:EDGES_LIMIT]
+    rows = edges.iloc[positions][
+        [c for c in ("place_id",) + EDGE_COLUMNS if c in edges.columns]
+    ]
+    if build.edge_service is not None:  # the parsed copies, by edge position
+        rows = rows.assign(service=[build.edge_service[i] for i in positions])
+    places = build.table[["place_id", "name", "kind"]].rename(
+        columns={"name": "place_name"}
+    )
+    rows = rows.merge(places, on="place_id", how="left")
+    if "name" in build.feeds.columns:
+        feeds = build.feeds[["feed_id", "name"]].rename(columns={"name": "feed_name"})
+        rows = rows.merge(feeds, on="feed_id", how="left")
+    return {"total": total, "truncated": total > EDGES_LIMIT, "rows": _json_ready(rows)}
 
 
 def _overflow(matched, max_features, **extra):
@@ -868,6 +1003,34 @@ def create_app(cache, size=CACHED_BUILDS):
         if result is None:
             raise HTTPException(404, f"{root}: not a place in {build_id}")
         return JSONResponse(result, headers={"X-Snapshot": build.snapshot_id})
+
+    @app.get("/api/builds/{build_id}/feeds")
+    def feeds(build_id: str):
+        build = opened(build_id)
+        return JSONResponse(
+            feeds_table(build), headers={"X-Snapshot": build.snapshot_id}
+        )
+
+    @app.get("/api/builds/{build_id}/feeds/{feed_id}")
+    def feed(build_id: str, feed_id: str):
+        build = opened(build_id)
+        body = feed_record(build, feed_id)
+        if body is None:
+            raise HTTPException(404, f"{feed_id}: not a feed in {build_id}")
+        return Response(
+            body,
+            media_type="application/geo+json",
+            headers={"X-Snapshot": build.snapshot_id},
+        )
+
+    @app.get("/api/builds/{build_id}/edges")
+    def edges(build_id: str, place_id: str | None = None, feed_id: str | None = None):
+        build = opened(build_id)
+        try:
+            reply = edges_of(build, place_id, feed_id)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return JSONResponse(reply, headers={"X-Snapshot": build.snapshot_id})
 
     return app
 

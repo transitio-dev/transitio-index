@@ -4,6 +4,7 @@ A publish-shaped build is written into a temp cache with real parquet and a
 snapshot whose digests match, then tampered with per case.
 """
 
+import datetime
 import hashlib
 import importlib.util
 import io
@@ -446,6 +447,20 @@ def test_the_api_serves_the_listing_summaries_and_bounded_slices(tmp_path, monke
     assert client.get(f"/api/builds/{iv.LATEST}/tree?depth=x").status_code == 400
     roots = client.get(f"/api/builds/{iv.LATEST}/tree")
     assert roots.headers["x-snapshot"] == summary["snapshot_id"]
+    feeds_reply = client.get(f"/api/builds/{iv.LATEST}/feeds")
+    feeds = feeds_reply.json()
+    assert feeds["total"] == 1 and feeds["rows"][0]["feed_id"] == "f1"
+    feed = client.get(f"/api/builds/{iv.LATEST}/feeds/f1")
+    assert feed.headers["content-type"].startswith("application/geo+json")
+    assert feed.json()["properties"]["places_served"] == 1
+    assert client.get(f"/api/builds/{iv.LATEST}/feeds/nope").status_code == 404
+    edges = client.get(f"/api/builds/{iv.LATEST}/edges", params={"feed_id": "f1"})
+    assert [e["place_name"] for e in edges.json()["rows"]] == ["Helsinki"]
+    for reply in (feeds_reply, feed, edges):  # one snapshot, like every route
+        assert reply.headers["x-snapshot"] == summary["snapshot_id"]
+    assert client.get(f"/api/builds/{iv.LATEST}/edges").status_code == 400
+    both = {"place_id": "hel", "feed_id": "f1"}
+    assert client.get(f"/api/builds/{iv.LATEST}/edges", params=both).status_code == 400
     for bad in ({"kind": "city"}, {"bbox": "1,2,3"}, {"served": "maybe"}):
         assert client.get(base, params=bad).status_code == 400, bad
     monkeypatch.setattr(iv, "MAX_FEATURES", 2)
@@ -661,3 +676,91 @@ def test_the_tree_lists_roots_and_nests_children_by_level(tmp_path):
     assert iv.tree_nodes(build, root="uus")["nodes"] == uusimaa["children"]
     assert iv.tree_nodes(build, root="hel")["nodes"] == []
     assert iv.tree_nodes(build, root="nope") is None
+
+
+def test_feeds_have_a_table_a_record_with_a_hull_and_edges_both_ways(
+    tmp_path, monkeypatch
+):
+    hull = shapely.to_wkb(BOX(24, 60, 26, 61))
+    crawled = datetime.datetime(2026, 9, 10, 12, 0, tzinfo=datetime.timezone.utc)
+    feeds = [  # a timestamp column, as parquet may carry: it must serialize
+        FEEDS[0] | {"coverage": hull, "last_crawled": crawled},
+        {"feed_id": "f2", "name": None, "coverage": None, "last_crawled": None},
+    ]
+    # f1 serves two places over three edges: Helsinki twice (local first).
+    edges = EDGES + [
+        {"place_id": "esp", "feed_id": "f1", "tier": "regional"},
+        {"place_id": "hel", "feed_id": "f1", "tier": "regional"},
+    ]
+    path = write_build(tmp_path, feeds=feeds, edges=edges) and tmp_path
+    build = iv.load_build("b", path)
+    table = iv.feeds_table(build)
+    assert table["total"] == 2
+    assert table["rows"][0] == {
+        "feed_id": "f1",
+        "name": "HSL",
+        "has_coverage": True,
+        "places_served": 2,
+        "tier_local": 1,
+        "tier_regional": 2,
+        "tier_national": 0,
+        "tier_international": 0,
+        "tier_unknown": 0,
+    }
+    assert (
+        table["rows"][1]["places_served"] == 0 and not table["rows"][1]["has_coverage"]
+    )
+    record = json.loads(iv.feed_record(build, "f1"))
+    assert record["id"] == "f1" and record["geometry"]["type"] == "Polygon"
+    props = record["properties"]
+    # One row per place (the first edge in table order), not one per edge.
+    assert props["places"] == [
+        {"place_id": "hel", "name": "Helsinki", "kind": "city", "tier": "local"},
+        {"place_id": "esp", "name": "Espoo", "kind": "city", "tier": "regional"},
+    ]
+    assert props["places_total"] == 2 and not props["places_truncated"]
+    assert props["places_served"] == 2
+    assert props["last_crawled"].startswith("2026-09-10T12:00:00")  # ISO, not a 500
+    assert json.loads(iv.feed_record(build, "f2"))["properties"]["last_crawled"] is None
+    assert props["tiers"] == {  # tiers count edges
+        "local": 1,
+        "regional": 2,
+        "national": 0,
+        "international": 0,
+        "unknown": 0,
+    }
+    assert json.loads(iv.feed_record(build, "f2"))["geometry"] is None
+    assert iv.feed_record(build, "nope") is None
+    by_place = iv.edges_of(build, place_id="hel")
+    assert by_place["total"] == 2 and not by_place["truncated"]
+    assert by_place["rows"][0] == {
+        "place_id": "hel",
+        "feed_id": "f1",
+        "tier": "local",
+        "place_name": "Helsinki",
+        "kind": "city",
+        "feed_name": "HSL",
+    }
+    by_feed = iv.edges_of(build, feed_id="f1")
+    assert [r["place_id"] for r in by_feed["rows"]] == ["hel", "esp", "hel"]
+    assert iv.edges_of(build, feed_id="f2") == {
+        "total": 0,
+        "truncated": False,
+        "rows": [],
+    }
+    for bad in ({}, {"place_id": "hel", "feed_id": "f1"}):
+        with pytest.raises(ValueError, match="exactly one"):
+            iv.edges_of(build, **bad)
+    # Both lists are bounded: the totals stay true, the rows stop at the limit.
+    monkeypatch.setattr(iv, "FEED_PLACES_LIMIT", 1)
+    monkeypatch.setattr(iv, "EDGES_LIMIT", 1)
+    cut = json.loads(iv.feed_record(build, "f1"))["properties"]
+    assert (
+        len(cut["places"]) == 1 and cut["places_total"] == 2 and cut["places_truncated"]
+    )
+    cut_edges = iv.edges_of(build, feed_id="f1")
+    assert (
+        cut_edges["total"] == 3
+        and cut_edges["truncated"]
+        and len(cut_edges["rows"]) == 1
+    )
