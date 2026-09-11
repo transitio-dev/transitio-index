@@ -197,7 +197,7 @@ def test_the_cli_runs_the_stage_between_prune_and_publish():
 
     order = list(build_index.STAGES)
     assert order.index("prune") < order.index("license") < order.index("publish")
-    assert build_index.stages_from("license", True) == ["license", "publish"]
+    assert build_index.stages_from("license", True) == ["license", "publish", "stats"]
 
 
 def test_only_a_licensed_snapshot_is_released(tmp_path):

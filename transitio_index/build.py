@@ -51,6 +51,7 @@ from transitio_index import (  # noqa: E402
     publish,
     rank,
     registry,
+    stats,
     resolve,
     seed,
     store,
@@ -322,6 +323,10 @@ def run_publish(arguments, places):
     ]
 
 
+def run_stats(arguments):
+    return [stats.stats(arguments.cache_dir)]
+
+
 STAGES = {
     "ingest": run_ingest,
     "crosswalk": run_crosswalk,
@@ -336,6 +341,7 @@ STAGES = {
     "prune": run_prune,
     "license": run_license,
     "publish": run_publish,
+    "stats": run_stats,
 }
 
 
