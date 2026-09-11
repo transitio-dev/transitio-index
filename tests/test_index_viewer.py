@@ -1,4 +1,4 @@
-"""Tests for the index viewer's data layer: loading, the build cache and slices.
+"""Tests for the index viewer's data layer: loading, the build cache, slices and the API.
 
 A publish-shaped build is written into a temp cache with real parquet and a
 snapshot whose digests match, then tampered with per case.
@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import threading
 from pathlib import Path
 
 import pyarrow as pa
@@ -368,3 +369,87 @@ def test_generalization_shrinks_a_slice_and_keeps_a_tiny_place(tmp_path):
     # topology-preserving fallback keeps a ring.
     assert features["tiny"]["geometry"]["type"] == "Polygon"
     assert len(features["tiny"]["geometry"]["coordinates"][0]) >= 4
+
+
+def test_the_api_serves_the_listing_summaries_and_bounded_slices(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    write_build(cache / "index")
+    write_build(cache / "builds" / "fi-abc" / "index")
+    _tamper_places(cache / "builds" / "fi-abc" / "index")
+    client = TestClient(iv.create_app(cache))
+    assert [row["id"] for row in client.get("/api/builds").json()] == [
+        iv.LATEST,
+        "fi-abc",
+    ]
+    summary = client.get(f"/api/builds/{iv.LATEST}/summary").json()
+    assert summary["counts"] == {"places": 6} and summary["served_places"] == 1
+    assert summary["built_at"] == "2026-09-11T00:00:00+00:00"
+    assert client.get("/api/builds/fi-abc/summary").status_code == 404  # tampered
+    assert client.get("/api/builds/nope/summary").status_code == 404
+    base = f"/api/builds/{iv.LATEST}/places"
+    overview = client.get(base)
+    assert overview.headers["content-type"].startswith("application/geo+json")
+    assert {f["id"] for f in overview.json()["features"]} == {"fi", "uus", "lap"}
+    cities = client.get(base, params={"kind": "city", "parent_id": "uus"}).json()
+    assert {f["id"] for f in cities["features"]} == {"hel", "esp"}
+    fed = client.get(base, params={"feed_id": "f1", "bbox": "19,59,32,71"}).json()
+    assert [f["id"] for f in fed["features"]] == ["hel"]  # kind defaulted to all
+    clipped = client.get(base, params={"bbox": "24,60,25,60.5"}).json()["features"]
+    assert {f["id"] for f in clipped} == {"fi", "uus"}  # cut to the box
+    assert all(
+        24 <= x <= 25 and 60 <= y <= 60.5
+        for f in clipped
+        for x, y in f["geometry"]["coordinates"][0]
+    )
+    for bad in ({"kind": "city"}, {"bbox": "1,2,3"}, {"served": "maybe"}):
+        assert client.get(base, params=bad).status_code == 400, bad
+    monkeypatch.setattr(iv, "MAX_FEATURES", 2)
+    overflow = client.get(base)  # the answer, not an error: 200 with the record
+    assert overflow.status_code == 200
+    assert overflow.json() == {"overflow": True, "matched": 3, "limit": 2}
+
+
+def test_a_clipped_slice_keeps_only_what_lies_inside_the_box(tmp_path):
+    triangle = shapely.Polygon([(26, 66), (30, 66), (26, 70)])
+    places = PLACES[:1] + [_place("tri", "region", "Triangle", "fi", triangle)]
+    build = iv.load_build("b", write_build(tmp_path, places=places) and tmp_path)
+    box = (29, 69, 30, 70)  # touches the triangle's bounds, not the triangle
+    mask = iv.filter_places(build, bbox=box)
+    assert set(build.places["place_id"][mask]) == {"fi", "tri"}
+    body, _ = iv.places_geojson(build, mask, clip=box)
+    features = json.loads(body)["features"]
+    assert [f["id"] for f in features] == ["fi"]  # nothing of the triangle shows
+    assert set(map(tuple, features[0]["geometry"]["coordinates"][0])) == {
+        (29.0, 69.0),
+        (30.0, 69.0),
+        (30.0, 70.0),
+        (29.0, 70.0),
+    }
+
+
+def test_the_cache_serves_concurrent_requests_without_losing_entries(tmp_path):
+    cache = tmp_path / "cache"
+    write_build(cache / "index")
+    write_build(cache / "builds" / "fi-abc" / "index")
+    builds = iv.BuildCache(cache, size=1)  # every other get evicts the other id
+    failures = []
+
+    def worker(build_id):
+        try:
+            for _ in range(20):
+                assert builds.get(build_id).id == build_id
+        except Exception as error:  # collected: a thread's failure must surface
+            failures.append(error)
+
+    threads = [
+        threading.Thread(target=worker, args=(build_id,))
+        for build_id in (iv.LATEST, "fi-abc") * 4
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert failures == [] and len(builds._builds) == 1

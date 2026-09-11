@@ -16,10 +16,11 @@ with another's edges: a digest that does not match means the build is
 mid-publish, and it is reported unavailable rather than cached. Per-country
 builds are written once and never rewritten; only ``cache/index`` churns.
 
-The bounded map slices, and the web app and page that serve them, build on
-this loader.
+The bounded map slices and the web app that serves them build on this
+loader; ``python scripts/index_viewer.py --cache cache`` runs the app.
 """
 
+import argparse
 import collections
 import hashlib
 import io
@@ -27,6 +28,7 @@ import json
 import math
 import os
 import stat
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -262,6 +264,9 @@ class BuildCache:
         self.size = size
         self.read_bytes = read_bytes
         self._builds = collections.OrderedDict()
+        # The web app's handlers run in worker threads; a get is one
+        # lookup-load-evict transaction, so it holds the lock throughout.
+        self._lock = threading.Lock()
 
     def summaries(self):
         return [
@@ -270,6 +275,10 @@ class BuildCache:
         ]
 
     def get(self, build_id):
+        with self._lock:
+            return self._get(build_id)
+
+    def _get(self, build_id):
         path = discover(self.cache).get(build_id)
         if path is None:
             self._builds.pop(build_id, None)  # gone: never serve the stale copy
@@ -393,21 +402,32 @@ def _overflow(matched, max_features, **extra):
 
 
 def places_geojson(
-    build, mask, tolerance=None, max_features=MAX_FEATURES, max_bytes=MAX_BYTES
+    build,
+    mask,
+    tolerance=None,
+    max_features=MAX_FEATURES,
+    max_bytes=MAX_BYTES,
+    clip=None,
 ):
     """``(body, overflow)`` for the masked places.
 
     ``body`` is the UTF-8 GeoJSON FeatureCollection and ``overflow`` None, or
     ``body`` is None and ``overflow`` the record to send instead. The count is
-    checked before any geometry work; the geometry is simplified over the whole
-    array, serialized in one pass, and the byte budget measured on exactly what
-    would be sent. Properties stay compact; ``service`` is the row's JSON string.
+    checked before any geometry work; with ``clip`` (a bbox) every geometry is
+    cut to the box and a place whose geometry does not reach into it is
+    dropped; the geometry is generalized over the whole array, serialized in
+    one pass, and the byte budget measured on exactly what would be sent.
+    Properties stay compact; ``service`` is the row's JSON string.
     """
     matched = int(np.count_nonzero(mask))
     if matched > max_features:  # decided before anything is materialized
         return None, _overflow(matched, max_features)
     index = np.flatnonzero(mask)
     geoms = build.geoms[index]
+    if clip is not None:
+        geoms = shapely.clip_by_rect(geoms, *clip)
+        visible = ~shapely.is_empty(geoms)
+        index, geoms = index[visible], geoms[visible]
     if tolerance is not None:
         geoms = generalize(geoms, tolerance)
     geometry = shapely.to_geojson(geoms)
@@ -438,3 +458,100 @@ def places_geojson(
             matched, max_features, bytes=len(body), byte_limit=max_bytes
         )
     return body, None
+
+
+def _parse_served(value):
+    """The ``served=`` parameter: ``true``/``false`` (or ``1``/``0``), else None."""
+    if value is None:
+        return None
+    if value in ("true", "1"):
+        return True
+    if value in ("false", "0"):
+        return False
+    raise ValueError("served must be true or false")
+
+
+def create_app(cache, size=CACHED_BUILDS):
+    """The viewer's web app over one build cache.
+
+    FastAPI is imported here, not at module level, so the loader and the
+    slices import and test without the ``viewer`` extra.
+    """
+    from fastapi import FastAPI, HTTPException, Response
+
+    builds = BuildCache(cache, size)
+    app = FastAPI(title="transitio index viewer", docs_url=None, redoc_url=None)
+
+    def opened(build_id):
+        build = builds.get(build_id)
+        if build is None:
+            raise HTTPException(404, f"{build_id}: not an available build")
+        return build
+
+    @app.get("/api/builds")
+    def list_builds():
+        return builds.summaries()
+
+    @app.get("/api/builds/{build_id}/summary")
+    def summary(build_id: str):
+        build = opened(build_id)
+        return {
+            **build.snapshot,
+            "id": build.id,
+            "served_places": int(build.served.sum()),
+        }
+
+    @app.get("/api/builds/{build_id}/places")
+    def places(
+        build_id: str,
+        kind: str | None = None,
+        parent_id: str | None = None,
+        bbox: str | None = None,
+        served: str | None = None,
+        q: str | None = None,
+        feed_id: str | None = None,
+        zoom: float | None = None,
+    ):
+        build = opened(build_id)
+        try:
+            # A feed's served places are mostly cities: with ``feed_id`` and
+            # no ``kind`` the slice covers every kind.
+            kinds = None if kind is None and feed_id is not None else parse_kinds(kind)
+            box = parse_bbox(bbox) if bbox is not None else None
+            mask = filter_places(
+                build,
+                kinds=kinds,
+                parent_id=parent_id,
+                bbox=box,
+                served=_parse_served(served),
+                q=q,
+                feed_id=feed_id,
+            )
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        body, overflow = places_geojson(
+            build, mask, tolerance_for_zoom(zoom), MAX_FEATURES, MAX_BYTES, clip=box
+        )
+        if overflow is not None:
+            return overflow
+        return Response(body, media_type="application/geo+json")
+
+    return app
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Serve a built index for inspection in the browser."
+    )
+    parser.add_argument("--cache", default="cache", help="the build cache directory")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args(argv)
+    import uvicorn
+
+    print(f"index viewer at http://{args.host}:{args.port}/ over {args.cache}")
+    uvicorn.run(create_app(args.cache), host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
