@@ -508,7 +508,7 @@ class BoundaryLookup:
         def scan():
             opened.append(open_dataset())
             return opened[0].to_batches(
-                columns=AREA_COLUMNS, filter=predicate, **geometry.SCAN_OPTIONS
+                columns=AREA_COLUMNS, filter=predicate, **geometry.scan_options()
             )
 
         polygons = {}
@@ -545,7 +545,9 @@ class BoundaryLookup:
             def scan():
                 opened.append(open_dataset())
                 return opened[0].to_batches(
-                    columns=overture.PROJECT, filter=predicate, **geometry.SCAN_OPTIONS
+                    columns=overture.PROJECT,
+                    filter=predicate,
+                    **geometry.scan_options(),
                 )
 
             found = {}

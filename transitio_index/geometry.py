@@ -46,7 +46,7 @@ AREA_CHUNK = int(os.environ.get("TRANSITIO_AREA_CHUNK", "0") or "0")
 AREA_READ_DEADLINE = float(os.environ.get("TRANSITIO_AREA_DEADLINE", "600") or "600")
 AREA_READ_ATTEMPTS = 3
 # IO workers added to pyarrow's pool before each retry: an abandoned attempt
-# keeps the ones it is blocked on (SCAN_OPTIONS lets it hold about two).
+# keeps the ones it is blocked on (PROXY_SCAN_OPTIONS lets it hold about two).
 RETRY_IO_THREADS = 2
 
 # Explicit allowlist of AUDITED geometry sources, keyed by ``(dataset, licence)``
@@ -314,10 +314,22 @@ class AreaReadStalled(overture.GazetteerError):
     """An S3 area scan yielded nothing for the deadline: a hung connection."""
 
 
-# One fragment in flight and no batch readahead for every scan over S3: a
+# One fragment in flight and no batch readahead for a scan through a proxy: a
 # proxied read survives on a couple of connections where eight concurrent ones
 # get dropped and the SDK then waits on them forever.
-SCAN_OPTIONS = {"use_threads": False, "batch_readahead": 0, "fragment_readahead": 1}
+PROXY_SCAN_OPTIONS = {
+    "use_threads": False,
+    "batch_readahead": 0,
+    "fragment_readahead": 1,
+}
+
+
+def scan_options():
+    """The ``to_batches`` options for a scan over S3: the conservative set
+    behind a proxy, pyarrow's threaded, read-ahead defaults on a direct
+    connection, which the conservative set would throttle to a few rows a
+    second."""
+    return dict(PROXY_SCAN_OPTIONS) if overture.proxy_url() else {}
 
 
 def _scan(dataset, ids, countries=None):
@@ -330,7 +342,7 @@ def _scan(dataset, ids, countries=None):
     if countries:
         country = ds.field("country")
         predicate = predicate & (country.isin(sorted(countries)) | country.is_null())
-    return dataset.to_batches(columns=AREA_PROJECT, filter=predicate, **SCAN_OPTIONS)
+    return dataset.to_batches(columns=AREA_PROJECT, filter=predicate, **scan_options())
 
 
 def retrying(open_dataset, reopen, attempt):

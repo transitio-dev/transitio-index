@@ -556,3 +556,17 @@ def test_the_metros_read_warms_the_area_cache_for_every_seeded_division(tmp_path
         countries={"FI"},
     )
     assert set(later) == {"region"} and scans["n"] == 1  # served from the warmed cache
+
+
+@pytest.mark.parametrize("proxied", [True, False], ids=["proxy", "direct"])
+def test_the_conservative_scan_settings_apply_only_behind_a_proxy(monkeypatch, proxied):
+    """The single-connection scan settings kept a proxied read alive but were
+    applied to every S3 scan, throttling a direct connection to a few rows a
+    second; they now follow the proxy the environment names."""
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    if proxied:
+        monkeypatch.setenv("https_proxy", "http://127.0.0.1:3128")
+    expected = geometry.PROXY_SCAN_OPTIONS if proxied else {}
+    assert geometry.scan_options() == expected
+    assert (overture.proxy_url() is not None) is proxied
