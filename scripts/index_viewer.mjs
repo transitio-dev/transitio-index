@@ -253,6 +253,46 @@ export function detailsHtml(record) {
   );
 }
 
+// --- the hierarchy tree: one node per place, expanded lazily
+
+export const KIND_RANK = { country: 0, region: 1, city: 2 };
+
+export function kindRank(kind) {
+  return KIND_RANK[kind] ?? Object.keys(KIND_RANK).length;
+}
+
+// A node's list item: a caret only where there are children (its <ul> is
+// filled when expanded, or already when the node arrived with children), the
+// name as the button that selects the place, and the counts that are not
+// zero — children below it, feeds serving it — as a hint.
+export function treeNodeHtml(node, selectedId) {
+  const id = escapeHtml(node.place_id);
+  const expanded = Array.isArray(node.children);
+  const caret = node.child_count
+    ? `<button type="button" class="caret" data-id="${id}" aria-expanded="${expanded}">${expanded ? "▾" : "▸"}</button>`
+    : '<span class="caret leaf"></span>';
+  const counts = [
+    node.child_count ? `${escapeHtml(node.child_count)} children` : null,
+    node.feed_count ? `${escapeHtml(node.feed_count)} feed${node.feed_count === 1 ? "" : "s"}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const count = counts ? ` <small class="counts">${counts}</small>` : "";
+  const selected = node.place_id === selectedId ? ' aria-selected="true"' : "";
+  const children = expanded ? node.children.map((c) => treeNodeHtml(c, selectedId)).join("") : "";
+  return (
+    `<li data-id="${id}"${selected}>${caret}` +
+    `<button type="button" class="node${node.served ? "" : " unserved"}" data-id="${id}">` +
+    `${escapeHtml(node.name)}</button><small class="kind">${escapeHtml(node.kind)}</small>${count}` +
+    `<ul${expanded ? "" : " hidden"}>${children}</ul></li>`
+  );
+}
+
+// The ids to expand, root first, ending with the place itself.
+export function revealPath(record) {
+  return [...record.properties.ancestors.map((a) => a.place_id), record.properties.place_id];
+}
+
 const OSM_STYLE = {
   version: 8,
   sources: {
@@ -303,6 +343,11 @@ async function main() {
   const tablePrev = document.getElementById("places-prev");
   const tableNext = document.getElementById("places-next");
   const PLACEHOLDER = details.innerHTML;
+  const treeRoot = document.getElementById("tree-root");
+  const treeSection = document.getElementById("tree");
+  let selectedId = null; // the selected place, marked in the tree
+  let selectedRecord = null; // `{ record, mine }`: revealed once the tree has loaded
+  let pendingScroll = null; // the tree item to scroll to when the Tree tab is next shown
   const builds = await fetchJson("/api/builds");
   for (const row of builds) {
     const option = document.createElement("option");
@@ -422,6 +467,10 @@ async function main() {
     tableHead.innerHTML = tableBody.innerHTML = "";
     tableCount.textContent = "";
     tablePrev.disabled = tableNext.disabled = true;
+    selectedId = null;
+    treeRoot.innerHTML = "";
+    selectedRecord = null;
+    pendingScroll = null;
     let summary;
     try {
       summary = await fetchJson(`/api/builds/${encodeURIComponent(id)}/summary`);
@@ -436,6 +485,7 @@ async function main() {
     snapshot = summary.snapshot_id;
     stats.textContent = summaryLabel(summary);
     loadTable().catch(console.error);
+    loadTree().catch(console.error);
     await refresh(id, gen, true);
   }
 
@@ -470,6 +520,11 @@ async function main() {
     for (const button of panel.querySelectorAll("nav button")) {
       button.classList.toggle("active", button.dataset.tab === name);
     }
+    if (name === "tree" && pendingScroll) {
+      // A hidden section has no layout to scroll: the reveal left this for now.
+      pendingScroll.scrollIntoView({ block: "nearest" });
+      pendingScroll = null;
+    }
   };
 
   // One selection at a time: a later click supersedes an earlier one still
@@ -496,7 +551,10 @@ async function main() {
       return;
     }
     const record = reply.data;
+    selectedId = record.properties.place_id;
+    selectedRecord = { record, mine }; // with the sequence it was accepted under
     details.innerHTML = detailsHtml(record);
+    revealInTree(record, mine).catch(console.error);
     if (fromPopup && popup === fromPopup && popup.isOpen()) popup.setHTML(detailsHtml(record));
     showTab("details");
     map.getSource("selected").setData(record);
@@ -576,6 +634,115 @@ async function main() {
   for (const button of panel.querySelectorAll("nav button")) {
     button.addEventListener("click", () => showTab(button.dataset.tab));
   }
+
+  // --- the Tree tab: roots with their first level, deeper levels on demand
+  const treeUrl = (build, root) =>
+    `/api/builds/${encodeURIComponent(build)}/tree?` +
+    new URLSearchParams(root ? { root } : { depth: "2" });
+
+  async function loadTree() {
+    const build = current;
+    const gen = generation;
+    let reply;
+    try {
+      reply = await fetchSlice(treeUrl(build, null));
+    } catch (error) {
+      if (gen === generation) showHint(String(error));
+      return;
+    }
+    if (gen !== generation) return;
+    if (reply.snapshot !== snapshot) {
+      startLoad(build); // ``latest`` was republished: one snapshot for all
+      return;
+    }
+    treeRoot.innerHTML = reply.data.nodes.map((n) => treeNodeHtml(n, selectedId)).join("");
+    // A place selected before the roots arrived is revealed now — only if
+    // that selection is still the current one.
+    if (selectedRecord && selectedRecord.mine === selectionSequence) {
+      revealInTree(selectedRecord.record, selectedRecord.mine).catch(console.error);
+    }
+  }
+
+  // Fills a node's <ul> once and shows it. Concurrent callers share one
+  // fetch (keyed by generation, snapshot and node, so a build change never
+  // reuses an old request); every caller checks ``wanted`` after the await
+  // and before filling or opening, so a superseded reveal fills and opens
+  // nothing; a list filled meanwhile is never re-rendered, so a marked or
+  // pending node inside it stays attached.
+  const expanding = new Map(); // `${generation}/${snapshot}/${id}` -> the pending fetch
+  async function expandNode(item, wanted = () => true) {
+    const list = item.querySelector(":scope > ul");
+    const caret = item.querySelector(":scope > .caret");
+    if (!caret) return list;
+    if (!list.children.length) {
+      const build = current;
+      const gen = generation;
+      const key = `${gen}/${snapshot}/${item.dataset.id}`;
+      if (!expanding.has(key)) {
+        const fetching = fetchSlice(treeUrl(build, item.dataset.id)).finally(() => {
+          if (expanding.get(key) === fetching) expanding.delete(key);
+        });
+        expanding.set(key, fetching);
+      }
+      const reply = await expanding.get(key);
+      if (gen !== generation || !wanted()) return list;
+      if (reply.snapshot !== snapshot) {
+        startLoad(build);
+        return list;
+      }
+      if (!list.children.length) {
+        list.innerHTML = reply.data.nodes.map((n) => treeNodeHtml(n, selectedId)).join("");
+      }
+    } else if (!wanted()) {
+      return list;
+    }
+    caret.setAttribute("aria-expanded", "true");
+    caret.textContent = "▾";
+    list.hidden = false;
+    return list;
+  }
+
+  function collapseNode(item) {
+    item.querySelector(":scope > ul").hidden = true;
+    const caret = item.querySelector(":scope > .caret");
+    caret.setAttribute("aria-expanded", "false");
+    caret.textContent = "▸";
+  }
+
+  // Expands the selection's ancestors in order, marks its node and scrolls to
+  // it — at once when the Tree tab is visible, else when it is next shown.
+  // Guarded by the selection sequence, so a slower reveal of an earlier
+  // selection never touches a newer one; a place selected before the roots
+  // loaded is revealed by loadTree afterwards.
+  async function revealInTree(record, mine) {
+    const gen = generation;
+    const wanted = () => gen === generation && mine === selectionSequence;
+    let item = null;
+    for (const id of revealPath(record)) {
+      const next = treeRoot.querySelector(`li[data-id="${CSS.escape(id)}"]`);
+      if (!next) break;
+      item = next;
+      if (id !== record.properties.place_id) await expandNode(item, wanted);
+      if (!wanted()) return;
+    }
+    if (!item || item.dataset.id !== record.properties.place_id) return; // not loaded yet
+    for (const marked of treeRoot.querySelectorAll("[aria-selected]")) marked.removeAttribute("aria-selected");
+    item.setAttribute("aria-selected", "true");
+    if (treeSection.hidden) pendingScroll = item;
+    else item.scrollIntoView({ block: "nearest" });
+  }
+
+  treeRoot.addEventListener("click", (event) => {
+    const caret = event.target.closest("button.caret");
+    if (caret) {
+      const item = caret.closest("li");
+      if (caret.getAttribute("aria-expanded") === "true") collapseNode(item);
+      else expandNode(item).catch((error) => showHint(String(error)));
+      return;
+    }
+    const node = event.target.closest("button.node");
+    if (node) selectPlace(node.dataset.id, { zoom: true }).catch(console.error);
+  });
 
   map.on("load", () => {
     map.addSource("places", { type: "geojson", data: EMPTY });

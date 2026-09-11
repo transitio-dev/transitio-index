@@ -440,6 +440,12 @@ def test_the_api_serves_the_listing_summaries_and_bounded_slices(tmp_path, monke
         "uus",
     ]
     assert client.get(f"/api/builds/{iv.LATEST}/places/nope").status_code == 404
+    tree = client.get(f"/api/builds/{iv.LATEST}/tree", params={"depth": 2}).json()
+    assert [c["place_id"] for c in tree["nodes"][0]["children"]] == ["lap", "uus"]
+    assert client.get(f"/api/builds/{iv.LATEST}/tree?root=nope").status_code == 404
+    assert client.get(f"/api/builds/{iv.LATEST}/tree?depth=x").status_code == 400
+    roots = client.get(f"/api/builds/{iv.LATEST}/tree")
+    assert roots.headers["x-snapshot"] == summary["snapshot_id"]
     for bad in ({"kind": "city"}, {"bbox": "1,2,3"}, {"served": "maybe"}):
         assert client.get(base, params=bad).status_code == 400, bad
     monkeypatch.setattr(iv, "MAX_FEATURES", 2)
@@ -631,3 +637,27 @@ def test_non_finite_service_numbers_never_reach_the_json(tmp_path):
     broken = tmp_path / "broken"
     write_build(broken, edges=[EDGES[0] | {"service": "{not json"}])
     assert iv.load_build("b", broken) is None
+
+
+def test_the_tree_lists_roots_and_nests_children_by_level(tmp_path):
+    # A region whose parent is not in the build is a root too.
+    orphan = _place("orphan", "region", "Orphan", "gone", BOX(0, 0, 1, 1))
+    build = iv.load_build(
+        "b", write_build(tmp_path, places=PLACES + [orphan]) and tmp_path
+    )
+    roots = iv.tree_nodes(build)
+    assert [n["place_id"] for n in roots["nodes"]] == ["fi", "orphan"]  # kind rank
+    assert roots["nodes"][0]["child_count"] == 2 and "children" not in roots["nodes"][0]
+    assert roots["depth"] == 1 and not roots["truncated"]
+    nested = iv.tree_nodes(build, depth=9)  # clamped to three levels
+    finland = nested["nodes"][0]
+    assert nested["depth"] == 3
+    assert [c["place_id"] for c in finland["children"]] == ["lap", "uus"]
+    uusimaa = finland["children"][1]
+    assert [(c["place_id"], c["served"]) for c in uusimaa["children"]] == [
+        ("esp", False),
+        ("hel", True),
+    ]
+    assert iv.tree_nodes(build, root="uus")["nodes"] == uusimaa["children"]
+    assert iv.tree_nodes(build, root="hel")["nodes"] == []
+    assert iv.tree_nodes(build, root="nope") is None

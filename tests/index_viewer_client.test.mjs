@@ -8,6 +8,7 @@ import {
   crumbs,
   detailsHtml,
   headerHtml,
+  kindRank,
   buildLabel,
   collectionBounds,
   overflowText,
@@ -15,11 +16,13 @@ import {
   paddedBounds,
   placesUrl,
   popupHtml,
+  revealPath,
   rowHtml,
   sliceParams,
   summaryLabel,
   tableState,
   tableUrl,
+  treeNodeHtml,
 } from "../scripts/index_viewer.mjs";
 
 const bounds = { west: 19.123456, south: 59, east: 32, north: 71 };
@@ -180,4 +183,35 @@ test("the details render the chain, feeds and external ids, escaped", () => {
   const escaped = detailsHtml(hostile);
   assert.match(escaped, /&lt;img&gt; children \(&lt;i&gt; &lt;b&gt;\), &lt;u&gt; served/);
   assert.doesNotMatch(escaped, /<img>|<b>|<i>|<u>/);
+});
+
+test("tree nodes render a caret only with children, nest arrived children and mark the selection", () => {
+  const leaf = { place_id: "hel", name: "Hel<sinki", kind: "city", served: true, feed_count: 1, child_count: 0 };
+  const html = treeNodeHtml(leaf, "hel");
+  assert.match(html, /^<li data-id="hel" aria-selected="true"><span class="caret leaf"><\/span>/);
+  assert.match(html, /class="node" data-id="hel">Hel&lt;sinki<\/button><small class="kind">city<\/small> <small class="counts">1 feed<\/small><ul hidden><\/ul><\/li>$/);
+  const region = { place_id: "uus", name: "Uusimaa", kind: "region", served: false, feed_count: 0, child_count: 2 };
+  assert.match(treeNodeHtml(region, null), /<button type="button" class="caret" data-id="uus" aria-expanded="false">▸<\/button>/);
+  assert.match(treeNodeHtml(region, null), /class="node unserved"/);
+  assert.match(treeNodeHtml(region, null), /<small class="counts">2 children<\/small>/);
+  assert.match(treeNodeHtml({ ...region, feed_count: 3 }, null), /<small class="counts">2 children · 3 feeds<\/small>/);
+  assert.doesNotMatch(treeNodeHtml({ ...leaf, feed_count: 0 }, null), /counts/); // nothing to count
+  const nested = treeNodeHtml({ ...region, children: [leaf] }, "x");
+  assert.match(nested, /aria-expanded="true">▾<\/button>/);
+  assert.match(nested, /<ul><li data-id="hel">/);
+  assert.deepEqual([kindRank("country"), kindRank("region"), kindRank("city"), kindRank("odd")], [0, 1, 2, 3]);
+});
+
+test("the reveal path runs from the root to the place itself", () => {
+  const record = {
+    properties: {
+      place_id: "hel",
+      ancestors: [
+        { place_id: "fi", name: "Finland", kind: "country" },
+        { place_id: "uus", name: "Uusimaa", kind: "region" },
+      ],
+    },
+  };
+  assert.deepEqual(revealPath(record), ["fi", "uus", "hel"]);
+  assert.deepEqual(revealPath({ properties: { place_id: "fi", ancestors: [] } }), ["fi"]);
 });

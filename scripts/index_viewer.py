@@ -97,6 +97,8 @@ ZOOM_TOLERANCES = ((6, 0.02), (9, 0.005))
 PROPERTY_COLUMNS = ("place_id", "name", "kind", "parent_id", "country_code", "service")
 _HERE = Path(__file__).resolve().parent  # the page and its module live here
 TABLE_LIMIT = 200  # rows per page of the places table, at most
+TREE_LIMIT = 2000  # nodes per tree level, at most
+KIND_RANK = {"country": 0, "region": 1, "city": 2}  # the tree's order
 SERVICE_STATS = ("stops", "routes", "departures_per_day")
 TABLE_SORT_COLUMNS = (
     "place_id",
@@ -220,6 +222,10 @@ class Build:
             else None
         )
         self.table = _place_table(self)
+        children = self.places["parent_id"].value_counts()
+        self.child_count = (
+            self.places["place_id"].map(children).fillna(0).astype(int).to_numpy()
+        )
 
 
 def load_build(build_id, path, read_bytes=_read_file):
@@ -613,6 +619,49 @@ def place_record(build, place_id):
     return body.encode("utf-8")
 
 
+def _tree_level(build, mask):
+    """The nodes for the masked places, kind rank then name, cut at TREE_LIMIT."""
+    columns = ["place_id", "name", "kind", "parent_id", "served", "feed_count"]
+    frame = build.table.loc[mask, columns].copy()
+    frame["child_count"] = build.child_count[mask]
+    frame["rank"] = frame["kind"].map(KIND_RANK).fillna(len(KIND_RANK))
+    frame = frame.sort_values(["rank", "name"], kind="stable").drop(columns="rank")
+    return _json_ready(frame.iloc[:TREE_LIMIT]), len(frame) > TREE_LIMIT
+
+
+def tree_nodes(build, root=None, depth=1):
+    """``{"root", "depth", "nodes", "truncated"}``: the roots, or ``root``'s children.
+
+    A root is a place whose parent is null or not in the build. With ``depth``
+    above 1 (clamped to 3) each node carries its ``children`` one level down;
+    every level is one ``isin`` mask over the parent column, nested in Python
+    over the few hundred nodes. None when ``root`` is not a place.
+    """
+    depth = max(1, min(int(depth), 3))
+    parents = build.places["parent_id"]
+    if root is None:
+        mask = (parents.isna() | ~parents.isin(build._row_of.index)).to_numpy()
+    elif root in build._row_of.index:
+        mask = (parents == root).to_numpy()
+    else:
+        return None
+    nodes, truncated = _tree_level(build, mask)
+    level = nodes
+    for _ in range(depth - 1):
+        ids = [node["place_id"] for node in level if node["child_count"]]
+        if not ids:
+            break
+        children, cut = _tree_level(build, parents.isin(ids).to_numpy())
+        truncated = truncated or cut
+        by_parent = {}
+        for child in children:
+            by_parent.setdefault(child["parent_id"], []).append(child)
+        for node in level:
+            node["children"] = by_parent.get(node["place_id"], [])
+        level = children
+    return {"root": root, "depth": depth, "nodes": nodes, "truncated": truncated}
+
+
 def _overflow(matched, max_features, **extra):
     return {"overflow": True, "matched": matched, "limit": max_features, **extra}
 
@@ -807,6 +856,18 @@ def create_app(cache, size=CACHED_BUILDS):
             media_type="application/geo+json",
             headers={"X-Snapshot": build.snapshot_id},
         )
+
+    @app.get("/api/builds/{build_id}/tree")
+    def tree(build_id: str, root: str | None = None, depth: str = "1"):
+        build = opened(build_id)
+        try:
+            levels = int(depth)
+        except ValueError as error:
+            raise HTTPException(400, "depth must be an integer") from error
+        result = tree_nodes(build, root, levels)
+        if result is None:
+            raise HTTPException(404, f"{root}: not a place in {build_id}")
+        return JSONResponse(result, headers={"X-Snapshot": build.snapshot_id})
 
     return app
 

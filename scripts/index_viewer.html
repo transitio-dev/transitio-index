@@ -33,6 +33,13 @@
   #places-table tbody tr:hover { background: #eef2ff; }
   .table-wrap { overflow: auto; }
   .pager { display: flex; gap: 0.5rem; align-items: center; justify-content: flex-end; margin-top: 0.4rem; }
+  .tree, .tree ul { list-style: none; margin: 0; padding-left: 1rem; }
+  .tree li { line-height: 1.6; }
+  .tree li[aria-selected] > .node { background: #dbeafe; border-radius: 0.2rem; }
+  .tree .caret { width: 1.2rem; border: none; background: none; cursor: pointer; color: #555; display: inline-block; }
+  .tree .node { border: none; background: none; font: inherit; cursor: pointer; padding: 0 0.2rem; }
+  .tree .node.unserved { color: #777; }
+  .tree .kind { color: #888; margin-left: 0.3rem; }
   .maplibregl-popup-content { font: 13px/1.4 system-ui, sans-serif; }
   .maplibregl-popup-content ul { margin: 0.3rem 0 0; padding-left: 1.1rem; }
 </style>
@@ -49,6 +56,7 @@
     <nav>
       <button type="button" data-tab="details" class="active">Details</button>
       <button type="button" data-tab="places">Places</button>
+      <button type="button" data-tab="tree">Tree</button>
     </nav>
     <section id="details" class="tab"><p class="muted">Click a place on the map, or a row under Places.</p></section>
     <section id="places" class="tab" hidden>
@@ -60,6 +68,7 @@
       <div class="table-wrap"><table id="places-table"><thead><tr></tr></thead><tbody></tbody></table></div>
       <div class="pager"><button type="button" id="places-prev">‹</button><span id="places-count"></span><button type="button" id="places-next">›</button></div>
     </section>
+    <section id="tree" class="tab" hidden><ul id="tree-root" class="tree"></ul></section>
   </aside>
 </div>
 <script type="module" src="/static/index_viewer.mjs"></script>
