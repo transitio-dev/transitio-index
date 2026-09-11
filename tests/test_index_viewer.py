@@ -1,4 +1,4 @@
-"""Tests for the index viewer's data layer: verified build loading.
+"""Tests for the index viewer's data layer: verified loading and the build cache.
 
 A publish-shaped build is written into a temp cache with real parquet and a
 snapshot whose digests match, then tampered with per case.
@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pyarrow as pa
@@ -180,11 +181,12 @@ def test_a_build_loads_only_when_every_file_verifies(tmp_path, tamper, loads):
         assert build.feed_count[list(build.places["place_id"]).index("hel")] == 1
 
 
-def test_a_file_swapped_between_reads_is_refused(tmp_path):
+def test_a_file_swapped_between_reads_is_refused_and_not_cached(tmp_path):
     # The snapshot describes generation A; a republish lands generation B's
     # places before that file is read. Hashing the bytes that are parsed makes
-    # the swap a mismatch, so nothing mixed is ever returned.
-    write_build(tmp_path / "index")
+    # the swap a mismatch, so nothing mixed is cached.
+    cache = tmp_path / "cache"
+    write_build(cache / "index")
     other = tmp_path / "other"
     write_build(other, places=PLACES[:2])
 
@@ -194,4 +196,68 @@ def test_a_file_swapped_between_reads_is_refused(tmp_path):
             return (other / "places.parquet").read_bytes()
         return path.read_bytes()
 
-    assert iv.load_build("b", tmp_path / "index", read_bytes=swapped) is None
+    builds = iv.BuildCache(cache, read_bytes=swapped)
+    assert builds.get(iv.LATEST) is None
+    assert builds._builds == {}
+
+
+def _symlink(target, link):
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+def test_discovery_reserves_latest_and_skips_what_is_not_a_real_build(
+    tmp_path, request
+):
+    cache = tmp_path / "cache"
+    write_build(cache / "index")
+    write_build(cache / "builds" / "fi-abc" / "index")
+    write_build(cache / "builds" / "latest" / "index", places=PLACES[:2])
+    (cache / "builds" / "half").mkdir(parents=True)  # no index: not a build
+    # Snapshots that are not a JSON object, or do not parse at all: listed as
+    # incomplete, never opened.
+    for name, snapshot in (("null", "null"), ("deep", DEEP_JSON)):
+        (cache / "builds" / name / "index").mkdir(parents=True)
+        (cache / "builds" / name / "index" / "snapshot.json").write_text(snapshot)
+    write_build(tmp_path / "outside" / "index")  # a build outside the cache
+    linked = _symlink(tmp_path / "outside", cache / "builds" / "link")
+    locked = cache / "builds" / "locked"  # cannot be inspected: not a build
+    locked.mkdir()
+    if getattr(os, "geteuid", lambda: 1)() != 0:
+        locked.chmod(0)
+        request.addfinalizer(lambda: locked.chmod(0o700))
+    found = iv.discover(cache)
+    assert found[iv.LATEST] == cache / "index"  # the reserved name: cache/index wins
+    assert list(found) == [iv.LATEST, "deep", "fi-abc", "null"]  # no latest child/link
+    builds = iv.BuildCache(cache)
+    rows = {row["id"]: row for row in builds.summaries()}
+    assert rows["fi-abc"]["complete"]
+    assert not rows["null"]["complete"] and not rows["deep"]["complete"]
+    assert builds.get("null") is None and builds.get("deep") is None
+    assert builds._builds == {}  # nothing unavailable is cached
+    if linked:
+        # A symlinked file is refused too, not just a symlinked directory.
+        real = cache / "builds" / "fi-abc" / "index" / "NOTICE"
+        real.rename(cache / "elsewhere")
+        assert _symlink(cache / "elsewhere", real)
+        assert iv.load_build("fi-abc", real.parent) is None
+        assert not iv.describe("fi-abc", real.parent)["complete"]
+
+
+def test_the_cache_reloads_on_digest_change_and_evicts_a_vanished_build(tmp_path):
+    cache = tmp_path / "cache"
+    write_build(cache / "index")
+    write_build(cache / "builds" / "fi-abc" / "index")
+    builds = iv.BuildCache(cache)
+    country = builds.get("fi-abc")
+    assert builds.get("fi-abc") is country  # unchanged: served from the cache
+    first = builds.get(iv.LATEST)
+    write_build(cache / "index", places=PLACES[:3])  # a republish
+    second = builds.get(iv.LATEST)
+    assert second is not first and len(second.places) == 3
+    shutil.rmtree(cache / "builds" / "fi-abc")  # the build vanishes
+    assert builds.get("fi-abc") is None and "fi-abc" not in builds._builds
+    assert builds.get("nope") is None

@@ -20,6 +20,7 @@ The bounded map slices, and the web app and page that serve them, build on
 this loader.
 """
 
+import collections
 import hashlib
 import io
 import json
@@ -76,6 +77,14 @@ _OPEN_FLAGS = (
     | getattr(os, "O_NONBLOCK", 0)
     | getattr(os, "O_BINARY", 0)
 )
+
+
+def _is_regular_file(path):
+    """A regular file that is not a symlink; False if it cannot be inspected."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 def _read_file(path):
@@ -162,3 +171,112 @@ def load_build(build_id, path, read_bytes=_read_file):
         return Build(build_id, path, snapshot, digests, tables)
     except _BUILD_ERRORS:
         return None
+
+
+def _is_build_dir(index, root):
+    """A real directory inside ``root`` holding a regular ``snapshot.json``.
+
+    Neither the directory nor the snapshot may be a symlink, and the directory
+    must *resolve* under the resolved cache root, so a link anywhere in the
+    path cannot point discovery outside the cache. An entry that cannot be
+    inspected (unreadable, or gone mid-scan) is not a build.
+    """
+    try:
+        return (
+            index.is_dir()
+            and not index.is_symlink()
+            and _is_regular_file(index / "snapshot.json")
+            and index.resolve().is_relative_to(root)
+        )
+    except OSError:
+        return False
+
+
+def discover(cache):
+    """``{build_id: index directory}`` for every build under ``cache``."""
+    cache = Path(cache)
+    root = cache.resolve()
+    found = {}
+    if _is_build_dir(cache / "index", root):
+        found[LATEST] = cache / "index"
+    builds = cache / "builds"
+    try:
+        entries = sorted(builds.iterdir()) if not builds.is_symlink() else []
+    except OSError:  # no builds/ directory, or it went away mid-scan
+        entries = []
+    for entry in entries:
+        # ``latest`` is reserved for cache/index, and a symlinked entry
+        # could redirect discovery outside the cache.
+        if entry.name == LATEST or entry.is_symlink():
+            continue
+        if _is_build_dir(entry / "index", root):
+            found[entry.name] = entry / "index"
+    return found
+
+
+def describe(build_id, path, read_bytes=_read_file):
+    """A build's listing row from its snapshot alone: cheap, no hashing.
+
+    ``complete`` says the snapshot records every digest and every file is a
+    regular, unlinked file; full verification happens when the build is opened.
+    """
+    row = {"id": build_id, "path": str(path), "complete": False}
+    try:
+        snapshot = json.loads(read_bytes(Path(path) / "snapshot.json"))
+    except _SNAPSHOT_ERRORS:
+        return row
+    if not isinstance(snapshot, dict):
+        return row
+    row["built_at"] = snapshot.get("built_at")
+    row["counts"] = snapshot.get("counts")
+    row["complete"] = snapshot_digests(snapshot) is not None and all(
+        _is_regular_file(Path(path) / name) for name in INDEX_FILES
+    )
+    return row
+
+
+class BuildCache:
+    """Verified builds by id, reloaded exactly when a snapshot's digests change.
+
+    ``get`` re-reads the small ``snapshot.json`` on every call and compares its
+    digests with the cached build's: the churning ``cache/index`` is reloaded
+    when it changes, a per-country build is hashed once. The most recent
+    ``size`` builds are kept.
+    """
+
+    def __init__(self, cache, size=CACHED_BUILDS, read_bytes=_read_file):
+        self.cache = Path(cache)
+        self.size = size
+        self.read_bytes = read_bytes
+        self._builds = collections.OrderedDict()
+
+    def summaries(self):
+        return [
+            describe(build_id, path, self.read_bytes)
+            for build_id, path in discover(self.cache).items()
+        ]
+
+    def get(self, build_id):
+        path = discover(self.cache).get(build_id)
+        if path is None:
+            self._builds.pop(build_id, None)  # gone: never serve the stale copy
+            return None
+        try:
+            current = snapshot_digests(
+                json.loads(self.read_bytes(path / "snapshot.json"))
+            )
+        except _SNAPSHOT_ERRORS:
+            current = None
+        cached = self._builds.get(build_id)
+        if cached is not None and current is not None and cached.digests == current:
+            self._builds.move_to_end(build_id)
+            return cached
+        build = load_build(build_id, path, self.read_bytes) if current else None
+        if build is None:
+            self._builds.pop(build_id, None)
+            return None
+        self._builds[build_id] = build
+        self._builds.move_to_end(build_id)
+        while len(self._builds) > self.size:
+            self._builds.popitem(last=False)
+        return build
