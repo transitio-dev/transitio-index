@@ -634,7 +634,8 @@ def resolve_seed(
     when no locality carries the name, to a skeleton region or county, placed at
     level ``district`` — (its subdivision to a region, or its country to a
     country, when no finer level is declared), and emits that place with its
-    administrative ancestors; unmatched feeds go to ``seed_report.jsonl``. With a ``registry`` session every place
+    administrative ancestors; unmatched feeds go to ``seed_report.jsonl``. With a
+    ``registry`` session every place
     also gets its registry id (``tp_id``) and ``wikidata_id``. Returns the
     generation manifest.
     """
