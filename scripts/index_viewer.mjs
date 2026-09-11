@@ -2,6 +2,7 @@
 // unit tests; the DOM and map wiring at the bottom runs only in a browser.
 
 const VIEWPORT_ZOOM = 7; // from here the slice follows the viewport
+export const CITY_ZOOM = 9; // from here the slice includes cities
 const KIND_COLORS = { country: "#6b7280", region: "#2563eb", city: "#f59e0b" };
 
 export function placesUrl(build, params = {}) {
@@ -41,6 +42,7 @@ export function paddedBounds(bounds, factor = 0.5) {
 export function sliceParams(zoom, bounds) {
   const params = { zoom };
   if (zoom >= VIEWPORT_ZOOM) params.bbox = bboxParam(paddedBounds(bounds));
+  if (zoom >= CITY_ZOOM) params.kind = "all";
   return params;
 }
 
@@ -120,6 +122,137 @@ export function overflowText(record) {
   return `${record.matched} places match${size}; zoom in to load at most ${record.limit}.`;
 }
 
+// --- the places explorer: the table's state and the details renderer ---
+
+export const TABLE_PAGE = 50;
+export const INITIAL_TABLE = { query: "", kind: "", served: "", sort: "name", order: "asc", offset: 0 };
+
+// One reducer for the Places tab: every change that narrows or reorders the
+// table goes back to the first page; sorting the sorted column flips it.
+export function tableState(state, action) {
+  switch (action.type) {
+    case "search":
+      return { ...state, query: action.query, offset: 0 };
+    case "filter":
+      return { ...state, [action.field]: action.value, offset: 0 };
+    case "sort":
+      if (state.sort === action.sort) {
+        return { ...state, order: state.order === "asc" ? "desc" : "asc", offset: 0 };
+      }
+      return { ...state, sort: action.sort, order: "asc", offset: 0 };
+    case "page":
+      return { ...state, offset: Math.max(0, state.offset + action.delta * TABLE_PAGE) };
+    default:
+      return state;
+  }
+}
+
+export function tableUrl(build, state) {
+  const params = new URLSearchParams({
+    sort: state.sort,
+    order: state.order,
+    offset: String(state.offset),
+    limit: String(TABLE_PAGE),
+  });
+  if (state.query) params.set("q", state.query);
+  if (state.kind) params.set("kind", state.kind);
+  if (state.served) params.set("served", state.served);
+  return `/api/builds/${encodeURIComponent(build)}/places/table?${params}`;
+}
+
+const DASH = "—";
+
+export function formatStat(value) {
+  if (value === null || value === undefined) return DASH;
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+export const TABLE_COLUMNS = [
+  ["name", "Name"],
+  ["kind", "Kind"],
+  ["parent_name", "Parent"],
+  ["country_code", "Country"],
+  ["served", "Served"],
+  ["feed_count", "Feeds"],
+  ["stops", "Stops"],
+  ["routes", "Routes"],
+  ["departures_per_day", "Departures/day"],
+];
+
+export function rowHtml(row) {
+  const cells = TABLE_COLUMNS.map(([column]) => {
+    const value = row[column];
+    if (column === "served") return value ? "yes" : "no";
+    return typeof value === "number" ? formatStat(value) : escapeHtml(value ?? DASH);
+  });
+  return `<tr data-id="${escapeHtml(row.place_id)}">${cells.map((c) => `<td>${c}</td>`).join("")}</tr>`;
+}
+
+export function headerHtml(state) {
+  return TABLE_COLUMNS.map(([column, label]) => {
+    const marker = state.sort === column ? (state.order === "asc" ? " ▲" : " ▼") : "";
+    return `<th data-sort="${column}">${label}${marker}</th>`;
+  }).join("");
+}
+
+// The place itself after its ancestors: the chain the details panel shows.
+export function crumbs(record) {
+  const p = record.properties;
+  return [...p.ancestors, { place_id: p.place_id, name: p.name, kind: p.kind }];
+}
+
+const EXTERNAL_IDS = [
+  ["wikidata_id", "Wikidata", (id) => `https://www.wikidata.org/wiki/${encodeURIComponent(id)}`],
+  ["osm_relation_id", "OSM relation", (id) => `https://www.openstreetmap.org/relation/${encodeURIComponent(id)}`],
+  ["geonames_id", "GeoNames", (id) => `https://www.geonames.org/${encodeURIComponent(id)}`],
+  ["overture_id", "Overture", null],
+];
+
+export function detailsHtml(record) {
+  const p = record.properties;
+  const chain = crumbs(record)
+    .map((c, i, all) =>
+      i === all.length - 1
+        ? `<strong>${escapeHtml(c.name)}</strong>`
+        : `<button type="button" class="crumb" data-id="${escapeHtml(c.place_id)}">${escapeHtml(c.name)}</button>`,
+    )
+    .join(" › ");
+  const served = p.served ? `served by ${p.feed_count} feed${p.feed_count === 1 ? "" : "s"}` : "not served";
+  const stats = Object.entries(p.service || {})
+    .map(([key, value]) => `<li>${escapeHtml(key)}: ${escapeHtml(formatStat(value))}</li>`)
+    .join("");
+  const children = p.children && p.children.count
+    ? `<p>${escapeHtml(p.children.count)} children (${Object.entries(p.children.by_kind || {})
+        .map(([kind, n]) => `${escapeHtml(n)} ${escapeHtml(kind)}`)
+        .join(", ")}), ${escapeHtml(p.children.served)} served</p>`
+    : "";
+  const feeds = (p.edges || [])
+    .map(
+      (e) =>
+        `<tr><td>${escapeHtml(e.feed_name ?? e.feed_id)}</td><td>${escapeHtml(e.tier ?? DASH)}</td>` +
+        `<td>${e.tier_confidence == null ? DASH : e.tier_confidence.toFixed(2)}</td>` +
+        `<td>${escapeHtml(e.method ?? DASH)}</td></tr>`,
+    )
+    .join("");
+  const ids = EXTERNAL_IDS.filter(([key]) => p[key])
+    .map(([key, label, link]) =>
+      link
+        ? `<li>${label}: <a href="${link(p[key])}" target="_blank" rel="noopener">${escapeHtml(p[key])}</a></li>`
+        : `<li>${label}: ${escapeHtml(p[key])}</li>`,
+    )
+    .join("");
+  return (
+    `<p class="chain">${chain}</p>` +
+    `<p><small>${escapeHtml(p.kind)} · ${escapeHtml(p.place_id)}</small> · ${escapeHtml(served)}</p>` +
+    (stats ? `<ul class="stats">${stats}</ul>` : "") +
+    children +
+    (feeds
+      ? `<table class="feeds"><thead><tr><th>Feed</th><th>Tier</th><th>Conf.</th><th>Method</th></tr></thead><tbody>${feeds}</tbody></table>`
+      : "") +
+    (ids ? `<ul class="ids">${ids}</ul>` : "")
+  );
+}
+
 const OSM_STYLE = {
   version: 8,
   sources: {
@@ -159,6 +292,17 @@ async function main() {
   const select = document.getElementById("build");
   const stats = document.getElementById("stats");
   const hint = document.getElementById("hint");
+  const panel = document.getElementById("panel");
+  const details = document.getElementById("details");
+  const tableHead = document.querySelector("#places-table thead tr");
+  const tableBody = document.querySelector("#places-table tbody");
+  const tableSearch = document.getElementById("places-search");
+  const tableKind = document.getElementById("places-kind");
+  const tableServed = document.getElementById("places-served");
+  const tableCount = document.getElementById("places-count");
+  const tablePrev = document.getElementById("places-prev");
+  const tableNext = document.getElementById("places-next");
+  const PLACEHOLDER = details.innerHTML;
   const builds = await fetchJson("/api/builds");
   for (const row of builds) {
     const option = document.createElement("option");
@@ -180,12 +324,18 @@ async function main() {
   let generation = 0; // bumped on every build change
   let sequence = 0; // bumped on every slice request
   let fitting = false; // a build change is fitting the map: moveend waits for its own fit
+  let loadSelection = 0; // the selection sequence when the current build load began
 
   const boundsOf = () => {
     const b = map.getBounds();
     return { west: b.getWest(), south: b.getSouth(), east: b.getEast(), north: b.getNorth() };
   };
-  const clear = () => map.getSource("places").setData(EMPTY);
+  // A slice that overflows or fails clears only the places layer; the
+  // selection outlines go with a build change or another selection.
+  const clearPlaces = () => map.getSource("places").setData(EMPTY);
+  const clear = () => {
+    for (const name of ["places", "selected", "ancestors"]) map.getSource(name).setData(EMPTY);
+  };
   const showHint = (text) => {
     hint.textContent = text;
     hint.hidden = false;
@@ -193,7 +343,7 @@ async function main() {
   // A failure of a request that is still current clears the screen and shows
   // the error where the overflow hint goes; a superseded one says nothing.
   const fail = (error) => {
-    clear();
+    clearPlaces();
     stats.textContent = "";
     showHint(String(error));
   };
@@ -222,13 +372,20 @@ async function main() {
     }
     const data = slice.data;
     if (data.overflow) {
-      clear();
+      clearPlaces();
       showHint(overflowText(data));
       fitting = false;
       return;
     }
     hint.hidden = true;
     map.getSource("places").setData(data);
+    if (fit && selectionSequence !== loadSelection) {
+      // A selection made while the overview loaded has moved the map already:
+      // its zoom wins, and the viewport slice follows right away.
+      fitting = false;
+      refresh(build, gen, false).catch(console.error);
+      return;
+    }
     const extent = fit && collectionBounds(data);
     if (extent) {
       // The fit's own moveend requests the first viewport slice; until then
@@ -252,6 +409,19 @@ async function main() {
     clear();
     stats.textContent = "";
     hint.hidden = true;
+    // The panel forgets the old build at once: nothing of it stays clickable
+    // while the new summary loads, and selections or pages still in flight
+    // are dropped when they land.
+    loadSelection = ++selectionSequence;
+    tableSequence++;
+    recordCache.clear();
+    dropPopup();
+    details.innerHTML = PLACEHOLDER;
+    table = { ...INITIAL_TABLE };
+    tableSearch.value = tableKind.value = tableServed.value = "";
+    tableHead.innerHTML = tableBody.innerHTML = "";
+    tableCount.textContent = "";
+    tablePrev.disabled = tableNext.disabled = true;
     let summary;
     try {
       summary = await fetchJson(`/api/builds/${encodeURIComponent(id)}/summary`);
@@ -265,6 +435,7 @@ async function main() {
     if (gen !== generation) return;
     snapshot = summary.snapshot_id;
     stats.textContent = summaryLabel(summary);
+    loadTable().catch(console.error);
     await refresh(id, gen, true);
   }
 
@@ -272,10 +443,153 @@ async function main() {
     loadBuild(id, ++generation).catch(console.error);
   }
 
+  // --- selection: one record per click, outlined, with its ancestors dashed
+  // Records are cached per build *and* snapshot, as `{ data, snapshot }`, so
+  // a republished `latest` can never serve a record from the old snapshot.
+  const recordCache = new Map();
+  let selectionSequence = 0; // bumped on every selection and build change
+  let popup = null; // the map popup of the last click, if any
+  const fetchRecord = (build, id) => {
+    const key = `${build}/${snapshot}/${id}`;
+    if (!recordCache.has(key)) {
+      const url = `/api/builds/${encodeURIComponent(build)}/places/${encodeURIComponent(id)}`;
+      const pending = fetchSlice(url).catch((error) => {
+        if (recordCache.get(key) === pending) recordCache.delete(key); // retry later
+        throw error;
+      });
+      recordCache.set(key, pending);
+    }
+    return recordCache.get(key);
+  };
+  const dropPopup = () => {
+    if (popup) popup.remove();
+    popup = null;
+  };
+  const showTab = (name) => {
+    for (const tab of panel.querySelectorAll(".tab")) tab.hidden = tab.id !== name;
+    for (const button of panel.querySelectorAll("nav button")) {
+      button.classList.toggle("active", button.dataset.tab === name);
+    }
+  };
+
+  // One selection at a time: a later click supersedes an earlier one still
+  // loading, and a record from another snapshot restarts the build load. A
+  // popup belongs to the map click that opened it: it is filled only while
+  // that selection is current, and any other selection removes it.
+  async function selectPlace(id, { zoom, fromPopup = null }) {
+    const build = current;
+    const gen = generation;
+    const mine = ++selectionSequence;
+    const wanted = () => gen === generation && mine === selectionSequence;
+    if (fromPopup) popup = fromPopup;
+    else dropPopup();
+    let reply;
+    try {
+      reply = await fetchRecord(build, id);
+    } catch (error) {
+      if (wanted()) showHint(String(error));
+      return;
+    }
+    if (!wanted()) return;
+    if (reply.snapshot !== snapshot) {
+      startLoad(build);
+      return;
+    }
+    const record = reply.data;
+    details.innerHTML = detailsHtml(record);
+    if (fromPopup && popup === fromPopup && popup.isOpen()) popup.setHTML(detailsHtml(record));
+    showTab("details");
+    map.getSource("selected").setData(record);
+    map.getSource("ancestors").setData(EMPTY); // the old chain goes with the old selection
+    const box = record.properties.bbox;
+    if (zoom && Array.isArray(box) && box.length === 4 && box.every(Number.isFinite)) {
+      map.fitBounds(box, { padding: 40, maxZoom: 12 });
+    }
+    const replies = await Promise.all(
+      record.properties.ancestors.map((a) => fetchRecord(build, a.place_id).catch(() => null)),
+    );
+    if (!wanted()) return;
+    if (replies.some((r) => r && r.snapshot !== snapshot)) {
+      startLoad(build); // an ancestor from another snapshot: start over
+      return;
+    }
+    const features = replies.filter(Boolean).map((r) => r.data);
+    map.getSource("ancestors").setData({ type: "FeatureCollection", features });
+  }
+
+  // --- the Places tab: the whole build, paged and sorted by the server
+  let table = { ...INITIAL_TABLE };
+  let tableSequence = 0;
+
+  async function loadTable() {
+    if (!current) return;
+    const build = current;
+    const gen = generation;
+    const mine = ++tableSequence;
+    tableHead.innerHTML = headerHtml(table);
+    let page;
+    try {
+      page = await fetchSlice(tableUrl(build, table));
+    } catch (error) {
+      if (gen === generation && mine === tableSequence) showHint(String(error));
+      return;
+    }
+    if (gen !== generation || mine !== tableSequence) return;
+    if (page.snapshot !== snapshot) {
+      startLoad(build); // ``latest`` was republished: one snapshot for all
+      return;
+    }
+    page = page.data;
+    tableBody.innerHTML = page.rows.map(rowHtml).join("");
+    const last = page.offset + page.rows.length;
+    tableCount.textContent = `${page.total ? page.offset + 1 : 0}–${last} of ${page.total}`;
+    tablePrev.disabled = page.offset === 0;
+    tableNext.disabled = last >= page.total;
+  }
+  const dispatch = (action) => {
+    table = tableState(table, action);
+    loadTable().catch(console.error);
+  };
+  let searchTimer = null;
+  tableSearch.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => dispatch({ type: "search", query: tableSearch.value.trim() }), 250);
+  });
+  tableKind.addEventListener("change", () => dispatch({ type: "filter", field: "kind", value: tableKind.value }));
+  tableServed.addEventListener("change", () =>
+    dispatch({ type: "filter", field: "served", value: tableServed.value }),
+  );
+  tableHead.addEventListener("click", (event) => {
+    const header = event.target.closest("th[data-sort]");
+    if (header) dispatch({ type: "sort", sort: header.dataset.sort });
+  });
+  tablePrev.addEventListener("click", () => dispatch({ type: "page", delta: -1 }));
+  tableNext.addEventListener("click", () => dispatch({ type: "page", delta: 1 }));
+  tableBody.addEventListener("click", (event) => {
+    const row = event.target.closest("tr[data-id]");
+    if (row) selectPlace(row.dataset.id, { zoom: true }).catch(console.error);
+  });
+  details.addEventListener("click", (event) => {
+    const crumb = event.target.closest(".crumb");
+    if (crumb) selectPlace(crumb.dataset.id, { zoom: true }).catch(console.error);
+  });
+  for (const button of panel.querySelectorAll("nav button")) {
+    button.addEventListener("click", () => showTab(button.dataset.tab));
+  }
+
   map.on("load", () => {
     map.addSource("places", { type: "geojson", data: EMPTY });
     map.addLayer({ id: "places-fill", type: "fill", source: "places", paint: FILL_PAINT });
     map.addLayer({ id: "places-line", type: "line", source: "places", paint: LINE_PAINT });
+    map.addSource("ancestors", { type: "geojson", data: EMPTY });
+    map.addLayer({
+      id: "ancestors-line",
+      type: "line",
+      source: "ancestors",
+      paint: { "line-color": "#111", "line-width": 1.5, "line-dasharray": [2, 2] },
+    });
+    map.addSource("selected", { type: "geojson", data: EMPTY });
+    map.addLayer({ id: "selected-line", type: "line", source: "selected", paint: { "line-color": "#111", "line-width": 2.5 } });
     map.on("mousemove", "places-fill", (event) => {
       map.getCanvas().title = event.features[0].properties.name;
     });
@@ -283,10 +597,14 @@ async function main() {
       map.getCanvas().title = "";
     });
     map.on("click", "places-fill", (event) => {
-      new maplibregl.Popup()
+      // The slice's summary at once; the full details replace it when the
+      // record arrives (the same request the panel uses).
+      dropPopup();
+      const opened = new maplibregl.Popup()
         .setLngLat(event.lngLat)
         .setHTML(popupHtml(event.features[0].properties))
         .addTo(map);
+      selectPlace(event.features[0].id, { zoom: false, fromPopup: opened }).catch(console.error);
     });
     map.on("moveend", () => {
       if (current && !fitting) refresh(current, generation, false).catch(console.error);

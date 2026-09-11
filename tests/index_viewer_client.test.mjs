@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  INITIAL_TABLE,
   bboxParam,
+  crumbs,
+  detailsHtml,
+  headerHtml,
   buildLabel,
   collectionBounds,
   overflowText,
@@ -11,8 +15,11 @@ import {
   paddedBounds,
   placesUrl,
   popupHtml,
+  rowHtml,
   sliceParams,
   summaryLabel,
+  tableState,
+  tableUrl,
 } from "../scripts/index_viewer.mjs";
 
 const bounds = { west: 19.123456, south: 59, east: 32, north: 71 };
@@ -92,4 +99,85 @@ test("the overflow hint names the count and, when known, the size", () => {
     overflowText({ matched: 800, limit: 3000, bytes: 9 * 1048576 }),
     "800 places match (9.0 MB); zoom in to load at most 3000.",
   );
+});
+
+test("from zoom 9 the viewport slice asks for every kind", () => {
+  assert.equal(sliceParams(8, bounds).kind, undefined);
+  assert.equal(sliceParams(9, bounds).kind, "all");
+});
+
+test("the table state resets its page when narrowed and flips a re-sorted column", () => {
+  let state = tableState(INITIAL_TABLE, { type: "page", delta: 2 });
+  assert.equal(state.offset, 100);
+  state = tableState(state, { type: "search", query: "mad" });
+  assert.deepEqual([state.query, state.offset], ["mad", 0]);
+  state = tableState(tableState(state, { type: "page", delta: 1 }), { type: "sort", sort: "stops" });
+  assert.deepEqual([state.sort, state.order, state.offset], ["stops", "asc", 0]);
+  state = tableState(state, { type: "sort", sort: "stops" });
+  assert.equal(state.order, "desc");
+  assert.equal(tableState(state, { type: "page", delta: -3 }).offset, 0);
+  state = tableState(state, { type: "filter", field: "kind", value: "city" });
+  assert.equal(
+    tableUrl("es full", state),
+    "/api/builds/es%20full/places/table?sort=stops&order=desc&offset=0&limit=50&q=mad&kind=city",
+  );
+});
+
+test("table rows and headers render stats, dashes and the sort marker", () => {
+  const html = rowHtml({
+    place_id: "x<y",
+    name: "A & B",
+    kind: "city",
+    parent_name: null,
+    country_code: "FI",
+    served: true,
+    feed_count: 2,
+    stops: 10,
+    routes: null,
+    departures_per_day: 12.34,
+  });
+  assert.match(html, /^<tr data-id="x&lt;y">/);
+  assert.match(html, /<td>A &amp; B<\/td><td>city<\/td><td>—<\/td><td>FI<\/td><td>yes<\/td><td>2<\/td><td>10<\/td><td>—<\/td><td>12.3<\/td>/);
+  assert.match(headerHtml({ sort: "stops", order: "desc" }), /<th data-sort="stops">Stops ▼<\/th>/);
+  assert.match(headerHtml({ sort: "stops", order: "desc" }), /<th data-sort="name">Name<\/th>/);
+});
+
+test("the details render the chain, feeds and external ids, escaped", () => {
+  const record = {
+    properties: {
+      place_id: "hel",
+      name: "Hel<b>sinki",
+      kind: "city",
+      served: true,
+      feed_count: 1,
+      service: { stops: 649, departures_per_day: 41936.01 },
+      ancestors: [
+        { place_id: "fi", name: "Finland", kind: "country" },
+        { place_id: "uus", name: "Uusimaa", kind: "region" },
+      ],
+      children: { count: 0, by_kind: {}, served: 0 },
+      edges: [{ feed_id: "f1", feed_name: "HSL", tier: "local", tier_confidence: 0.85, method: "crawl" }],
+      wikidata_id: "Q1757",
+      osm_relation_id: null,
+    },
+  };
+  assert.deepEqual(crumbs(record).map((c) => c.place_id), ["fi", "uus", "hel"]);
+  const html = detailsHtml(record);
+  assert.match(html, /<button type="button" class="crumb" data-id="fi">Finland<\/button> › <button[^>]*data-id="uus">Uusimaa<\/button> › <strong>Hel&lt;b&gt;sinki<\/strong>/);
+  assert.match(html, /served by 1 feed</);
+  assert.match(html, /<li>stops: 649<\/li><li>departures_per_day: 41936.0<\/li>/);
+  assert.match(html, /<td>HSL<\/td><td>local<\/td><td>0.85<\/td><td>crawl<\/td>/);
+  assert.match(html, /href="https:\/\/www.wikidata.org\/wiki\/Q1757"/);
+  assert.doesNotMatch(html, /OSM relation/);
+  assert.doesNotMatch(html, /children/);
+  // Every value of a hostile record is escaped, the counts included.
+  const hostile = {
+    properties: {
+      ...record.properties,
+      children: { count: "<img>", by_kind: { "<b>": "<i>" }, served: "<u>" },
+    },
+  };
+  const escaped = detailsHtml(hostile);
+  assert.match(escaped, /&lt;img&gt; children \(&lt;i&gt; &lt;b&gt;\), &lt;u&gt; served/);
+  assert.doesNotMatch(escaped, /<img>|<b>|<i>|<u>/);
 });
