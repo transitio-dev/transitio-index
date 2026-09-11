@@ -33,15 +33,18 @@ def _feed_names(feeds):
 
 
 def _feeds_by_place(edges, feed_names):
-    """``{place_id: [{feed_id, name, tiers}]}`` from the membership edges.
+    """``{place_id: [{feed_id, name, tiers, categories}]}`` from the
+    membership edges.
 
-    A (place, feed) pair may have several tier edges, so its tiers are gathered
-    into one entry; feeds are sorted by id for a stable layer.
+    A (place, feed) pair may have several tier edges, so its tiers and their
+    relevance categories are gathered into one entry; feeds are sorted by id
+    for a stable layer.
     """
-    tiers = {}
+    tiers, categories = {}, {}
     for edge in edges:
         key = (edge["place_id"], edge["feed_id"])
         tiers.setdefault(key, set()).add(edge.get("tier"))
+        categories.setdefault(key, set()).add(edge.get("relevance_category"))
     by_place = {}
     for (place_id, feed_id), feed_tiers in tiers.items():
         by_place.setdefault(place_id, []).append(
@@ -49,6 +52,9 @@ def _feeds_by_place(edges, feed_names):
                 "feed_id": feed_id,
                 "name": feed_names.get(feed_id, feed_id),
                 "tiers": sorted(tier for tier in feed_tiers if tier is not None),
+                "categories": sorted(
+                    c for c in categories[(place_id, feed_id)] if c is not None
+                ),
             }
         )
     for feeds in by_place.values():

@@ -27,6 +27,15 @@ from transitio.exceptions import IncompatibleIndexError  # noqa: E402
 from transitio.exceptions import PlaceNotFoundError  # noqa: E402
 
 
+# The feeds columns schema 7 added; an older shape is recreated by dropping them.
+_SCHEMA_7_FEED_COLUMNS = (
+    "home_country",
+    "country_shares",
+    "scope",
+    "declared_countries",
+)
+
+
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
 def addressing(request, monkeypatch, tmp_path):
     if request.param == "paths":
@@ -406,7 +415,8 @@ def test_the_reader_still_reads_a_schema_4_index(tmp_path):
 
     cache, _ = _build_index(tmp_path)
     index_dir = cache / "index"
-    feeds = pandas.read_parquet(index_dir / "feeds.parquet").drop(columns=["files"])
+    feeds = pandas.read_parquet(index_dir / "feeds.parquet")
+    feeds = feeds.drop(columns=["files", *_SCHEMA_7_FEED_COLUMNS])
     feeds.to_parquet(index_dir / "feeds.parquet", index=False)
     snapshot = json.loads((index_dir / "snapshot.json").read_text())
     snapshot["schema_version"] = 4
@@ -910,14 +920,13 @@ def test_crawl_evidence_and_provenance_round_trip(tmp_path):
         "files": manifest_files,
     }
     cache, manifest = _edges_index(tmp_path, [_edge("Q1757", "f-a")], feeds=[crawled])
-    assert manifest["schema_version"] == 6
+    assert manifest["schema_version"] == publish.SCHEMA_VERSION
     assert (
         manifest["discovery_semantics_version"]
         == transitio_index.DISCOVERY_SEMANTICS_VERSION
     )
-    assert (
-        manifest["min_reader_version"]
-        == transitio_index.MIN_READER_VERSIONS[publish.SCHEMA_VERSION]
+    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
+        publish.SCHEMA_VERSION, publish.MIN_READER_VERSION
     )
     assert manifest["built_with"] == transitio.__version__
     index = transitio_index.read_index(cache / "index")
@@ -1188,14 +1197,22 @@ def test_a_table_declaring_more_than_the_reader_loads_is_refused(tmp_path, monke
 
 
 def _restamp(index_dir, version, places):
-    """Rewrite the places table and stamp the manifest to ``version``."""
+    """Rewrite the places table and stamp the manifest to ``version``; a
+    version before 7 also loses the feeds columns schema 7 added."""
+    import pandas
+
     places.to_parquet(index_dir / "places.parquet", index=False)
     snapshot = json.loads((index_dir / "snapshot.json").read_text())
     snapshot["schema_version"] = version
     snapshot["min_reader_version"] = transitio_index.MIN_READER_VERSIONS[version]
-    snapshot["places_sha256"] = hashlib.sha256(
-        (index_dir / "places.parquet").read_bytes()
-    ).hexdigest()
+    if version < 7:
+        feeds = pandas.read_parquet(index_dir / "feeds.parquet")
+        dropped = [c for c in _SCHEMA_7_FEED_COLUMNS if c in feeds.columns]
+        feeds.drop(columns=dropped).to_parquet(index_dir / "feeds.parquet", index=False)
+    for table in ("places", "feeds"):
+        snapshot[f"{table}_sha256"] = hashlib.sha256(
+            (index_dir / f"{table}.parquet").read_bytes()
+        ).hexdigest()
     (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
 
 
@@ -1249,7 +1266,7 @@ def test_the_publisher_writes_the_identity_beside_every_place(tmp_path):
     # identity: schema 6 with the QID beside the id and nothing merged.
     cache, _ = _build_index(tmp_path, places=PLACES)
     index = transitio_index.read_index(cache / "index")
-    assert index.schema_version == 6
+    assert index.schema_version == publish.SCHEMA_VERSION
     place = transitio_index.place("Q1757", index=index)
     assert place.wikidata_id == "Q1757" and place.former_ids == []
     assert place.concordances == {"wikidata": ["Q1757"]}
@@ -1340,7 +1357,7 @@ def test_a_registry_backed_index_reads_back_its_identity(tmp_path):
         run_digest=hashlib.sha256(path.read_bytes()).hexdigest(),
     )
     index = transitio_index.read_index(cache / "index")
-    assert index.schema_version == 6
+    assert index.schema_version == publish.SCHEMA_VERSION
     helsinki = transitio_index.place("tp_1", index=index)
     assert helsinki.wikidata_id == "Q1757" and helsinki.former_ids == ["tp_3"]
     assert helsinki.concordances == {
@@ -1403,3 +1420,30 @@ def test_a_place_without_a_qid_publishes_and_reads_back(tmp_path):
     tampere = transitio_index.place("Tampere", index=index)
     assert tampere.id == "tp_1" and tampere.wikidata_id is None
     assert tampere.concordances == {"overture": ["fi-tre"]} and tampere.former_ids == []
+
+
+def test_schema_7_ships_the_country_and_relevance_columns(tmp_path):
+    import pyarrow.parquet as pq
+
+    # Classify decides the country fields: a declared-only feed with an MDB
+    # country keeps that claim and no home.
+    feed = {**_covered_feed("f-a"), "mdb": {"location": {"country_code": "fi"}}}
+    edge = {
+        **_edge("Q1757", "f-a", tier="local"),
+        "relevance_category": "primary",
+        "relevance": 0.75,
+        "cross_border": False,
+    }
+    cache, manifest = _edges_index(tmp_path, [edge], feeds=[feed])
+    assert manifest["schema_version"] == 7 == publish.SCHEMA_VERSION
+    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
+        7, publish.MIN_READER_VERSION
+    )
+    feeds = pq.read_table(cache / "index" / "feeds.parquet").to_pylist()
+    (row,) = [r for r in feeds if r["feed_id"] == "f-a"]
+    assert row["home_country"] is None and row["scope"] == "declared"
+    assert json.loads(row["country_shares"]) == {}
+    assert row["declared_countries"] == ["FI"]
+    (edge_row,) = pq.read_table(cache / "index" / "edges.parquet").to_pylist()
+    assert edge_row["relevance_category"] == "primary"
+    assert edge_row["relevance"] == 0.75 and edge_row["cross_border"] is False

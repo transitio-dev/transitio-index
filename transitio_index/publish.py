@@ -33,7 +33,10 @@ from transitio_index import overture
 from transitio_index import registry as _registry
 from transitio_index import store
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+# The reader release that first reads this schema; the installed reader's own
+# floor table wins once it knows the version.
+MIN_READER_VERSION = "0.12.0"
 # The edge generations that carry curation (curate, and rank on top of it).
 FINAL_SOURCES = ("curate", "rank")
 FEEDS_FILE = "feeds.parquet"
@@ -80,6 +83,13 @@ _SCHEMA = pa.schema(
         # Whether the feed's licence permits redistributing derived data;
         # null when unknown. Set by the license stage.
         ("redistribution_allowed", pa.bool_()),
+        # The feed's home country from its stops, its stop shares per country
+        # (a JSON object), its scope and the catalogues' claimed countries
+        # (schema_version 7). Set by the classify stage.
+        ("home_country", pa.string()),
+        ("country_shares", pa.string()),
+        ("scope", pa.string()),
+        ("declared_countries", pa.list_(pa.string())),
         ("snapshot", pa.string()),
     ]
 )
@@ -119,6 +129,10 @@ def _row(record, snapshot_id):
         "crawl_status": record.get("crawl_status"),
         "files": record.get("files") or [],
         "redistribution_allowed": record.get("redistribution_allowed"),
+        "home_country": record.get("home_country"),
+        "country_shares": _json_block(record.get("country_shares")),
+        "scope": record.get("scope"),
+        "declared_countries": record.get("declared_countries") or [],
         "snapshot": snapshot_id,
     }
 
@@ -423,6 +437,12 @@ _EDGES_SCHEMA = pa.schema(
         ("selector_state", pa.string()),
         ("selector", pa.string()),
         ("needs_review", pa.bool_()),
+        # The rank stage's relevance (schema_version 7): the category the
+        # tier maps to, the score within it and whether the place lies
+        # outside the feed's home country.
+        ("relevance_category", pa.string()),
+        ("relevance", pa.float64()),
+        ("cross_border", pa.bool_()),
         ("snapshot", pa.string()),
     ]
 )
@@ -446,6 +466,9 @@ def _edge_row(record, snapshot_id):
         "selector_state": record["selector_state"],
         "selector": _json_block(record.get("selector")),
         "needs_review": record["needs_review"],
+        "relevance_category": record.get("relevance_category"),
+        "relevance": record.get("relevance"),
+        "cross_border": record.get("cross_border"),
         "snapshot": snapshot_id,
     }
 
@@ -1064,7 +1087,9 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             # build's version are recorded so a reproduction can say whether
             # it is exact, and a reader below the schema's floor refuses it.
             "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
-            "min_reader_version": MIN_READER_VERSIONS[SCHEMA_VERSION],
+            "min_reader_version": MIN_READER_VERSIONS.get(
+                SCHEMA_VERSION, MIN_READER_VERSION
+            ),
             "built_with": built_with,
             "snapshot_id": snapshot_id,
             "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),

@@ -21,14 +21,14 @@ def test_feed_names_fall_back_to_the_id():
 
 def test_feeds_by_place_gathers_tiers_per_pair():
     edges = [
-        {"place_id": "p1", "feed_id": "f1", "tier": "b"},
-        {"place_id": "p1", "feed_id": "f1", "tier": "a"},
-        {"place_id": "p1", "feed_id": "f2", "tier": "a"},
+        {"place_id": "p1", "feed_id": "f1", "tier": "b", "relevance_category": "y"},
+        {"place_id": "p1", "feed_id": "f1", "tier": "a", "relevance_category": "x"},
+        {"place_id": "p1", "feed_id": "f2", "tier": "a"},  # unranked
     ]
     by_place = eil._feeds_by_place(edges, {"f1": "HSL", "f2": "Föli"})
     assert by_place["p1"] == [
-        {"feed_id": "f1", "name": "HSL", "tiers": ["a", "b"]},
-        {"feed_id": "f2", "name": "Föli", "tiers": ["a"]},
+        {"feed_id": "f1", "name": "HSL", "tiers": ["a", "b"], "categories": ["x", "y"]},
+        {"feed_id": "f2", "name": "Föli", "tiers": ["a"], "categories": []},
     ]
 
 
