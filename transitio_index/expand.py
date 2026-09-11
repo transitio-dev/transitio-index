@@ -226,6 +226,21 @@ def _attach_metros(places_by_id, new_cities, wikidata, report, registry=None):
     return added, touched
 
 
+def dropped_qids(generation):
+    """The QIDs of the discoveries the expansion report in ``generation`` — a
+    resolved ``expanded.json`` — lists as conflicts: placed nowhere, so a stop
+    inside one is a known miss for the stages measuring stops, not a sign of
+    a stale expansion. An expansion published without a report dropped
+    nothing."""
+    if not generation.has(REPORT_ARTIFACT):
+        return set()
+    return {
+        row["place_id"]
+        for row in store.parse_jsonl(generation.read_bytes(REPORT_ARTIFACT))
+        if row.get("kind") == "conflict" and row.get("place_id")
+    }
+
+
 def _discover(
     cache_dir,
     places_by_id,

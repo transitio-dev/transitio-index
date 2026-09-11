@@ -434,12 +434,15 @@ STOP_TIMES_A = (
 )
 
 
-def _coverage(cache, feeds, candidates, *, places=PLACES):
+def _coverage(cache, feeds, candidates, *, places=PLACES, report=None):
+    artifacts = {"places_expanded.jsonl": places}
+    if report is not None:
+        artifacts["expansion_report.jsonl"] = report
     expanded = _publish(
         cache,
         "gazetteer",
         "expanded.json",
-        {"places_expanded.jsonl": places},
+        artifacts,
         {
             "source": "expand",
             "places_overrides_sha256": None,
@@ -1140,3 +1143,40 @@ def test_feeds_yaml_edited_after_the_resolve_stage_refuses_to_classify(tmp_path)
     )
     with pytest.raises(overrides.OverrideError, match="re-run the coverage"):
         classify.classify(cache, lookup=LOOKUP, overrides_dir=directory)
+
+
+@pytest.mark.parametrize("dropped", [False, True], ids=["unknown", "dropped-by-expand"])
+def test_a_stop_in_a_division_expand_dropped_is_a_logged_miss(
+    tmp_path, dropped, caplog
+):
+    # Classify resolves the stops again; a division the expansion report says
+    # expand dropped as a conflict is a warning, any other unknown QID-bearing
+    # division still means a stale expansion.
+    cache = tmp_path / "cache"
+    feeds = [
+        {"feed_id": "f-x", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    _write_crawl(
+        cache,
+        "f-x",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\nx1,1.0,30.0\nx2,1.0,10.0\n",
+            "routes.txt": b"route_id,route_type\nr,3\n",
+        },
+        "absent",
+    )
+    lookup = StubLookup(
+        {
+            **LOOKUP.by_x,
+            30.0: [{"kind": "city", "wikidata": "Q999999", "overture_id": "xx"}],
+        }
+    )
+    report = [{"kind": "conflict", "place_id": "Q999999"}] if dropped else None
+    _coverage(cache, feeds, [_candidate("Q-city", "f-x")], report=report)
+    if not dropped:
+        with pytest.raises(classify.ClassifyError, match="expand stage"):
+            classify.classify(cache, lookup=lookup)
+        return
+    manifest = classify.classify(cache, lookup=lookup)
+    assert manifest["feeds_by_status"] == {"no_route_evidence": 1}  # classified
+    assert "Q999999" in caplog.text and "dropped as a conflict" in caplog.text

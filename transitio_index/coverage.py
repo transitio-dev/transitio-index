@@ -331,6 +331,31 @@ def stop_places(lookup, x, y, by_overture, by_qid):
     return hit, countries, stale
 
 
+def known_misses(stale, conflicts, stage):
+    """Split the QID-bearing divisions no place answered to into the ones the
+    expand stage dropped as ``conflicts`` — logged by ``stage`` as a miss, the
+    stops counting for the enclosing places only — and the rest, which mean a
+    stale expansion; ``(sorted dropped hits, remaining stale)``."""
+    dropped_hit = sorted(stale & set(conflicts))
+    for qid in dropped_hit:
+        log.warning(
+            "%s: stops fall in %s, which the expand stage dropped as a conflict; "
+            "they count for its enclosing places only",
+            stage,
+            qid,
+        )
+    return dropped_hit, stale - set(conflicts)
+
+
+def stale_expansion(stale):
+    """The message for stops in QID-bearing divisions no place knows."""
+    return (
+        "crawled stops hit QID-bearing divisions the gazetteer does not "
+        f"know ({', '.join(sorted(stale)[:5])}); places_expanded predates "
+        "the crawl — re-run the expand stage"
+    )
+
+
 def crawled_edges(cache_dir, feeds, places, lookup, conflicts=frozenset()):
     """Measured edges for the crawled feeds; ``(edges_by_key, report)``.
 
@@ -447,20 +472,9 @@ def crawled_edges(cache_dir, feeds, places, lookup, conflicts=frozenset()):
                     edge = _edge(target, feed_id, evidence, "crawl", service)
                     edge["_own"] = own
                     by_key[key] = edge
-    dropped_hit = sorted(stale & set(conflicts))
-    for qid in dropped_hit:
-        log.warning(
-            "coverage: stops fall in %s, which the expand stage dropped as a "
-            "conflict; they count for its enclosing places only",
-            qid,
-        )
-    stale -= set(conflicts)
+    dropped_hit, stale = known_misses(stale, conflicts, "coverage")
     if stale:
-        raise CoverageError(
-            "crawled stops hit QID-bearing divisions the gazetteer does not "
-            f"know ({', '.join(sorted(stale)[:5])}); places_expanded predates "
-            "the crawl — re-run the expand stage"
-        )
+        raise CoverageError(stale_expansion(stale))
     for edge in by_key.values():
         edge.pop("_own", None)
     report = {
@@ -580,16 +594,9 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 place_rows = store.parse_jsonl(
                     expanded.read_bytes("places_expanded.jsonl")
                 )
-                expansion_report = (
-                    store.parse_jsonl(expanded.read_bytes("expansion_report.jsonl"))
-                    if expanded.has("expansion_report.jsonl")
-                    else []
-                )
-            conflicts = {
-                row["place_id"]
-                for row in expansion_report
-                if row.get("kind") == "conflict" and row.get("place_id")
-            }
+                from transitio_index import expand
+
+                conflicts = expand.dropped_qids(expanded)
             placements, seed_manifest = store.read_jsonl(
                 cache_dir / "gazetteer", "seed.json", "feed_places.jsonl"
             )
