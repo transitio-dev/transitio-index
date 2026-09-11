@@ -14,7 +14,14 @@ import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
 import test_index_boundaries as bt  # noqa: E402
-from transitio_index import boundaries, coverage, overture, registry, seed  # noqa: E402
+from transitio_index import (  # noqa: E402
+    boundaries,
+    coverage,
+    geometry,
+    overture,
+    registry,
+    seed,
+)
 
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
 
@@ -475,3 +482,42 @@ def test_the_boundary_memo_grows_by_appended_parts(tmp_path, monkeypatch):
     (memo / "divisions-0007.parquet").mkdir()
     repair()
     assert parts() == first + ["divisions-0007.parquet", "divisions-0008.parquet"]
+
+
+def test_a_division_without_area_rows_is_not_rescanned(tmp_path):
+    """The area cache kept no negative entries, so a division the theme has no
+    rows for was rescanned by every stage asking for it — and an id filter
+    cannot prune row groups, so each rescan read a whole country's geometry.
+    Absence is now recorded with the scan's country scope and answers a later
+    read whose scope it covers."""
+    dataset = fx.write_area_dataset(
+        tmp_path / "a.parquet", [fx.area("A", _wkb(0, 0, 1, 1), GOOD, country="FI")]
+    )
+    scans = {"n": 0}
+
+    class Counting:
+        def to_batches(self, **kwargs):
+            scans["n"] += 1
+            return dataset.to_batches(**kwargs)
+
+    cache = (tmp_path / "cache", "2026-08-19.0")
+
+    def read(ids, countries):
+        return geometry.read_areas(Counting(), ids, cache=cache, countries=countries)
+
+    assert set(read({"A", "ghost"}, {"FI"})) == {"A"}
+    assert read({"ghost"}, {"FI"}) == {} and scans["n"] == 1  # same scope: answered
+    assert read({"ghost"}, {"FI", "SE"}) == {} and scans["n"] == 2  # wider: scanned
+    assert read({"ghost"}, {"SE"}) == {} and scans["n"] == 2  # covered by the wider
+    assert read({"ghost"}, None) == {} and scans["n"] == 3  # unnarrowed: scanned
+    assert read({"ghost"}, {"DE"}) == {} and scans["n"] == 3  # `*` covers any scope
+    # The absence table is held to the cache root like the rows are.
+    absent = cache[0] / "overture_areas" / cache[1] / "absent"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for entry in absent.iterdir():
+        entry.rename(outside / entry.name)
+    absent.rmdir()
+    absent.symlink_to(outside)
+    with pytest.raises(ValueError, match="escapes the cache root"):
+        read({"ghost"}, {"FI"})

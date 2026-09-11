@@ -254,15 +254,16 @@ def _area_batches(dataset, ids, cache, reopen=None, countries=None):
     memory at a time (never the whole set at once). With ``cache`` a
     ``(cache_dir, release)`` pair the rows are memoized under a release-keyed
     local parquet — ids not already stored are streamed in from S3 first — so
-    each division is read from S3 at most once; the release is immutable, so the
-    cache stays valid until it is bumped. Builds run one at a time, so the
-    unique per-fetch filenames need no lock."""
+    each division's rows are fetched once, and a division found to have none
+    is not rescanned by a read whose country scope the recorded one covers; the
+    release is immutable, so the cache stays valid until it is bumped. Builds
+    run one at a time, so the unique per-fetch filenames need no lock."""
     if cache is None:
         yield from progress(_scan(dataset, ids, countries), "areas")
         return
     cache_dir, release = cache
     rows_dir = _cache_rows_dir(cache_dir, release)
-    cached = _cached_area_ids(rows_dir)
+    cached = _cached_area_ids(rows_dir, countries)
     missing = [i for i in ids if i not in cached]
     if missing:
         _fetch_into_cache(dataset, missing, rows_dir, reopen, countries)
@@ -284,12 +285,15 @@ def _cache_rows_dir(cache_dir, release):
     """
     if not store.safe_component(str(release)):
         raise ValueError(f"unsafe Overture release for the area cache: {release!r}")
-    rows_dir = cache_dir / "overture_areas" / str(release) / "rows"
+    return _contained(cache_dir, cache_dir / "overture_areas" / str(release) / "rows")
+
+
+def _contained(cache_dir, path):
+    """``path``, refusing one a symlink has redirected outside ``cache_dir``."""
     root = os.path.realpath(cache_dir)
-    resolved = os.path.realpath(rows_dir)
-    if os.path.commonpath([root, resolved]) != root:
-        raise ValueError(f"area cache path escapes the cache root: {rows_dir}")
-    return rows_dir
+    if os.path.commonpath([root, os.path.realpath(path)]) != root:
+        raise ValueError(f"area cache path escapes the cache root: {path}")
+    return path
 
 
 class AreaReadStalled(overture.GazetteerError):
@@ -417,11 +421,13 @@ def _stream_into_cache(open_dataset, ids, rows_dir, countries=None):
     tmp = rows_dir / f".{uuid.uuid4().hex}.parquet.tmp"
     writer = None
     published = False
+    seen = set()
     try:
         batches = with_deadline(
             lambda: _scan(open_dataset(), ids, countries), AREA_READ_DEADLINE
         )
         for batch in progress(batches, "areas"):
+            seen.update(batch.column("division_id").to_pylist())
             if writer is None:
                 writer = pq.ParquetWriter(tmp, batch.schema)
             writer.write_batch(batch)
@@ -430,6 +436,9 @@ def _stream_into_cache(open_dataset, ids, rows_dir, countries=None):
             writer = None
             os.replace(tmp, rows_dir / f"{uuid.uuid4().hex}.parquet")
         published = True
+        # The scan ran to completion, so an id it carried no row for has none
+        # under this scope; recorded, so no later read repeats the scan.
+        _record_absent(rows_dir, set(ids) - seen, countries)
     finally:
         if writer is not None:
             try:
@@ -440,23 +449,77 @@ def _stream_into_cache(open_dataset, ids, rows_dir, countries=None):
             tmp.unlink(missing_ok=True)
 
 
-def _has_cache(rows_dir):
-    return rows_dir.exists() and any(rows_dir.glob("*.parquet"))
+def _has_cache(directory):
+    return directory.exists() and any(directory.glob("*.parquet"))
 
 
-def _cached_area_ids(rows_dir):
-    """Division ids already fetched into the local area cache — those with any
-    stored row, land or maritime. A division absent from the theme entirely (no
-    rows at all) is not recorded, so it is re-scanned next time (a cheap empty
-    S3 read) rather than complicating the cache with negative entries."""
-    if not _has_cache(rows_dir):
-        return set()
-    column = (
-        ds.dataset(rows_dir, format="parquet")
-        .to_table(columns=["division_id"])
-        .column("division_id")
+def _absent_dir(rows_dir):
+    """The absence table beside ``rows_dir``, held inside the cache root (the
+    directory three above the rows) like the rows are, checked at every use."""
+    return _contained(rows_dir.parents[2], rows_dir.parent / "absent")
+
+
+def _scope(countries):
+    """A scan's country narrowing as a string: the sorted codes, or ``*`` when
+    it was not narrowed."""
+    return ",".join(sorted(countries)) if countries else "*"
+
+
+def _covers(scope, countries):
+    """Whether a scan narrowed to ``scope`` read every row group a scan narrowed
+    to ``countries`` would: unnarrowed, or the same or a wider country set."""
+    if scope == "*":
+        return True
+    return bool(countries) and set(countries) <= set(scope.split(","))
+
+
+def _record_absent(rows_dir, ids, countries):
+    """Record ``ids`` as having no rows in the theme under the scan's scope."""
+    if not ids:
+        return
+    absent_dir = _absent_dir(rows_dir)
+    absent_dir.mkdir(parents=True, exist_ok=True)
+    table = pa.table(
+        {
+            "division_id": pa.array(sorted(ids), pa.string()),
+            "scope": pa.array([_scope(countries)] * len(ids), pa.string()),
+        }
     )
-    return set(column.to_pylist())
+    tmp = absent_dir / f".{uuid.uuid4().hex}.parquet.tmp"
+    try:
+        pq.write_table(table, tmp)
+        os.replace(tmp, absent_dir / f"{uuid.uuid4().hex}.parquet")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _cached_area_ids(rows_dir, countries=None):
+    """Division ids the local area cache already answers for ``countries``:
+    those with any stored row, land or maritime, and those recorded absent
+    from the theme under a scope covering this read's. Absence is recorded
+    because the scan establishing it cannot be pruned by id — it reads every
+    row group of the countries' geometry — and every stage asking for the id
+    would otherwise repeat it."""
+    ids = set()
+    if _has_cache(rows_dir):
+        column = (
+            ds.dataset(rows_dir, format="parquet")
+            .to_table(columns=["division_id"])
+            .column("division_id")
+        )
+        ids.update(column.to_pylist())
+    absent_dir = _absent_dir(rows_dir)
+    if _has_cache(absent_dir):
+        table = ds.dataset(absent_dir, format="parquet").to_table()
+        scopes = table.column("scope").to_pylist()
+        ids.update(
+            division_id
+            for division_id, scope in zip(
+                table.column("division_id").to_pylist(), scopes
+            )
+            if _covers(scope, countries)
+        )
+    return ids
 
 
 def _source_key(source):
