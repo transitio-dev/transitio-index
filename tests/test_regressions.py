@@ -660,3 +660,26 @@ def test_a_crawled_division_the_registry_refuses_is_reported_by_expand(tmp_path)
     (row,) = [r for r in report if r.get("kind") == "conflict"]
     assert row["place_id"] == "Q40840" and row["overture_id"] == "fi-tre"
     assert "not a city" in row["reason"]
+
+
+def test_a_discovered_district_that_is_also_a_city_is_the_city(tmp_path):
+    """Only the district of a city that is its own district carries an area, so
+    a stop discovers the district and expand minted it as a region — while the
+    seed places the same QID as a city from its name, and the two then refused
+    each other's place. A region-kind discovery whose QID a locality also
+    carries is now the city; a district no locality shares stays a region."""
+    import test_index_expand as ex
+
+    cache = tmp_path / "cache"
+    ex._publish_names(cache, ex.SEED_PLACES)
+    ex._write_crawl(cache, "f-tku", ["s1,60.45,22.2\n", "s2,60.45,23.2\n"])
+    _, places, _ = ex._expand(tmp_path, cache)
+    turku = places["Q38511"]
+    assert turku["kind"] == "city" and turku["source_subtype"] == "county"
+    # The district's area and ancestry are kept: the city sits under its region.
+    assert turku["overture_id"] == "fi-tku-county" and turku["parent_id"] == "Q999004"
+    assert places["Q999004"]["kind"] == "region"
+    assert places["Q999003"]["kind"] == "region"
+    assert places["Q999003"]["parent_id"] == "Q999004"
+    # Nothing to look up means no scan: a memo-only lookup opens no dataset.
+    assert seed.city_qids(None, set()) == set()

@@ -91,6 +91,57 @@ DIVISIONS = [
             ("fi", "country", "Finland"), ("fi-badgeo", "locality", "Badgeo")
         ),
     ),
+    # Turku as a city that is its own district under the Varsinais-Suomi
+    # region: the county carries the area (below), the locality carries the
+    # same QID and no area.
+    fx.division(
+        "fi-vs",
+        "FI",
+        "region",
+        wikidata="Q999004",
+        name="Varsinais-Suomi",
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"), ("fi-vs", "region", "Varsinais-Suomi")
+        ),
+    ),
+    fx.division(
+        "fi-tku-county",
+        "FI",
+        "county",
+        wikidata="Q38511",
+        name="Turku",
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-vs", "region", "Varsinais-Suomi"),
+            ("fi-tku-county", "county", "Turku"),
+        ),
+    ),
+    fx.division(
+        "fi-tku",
+        "FI",
+        "locality",
+        wikidata="Q38511",
+        name="Turku",
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-vs", "region", "Varsinais-Suomi"),
+            ("fi-tku-county", "county", "Turku"),
+            ("fi-tku", "locality", "Turku"),
+        ),
+    ),
+    # A district no locality shares a QID with: it stays a region.
+    fx.division(
+        "fi-salo-county",
+        "FI",
+        "county",
+        wikidata="Q999003",
+        name="Salo district",
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-vs", "region", "Varsinais-Suomi"),
+            ("fi-salo-county", "county", "Salo district"),
+        ),
+    ),
 ]
 
 AREAS = [
@@ -102,6 +153,9 @@ AREAS = [
     fx.area("fi-noqid", _wkb(26.0, 62.0, 26.4, 62.2), GOOD, country="FI"),
     fx.area("us-spring", _wkb(-89.8, 39.7, -89.5, 39.9), GOOD, country="US"),
     fx.area("fi-badgeo", _wkb(28.0, 62.0, 28.4, 62.2), BAD, country="FI"),
+    fx.area("fi-vs", _wkb(21.5, 60.0, 23.5, 60.8), GOOD, country="FI"),
+    fx.area("fi-tku-county", _wkb(22.0, 60.3, 22.4, 60.6), GOOD, country="FI"),
+    fx.area("fi-salo-county", _wkb(23.0, 60.3, 23.4, 60.6), GOOD, country="FI"),
 ]
 
 

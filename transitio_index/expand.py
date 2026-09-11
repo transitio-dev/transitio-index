@@ -274,6 +274,20 @@ def _discover(
 
     candidates = [dict(record) for record in divisions.values() if record.get("kind")]
     seed._resolve_candidates(candidates, wikidata)
+    # A district or region whose QID a city-level division also carries is a
+    # city that is its own district (Augsburg, Ulm, Wien): only the district
+    # has an area, so the stop reached it, but the place is the city — the
+    # kind the seed gives the same QID from its declared name.
+    shared = {c["qid"] for c in candidates if c["kind"] == "region" and c["qid"]}
+    cities = set()
+    if shared:
+        # A memo-only lookup answered the stops from its cache; the theme is
+        # opened here for the one scan.
+        dataset = lookup.division_dataset() or overture.overture_dataset(release)
+        cities = seed.city_qids(dataset, shared)
+    for record in candidates:
+        if record["kind"] == "region" and record["qid"] in cities:
+            record["kind"] = "city"
     skeleton = {}
     for record in candidates:
         if record["qid"] or overture.qidless_place(record):

@@ -143,6 +143,23 @@ def read_city_candidates(dataset, countries, wanted):
     return kept
 
 
+def city_qids(dataset, qids):
+    """The QIDs among ``qids`` that a locality or localadmin carries in the
+    theme — one scan by QID. A district or region sharing its QID with a
+    city-level division is a city that is its own district; the place is the
+    city, as ``match`` decides for a declared name."""
+    wanted = {qid for qid in qids if qid}
+    if not wanted:
+        return set()
+    predicate = ds.field("subtype").isin(list(CITY_SUBTYPES)) & ds.field(
+        "wikidata"
+    ).isin(sorted(wanted))
+    found = set()
+    for batch in dataset.to_batches(columns=["wikidata"], filter=predicate):
+        found.update(batch.column("wikidata").to_pylist())
+    return found & wanted
+
+
 def _resolve_candidates(candidates, wikidata):
     """Attach a resolved ``qid``/``resolution_method`` to each candidate."""
     pending = {

@@ -498,6 +498,11 @@ class BoundaryLookup:
     def _open_division(self):
         return self._division_dataset
 
+    def division_dataset(self):
+        """The divisions dataset the lookup reads metadata from, for the stage
+        that owns the lookup (``None`` for a memo-only lookup)."""
+        return self._division_dataset
+
     @staticmethod
     def _row_groups(open_dataset, cells):
         """``(dataset, [(fragment path, row group index), ...])``: the row
