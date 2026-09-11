@@ -284,14 +284,249 @@ def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
     with generation:
         table = pq.read_table(pa_source(generation.read_bytes("catalogue.parquet")))
         summary = json.loads(generation.read_bytes("summary.json"))
+        feeds = pq.read_table(pa_source(generation.read_bytes("feeds.parquet")))
     rows = table.to_pylist()
     # The url-matched MDB row and its Atlas feed both name the same feed.
     assert {r["feed_id"] for r in rows if r["source_id"] in ("mdb-1", "f-a")} == {"f-a"}
     assert summary["identity"]["rows_into_feeds"] == len(rows)
     assert summary["identity"]["feeds"] == published["counts"]["feeds"]
+    # The published feeds (never crawled here) become the feed table too.
+    assert feeds.num_rows == manifest["feeds"] == published["counts"]["feeds"]
+    assert set(feeds.column("crawl_outcome").to_pylist()) == {"not_crawled"}
+    assert summary["availability"]["crawled"] == 0
 
 
 def pa_source(data):
     import io
 
     return io.BytesIO(data)
+
+
+@pytest.mark.parametrize(
+    "reason, expected",
+    [
+        ("GET https://x/gtfs.zip: HTTP 404", "404"),
+        ("GET https://x/gtfs.zip: HTTP 401", "401"),
+        ("GET https://x/gtfs.zip: HTTP 503", "5xx"),
+        ("GET https://x/gtfs.zip: HTTP 302", "other_http"),
+        ("File is not a zip file", "not-an-archive"),
+        ("cache/crawl/id-1/stop_times.txt: over the 3 GB member ceiling", "oversize"),
+        (
+            "GET https://x: host x unreachable this run (3 consecutive transport failures)",
+            "transport",
+        ),
+        ("GET https://x: certificate verify failed", "tls"),
+        ("GET https://x: read timed out", "timeout"),
+        ("GET ftp://x/gtfs.zip: scheme 'ftp' is not fetched", "blocked_url"),
+        ("something else entirely", "other"),
+        (None, None),
+    ],
+)
+def test_failure_classes_follow_the_recorded_reason(reason, expected):
+    assert stats.failure_class(reason) == expected
+
+
+PLACES = {
+    "fi": {
+        "place_id": "fi",
+        "kind": "country",
+        "country_code": "FI",
+        "parent_id": None,
+    },
+    "uus": {
+        "place_id": "uus",
+        "kind": "region",
+        "country_code": "FI",
+        "parent_id": "fi",
+    },
+    "hel": {
+        "place_id": "hel",
+        "kind": "city",
+        "country_code": "FI",
+        "parent_id": "uus",
+    },
+    "esp": {
+        "place_id": "esp",
+        "kind": "city",
+        "country_code": "FI",
+        "parent_id": "uus",
+    },
+    "tll": {"place_id": "tll", "kind": "city", "country_code": "EE", "parent_id": None},
+}
+
+
+def _feed(feed_id, **kw):
+    return {
+        "feed_id": feed_id,
+        "aliases": kw.get("aliases", []),
+        "source": kw.get("source", "mdb"),
+        "spec": "gtfs",
+        "crosswalk_method": "none",
+        "crosswalk_confidence": None,
+        "mdb_id": kw.get("mdb_id"),
+        "stop_count": kw.get("stops"),
+        "files": kw.get("files", []),
+        "home_country": kw.get("home"),
+        "scope": kw.get("scope", "declared"),
+        "country_shares": kw.get("shares", {}),
+        "declared_countries": kw.get("declared", []),
+        "redistribution_allowed": kw.get("allowed"),
+        "atlas": kw.get("atlas"),
+        "mdb": kw.get("mdb"),
+        "gbfs": kw.get("gbfs"),
+    }
+
+
+def _edge(feed_id, place_id, tier, relevance=None, method="crawl"):
+    return {
+        "feed_id": feed_id,
+        "place_id": place_id,
+        "tier": tier,
+        "method": method,
+        "relevance": relevance,
+        "relevance_category": None if relevance is None else "primary",
+    }
+
+
+def test_feed_rows_join_the_crawl_log_placements_and_edges():
+    feeds = [
+        _feed(
+            "hsl",
+            mdb_id="mdb-1",
+            stops=100,
+            files=["calendar.txt"],
+            home="FI",
+            scope="domestic",
+            shares={"FI": 1.0},
+            declared=["FI"],
+            allowed=True,
+            atlas={"license": {"spdx_identifier": "CC-BY-4.0"}},
+            mdb={"urls": {"direct_download": "https://hsl.fi/g.zip"}},
+        ),
+        _feed(
+            "rail",
+            aliases=["f-old-rail"],
+            mdb_id="mdb-2",
+            stops=500,
+            home="FI",
+            scope="domestic",
+            declared=["EE"],
+            mdb={"urls": {"license": "https://l"}},
+        ),
+        _feed("gone", mdb_id="mdb-3", declared=["FI"]),
+        _feed("far", mdb_id="mdb-4", home="FI", scope="domestic"),
+        _feed("lost", mdb_id="mdb-5", home="FI", scope="domestic"),
+        _feed(
+            "bikes",
+            source="systems_csv",
+            gbfs={"auto_discovery_url": "https://b/gbfs.json"},
+        ),
+    ]
+    edges = [
+        _edge("hsl", "hel", "local", 0.9),
+        _edge("hsl", "hel", "regional", 0.9),
+        _edge("hsl", "uus", "regional", 0.4),
+        _edge("hsl", "tll", "international", 0.1),
+        _edge("rail", "esp", "national", 0.5),  # declared Helsinki: in its region
+        _edge("gone", "hel", "unknown", method="inferred"),
+        _edge("far", "tll", "national", 0.2),  # declared Helsinki: elsewhere
+        _edge("lost", "hel", "local", 0.3),  # declared a place the index lost
+    ]
+    crawl_log = [
+        {"feed_id": "hsl", "method": "download", "route_count": 7},
+        {"feed_id": "f-old-rail", "method": "download", "route_count": 2},
+        {
+            "feed_id": "gone",
+            "method": "failed",
+            "fallback_reason": "GET https://x: HTTP 404",
+        },
+        {"feed_id": "far", "method": "not_modified"},
+        {"feed_id": "lost", "method": "range"},
+        {"feed_id": "bikes", "method": "skipped", "fallback_reason": "boom"},
+    ]
+    placements = [
+        {"feed_id": "hsl", "level": "municipality", "place_id": "hel"},
+        {"feed_id": "f-old-rail", "level": "municipality", "place_id": "hel"},
+        {"feed_id": "far", "level": "municipality", "place_id": "hel"},
+        {"feed_id": "lost", "level": "district", "place_id": "vanished"},
+    ]
+    statuses = {"mdb-1": "active", "mdb-3": "deprecated"}
+    rows = stats.feed_rows(
+        feeds, edges, PLACES, crawl_log, placements, statuses, "snap"
+    )
+    by_id = {row["feed_id"]: row for row in rows}
+    hsl = by_id["hsl"]
+    assert hsl["crawl_outcome"] == "ok" and hsl["failure_class"] is None
+    assert hsl["route_count"] == 7 and hsl["has_calendar"] is True
+    assert hsl["country_agreement"] == "agree"
+    assert hsl["municipality_outcome"] == "in_place"
+    assert hsl["places_served"] == 3 and hsl["cities_served"] == 2
+    assert hsl["countries_served"] == 2
+    assert json.loads(hsl["edges_by_tier"]) == {
+        "local": 1,
+        "regional": 2,
+        "international": 1,
+    }
+    assert json.loads(hsl["edges_by_category"]) == {"primary": 4}
+    assert hsl["relevance_max"] == 0.9 and hsl["relevance_median"] == pytest.approx(
+        0.65
+    )
+    assert hsl["licence_state"] == "declared" and hsl["redistribution_allowed"] is True
+    assert hsl["download_url"] == "https://hsl.fi/g.zip"
+    assert hsl["catalogue_status"] == "active" and hsl["snapshot_id"] == "snap"
+    # The crawl log and the placement name an alias: both still join.
+    rail = by_id["rail"]
+    assert rail["route_count"] == 2 and rail["municipality_outcome"] == "in_region"
+    assert rail["country_agreement"] == "disagree"
+    assert rail["licence_state"] == "declared"
+    gone = by_id["gone"]
+    assert gone["crawl_outcome"] == "failed" and gone["failure_class"] == "404"
+    assert gone["country_agreement"] == "unobserved"
+    assert gone["municipality_outcome"] is None and gone["places_served"] == 1
+    assert gone["relevance_max"] is None and gone["licence_state"] == "none"
+    assert by_id["far"]["municipality_outcome"] == "elsewhere"
+    assert by_id["far"]["crawl_outcome"] == "not_modified"
+    assert by_id["lost"]["municipality_outcome"] == "unplaceable"
+    assert by_id["lost"]["country_agreement"] == "undeclared"
+    bikes = by_id["bikes"]
+    assert bikes["crawl_outcome"] == "skipped" and bikes["failure_class"] is None
+    assert bikes["download_url"] == "https://b/gbfs.json"
+    sections = stats.feed_sections(rows)
+    assert sections["availability"]["by_outcome"] == {
+        "ok": 2,
+        "failed": 1,
+        "not_modified": 1,
+        "range": 1,
+        "skipped": 1,
+    }
+    assert sections["availability"]["failures_by_class"] == {"404": 1}
+    assert sections["availability"]["outcome_by_catalogue_status"] == {
+        "active": {"ok": 1},
+        "deprecated": {"failed": 1},
+        "unknown": {"ok": 1, "not_modified": 1, "range": 1, "skipped": 1},
+    }
+    assert sections["licensing"]["licence_state"] == {"declared": 2, "none": 4}
+    assert sections["licensing"]["redistribution_allowed"] == {"yes": 1, "unknown": 5}
+    assert sections["scale"]["stop_count"] == {
+        "count": 2,
+        "median": 300.0,
+        "p95": 500,
+        "max": 500,
+    }
+    assert sections["scale"]["countries_served"] == {"2": 1, "1": 4}
+    assert sections["country_agreement"]["by_agreement"] == {
+        "agree": 1,
+        "disagree": 1,
+        "unobserved": 2,
+        "undeclared": 2,
+    }
+    assert sections["declared_municipality"]["outcome"] == {
+        "in_place": 1,
+        "in_region": 1,
+        "elsewhere": 1,
+        "unplaceable": 1,
+    }
+    assert sections["declared_municipality"]["by_level"] == {
+        "municipality": 3,
+        "district": 1,
+    }

@@ -4,9 +4,12 @@ The article's tables come from a build, not from hand-counted exports: this
 stage reads the ingest generations (every Mobility Database, Transitland Atlas
 and GBFS row the build ingested) and the crosswalk generation (the feeds they
 became) and writes a ``stats`` generation with ``catalogue.parquet`` — one row
-per catalogue row, whether or not it became a feed — and ``summary.json``, the
-totals and shares the report renders, keyed by section: the build's
-provenance, the declared places and identity and duplication. Nothing is re-run and
+per catalogue row, whether or not it became a feed — ``feeds.parquet`` — one
+row per published feed, joined with the crawl log, the seed placements and
+the published edges — and ``summary.json``, the totals the report renders,
+keyed by section: the build's provenance, the declared places, identity and
+duplication, availability, licensing, scale, the declared-versus-observed
+country agreement and the declared-municipality outcomes. Nothing is re-run and
 no network is touched; for a sample build the rows are the sample's, and the
 summary records the build's snapshot id and source versions.
 """
@@ -25,7 +28,10 @@ from transitio_index import store
 from transitio_index.crosswalk import _clean_url, _host
 
 STATS_POINTER = "stats.json"
+# The shape of the stats artifacts; the aggregation script refuses a mismatch.
+STATS_SCHEMA_VERSION = 1
 CATALOGUE_ARTIFACT = "catalogue.parquet"
+FEEDS_ARTIFACT = "feeds.parquet"
 SUMMARY_ARTIFACT = "summary.json"
 
 # The ingest pointers and artifacts the catalogue rows come from.
@@ -355,8 +361,8 @@ def _snapshot(cache_dir, crosswalk, manifests):
     return snapshot
 
 
-def _parquet(rows):
-    table = pa.Table.from_pylist(rows, schema=CATALOGUE_SCHEMA)
+def _parquet(rows, schema=CATALOGUE_SCHEMA):
+    table = pa.Table.from_pylist(rows, schema=schema)
     sink = io.BytesIO()
     pq.write_table(table, sink)
     return sink.getvalue()
@@ -392,6 +398,7 @@ def stats(cache_dir):
         summary = {
             "build": {
                 "snapshot_id": snapshot_id,
+                "stats_schema_version": STATS_SCHEMA_VERSION,
                 "schema_version": snapshot.get("schema_version"),
                 "overture_release": snapshot.get("overture_release"),
                 "sources": crosswalk.get("sources"),
@@ -406,8 +413,35 @@ def stats(cache_dir):
             "declared_places": declared_places(rows),
             "identity": identity(rows, feeds),
         }
+        feed_table = None
+        if snapshot.get("partitions"):
+            from transitio_index import crawl
+
+            with crawl.reading(cache_dir):
+                # The crawl the published edges were measured against.
+                if crawl.states_digest(cache_dir) != snapshot.get("crawl_digest"):
+                    raise StatsError(
+                        "the crawl changed since the index was published; re-run "
+                        "the pipeline in stage order"
+                    )
+                published, edges, places = _index_tables(cache_dir, snapshot)
+                by_place = {place["place_id"]: place for place in places}
+                statuses = {
+                    r["source_id"]: r["status"] for r in rows if r["source"] == "mdb"
+                }
+                feed_table = feed_rows(
+                    published,
+                    edges,
+                    by_place,
+                    _crawl_log(cache_dir),
+                    _placements(cache_dir, snapshot),
+                    statuses,
+                    snapshot_id,
+                )
+            summary.update(feed_sections(feed_table))
         manifest = {
             "source": "stats",
+            "stats_schema_version": STATS_SCHEMA_VERSION,
             "snapshot_id": snapshot_id,
             "crosswalk_generation": crosswalk.get("generation"),
             "raw_generations": {s: m.get("generation") for s, m in manifests.items()},
@@ -417,10 +451,368 @@ def stats(cache_dir):
         }
         data = _parquet(rows)
         text = json.dumps(summary, indent=2, sort_keys=True)
+        artifacts = {
+            CATALOGUE_ARTIFACT: lambda: [data],
+            SUMMARY_ARTIFACT: lambda: [text],
+        }
+        if feed_table is not None:
+            feed_data = _parquet(feed_table, FEED_SCHEMA)
+            artifacts[FEEDS_ARTIFACT] = lambda: [feed_data]
+            manifest["feeds"] = len(feed_table)
         return store.publish(
-            cache_dir / "stats",
-            STATS_POINTER,
-            {CATALOGUE_ARTIFACT: lambda: [data], SUMMARY_ARTIFACT: lambda: [text]},
-            manifest,
-            held=directory,
+            cache_dir / "stats", STATS_POINTER, artifacts, manifest, held=directory
         )
+
+
+# ---- feed level ----
+
+FEED_SCHEMA = pa.schema(
+    [
+        ("feed_id", pa.string()),
+        ("source", pa.string()),
+        ("spec", pa.string()),
+        ("crosswalk_method", pa.string()),
+        ("crosswalk_confidence", pa.float64()),
+        ("catalogue_status", pa.string()),
+        ("crawl_outcome", pa.string()),
+        ("failure_class", pa.string()),
+        ("stop_count", pa.int64()),
+        ("route_count", pa.int64()),
+        ("has_calendar", pa.bool_()),
+        ("home_country", pa.string()),
+        ("scope", pa.string()),
+        ("country_shares", pa.string()),
+        ("declared_countries", pa.list_(pa.string())),
+        ("country_agreement", pa.string()),
+        ("declared_place_id", pa.string()),
+        ("declared_level", pa.string()),
+        ("municipality_outcome", pa.string()),
+        ("download_url", pa.string()),
+        ("places_served", pa.int64()),
+        ("cities_served", pa.int64()),
+        ("countries_served", pa.int64()),
+        ("edges_by_tier", pa.string()),
+        ("edges_by_category", pa.string()),
+        ("relevance_max", pa.float64()),
+        ("relevance_median", pa.float64()),
+        ("licence_state", pa.string()),
+        ("redistribution_allowed", pa.bool_()),
+        ("snapshot_id", pa.string()),
+    ]
+)
+# The crawl log's method for a feed, as the availability section counts it.
+CRAWL_OUTCOMES = {
+    "download": "ok",
+    "not_modified": "not_modified",
+    "range": "range",
+    "failed": "failed",
+    "skipped": "skipped",
+}
+_HTTP = re.compile(r"HTTP (\d{3})")
+
+
+def failure_class(reason):
+    """The class of a crawl failure from the fetcher's recorded reason."""
+    if not reason:
+        return None
+    text = reason.lower()
+    status = _HTTP.search(reason)
+    if status:
+        code = status.group(1)
+        if code in ("401", "403", "404"):
+            return code
+        return "5xx" if code.startswith("5") else "other_http"
+    if "not a zip file" in text or "not an archive" in text:
+        return "not-an-archive"
+    if "ceiling" in text or "over the" in text:
+        return "oversize"
+    if "certificate" in text or "ssl" in text or "tls" in text:
+        return "tls"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "getaddrinfo" in text or "name or service" in text or "nodename" in text:
+        return "dns"
+    if "scheme" in text or "blocked" in text or "not fetched" in text:
+        return "blocked_url"
+    if "unreachable" in text or "transport" in text:
+        return "transport"
+    return "other"
+
+
+def _median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    middle = len(values) // 2
+    if len(values) % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2
+
+
+def _municipality_outcome(placement, served, places):
+    """How the crawled places relate to the declared municipality: in the
+    place, in its region (a served place's parent chain reaches the declared
+    place or its parent), elsewhere, or unplaceable when the declared place
+    left the index."""
+    if placement is None or not served:
+        return None
+    declared = placement["place_id"]
+    if declared not in places:
+        return "unplaceable"
+    if declared in served:
+        return "in_place"
+    region = places[declared].get("parent_id")
+    targets = {declared, region} - {None}
+    for place_id in served:
+        seen = set()
+        current = place_id
+        while current is not None and current not in seen:
+            if current in targets:
+                return "in_region"
+            seen.add(current)
+            current = (places.get(current) or {}).get("parent_id")
+    return "elsewhere"
+
+
+def _licence_state(feed):
+    """Whether the catalogues declare a licence for the feed."""
+    atlas = (feed.get("atlas") or {}).get("license") or {}
+    if atlas.get("spdx_identifier") or atlas.get("url"):
+        return "declared"
+    if ((feed.get("mdb") or {}).get("urls") or {}).get("license"):
+        return "declared"
+    return "none"
+
+
+def _download_url(feed):
+    mdb = ((feed.get("mdb") or {}).get("urls") or {}).get("direct_download")
+    atlas = ((feed.get("atlas") or {}).get("urls") or {}).get("static_current")
+    gbfs = (feed.get("gbfs") or {}).get("auto_discovery_url")
+    return _clean_url(mdb) or _clean_url(atlas) or _clean_url(gbfs)
+
+
+def feed_rows(
+    feeds, edges, places, crawl_log, placements, status_by_mdb_id, snapshot_id=None
+):
+    """One row per index feed from the published tables, the crawl log
+    (keyed by the crawl-time id or an alias), the seed placements and the
+    catalogue statuses."""
+    from transitio_index import classify, coverage
+
+    canonical = coverage._canonical_ids(feeds)
+    log = {}
+    for record in crawl_log:
+        feed_id = canonical.get(record.get("feed_id"))
+        if feed_id is not None:
+            log[feed_id] = record
+    placed = {}
+    for placement in placements:
+        feed_id = canonical.get(placement.get("feed_id"))
+        if feed_id is not None:
+            placed.setdefault(feed_id, placement)
+    by_feed = collections.defaultdict(list)
+    for edge in edges:
+        by_feed[edge["feed_id"]].append(edge)
+    rows = []
+    for feed in feeds:
+        feed_id = feed["feed_id"]
+        mine = by_feed.get(feed_id, [])
+        served = {e["place_id"] for e in mine}
+        crawled = {e["place_id"] for e in mine if e.get("method") == "crawl"}
+        record = log.get(feed_id)
+        outcome = CRAWL_OUTCOMES.get((record or {}).get("method"), "other")
+        relevance = [e["relevance"] for e in mine if e.get("relevance") is not None]
+        files = set(feed.get("files") or (record or {}).get("files") or [])
+        home = feed.get("home_country")
+        declared = feed.get("declared_countries") or []
+        rows.append(
+            {
+                "feed_id": feed_id,
+                "source": feed.get("source"),
+                "spec": feed.get("spec"),
+                "crosswalk_method": feed.get("crosswalk_method"),
+                "crosswalk_confidence": feed.get("crosswalk_confidence"),
+                "catalogue_status": status_by_mdb_id.get(feed.get("mdb_id")),
+                "crawl_outcome": outcome if record else "not_crawled",
+                "failure_class": (
+                    failure_class(record.get("fallback_reason"))
+                    if record and record.get("method") == "failed"
+                    else None
+                ),
+                "stop_count": feed.get("stop_count"),
+                "route_count": (record or {}).get("route_count"),
+                "has_calendar": bool(files & {"calendar.txt", "calendar_dates.txt"}),
+                "home_country": home,
+                "scope": feed.get("scope"),
+                "country_shares": json.dumps(
+                    feed.get("country_shares") or {}, sort_keys=True
+                ),
+                "declared_countries": list(declared),
+                "country_agreement": classify._agreement(home, declared),
+                "declared_place_id": (placed.get(feed_id) or {}).get("place_id"),
+                "declared_level": (placed.get(feed_id) or {}).get("level"),
+                "municipality_outcome": _municipality_outcome(
+                    placed.get(feed_id), crawled, places
+                ),
+                "download_url": _download_url(feed),
+                "places_served": len(served),
+                "cities_served": sum(
+                    1 for p in served if (places.get(p) or {}).get("kind") == "city"
+                ),
+                "countries_served": len(
+                    {(places.get(p) or {}).get("country_code") for p in served} - {None}
+                ),
+                "edges_by_tier": json.dumps(
+                    dict(collections.Counter(e["tier"] for e in mine)), sort_keys=True
+                ),
+                "edges_by_category": json.dumps(
+                    dict(
+                        collections.Counter(
+                            e.get("relevance_category")
+                            for e in mine
+                            if e.get("relevance_category")
+                        )
+                    ),
+                    sort_keys=True,
+                ),
+                "relevance_max": max(relevance) if relevance else None,
+                "relevance_median": _median(relevance),
+                "licence_state": _licence_state(feed),
+                "redistribution_allowed": feed.get("redistribution_allowed"),
+                "snapshot_id": snapshot_id,
+            }
+        )
+    return rows
+
+
+def _quantiles(values):
+    values = sorted(v for v in values if v is not None)
+    if not values:
+        return {"count": 0}
+    return {
+        "count": len(values),
+        "median": _median(values),
+        "p95": values[min(len(values) - 1, int(round(0.95 * (len(values) - 1))))],
+        "max": values[-1],
+    }
+
+
+def feed_sections(rows):
+    """The summary sections the feed rows answer: availability by outcome,
+    failure class and catalogue status; licensing; scale; the declared-versus-
+    observed country agreement; the declared-municipality outcomes."""
+
+    def counts(key, subset=None):
+        return dict(
+            collections.Counter(
+                r[key] for r in (subset if subset is not None else rows) if r[key]
+            )
+        )
+
+    crawled = [r for r in rows if r["crawl_outcome"] != "not_crawled"]
+    by_status = collections.defaultdict(collections.Counter)
+    for r in crawled:
+        by_status[r["catalogue_status"] or "unknown"][r["crawl_outcome"]] += 1
+    return {
+        "availability": {
+            "feeds": len(rows),
+            "crawled": len(crawled),
+            "by_outcome": counts("crawl_outcome"),
+            "failures_by_class": counts("failure_class"),
+            "outcome_by_catalogue_status": {
+                status: dict(c) for status, c in sorted(by_status.items())
+            },
+            "with_calendar": sum(1 for r in crawled if r["has_calendar"]),
+        },
+        "licensing": {
+            "licence_state": counts("licence_state"),
+            "redistribution_allowed": dict(
+                collections.Counter(
+                    {True: "yes", False: "no", None: "unknown"}[
+                        r["redistribution_allowed"]
+                    ]
+                    for r in rows
+                )
+            ),
+        },
+        "scale": {
+            "stop_count": _quantiles([r["stop_count"] for r in rows]),
+            "places_served": _quantiles(
+                [r["places_served"] for r in rows if r["places_served"]]
+            ),
+            "countries_served": dict(
+                collections.Counter(
+                    str(r["countries_served"]) for r in rows if r["places_served"]
+                )
+            ),
+        },
+        "country_agreement": {
+            "by_agreement": counts("country_agreement"),
+            "by_source": {
+                source: dict(
+                    collections.Counter(
+                        r["country_agreement"] for r in rows if r["source"] == source
+                    )
+                )
+                for source in sorted({r["source"] for r in rows if r["source"]})
+            },
+            "scope": counts("scope"),
+        },
+        "declared_municipality": {
+            "placed": sum(1 for r in rows if r["declared_place_id"]),
+            "by_level": counts("declared_level"),
+            "outcome": counts("municipality_outcome"),
+        },
+    }
+
+
+def _index_tables(cache_dir, snapshot):
+    """``(feeds, edges, places)`` of the published index, its partitions
+    joined; JSON columns decoded."""
+    tables = {"feeds": [], "edges": [], "places": []}
+    for partition, listed in (snapshot.get("partitions") or {}).items():
+        for table in listed:
+            path = cache_dir / "index" / partition / f"{table}.parquet"
+            tables[table].extend(pq.read_table(path).to_pylist())
+    for feed in tables["feeds"]:
+        for key in ("atlas", "mdb", "gbfs", "country_shares"):
+            if isinstance(feed.get(key), str):
+                feed[key] = json.loads(feed[key])
+    return tables["feeds"], tables["edges"], tables["places"]
+
+
+def _crawl_log(cache_dir):
+    """The crawl log's records, each with the feed's route count when its
+    routes were crawled; empty without a crawl."""
+    from transitio_index import classify, crawl
+
+    path = cache_dir / "crawl" / crawl.LOG_FILE
+    records = []
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+    routes = {}
+    for feed_dir, state in crawl.crawled_feeds(cache_dir):
+        with crawl.verified_member(feed_dir, state, "routes.txt") as opened:
+            if opened is not None:
+                routes[state.get("feed_id")] = len(classify._read_routes(opened)[0])
+    for record in records:
+        record["route_count"] = routes.get(record.get("feed_id"))
+    return records
+
+
+def _placements(cache_dir, snapshot):
+    """The seed placements the snapshot descends from, or none."""
+    recorded = (snapshot.get("generations") or {}).get("gazetteer/seed.json")
+    if recorded is None:
+        return []
+    placements, manifest = store.read_jsonl(
+        cache_dir / "gazetteer", "seed.json", "feed_places.jsonl"
+    )
+    if manifest.get("generation") != recorded:
+        raise StatsError(
+            "the published index was not built from the current seed placements; "
+            "re-run the pipeline in stage order"
+        )
+    return placements
