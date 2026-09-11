@@ -29,6 +29,14 @@ evidence stays ``unavailable`` with no fingerprint (``none``): a selector is
 never built from less than complete route coverage. A skipped feed whose
 whole-feed claim no longer holds is requested for a complete recrawl
 through ``recrawl_requests.jsonl``, the one artifact that crosses builds.
+
+The stage also decides each feed's home country from its stops: the distinct
+scheduled stops per country (``country_stops``), their shares, the country
+holding at least ``HOME_SHARE`` of them (``home_country``, else null) and the
+resulting ``scope`` — ``domestic``, ``international`` (stops, no home),
+``declared`` (no stop evidence, a catalogue country) or ``unknown``. The
+catalogues' ``declared_countries`` never set the home; they only tell
+``declared`` from ``unknown`` and feed the statistics.
 """
 
 import collections
@@ -61,6 +69,8 @@ REVIEW_CUTOFF = coverage.REVIEW_CUTOFF
 # every one of them; a neighbourhood route's single stop serves the people
 # around it.
 ROUTE_MIN_STOPS = 1
+# A feed's home country holds at least this share of its scheduled stops.
+HOME_SHARE = 0.80
 # A route decided within this fraction of a threshold has its confidence
 # multiplied by the penalty.
 MARGIN = 0.20
@@ -230,11 +240,11 @@ def _read_routes(opened):
 
 def _read_trips(opened, routes):
     """``({trip_id: route_id}, {trip_id: service_id}, orphans)`` for trips of
-    known routes, ids verbatim; ``orphans`` counts trips naming a route the
-    feed lacks."""
+    known routes, ids verbatim; ``orphans`` is the set of trip ids naming a
+    route the feed lacks."""
     trips = {}
     services = {}
-    orphans = 0
+    orphans = set()
     for row in _reader(opened):
         trip_id = row.get("trip_id") or ""
         route_id = row.get("route_id") or ""
@@ -244,7 +254,7 @@ def _read_trips(opened, routes):
             trips[trip_id] = route_id
             services[trip_id] = row.get("service_id") or ""
         else:
-            orphans += 1
+            orphans.add(trip_id)
     return trips, services, orphans
 
 
@@ -346,7 +356,7 @@ def _date(value):
         return None
 
 
-def _read_stop_times(opened, trip_routes, trip_services, weights=None):
+def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=None):
     """Per route, its distinct stop ids and its longest DISTINCT stop
     patterns, in two streamed passes — the file is never held whole.
 
@@ -365,9 +375,14 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None):
     ``weights`` maps a service id to its share of calendar days; with it,
     every scheduled stop-event adds that share to its stop's departures per
     day as the row streams by, one float per stop — the fourth result, or
-    None without a calendar.
+    None without a calendar. The fifth result is every served stop id the
+    file schedules for a trip the feed declares (``trips``, default the
+    joined ones), whether or not that trip joins a route: the feed's
+    country evidence must not shrink with a partial join.
     """
     stops = collections.defaultdict(set)
+    scheduled = set()
+    declared = trip_routes if trips is None else trips
     trip_rows = collections.Counter()
     departures = collections.Counter()
     dangling = 0
@@ -375,6 +390,11 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None):
         trip_id = row.get("trip_id") or ""
         route_id = trip_routes.get(trip_id)
         stop_id = row.get("stop_id") or ""
+        traversal = (row.get("pickup_type") or "").strip() == "1" and (
+            row.get("drop_off_type") or ""
+        ).strip() == "1"
+        if stop_id and not traversal and trip_id in declared:
+            scheduled.add(stop_id)
         if route_id is None:
             # A row whose trip the feed does not join: counted, so a feed
             # classified from a partial join says so in its evidence.
@@ -383,9 +403,7 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None):
         if not stop_id:
             continue
         trip_rows[trip_id] += 1
-        if (row.get("pickup_type") or "").strip() == "1" and (
-            row.get("drop_off_type") or ""
-        ).strip() == "1":
+        if traversal:
             # Neither boarding nor alighting: traversal, not service. The
             # row still shapes the trip's pattern (legs), never its stops.
             continue
@@ -442,6 +460,7 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None):
         sequences,
         dangling,
         (dict(departures) if weights is not None else None),
+        scheduled,
     )
 
 
@@ -562,9 +581,16 @@ def _members(feed_dir, state, names):
                     parsed["sequences"],
                     dangling,
                     parsed["stop_departures"],
-                ) = _read_stop_times(opened, trip_routes, trip_services, weights)
+                    parsed["scheduled"],
+                ) = _read_stop_times(
+                    opened,
+                    trip_routes,
+                    trip_services,
+                    weights,
+                    trips=trip_routes.keys() | orphans,
+                )
             parsed["join_gaps"] = {
-                "orphan_trips": orphans,
+                "orphan_trips": len(orphans),
                 "dangling_stop_times": dangling,
             }
     except crawl.MEMBER_ERRORS:
@@ -579,6 +605,50 @@ def _edge(candidate, tier, tier_confidence, evidence, needs_review):
     edge["evidence"] = evidence
     edge["needs_review"] = needs_review
     return edge
+
+
+def _country_stops(stop_ids, stop_countries):
+    """Distinct stops per country code over ``stop_ids``, sorted by code; a
+    stop resolving to no country is not counted."""
+    counts = collections.Counter()
+    for stop_id in stop_ids:
+        counts.update(stop_countries.get(stop_id, ()))
+    return dict(sorted(counts.items()))
+
+
+def declared_countries(feed):
+    """The country codes the catalogues claim for ``feed`` — MDB
+    ``location.country_code``, GBFS ``country_code``; Atlas records carry
+    none — upper-cased and sorted."""
+    codes = {
+        ((feed.get("mdb") or {}).get("location") or {}).get("country_code"),
+        (feed.get("gbfs") or {}).get("country_code"),
+    }
+    return sorted(code.strip().upper() for code in codes if code and code.strip())
+
+
+def feed_scope(country_stops, declared):
+    """``(country_shares, home_country, scope)`` from the decision table:
+    ``domestic`` when one country holds at least ``HOME_SHARE`` of the stops,
+    ``international`` when stops exist but none does, ``declared`` when there
+    is no stop evidence but a catalogue country, else ``unknown``."""
+    total = sum(country_stops.values())
+    if not total:
+        return {}, None, "declared" if declared else "unknown"
+    shares = {code: count / total for code, count in country_stops.items()}
+    home = max(shares, key=shares.get)
+    if shares[home] < HOME_SHARE:
+        return shares, None, "international"
+    return shares, home, "domestic"
+
+
+def _agreement(home, declared):
+    """How the observed home country compares with the catalogues' claim."""
+    if home is None:
+        return "unobserved"
+    if not declared:
+        return "undeclared"
+    return "agree" if home in declared else "disagree"
 
 
 def _unknown_edge(candidate, reason, route_min_stops):
@@ -709,9 +779,11 @@ def _classify_feed(
     conflicts=frozenset(),
 ):
     """The classified edges for one crawled feed; ``(edges, status, routes,
-    dropped, join_gaps)`` — ``dropped`` counting candidate places no route
-    serves, ``join_gaps`` the trips and stop_times rows the feed failed to
-    join (None without route evidence). ``conflicts`` names the divisions the
+    dropped, join_gaps, country_stops)`` — ``dropped`` counting candidate
+    places no route serves, ``join_gaps`` the trips and stop_times rows the
+    feed failed to join (None without route evidence), ``country_stops`` the
+    feed's distinct scheduled stops per country (empty without route
+    evidence). ``conflicts`` names the divisions the
     expand stage dropped: a stop in one is a logged miss, any other unknown
     QID-bearing division a stale expansion.
 
@@ -733,6 +805,7 @@ def _classify_feed(
             0,
             0,
             None,
+            {},
         )
     coords = parsed["coords"]
     routes = parsed["routes"]
@@ -765,6 +838,7 @@ def _classify_feed(
                 0,
                 0,
                 None,
+                {},
             )
         # The crawl's skip rested on single-tier, single-country, single-city
         # conditions judged against the boundary memo of ITS time; judge the
@@ -786,6 +860,7 @@ def _classify_feed(
                 0,
                 0,
                 None,
+                {},
             )
         feed_countries = (
             set().union(*stop_countries.values()) if stop_countries else set()
@@ -824,7 +899,17 @@ def _classify_feed(
                     "whole_feed",
                 )
             )
-        return edges, "whole_feed", len(routes), 0, None
+        # The skip predicate proved the feed single-place and single-country
+        # with every stop served, the same claim the whole-feed service
+        # struct makes, so every located stop is its country evidence.
+        return (
+            edges,
+            "whole_feed",
+            len(routes),
+            0,
+            None,
+            _country_stops(coords, stop_countries),
+        )
 
     if mode != "complete":
         return (
@@ -836,6 +921,7 @@ def _classify_feed(
             0,
             0,
             None,
+            {},
         )
 
     # Per-route measurement, then service to each candidate place.
@@ -907,7 +993,14 @@ def _classify_feed(
                 "complete",
             )
         )
-    return edges, "route_stops", len(routes), dropped, parsed.get("join_gaps")
+    return (
+        edges,
+        "route_stops",
+        len(routes),
+        dropped,
+        parsed.get("join_gaps"),
+        _country_stops(parsed["scheduled"], stop_countries),
+    )
 
 
 def _request_recrawl(cache_dir, feed_ids):
@@ -1182,7 +1275,8 @@ def classify(
     Reads the coverage generation (feeds and candidate edges from one pointer
     resolution), the expanded places and the crawl artifacts, and writes
     ``edges.jsonl`` — every candidate edge carried forward with its tier —
-    alongside the feeds unchanged. Returns the manifest.
+    alongside the feeds, each with its country stops, shares, home country,
+    declared countries and scope. Returns the manifest.
     """
     directory = store.open_subdir(cache_dir, "classify")
     opened_lookup = None
@@ -1263,11 +1357,12 @@ def classify(
             edges_dropped = 0
             join_gaps = collections.Counter()
             stale_skips = []
+            country_stops = {}
             for feed_id in progress(sorted(by_feed), "classify"):
                 feed_candidates = by_feed[feed_id]
                 if sources.get(feed_id) == "crawl" and feed_id in crawled:
                     feed_dir, state = crawled[feed_id]
-                    classified, status, routes, dropped, gaps = _classify_feed(
+                    classified, status, routes, dropped, gaps, stops = _classify_feed(
                         feed_candidates,
                         feed_dir,
                         state,
@@ -1284,6 +1379,7 @@ def classify(
                         join_gaps[key] += value
                     if status == "skip_stale":
                         stale_skips.append(feed_id)
+                    country_stops[feed_id] = stops
                 else:
                     classified = [
                         _unknown_edge(c, "declared", route_min_stops)
@@ -1293,6 +1389,23 @@ def classify(
                 statuses[status] += 1
                 edges.extend(classified)
             edges.sort(key=lambda e: (e["place_id"], e["feed_id"], e["tier"]))
+            scopes = collections.Counter()
+            agreement = collections.Counter()
+            for feed in feeds:
+                stops = country_stops.get(feed["feed_id"], {})
+                declared = declared_countries(feed)
+                shares, home, scope = feed_scope(stops, declared)
+                feed.update(
+                    {
+                        "country_stops": stops,
+                        "country_shares": shares,
+                        "home_country": home,
+                        "declared_countries": declared,
+                        "scope": scope,
+                    }
+                )
+                scopes[scope] += 1
+                agreement[_agreement(home, declared)] += 1
             # Under the crawl lock still held: appenders and the crawl's own
             # rewrite of this file must never interleave.
             recrawl_requested = _request_recrawl(cache_dir, stale_skips)
@@ -1327,6 +1440,9 @@ def classify(
                     collections.Counter(e["fingerprint_kind"] for e in edges)
                 ),
                 "recrawl_requested": recrawl_requested,
+                "home_share": HOME_SHARE,
+                "feeds_by_scope": dict(scopes),
+                "home_country_agreement": dict(agreement),
                 "unknown_share": (by_tier["unknown"] / len(edges)) if edges else 0.0,
                 "needs_review": sum(1 for e in edges if e["needs_review"]),
                 "retrieved_at": datetime.datetime.now(

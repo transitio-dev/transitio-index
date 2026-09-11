@@ -221,7 +221,7 @@ def test_shorter_patterns_survive_many_longer_duplicates():
     rows += b"branch,a,1\nbranch,d,2\n"
     trips = {f"t{i:02d}": "r" for i in range(64)}
     trips["branch"] = "r"
-    _, sequences, _, _ = classify._read_stop_times(io.BytesIO(rows), trips, {})
+    _, sequences, _, _, _ = classify._read_stop_times(io.BytesIO(rows), trips, {})
     assert sequences["r"] == [("a", "b", "c"), ("a", "d")]
 
 
@@ -229,7 +229,9 @@ def test_a_blank_stop_id_row_leaves_no_legs():
     import io
 
     rows = b"trip_id,stop_id,stop_sequence\nt,a,1\nt,,2\nt,c,3\n"
-    stops, sequences, _, _ = classify._read_stop_times(io.BytesIO(rows), {"t": "r"}, {})
+    stops, sequences, _, _, _ = classify._read_stop_times(
+        io.BytesIO(rows), {"t": "r"}, {}
+    )
     assert stops["r"] == {"a", "c"}
     assert sequences == {}
 
@@ -245,7 +247,7 @@ def test_pattern_sampling_keeps_distinct_patterns():
     rows += b"branch,a,1\nbranch,d,2\n"
     trips = {f"t{i}": "r" for i in range(9)}
     trips["branch"] = "r"
-    stops, sequences, _, _ = classify._read_stop_times(io.BytesIO(rows), trips, {})
+    stops, sequences, _, _, _ = classify._read_stop_times(io.BytesIO(rows), trips, {})
     assert stops["r"] == {"a", "b", "c", "d"}
     assert sequences["r"] == [("a", "b", "c"), ("a", "d")]
 
@@ -486,6 +488,7 @@ def _build(tmp_path):
             "spec": "gtfs",
             "coverage_source": "declared",
             "aliases": [],
+            "mdb": {"location": {"country_code": "AA"}},
         },
     ]
     candidates = [
@@ -591,6 +594,102 @@ def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
         "declared": 1,
     }
     assert manifest["routes_classified"] == 3
+
+
+@pytest.mark.parametrize(
+    "country_stops, declared, home, scope",
+    [
+        ({"AA": 4, "BB": 1}, [], "AA", "domestic"),  # exactly HOME_SHARE
+        ({"AA": 3, "BB": 1}, ["AA"], None, "international"),
+        ({}, ["AA"], None, "declared"),
+        ({}, [], None, "unknown"),
+    ],
+    ids=["domestic", "international", "declared", "unknown"],
+)
+def test_feed_scope_follows_the_decision_table(country_stops, declared, home, scope):
+    shares, found_home, found_scope = classify.feed_scope(country_stops, declared)
+    assert (found_home, found_scope) == (home, scope)
+    assert sum(shares.values()) == pytest.approx(1.0 if country_stops else 0.0)
+    # The catalogues' claim comes from MDB and GBFS, upper-cased; Atlas has none.
+    feed = {"mdb": {"location": {"country_code": "fi"}}, "gbfs": {"country_code": "EE"}}
+    assert classify.declared_countries(feed) == ["EE", "FI"]
+    assert classify.declared_countries({"atlas": {"onestop_id": "f-x"}}) == []
+
+
+def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
+    cache, manifest, _ = _build(tmp_path)
+    feeds, _ = store.read_jsonl(
+        cache / "classify", "edges.json", "feeds_classified.jsonl"
+    )
+    by_id = {feed["feed_id"]: feed for feed in feeds}
+    # Five scheduled stops, all in AA: domestic with home AA; the whole-feed
+    # skip counts every stop; no route evidence leaves the catalogue's claim
+    # (declared) or nothing (unknown).
+    assert by_id["f-a"]["country_stops"] == {"AA": 5}
+    assert by_id["f-a"]["country_shares"] == {"AA": 1.0}
+    assert by_id["f-a"]["home_country"] == "AA"
+    assert by_id["f-a"]["scope"] == "domestic"
+    assert by_id["f-skip"]["country_stops"] == {"AA": 2}
+    assert by_id["f-none"]["scope"] == "unknown"
+    assert by_id["f-none"]["country_stops"] == {}
+    assert by_id["f-declared"]["scope"] == "declared"
+    assert by_id["f-declared"]["declared_countries"] == ["AA"]
+    assert by_id["f-declared"]["home_country"] is None
+    assert manifest["home_share"] == classify.HOME_SHARE
+    assert manifest["feeds_by_scope"] == {"domestic": 2, "declared": 1, "unknown": 1}
+    assert manifest["home_country_agreement"] == {"undeclared": 2, "unobserved": 2}
+
+
+def test_a_two_country_feed_without_a_home_is_international(tmp_path):
+    cache = tmp_path / "cache"
+    feeds = [
+        {
+            "feed_id": "f-intl",
+            "spec": "gtfs",
+            "coverage_source": "crawl",
+            "aliases": [],
+            "mdb": {"location": {"country_code": "AA"}},
+        }
+    ]
+    _write_crawl(
+        cache,
+        "f-intl",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\nb1,1.0,30.0\n",
+            "routes.txt": b"route_id,route_type\nr,3\n",
+            # The BB stop is scheduled by a declared trip whose route the feed
+            # lacks: it still counts as country evidence.
+            "trips.txt": b"trip_id,route_id\nt,r\ntx,zz\n",
+            "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt,s1,1\ntx,b1,1\n",
+        },
+        "complete",
+    )
+    places = PLACES + [_place("Q-bb", "city")]
+    lookup = StubLookup(
+        {
+            10.0: _records("Q-city"),
+            30.0: [
+                {
+                    "kind": "city",
+                    "wikidata": "Q-bb",
+                    "country": "BB",
+                    "overture_id": "o",
+                }
+            ],
+        }
+    )
+    candidates = [_candidate("Q-city", "f-intl"), _candidate("Q-bb", "f-intl")]
+    _coverage(cache, feeds, candidates, places=places)
+    manifest = classify.classify(cache, lookup=lookup)
+    (feed,), _ = store.read_jsonl(
+        cache / "classify", "edges.json", "feeds_classified.jsonl"
+    )
+    assert feed["country_stops"] == {"AA": 1, "BB": 1}
+    assert feed["country_shares"] == {"AA": 0.5, "BB": 0.5}
+    assert feed["home_country"] is None and feed["scope"] == "international"
+    assert feed["declared_countries"] == ["AA"]
+    assert manifest["home_country_agreement"] == {"unobserved": 1}
+    assert manifest["join_gaps"] == {"orphan_trips": 1, "dangling_stop_times": 1}
 
 
 def test_a_skipped_feed_is_whole_feed_at_its_fixed_tier(tmp_path):
