@@ -570,3 +570,62 @@ def test_the_conservative_scan_settings_apply_only_behind_a_proxy(monkeypatch, p
     expected = geometry.PROXY_SCAN_OPTIONS if proxied else {}
     assert geometry.scan_options() == expected
     assert (overture.proxy_url() is not None) is proxied
+
+
+def test_the_boundary_lookup_reads_only_the_row_groups_its_cells_touch(tmp_path):
+    """Query rectangles used to be merged into their bounding box and scanned
+    as one: a chain of stop cells across a continent read every row group
+    between them, and the memo's box-level coverage never matched the next
+    build's box. Row groups are now chosen by their footer footprints, each
+    read once, and coverage is recorded per rectangle."""
+    areas = fx.write_area_dataset(
+        tmp_path / "a.parquet",
+        [
+            fx.area("west", _wkb(0, 0, 1, 1), GOOD, country="FI"),
+            fx.area("middle", _wkb(5, 5, 6, 6), GOOD, country="FI"),
+            fx.area("east", _wkb(10, 10, 11, 11), GOOD, country="FI"),
+        ],
+        row_group_size=1,
+    )
+    divisions = fx.write_dataset(
+        tmp_path / "d.parquet",
+        [
+            fx.division(
+                name,
+                "FI",
+                "locality",
+                wikidata=f"Q{i}",
+                name=name.title(),
+                hierarchies=fx.chain((name, "locality", name.title())),
+            )
+            for i, name in enumerate(("west", "middle", "east"), start=1)
+        ],
+    )
+    reads = []
+
+    class Counting:  # the dataset, its fragments, and their row-group subsets
+        def __init__(self, target):
+            self._target = target
+
+        def __getattr__(self, name):
+            return getattr(self._target, name)
+
+        def get_fragments(self):
+            return [Counting(f) for f in self._target.get_fragments()]
+
+        def subset(self, **kw):
+            reads.extend(kw["row_group_ids"])
+            return self._target.subset(**kw)
+
+    cells = [(0.2, 0.2, 0.8, 0.8), (10.2, 10.2, 10.8, 10.8)]
+    with boundaries.BoundaryLookup(
+        tmp_path / "cache",
+        release="test-release",
+        area_dataset=Counting(areas),
+        division_dataset=divisions,
+    ) as lookup:
+        assert lookup.ensure(cells) == 2
+        assert sorted(reads) == [0, 2]  # the row group between them: untouched
+        assert lookup.ensure(cells) == 0 and len(reads) == 2  # covered per cell
+        assert [r["division_id"] for r in lookup.divisions_at(10.5, 10.5)] == ["east"]
+        assert lookup.divisions_at(5.5, 5.5) == []
