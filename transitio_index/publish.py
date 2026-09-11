@@ -34,6 +34,8 @@ from transitio_index import registry as _registry
 from transitio_index import store
 
 SCHEMA_VERSION = 6
+# The edge generations that carry curation (curate, and rank on top of it).
+FINAL_SOURCES = ("curate", "rank")
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
@@ -470,7 +472,7 @@ def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
     The release is taken from the same generation's own manifest, so the
     places cannot be labelled with a different pointer read separately.
     """
-    curated = edge_manifest is not None and edge_manifest.get("source") == "curate"
+    curated = edge_manifest is not None and edge_manifest.get("source") in FINAL_SOURCES
     pruned = cache_dir / "prune" / "places_pruned.json"
     if pruned.is_symlink() or pruned.exists():
         try:
@@ -552,6 +554,7 @@ def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
 RAW_POINTERS = ("atlas.json", "mdb.json", "gbfs.json")
 # The edge pointer each edge stage publishes.
 EDGE_POINTERS = {
+    "rank": ("rank", "edges_ranked.json"),
     "curate": ("curate", "edges_final.json"),
     "classify": ("classify", "edges.json"),
     "coverage": ("coverage", "coverage.json"),
@@ -598,6 +601,8 @@ def _generations(cache_dir, edges, resolved, places):
         leaves["edges"] = leaves["feeds"] = f"{subdir}/{pointer}"
         found["classify/edges.json"] = edges.get("classify_generation")
         found["coverage/coverage.json"] = edges.get("coverage_generation")
+        if edges.get("source") == "rank":
+            found["curate/edges_final.json"] = edges.get("curate_generation")
         if edges.get("source") == "classify":
             found["classify/edges.json"] = edges.get("generation")
         if edges.get("source") == "coverage":
@@ -775,6 +780,7 @@ STAGE_LOCKS = (
     "coverage",
     "classify",
     "curate",
+    "rank",
     "prune",
 )
 
@@ -850,7 +856,7 @@ def read_inputs(cache_dir, overrides_dir):
                 "the edges were derived from a different places generation "
                 "than the one being published; re-run the pipeline in stage order"
             )
-        if coverage.get("source") not in ("classify", "curate"):
+        if coverage.get("source") not in ("classify", *FINAL_SOURCES):
             # Candidate edges carry no tiers; shipping them would publish
             # every edge as unknown with the tier gate silently off.
             raise PublishError(
@@ -1124,7 +1130,7 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             "stale_feed_overrides": (coverage or {}).get("stale_feed_overrides"),
             "stale_edge_overrides": (
                 coverage.get("stale_overrides")
-                if coverage is not None and coverage.get("source") == "curate"
+                if coverage is not None and coverage.get("source") in FINAL_SOURCES
                 else 0
             ),
         }

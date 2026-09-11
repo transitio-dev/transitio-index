@@ -42,6 +42,7 @@ STAGE_LOCKS = (
     "coverage",
     "classify",
     "curate",
+    "rank",
     "prune",
 )
 USER_AGENT = "transitio-publish-index"

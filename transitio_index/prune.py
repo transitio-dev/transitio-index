@@ -136,10 +136,11 @@ def prune(cache_dir):
             _, edges, manifest = classify.read_edges(cache_dir, locked=True)
         except classify.ClassifyError as error:
             raise PruneError(str(error)) from error
-        if manifest is None or manifest.get("source") != "curate":
+        if manifest is None or manifest.get("source") != "rank":
             # Only final edges may prune: an add_edge or remove_edge that has
-            # not been applied would leave places and edges disagreeing.
-            raise PruneError("no curate generation to prune against; run curate")
+            # not been applied would leave places and edges disagreeing, and
+            # the ranked edges are the ones a build ships.
+            raise PruneError("no rank generation to prune against; run rank")
         place_rows, expanded = store.read_jsonl(
             cache_dir / "gazetteer", "expanded.json", "places_expanded.jsonl"
         )

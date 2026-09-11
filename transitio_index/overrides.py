@@ -251,7 +251,7 @@ def applied_digest(manifest, overrides_dir):
     an ``edges.yaml`` with no curate generation at all is a stage that has
     not run. Returns the current digest (None without a file)."""
     current = edges_digest(overrides_dir)
-    if manifest is not None and manifest.get("source") == "curate":
+    if manifest is not None and manifest.get("source") in ("curate", "rank"):
         if manifest.get("overrides_sha256") != current:
             raise OverrideError(
                 "edges.yaml changed since the curate stage applied it; "

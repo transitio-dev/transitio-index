@@ -1122,15 +1122,22 @@ def _require_service(edges, stage):
             )
 
 
-EDGE_STAGES = ("resolve", "gazetteer", "coverage", "classify", "curate")
+EDGE_STAGES = ("resolve", "gazetteer", "coverage", "classify", "curate", "rank")
+# The edge generations that carry curation: the final edges a build ships.
+FINAL_SOURCES = ("curate", "rank")
+# The rank stage's pointer and artifacts (its module imports this one).
+RANK_POINTER = "edges_ranked.json"
+RANKED_EDGES_ARTIFACT = "edges_ranked.jsonl"
+RANKED_FEEDS_ARTIFACT = "feeds_ranked.jsonl"
 
 
-def read_edges(cache_dir, *, locked=False, final=True):
+def read_edges(cache_dir, *, locked=False, final=True, ranked=True):
     """``(feeds, edges, manifest)`` of the latest edge stage, or ``(None,
     None, None)`` with no edge stage at all.
 
-    The curate generation is preferred over the classify one (unless
-    ``final`` is False, for the curate stage reading its own input), and
+    The rank generation is preferred over the curate one (unless ``ranked``
+    is False, for the rank stage reading its own input), curate over
+    classify (unless ``final`` is False, for the curate stage), and
     classify over coverage; each is refused (:class:`ClassifyError`) unless
     it descends from the CURRENT resolved feeds, expanded places, crawl (by
     digest) and the generation before it in the chain: a rerun of any input
@@ -1144,17 +1151,17 @@ def read_edges(cache_dir, *, locked=False, final=True):
     between the lineage checks and the artifacts returned.
     """
     if locked:
-        return _read_edges(cache_dir, final)
+        return _read_edges(cache_dir, final, ranked)
     with contextlib.ExitStack() as stack:
         for subdir in EDGE_STAGES:
             held = store.open_subdir(cache_dir, subdir)
             stack.callback(held.close)
             stack.enter_context(store.exclusive_writer(held))
         stack.enter_context(crawl.reading(cache_dir))
-        return _read_edges(cache_dir, final)
+        return _read_edges(cache_dir, final, ranked)
 
 
-def _read_edges(cache_dir, final):
+def _read_edges(cache_dir, final, ranked=True):
     """:func:`read_edges` under the caller's locks."""
     if _pointer_present(cache_dir / "curate" / CURATE_POINTER) and not _pointer_present(
         cache_dir / "classify" / CLASSIFY_POINTER
@@ -1164,6 +1171,10 @@ def _read_edges(cache_dir, final):
         raise ClassifyError(
             "a curate generation exists without its classify generation"
         )
+    if _pointer_present(cache_dir / "rank" / RANK_POINTER) and not _pointer_present(
+        cache_dir / "curate" / CURATE_POINTER
+    ):
+        raise ClassifyError("a rank generation exists without its curate generation")
     if not _pointer_present(cache_dir / "coverage" / coverage.COVERAGE_POINTER):
         if _pointer_present(cache_dir / "classify" / CLASSIFY_POINTER):
             # Classified edges cannot exist without the coverage they
@@ -1264,7 +1275,31 @@ def _read_edges(cache_dir, final):
         feeds = store.parse_jsonl(curated.read_bytes(CURATED_FEEDS_ARTIFACT))
         edges = store.parse_jsonl(curated.read_bytes(CURATED_EDGES_ARTIFACT))
     _require_service(edges, "curated")
-    return feeds, edges, curate_manifest
+    if not ranked or not _pointer_present(cache_dir / "rank" / RANK_POINTER):
+        return feeds, edges, curate_manifest
+    try:
+        ranked_gen, rank_manifest = store.resolve(cache_dir / "rank", RANK_POINTER)
+    except (store.StoreError, ValueError) as error:
+        raise ClassifyError(f"the rank generation is unreadable: {error}") from error
+    with ranked_gen:
+        _check_descends(
+            rank_manifest,
+            "curate_generation",
+            curate_manifest.get("generation"),
+            "the ranked edges",
+            "rank",
+        )
+        _check_descends(
+            rank_manifest,
+            "expanded_generation",
+            current_expanded,
+            "the ranked edges",
+            "rank",
+        )
+        feeds = store.parse_jsonl(ranked_gen.read_bytes(RANKED_FEEDS_ARTIFACT))
+        edges = store.parse_jsonl(ranked_gen.read_bytes(RANKED_EDGES_ARTIFACT))
+    _require_service(edges, "ranked")
+    return feeds, edges, rank_manifest
 
 
 def classify(

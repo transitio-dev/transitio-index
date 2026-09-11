@@ -1128,6 +1128,14 @@ def test_the_snapshot_records_every_generation_it_descends_from(tmp_path):
         "classify/edges.json": "c",
         "coverage/coverage.json": "v",
     }
+    # A rank leaf records the curate generation it descends from as well.
+    ranked = {**edges, "source": "rank", "generation": "k", "curate_generation": "e"}
+    generations, leaves = publish._generations(
+        cache, ranked, {"generation": "r2"}, places
+    )
+    assert leaves["edges"] == leaves["feeds"] == "rank/edges_ranked.json"
+    assert generations["rank/edges_ranked.json"] == "k"
+    assert generations["curate/edges_final.json"] == "e"
     assert publish._generations(cache, None, None, None) == (
         {**raw, "crosswalk/feeds.json": crosswalk["generation"]},
         {"feeds": "crosswalk/feeds.json"},

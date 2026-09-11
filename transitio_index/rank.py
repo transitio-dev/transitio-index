@@ -1,5 +1,4 @@
-"""Relevance of every final edge: the rank stage's scoring, between curate
-and prune.
+"""Stage: relevance of every final edge, between curate and prune.
 
 Tier says what kind of service a feed runs in a place; relevance says how much
 that place should care. Every edge gets a ``relevance_category`` from its
@@ -23,7 +22,15 @@ weights live here and nothing else in the pipeline reads them.
 """
 
 import collections
+import contextlib
+import datetime
 import statistics
+
+from transitio_index import classify, store
+
+RANK_POINTER = classify.RANK_POINTER
+EDGES_ARTIFACT = classify.RANKED_EDGES_ARTIFACT
+FEEDS_ARTIFACT = classify.RANKED_FEEDS_ARTIFACT
 
 W_PLACE = 0.7
 W_FEED = 0.3
@@ -159,3 +166,73 @@ def _quantiles(values):
         q1, median, q3 = statistics.quantiles(values, n=4, method="inclusive")
         summary.update({"p25": q1, "median": median, "p75": q3})
     return summary
+
+
+def rank(cache_dir):
+    """Rank the curated edges; publish the ``rank`` generation. Returns the
+    manifest."""
+    with contextlib.ExitStack() as stack:
+        # The global lock order — this stage's own directory is its last
+        # entry — then the crawl's.
+        for subdir in classify.EDGE_STAGES:
+            directory = store.open_subdir(cache_dir, subdir)
+            stack.callback(directory.close)
+            stack.enter_context(store.exclusive_writer(directory))
+        from transitio_index import crawl
+
+        stack.enter_context(crawl.reading(cache_dir))
+        try:
+            feeds, edges, curated = classify.read_edges(
+                cache_dir, locked=True, ranked=False
+            )
+        except classify.ClassifyError as error:
+            raise RankError(str(error)) from error
+        if curated is None or curated.get("source") != "curate":
+            raise RankError("no curate generation to rank; run curate")
+        place_rows, expanded = store.read_jsonl(
+            cache_dir / "gazetteer", "expanded.json", "places_expanded.jsonl"
+        )
+        if curated.get("expanded_generation") != expanded.get("generation"):
+            raise RankError(
+                "the curated edges were not derived from the current expanded "
+                "places; re-run the pipeline in stage order"
+            )
+        places = {place["place_id"]: place for place in place_rows}
+        ranked, report = rank_edges(edges, feeds, places)
+        lineage = (
+            "mode",
+            "sources",
+            "overture_release",
+            "classify_generation",
+            "coverage_generation",
+            "feeds_overrides_sha256",
+            "stale_feed_overrides",
+            "expanded_generation",
+            "overrides_sha256",
+            "stale_overrides",
+        )
+        by_tier = collections.Counter(e["tier"] for e in ranked)
+        manifest = {
+            "source": "rank",
+            **{key: curated.get(key) for key in lineage},
+            "curate_generation": curated.get("generation"),
+            "weights": {"place": W_PLACE, "feed": W_FEED},
+            "feeds": len(feeds),
+            "edges": len(ranked),
+            # The golden drift gate reads these from the latest edge stage.
+            "edges_by_tier": dict(by_tier),
+            "unknown_share": (by_tier["unknown"] / len(ranked)) if ranked else 0.0,
+            "needs_review": sum(1 for e in ranked if e["needs_review"]),
+            **report,
+            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        return store.publish(
+            cache_dir / "rank",
+            RANK_POINTER,
+            {
+                FEEDS_ARTIFACT: store.jsonl_chunks(feeds),
+                EDGES_ARTIFACT: store.jsonl_chunks(ranked),
+            },
+            manifest,
+            held=directory,
+        )

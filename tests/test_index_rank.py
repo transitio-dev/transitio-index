@@ -2,7 +2,8 @@
 
 import pytest
 
-from transitio_index import rank
+from transitio_index import classify, curate, prune, publish, rank  # noqa: E402
+from test_index_prune import _curated_cache  # noqa: E402
 
 PLACES = {
     "c1": {"place_id": "c1", "kind": "city", "country_code": "FI"},
@@ -125,3 +126,40 @@ def test_inconsistent_inputs_are_refused():
             rank.rank_edges([edge], FEEDS, PLACES)
     with pytest.raises(rank.RankError, match="duplicate feed"):
         rank.rank_edges([], FEEDS + [FEEDS[0]], PLACES)
+
+
+def test_the_stage_ranks_the_curated_edges_and_is_the_final_edge_stage(tmp_path):
+    cache = _curated_cache(tmp_path)
+    with pytest.raises(rank.RankError, match="run curate"):
+        rank.rank(tmp_path / "nowhere")
+    # A re-curation leaves stale ranked edges: nothing prunes until rank reruns.
+    curate.curate(cache, overrides_dir=None)
+    with pytest.raises(prune.PruneError, match="re-run the rank"):
+        prune.prune(cache)
+    manifest = rank.rank(cache)
+    assert manifest["source"] == "rank" and manifest["weights"] == {
+        "place": rank.W_PLACE,
+        "feed": rank.W_FEED,
+    }
+    assert 0.0 <= manifest["unknown_share"] < 1.0 and "edges_by_tier" in manifest
+    feeds, edges, read_manifest = classify.read_edges(cache)
+    assert read_manifest["source"] == "rank" and len(edges) == manifest["edges"]
+    assert {e["relevance_category"] for e in edges} >= {"primary", "tertiary"}
+    assert all(0.0 <= e["relevance"] <= 1.0 for e in edges)
+    assert feeds[0]["home_country"] == "AA"
+    # Prune and publish read the ranked edges as the final stage.
+    prune.prune(cache)
+    _, _, edge_manifest, _ = publish._read_coverage(cache)
+    assert edge_manifest["source"] == "rank"
+    publish._read_places(cache, edge_manifest)
+    # A re-curation leaves the ranked edges behind: refused until rank reruns.
+    curate.curate(cache, overrides_dir=None)
+    with pytest.raises(classify.ClassifyError, match="re-run the rank"):
+        classify.read_edges(cache)
+    # Rank reads the curated edges even while a stale rank generation exists.
+    rank.rank(cache)
+    _, _, read_manifest = classify.read_edges(cache)
+    assert read_manifest["source"] == "rank"
+    (cache / "curate" / "edges_final.json").unlink()
+    with pytest.raises(classify.ClassifyError, match="without its curate"):
+        classify.read_edges(cache)

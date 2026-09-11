@@ -2,7 +2,7 @@
 
 import pytest
 
-from transitio_index import classify, curate, prune, publish, store  # noqa: E402
+from transitio_index import classify, curate, prune, publish, rank, store  # noqa: E402
 from test_index_classify import (  # noqa: E402
     LOOKUP,
     PLACES,
@@ -107,6 +107,7 @@ def _curated_cache(tmp_path, extra_places=()):
     )
     classify.classify(cache, lookup=LOOKUP)
     curate.curate(cache, overrides_dir=None)
+    rank.rank(cache)
     return cache
 
 
@@ -125,8 +126,11 @@ def test_the_stage_prunes_against_the_curated_edges_and_publish_ships_the_result
     shipped, release, generation, _ = publish._read_places(cache, edge_manifest)
     assert {p["place_id"] for p in shipped} == {"Q-city", "Q-reg", "Q-c", "Q-metro"}
     assert generation == edge_manifest["expanded_generation"] and release
-    # A re-curation leaves the pruned places behind.
+    # A re-curation leaves the ranked edges and the pruned places behind.
     curate.curate(cache, overrides_dir=None)
+    with pytest.raises(publish.PublishError, match="re-run the rank"):
+        publish._read_coverage(cache)
+    rank.rank(cache)
     _, _, edge_manifest, _ = publish._read_coverage(cache)
     with pytest.raises(publish.PublishError, match="re-run the prune"):
         publish._read_places(cache, edge_manifest)
@@ -151,5 +155,5 @@ def test_a_curated_build_without_pruned_places_is_refused(tmp_path):
 def test_pruning_needs_final_edges(tmp_path):
     cache = tmp_path / "cache"
     cache.mkdir()
-    with pytest.raises(prune.PruneError, match="run curate"):
+    with pytest.raises(prune.PruneError, match="run rank"):
         prune.prune(cache)

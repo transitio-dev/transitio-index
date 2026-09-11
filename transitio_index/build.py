@@ -49,6 +49,7 @@ from transitio_index import (  # noqa: E402
     progress,
     prune,
     publish,
+    rank,
     registry,
     resolve,
     seed,
@@ -284,6 +285,11 @@ def run_curate(arguments, places):
 
 
 @consumes_run
+def run_rank(arguments, places):
+    return [rank.rank(arguments.cache_dir)]
+
+
+@consumes_run
 def run_prune(arguments, places):
     return [prune.prune(arguments.cache_dir)]
 
@@ -326,6 +332,7 @@ STAGES = {
     "coverage": run_coverage,
     "classify": run_classify,
     "curate": run_curate,
+    "rank": run_rank,
     "prune": run_prune,
     "license": run_license,
     "publish": run_publish,
