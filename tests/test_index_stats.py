@@ -54,11 +54,12 @@ RAW = {
             municipality="Espoo, Kauniainen",
             country=None,
         ),
-        # Deprecated, redirecting to a row the catalogue lacks; no municipality.
+        # Deprecated, redirecting first to a row the catalogue lacks, then to
+        # one it holds; no municipality.
         _mdb(
             "mdb-4",
             status="deprecated",
-            redirects=["mdb-9"],
+            redirects=["mdb-9", "tdg-2"],
             municipality=None,
             extracted=None,
         ),
@@ -154,7 +155,9 @@ def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
     assert hsl["has_license_url"] and hsl["has_latest_url"] and hsl["has_bbox"]
     assert by_id[("mdb", "mdb-3", None)]["redirect_target_status"] == "active"
     assert by_id[("mdb", "mdb-3", None)]["redirect_targets"] == ["mdb-1"]
-    assert by_id[("mdb", "mdb-4", "FI")]["redirect_target_status"] is None
+    assert by_id[("mdb", "mdb-4", "FI")]["redirect_target_status"] == "active"
+    assert by_id[("mdb", "mdb-4", "FI")]["redirect_targets"] == ["mdb-9", "tdg-2"]
+    assert by_id[("mdb", "mdb-4", "FI")]["redirect_target"] == "tdg-2"
     assert by_id[("mdb", "mdb-1", "FI")]["redirect_targets"] == []
     assert by_id[("atlas", "f-hsl", None)]["feed_id"] == "f-hsl"
     assert by_id[("gbfs", "bikes/FI", "FI")]["feed_id"] == "f-gbfs-bikes-fi"
@@ -167,6 +170,35 @@ def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
     assert stats._lon_span(wrapped) == pytest.approx(2.0)
     with pytest.raises(stats.StatsError, match="share a key"):
         stats.catalogue_rows({"mdb": [_mdb("mdb-1"), _mdb("mdb-1")]}, [])
+
+
+def test_summary_sections_count_the_catalogue_defects():
+    rows = stats.catalogue_rows(RAW, FEEDS)
+    declared = stats.declared_places(rows)
+    assert declared["mdb_rows"] == 4
+    assert declared["missing_country"] == 1 and declared["missing_municipality"] == 1
+    assert declared["subdivision_without_municipality"] == 1
+    assert declared["municipality_repeats_subdivision"] == 1
+    assert declared["municipality_lists_several"] == 1
+    assert declared["missing_bbox"] == 2
+    assert (
+        declared["bbox_over_15_degrees"] == 1 and declared["bbox_over_40_degrees"] == 1
+    )
+    assert declared["bbox_by_extracted_year"] == {"2026": 3}
+    assert declared["atlas_rows_without_location"] == 1
+    assert declared["gbfs_rows_with_free_text_location"] == 2
+    identity = stats.identity(rows, FEEDS)
+    assert identity["rows_by_source"] == {"mdb": 4, "atlas": 1, "gbfs": 2}
+    assert identity["id_namespaces"] == {"mdb": 3, "tdg": 1}
+    assert identity["deprecated_rows"] == 2 == identity["deprecated_with_redirect"]
+    assert identity["redirect_target_present"] == 2
+    assert identity["redirect_target_status"] == {"active": 2}
+    assert identity["redirect_shares_target_url"] == 1
+    assert identity["mdb_rows_without_name"] == 3
+    assert identity["gbfs_duplicate_system_ids"] == 1
+    assert identity["rows_into_feeds"] == 6
+    assert identity["rows_dropped_by_reason"] == {"ambiguous_id": 1}
+    assert identity["feeds_by_crosswalk_method"] == {"url_exact": 1, "none": 4}
 
 
 def _publish(cache, subdir, pointer, artifacts, manifest):
@@ -206,7 +238,7 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
         {"source": "crosswalk", "sources": {"mdb": {"csv_label": "x"}}},
     )
     generations["crosswalk/feeds.json"] = crosswalk["generation"]
-    (cache / "index").mkdir()
+    (cache / "index").mkdir(exist_ok=True)
     snapshot = cache / "index" / "snapshot.json"
     with pytest.raises(stats.StatsError, match="no published index"):
         stats.stats(cache)
@@ -226,7 +258,7 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
     )
     manifest = stats.stats(cache)
     assert manifest["catalogue_rows"] == 7 and manifest["snapshot_id"] == "abc"
-    assert manifest["sections"] == ["build"]
+    assert manifest["sections"] == ["build", "declared_places", "identity"]
     generation, _ = store.resolve(cache / "stats", "stats.json")
     with generation:
         table = pq.read_table(pa_source(generation.read_bytes("catalogue.parquet")))
@@ -239,6 +271,7 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
     # Every ingest read a local file: a cut sample, not the full catalogues.
     assert summary["build"]["sample"] == "sample"
     assert summary["build"]["sample_sources"] == ["mdb", "atlas", "gbfs"]
+    assert summary["identity"]["feeds"] == 5
 
 
 def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
@@ -254,8 +287,8 @@ def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
     rows = table.to_pylist()
     # The url-matched MDB row and its Atlas feed both name the same feed.
     assert {r["feed_id"] for r in rows if r["source_id"] in ("mdb-1", "f-a")} == {"f-a"}
-    assert all(r["feed_id"] for r in rows)
-    assert summary["build"]["snapshot_id"] == published["snapshot_id"]
+    assert summary["identity"]["rows_into_feeds"] == len(rows)
+    assert summary["identity"]["feeds"] == published["counts"]["feeds"]
 
 
 def pa_source(data):

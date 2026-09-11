@@ -5,8 +5,8 @@ stage reads the ingest generations (every Mobility Database, Transitland Atlas
 and GBFS row the build ingested) and the crosswalk generation (the feeds they
 became) and writes a ``stats`` generation with ``catalogue.parquet`` — one row
 per catalogue row, whether or not it became a feed — and ``summary.json``, the
-totals the report renders, keyed by section (the build's provenance here; the
-declared-place and identity sections follow). Nothing is re-run and
+totals and shares the report renders, keyed by section: the build's
+provenance, the declared places and identity and duplication. Nothing is re-run and
 no network is touched; for a sample build the rows are the sample's, and the
 summary records the build's snapshot id and source versions.
 """
@@ -16,6 +16,7 @@ import contextlib
 import datetime
 import io
 import json
+import re
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -33,6 +34,11 @@ RAW_SOURCES = {
     "atlas": ("atlas.json", "atlas_feeds.jsonl"),
     "gbfs": ("gbfs.json", "gbfs_systems.jsonl"),
 }
+
+# A declared bounding box wider than these, in degrees, is not a place.
+WIDE_BOX_DEGREES = (15.0, 40.0)
+# A municipality field naming several places at once.
+_SEVERAL = re.compile(r"[,/;]")
 
 CATALOGUE_SCHEMA = pa.schema(
     [
@@ -52,6 +58,7 @@ CATALOGUE_SCHEMA = pa.schema(
         ("bbox_lat_span", pa.float64()),
         ("bbox_extracted_year", pa.int64()),
         ("redirect_targets", pa.list_(pa.string())),
+        ("redirect_target", pa.string()),
         ("redirect_target_status", pa.string()),
         ("download_url", pa.string()),
         ("download_host", pa.string()),
@@ -84,9 +91,11 @@ def _mdb_row(record, status_by_id):
     location = record.get("location") or {}
     urls = record.get("urls") or {}
     box = record.get("bounding_box")
-    # Every replacement a deprecated row names; the status is the first's.
+    # Every replacement a deprecated row names; the status is that of the
+    # first one the catalogue holds, else of the first named.
     redirects = list(record.get("redirect_ids") or [])
-    target = redirects[0] if redirects else None
+    present = [t for t in redirects if t in status_by_id]
+    target = present[0] if present else (redirects[0] if redirects else None)
     url = _clean_url(urls.get("direct_download"))
     return {
         "source": "mdb",
@@ -105,6 +114,7 @@ def _mdb_row(record, status_by_id):
         "bbox_lat_span": box["max_lat"] - box["min_lat"] if box else None,
         "bbox_extracted_year": _year(record.get("bounding_box_extracted_on")),
         "redirect_targets": redirects,
+        "redirect_target": target,
         "redirect_target_status": status_by_id.get(target) if target else None,
         "download_url": url,
         "download_host": _host(url) if url else None,
@@ -206,6 +216,110 @@ def catalogue_rows(raw, feeds, snapshot_id=None):
     return rows
 
 
+def declared_places(rows):
+    """The declared-place section: what the MDB location fields leave out or
+    get wrong, and what the other catalogues never carry."""
+    mdb = [row for row in rows if row["source"] == "mdb"]
+    wide, very_wide = WIDE_BOX_DEGREES
+
+    def span(row):
+        return max(row["bbox_lon_span"] or 0.0, row["bbox_lat_span"] or 0.0)
+
+    def several(row):
+        return bool(row["declared_municipality"]) and bool(
+            _SEVERAL.search(row["declared_municipality"])
+        )
+
+    def repeats(row):
+        return bool(row["declared_municipality"]) and (
+            row["declared_municipality"].strip().casefold()
+            == (row["declared_subdivision"] or "").strip().casefold()
+        )
+
+    return {
+        "mdb_rows": len(mdb),
+        "missing_country": sum(1 for r in mdb if not r["declared_country"]),
+        "missing_subdivision": sum(1 for r in mdb if not r["declared_subdivision"]),
+        "missing_municipality": sum(1 for r in mdb if not r["declared_municipality"]),
+        "subdivision_without_municipality": sum(
+            1
+            for r in mdb
+            if r["declared_subdivision"] and not r["declared_municipality"]
+        ),
+        "municipality_repeats_subdivision": sum(1 for r in mdb if repeats(r)),
+        "municipality_lists_several": sum(1 for r in mdb if several(r)),
+        "missing_bbox": sum(1 for r in mdb if not r["has_bbox"]),
+        f"bbox_over_{wide:g}_degrees": sum(
+            1 for r in mdb if r["has_bbox"] and span(r) > wide
+        ),
+        f"bbox_over_{very_wide:g}_degrees": sum(
+            1 for r in mdb if r["has_bbox"] and span(r) > very_wide
+        ),
+        "bbox_by_extracted_year": dict(
+            collections.Counter(
+                str(r["bbox_extracted_year"])
+                for r in mdb
+                if r["bbox_extracted_year"] is not None
+            )
+        ),
+        "atlas_rows_without_location": sum(1 for r in rows if r["source"] == "atlas"),
+        "gbfs_rows_with_free_text_location": sum(
+            1 for r in rows if r["source"] == "gbfs" and r["declared_municipality"]
+        ),
+    }
+
+
+def identity(rows, feeds):
+    """The identity-and-duplication section: id namespaces, deprecated rows
+    and their redirects, nameless rows, duplicated GBFS ids, and what the
+    crosswalk made of the rows."""
+    mdb = [row for row in rows if row["source"] == "mdb"]
+    deprecated = [row for row in mdb if row["status"] == "deprecated"]
+    url_by_id = {row["source_id"]: row["download_url"] for row in mdb}
+    gbfs_ids = collections.Counter(
+        row["source_id"] for row in rows if row["source"] == "gbfs"
+    )
+    return {
+        "rows_by_source": dict(collections.Counter(row["source"] for row in rows)),
+        "id_namespaces": dict(collections.Counter(row["id_namespace"] for row in mdb)),
+        "deprecated_rows": len(deprecated),
+        "deprecated_with_redirect": sum(1 for r in deprecated if r["redirect_targets"]),
+        "redirect_target_present": sum(
+            1 for r in deprecated if r["redirect_target_status"] is not None
+        ),
+        "redirect_target_status": dict(
+            collections.Counter(
+                r["redirect_target_status"]
+                for r in deprecated
+                if r["redirect_target_status"] is not None
+            )
+        ),
+        "redirect_shares_target_url": sum(
+            1
+            for r in deprecated
+            if r["download_url"]
+            and any(
+                r["download_url"] == url_by_id.get(t) for t in r["redirect_targets"]
+            )
+        ),
+        "mdb_rows_without_name": sum(1 for r in mdb if not r["has_name"]),
+        "gbfs_duplicate_system_ids": sum(
+            1
+            for n in collections.Counter(k.split("/")[0] for k in gbfs_ids).values()
+            if n > 1
+        ),
+        "rows_into_feeds": sum(1 for r in rows if r["feed_id"]),
+        "rows_dropped_by_reason": dict(
+            collections.Counter(r["drop_reason"] for r in rows if r["drop_reason"])
+        ),
+        "feeds": len(feeds),
+        "feeds_by_source": dict(collections.Counter(f["source"] for f in feeds)),
+        "feeds_by_crosswalk_method": dict(
+            collections.Counter(f.get("crosswalk_method") for f in feeds)
+        ),
+    }
+
+
 def _read_raw(cache_dir):
     """``({source: records}, {source: manifest})`` for the ingests that ran."""
     records, manifests = {}, {}
@@ -252,9 +366,12 @@ def stats(cache_dir):
     """Gather the build's statistics; publish the ``stats`` generation.
     Returns the manifest."""
     with contextlib.ExitStack() as stack:
-        directory = store.open_subdir(cache_dir, "stats")
-        stack.callback(directory.close)
-        stack.enter_context(store.exclusive_writer(directory))
+        # The index lock publish takes to write: the snapshot read here is
+        # the one the statistics are published against.
+        for subdir in ("index", "stats"):
+            directory = store.open_subdir(cache_dir, subdir)
+            stack.callback(directory.close)
+            stack.enter_context(store.exclusive_writer(directory))
         if store.current_generation(cache_dir / "crosswalk", "feeds.json") is None:
             raise StatsError("no crosswalk generation to gather statistics from")
         feeds, crosswalk = store.read_jsonl(
@@ -286,6 +403,8 @@ def stats(cache_dir):
                 "sample": "sample" if local else "full",
                 "sample_sources": local,
             },
+            "declared_places": declared_places(rows),
+            "identity": identity(rows, feeds),
         }
         manifest = {
             "source": "stats",
