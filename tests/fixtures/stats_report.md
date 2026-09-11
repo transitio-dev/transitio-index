@@ -18,9 +18,9 @@ The snapshot the statistics describe and the catalogues it read.
 
 | key | archive_sha256 | commit | commit_verified | csv_label | csv_sha256 |
 |---|---|---|---|---|---|
-| atlas | <archive> | aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | False |  |  |
-| gbfs |  |  |  | 2026-08-28 | 5beb2ff25a7003704b9b2f35c6605e33f5657e5a76caf1e92f8d431730d002c8 |
-| mdb |  |  |  | 2026-08-28 | 0413ed59f046d67263228aa6af7239c098fa5f012a8440ab3d506060b394298f |
+| atlas | <digest> | aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | False |  |  |
+| gbfs |  |  |  | 2026-08-28 | <digest> |
+| mdb |  |  |  | 2026-08-28 | <digest> |
 
 ### catalogue dates
 
