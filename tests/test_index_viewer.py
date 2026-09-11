@@ -14,6 +14,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -419,6 +421,25 @@ def test_the_api_serves_the_listing_summaries_and_bounded_slices(tmp_path, monke
         for f in clipped
         for x, y in f["geometry"]["coordinates"][0]
     )
+    table = client.get(f"/api/builds/{iv.LATEST}/places/table")
+    assert table.status_code == 200 and table.json()["total"] == 6
+    assert table.headers["x-snapshot"] == summary["snapshot_id"]  # pages, one snapshot
+    page = client.get(
+        f"/api/builds/{iv.LATEST}/places/table",
+        params={"sort": "feed_count", "order": "desc", "limit": 999},
+    ).json()
+    assert page["rows"][0]["place_id"] == "hel" and page["limit"] == 200
+    assert (
+        client.get(f"/api/builds/{iv.LATEST}/places/table?sort=nope").status_code == 400
+    )
+    record = client.get(f"/api/builds/{iv.LATEST}/places/hel")
+    assert record.headers["content-type"].startswith("application/geo+json")
+    assert record.headers["x-snapshot"] == summary["snapshot_id"]
+    assert [a["place_id"] for a in record.json()["properties"]["ancestors"]] == [
+        "fi",
+        "uus",
+    ]
+    assert client.get(f"/api/builds/{iv.LATEST}/places/nope").status_code == 404
     for bad in ({"kind": "city"}, {"bbox": "1,2,3"}, {"served": "maybe"}):
         assert client.get(base, params=bad).status_code == 400, bad
     monkeypatch.setattr(iv, "MAX_FEATURES", 2)
@@ -519,3 +540,94 @@ def test_the_page_module_parses_as_esm_and_its_unit_tests_pass():
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_places_table_is_sorted_paged_and_geometry_free(tmp_path):
+    build = iv.load_build("b", write_build(tmp_path) and tmp_path)
+    everything = iv.filter_places(build, kinds=None, bounded=False)
+    page = iv.places_table(build, everything)
+    assert page["total"] == 6 and [r["name"] for r in page["rows"]][:2] == [
+        "Espoo",
+        "Finland",
+    ]
+    assert set(page["rows"][0]) == {
+        "place_id",
+        "name",
+        "kind",
+        "parent_id",
+        "parent_name",
+        "country_code",
+        "served",
+        "feed_count",
+        "stops",
+        "routes",
+        "departures_per_day",
+    }
+    busiest = iv.places_table(build, everything, sort="feed_count", order="desc")
+    assert busiest["rows"][0]["place_id"] == "hel" and busiest["rows"][0]["served"]
+    assert busiest["rows"][0]["parent_name"] == "Uusimaa"
+    assert busiest["rows"][0]["stops"] is None  # the fixture's service has none
+    paged = iv.places_table(build, everything, limit=2, offset=2)
+    assert paged["total"] == 6 and [r["name"] for r in paged["rows"]] == [
+        "Helsinki",
+        "Lapland",
+    ]
+    served = iv.places_table(
+        build, iv.filter_places(build, kinds=None, served=True, bounded=False)
+    )
+    assert [r["place_id"] for r in served["rows"]] == ["hel"]
+    with pytest.raises(ValueError, match="sort must be"):
+        iv.places_table(build, everything, sort="geometry")
+
+
+def test_a_place_record_carries_ancestors_children_and_feeds(tmp_path):
+    build = iv.load_build("b", write_build(tmp_path) and tmp_path)
+    feature = json.loads(iv.place_record(build, "hel"))
+    props = feature["properties"]
+    assert feature["type"] == "Feature" and feature["id"] == "hel"
+    stored = shapely.from_geojson(json.dumps(feature["geometry"]))
+    assert stored.equals(BOX(24.8, 60.1, 25.3, 60.35))  # the stored box, as is
+    assert [a["place_id"] for a in props["ancestors"]] == ["fi", "uus"]
+    assert props["served"] and props["feed_count"] == 1
+    assert props["bbox"] == [24.8, 60.1, 25.3, 60.35]
+    assert props["edges"] == [{"feed_id": "f1", "tier": "local", "feed_name": "HSL"}]
+    assert props["service"] == {"feeds": 1}
+    region = json.loads(iv.place_record(build, "uus"))["properties"]
+    assert region["children"] == {"count": 2, "by_kind": {"city": 2}, "served": 1}
+    assert iv.place_record(build, "nope") is None
+    # Arrow maps arrive as lists of pairs, empty or not; the record makes dicts.
+    assert iv._as_map([("en", "Helsinki"), ("fi", "Helsinki")]) == {
+        "en": "Helsinki",
+        "fi": "Helsinki",
+    }
+    assert iv._as_map([]) == {} and iv._as_map(None) is None
+    # Every missing scalar pandas can hand back becomes null, not a 500.
+    assert [iv._cell(v) for v in (pd.NA, pd.NaT, float("nan"), np.float64("inf"))] == [
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert iv._cell(np.int64(3)) == 3 and iv._cell(np.array(["a", "b"])) == ["a", "b"]
+
+
+def test_non_finite_service_numbers_never_reach_the_json(tmp_path):
+    # ``1e400`` is legal JSON that parses to infinity; it must not break the
+    # table's serialization or leak as a non-standard token in the record.
+    odd = dict(_place("odd", "region", "Odd", "fi", BOX(0, 0, 1, 1)))
+    odd["service"] = '{"stops": 1e400, "routes": -1e400, "feeds": 2}'
+    places = PLACES[:1] + [odd]
+    build = iv.load_build("b", write_build(tmp_path, places=places) and tmp_path)
+    row = iv.places_table(build, iv.filter_places(build, kinds={"region"}))["rows"][0]
+    assert row["stops"] is None and row["routes"] is None
+    record = json.loads(iv.place_record(build, "odd"))
+    assert record["properties"]["service"] == {
+        "stops": None,
+        "routes": None,
+        "feeds": 2,
+    }
+    # Service JSON is parsed once at load: a malformed edge service makes the
+    # build unavailable instead of failing a later request.
+    broken = tmp_path / "broken"
+    write_build(broken, edges=[EDGES[0] | {"service": "{not json"}])
+    assert iv.load_build("b", broken) is None

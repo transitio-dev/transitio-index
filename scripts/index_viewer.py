@@ -34,6 +34,7 @@ import webbrowser
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shapely
@@ -95,6 +96,47 @@ MAX_BYTES = 8 * 1024 * 1024
 ZOOM_TOLERANCES = ((6, 0.02), (9, 0.005))
 PROPERTY_COLUMNS = ("place_id", "name", "kind", "parent_id", "country_code", "service")
 _HERE = Path(__file__).resolve().parent  # the page and its module live here
+TABLE_LIMIT = 200  # rows per page of the places table, at most
+SERVICE_STATS = ("stops", "routes", "departures_per_day")
+TABLE_SORT_COLUMNS = (
+    "place_id",
+    "name",
+    "kind",
+    "parent_name",
+    "country_code",
+    "served",
+    "feed_count",
+) + SERVICE_STATS
+# The descriptive columns a place record carries when the build has them.
+RECORD_COLUMNS = (
+    "place_id",
+    "kind",
+    "source_subtype",
+    "name",
+    "names",
+    "aliases",
+    "parent_id",
+    "country_code",
+    "overture_id",
+    "osm_relation_id",
+    "wikidata_id",
+    "geonames_id",
+    "statistical_area_id",
+    "resolution_method",
+    "geometry_source",
+    "curated",
+    "metro_ids",
+    "member_ids",
+)
+EDGE_COLUMNS = (
+    "feed_id",
+    "tier",
+    "tier_confidence",
+    "method",
+    "needs_review",
+    "service",
+)
+EDGE_FEED_COLUMNS = ("name", "spec", "source", "crawl_status", "stop_count")
 
 
 def _is_regular_file(path):
@@ -153,9 +195,11 @@ class Build:
         places = tables["places.parquet"].to_pandas()
         self.geoms = shapely.from_wkb(places["geometry"].to_numpy())
         self.bounds = shapely.bounds(self.geoms)
-        self.places = places.drop(columns=["geometry"])
-        self.edges = tables["edges.parquet"].to_pandas()
-        self.feeds = tables["feeds.parquet"].to_pandas()
+        # Positional frames: a parquet written with a pandas index would
+        # restore it, and every lookup here is by row position.
+        self.places = places.drop(columns=["geometry"]).reset_index(drop=True)
+        self.edges = tables["edges.parquet"].to_pandas().reset_index(drop=True)
+        self.feeds = tables["feeds.parquet"].to_pandas().reset_index(drop=True)
         self.served = (
             self.places["place_id"].isin(set(self.edges["place_id"])).to_numpy()
         )
@@ -163,6 +207,19 @@ class Build:
         self.feed_count = (
             self.places["place_id"].map(per_place).fillna(0).astype(int).to_numpy()
         )
+        self._row_of = pd.Series(
+            np.arange(len(self.places)), index=self.places["place_id"].to_numpy()
+        )
+        # The ``service`` JSON of places and edges, parsed once here and
+        # normalized (non-finite → None); nothing parses it again per request,
+        # and malformed JSON makes the build unavailable rather than a 500.
+        self.service = [_loads(v) for v in self.places["service"].to_numpy()]
+        self.edge_service = (
+            [_loads(v) for v in self.edges["service"].to_numpy()]
+            if "service" in self.edges.columns
+            else None
+        )
+        self.table = _place_table(self)
 
 
 def load_build(build_id, path, read_bytes=_read_file):
@@ -339,17 +396,20 @@ def filter_places(
     served=None,
     q=None,
     feed_id=None,
+    bounded=True,
 ):
     """A boolean mask over the build's places for one slice.
 
     ``kinds`` is a collection of kinds (the default pair when omitted), or
-    None for every kind. A slice that can include
-    cities must be bounded by ``parent_id`` or ``bbox`` (``ValueError``
-    otherwise). ``feed_id`` keeps the places that feed serves, through the
+    None for every kind. With ``bounded`` (the default, for map slices) a
+    slice that can include cities must be bounded by ``parent_id`` or
+    ``bbox`` (``ValueError`` otherwise); the geometry-free table passes
+    ``bounded=False``. ``feed_id`` keeps the places that feed serves, through the
     edges. Every test is a vectorized mask over the build's arrays.
     """
     places = build.places
-    if (kinds is None or "city" in kinds) and parent_id is None and bbox is None:
+    unbounded = parent_id is None and bbox is None
+    if bounded and unbounded and (kinds is None or "city" in kinds):
         raise ValueError("a slice that includes cities needs parent_id or bbox")
     mask = np.ones(len(places), dtype=bool)
     if kinds is not None:
@@ -403,6 +463,154 @@ def generalize(geoms, tolerance):
             geoms[broken], tolerance, preserve_topology=True
         )
     return simplified
+
+
+def _service_frame(parsed):
+    """The parsed ``service`` dicts as a numeric frame, NaN where a stat is absent."""
+    records = [stats if isinstance(stats, dict) else {} for stats in parsed]
+    frame = pd.DataFrame.from_records(records).reindex(columns=SERVICE_STATS)
+    return frame.apply(pd.to_numeric, errors="coerce")
+
+
+def _place_table(build):
+    """The geometry-free table of a build's places, one row per place."""
+    places = build.places
+    names = pd.Series(places["name"].to_numpy(), index=places["place_id"].to_numpy())
+    table = places[["place_id", "name", "kind", "parent_id", "country_code"]].copy()
+    table["parent_name"] = places["parent_id"].map(names).to_numpy()
+    table["served"] = build.served
+    table["feed_count"] = build.feed_count
+    stats = _service_frame(build.service)
+    for column in SERVICE_STATS:
+        table[column] = stats[column].to_numpy()
+    return table.reset_index(drop=True)
+
+
+def _json_ready(frame):
+    """A frame's rows as plain JSON values: Python scalars, None for NaN and ±inf."""
+    frame = frame.replace([np.inf, -np.inf], np.nan).astype(object)
+    return frame.where(frame.notna(), None).to_dict(orient="records")
+
+
+def places_table(build, mask, sort="name", order="asc", offset=0, limit=50):
+    """``{"total", "offset", "limit", "rows"}``: a page of the masked places."""
+    if sort not in TABLE_SORT_COLUMNS:
+        raise ValueError(f"sort must be one of {', '.join(TABLE_SORT_COLUMNS)}")
+    if order not in ("asc", "desc"):
+        raise ValueError("order must be asc or desc")
+    if offset < 0 or limit < 1:
+        raise ValueError("offset must be at least 0 and limit at least 1")
+    limit = min(limit, TABLE_LIMIT)
+    rows = build.table[mask].sort_values(
+        sort, ascending=order == "asc", kind="stable", na_position="last"
+    )
+    page = rows.iloc[offset : offset + limit]
+    return {
+        "total": int(len(rows)),
+        "offset": offset,
+        "limit": limit,
+        "rows": _json_ready(page),
+    }
+
+
+def _cell(value):
+    """One pandas cell as a JSON value (Arrow maps arrive as lists of pairs)."""
+    if isinstance(value, np.ndarray):
+        return [_cell(item) for item in value.tolist()]
+    if isinstance(value, list):
+        if value and all(isinstance(item, tuple) and len(item) == 2 for item in value):
+            return dict(value)
+        return [_cell(item) for item in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is pd.NA or value is pd.NaT:  # pandas' own missing scalars
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _as_map(value):
+    """An Arrow map cell (a list of pairs, or empty) as a dict; None stays None."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return dict(value.tolist() if isinstance(value, np.ndarray) else value)
+
+
+def _finite(value):
+    """Parsed JSON with every non-finite number (``1e400`` → inf) made None."""
+    if isinstance(value, dict):
+        return {key: _finite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_finite(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _loads(value):
+    """A ``service`` JSON string parsed and normalized (at load), None when empty."""
+    return _finite(json.loads(value)) if isinstance(value, str) and value else None
+
+
+def place_record(build, place_id):
+    """One place as a GeoJSON Feature in UTF-8 bytes, or None when unknown.
+
+    The properties carry the row's descriptive columns present in this build,
+    its parsed ``service``, ``served`` and ``feed_count``, its ``bbox``, the
+    ``ancestors`` root first, a ``children`` summary and its ``edges`` joined
+    with the feed table.
+    """
+    if place_id not in build._row_of.index:
+        return None
+    row = int(build._row_of[place_id])
+    places = build.places
+    place = places.iloc[row]
+    props = {c: _cell(place[c]) for c in RECORD_COLUMNS if c in places.columns}
+    if "names" in props:  # an Arrow map: a dict even when empty
+        props["names"] = _as_map(place["names"])
+    props["service"] = build.service[row]
+    props["served"] = bool(build.served[row])
+    props["feed_count"] = int(build.feed_count[row])
+    props["bbox"] = [_cell(v) for v in build.bounds[row]]
+    ancestors = []
+    parent = place["parent_id"]
+    for _ in range(8):  # a bounded walk: a cycle in the data cannot loop
+        if not isinstance(parent, str) or parent not in build._row_of.index:
+            break
+        ancestor = places.iloc[int(build._row_of[parent])]
+        ancestors.append(
+            {"place_id": parent, "name": ancestor["name"], "kind": ancestor["kind"]}
+        )
+        parent = ancestor["parent_id"]
+    props["ancestors"] = ancestors[::-1]
+    children = (places["parent_id"] == place_id).to_numpy()
+    props["children"] = {
+        "count": int(children.sum()),
+        "by_kind": {
+            k: int(v) for k, v in places.loc[children, "kind"].value_counts().items()
+        },
+        "served": int(build.served[children].sum()),
+    }
+    positions = np.flatnonzero((build.edges["place_id"] == place_id).to_numpy())
+    edges = build.edges.iloc[positions]
+    if build.edge_service is not None:  # the parsed copies, by edge position
+        edges = edges.assign(service=[build.edge_service[i] for i in positions])
+    edges = edges[[c for c in EDGE_COLUMNS if c in edges.columns]]
+    feeds = build.feeds[
+        [c for c in ("feed_id",) + EDGE_FEED_COLUMNS if c in build.feeds]
+    ]
+    merged = edges.merge(
+        feeds.rename(columns={"name": "feed_name"}), on="feed_id", how="left"
+    )
+    props["edges"] = [{k: _cell(v) for k, v in r.items()} for r in _json_ready(merged)]
+    geometry = shapely.to_geojson(build.geoms[row])
+    body = '{"type":"Feature","id":%s,"geometry":%s,"properties":%s}' % (
+        json.dumps(place_id),
+        geometry if geometry is not None else "null",
+        json.dumps(props, ensure_ascii=False, allow_nan=False),
+    )
+    return body.encode("utf-8")
 
 
 def _overflow(matched, max_features, **extra):
@@ -559,6 +767,46 @@ def create_app(cache, size=CACHED_BUILDS):
         if overflow is not None:
             return JSONResponse(overflow, headers=headers)
         return Response(body, media_type="application/geo+json", headers=headers)
+
+    @app.get("/api/builds/{build_id}/places/table")
+    def table(
+        build_id: str,
+        kind: str | None = None,
+        parent_id: str | None = None,
+        served: str | None = None,
+        q: str | None = None,
+        sort: str = "name",
+        order: str = "asc",
+        offset: int = 0,
+        limit: int = 50,
+    ):
+        # Geometry-free, so every kind by default and no bound required.
+        build = opened(build_id)
+        try:
+            mask = filter_places(
+                build,
+                kinds=parse_kinds(kind) if kind is not None else None,
+                parent_id=parent_id,
+                served=_parse_served(served),
+                q=q,
+                bounded=False,
+            )
+            page = places_table(build, mask, sort, order, offset, limit)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return JSONResponse(page, headers={"X-Snapshot": build.snapshot_id})
+
+    @app.get("/api/builds/{build_id}/places/{place_id}")
+    def place(build_id: str, place_id: str):
+        build = opened(build_id)
+        body = place_record(build, place_id)
+        if body is None:
+            raise HTTPException(404, f"{place_id}: not a place in {build_id}")
+        return Response(
+            body,
+            media_type="application/geo+json",
+            headers={"X-Snapshot": build.snapshot_id},
+        )
 
     return app
 
