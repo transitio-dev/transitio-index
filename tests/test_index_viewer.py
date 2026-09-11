@@ -332,11 +332,39 @@ def test_tolerance_for_zoom(zoom, tolerance):
     assert iv.tolerance_for_zoom(zoom) == tolerance
 
 
-def test_generalization_shrinks_a_slice(tmp_path):
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("19,59,32,71", (19.0, 59.0, 32.0, 71.0)),
+        ("1,2,3", ValueError),  # three numbers
+        ("nan,59,32,71", ValueError),  # not finite
+        ("19,59,-inf,71", ValueError),
+        ("32,59,19,71", ValueError),  # west past east
+        ("19,71,32,59", ValueError),  # south past north
+    ],
+)
+def test_parse_bbox(value, expected):
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="bbox needs"):
+            iv.parse_bbox(value)
+    else:
+        assert iv.parse_bbox(value) == expected
+
+
+def test_generalization_shrinks_a_slice_and_keeps_a_tiny_place(tmp_path):
     dense = shapely.Point(25, 65).buffer(2, quad_segs=200)  # ~800 vertices
-    places = PLACES[:1] + [_place("dense", "region", "Dense", "fi", dense)]
+    tiny = BOX(20, 60, 20.001, 60.001)  # smaller than the coarse tolerance
+    places = PLACES[:1] + [
+        _place("dense", "region", "Dense", "fi", dense),
+        _place("tiny", "region", "Tiny", "fi", tiny),
+    ]
     build = iv.load_build("b", write_build(tmp_path, places=places) and tmp_path)
     mask = iv.filter_places(build, kinds={"region"})
     stored, _ = iv.places_geojson(build, mask)
     coarse, _ = iv.places_geojson(build, mask, tolerance=0.02)
     assert len(coarse) < len(stored) / 4
+    features = {f["id"]: f for f in json.loads(coarse)["features"]}
+    # Plain Douglas-Peucker would collapse the tiny box to nothing; the
+    # topology-preserving fallback keeps a ring.
+    assert features["tiny"]["geometry"]["type"] == "Polygon"
+    assert len(features["tiny"]["geometry"]["coordinates"][0]) >= 4

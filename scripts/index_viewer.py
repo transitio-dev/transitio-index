@@ -24,6 +24,7 @@ import collections
 import hashlib
 import io
 import json
+import math
 import os
 import stat
 from pathlib import Path
@@ -80,8 +81,9 @@ _OPEN_FLAGS = (
 )
 DEFAULT_KINDS = ("country", "region")
 # A slice is bounded twice: by feature count and by serialized size. 3,000 is
-# above any build's countries + regions (ES: 1,563) and 8 MB above the measured
-# all-regions overview at the coarsest zoom (7.3 MB for ES).
+# above any build's countries + regions (ES: 1,563), and 8 MB is above the
+# measured overviews at the coarsest zoom (ES 2.7 MB, AU 2.5, CA 2.5) and
+# 3,000 cities as stored (ES: 4.9 MB).
 MAX_FEATURES = 3000
 MAX_BYTES = 8 * 1024 * 1024
 # (highest zoom, tolerance in degrees) for the coarser views; a zoom past the
@@ -303,9 +305,12 @@ def parse_kinds(value):
 
 
 def parse_bbox(value):
+    """``minx,miny,maxx,maxy``: four finite numbers with min <= max on each axis."""
     parts = [float(part) for part in value.split(",")]
-    if len(parts) != 4:
-        raise ValueError("bbox needs minx,miny,maxx,maxy")
+    if len(parts) != 4 or not all(math.isfinite(part) for part in parts):
+        raise ValueError("bbox needs four finite numbers: minx,miny,maxx,maxy")
+    if parts[0] > parts[2] or parts[1] > parts[3]:
+        raise ValueError("bbox needs minx <= maxx and miny <= maxy")
     return tuple(parts)
 
 
@@ -364,6 +369,25 @@ def tolerance_for_zoom(zoom):
     return None
 
 
+def generalize(geoms, tolerance):
+    """``geoms`` simplified to ``tolerance`` for a coarser map view.
+
+    Douglas-Peucker over the whole array, and the slower topology-preserving
+    simplifier only for the few results that come out invalid or empty (a
+    place smaller than the tolerance keeps a valid ring instead of vanishing).
+    Measured on the Spain build's 1,563 countries and regions at 0.02°: 0.14 s
+    and 2.7 MB, against 2.7 s and 7.7 MB with topology preserved throughout —
+    that simplifier keeps most vertices of a many-island multipolygon.
+    """
+    simplified = shapely.simplify(geoms, tolerance, preserve_topology=False)
+    broken = ~shapely.is_valid(simplified) | shapely.is_empty(simplified)
+    if broken.any():
+        simplified[broken] = shapely.simplify(
+            geoms[broken], tolerance, preserve_topology=True
+        )
+    return simplified
+
+
 def _overflow(matched, max_features, **extra):
     return {"overflow": True, "matched": matched, "limit": max_features, **extra}
 
@@ -385,7 +409,7 @@ def places_geojson(
     index = np.flatnonzero(mask)
     geoms = build.geoms[index]
     if tolerance is not None:
-        geoms = shapely.simplify(geoms, tolerance, preserve_topology=True)
+        geoms = generalize(geoms, tolerance)
     geometry = shapely.to_geojson(geoms)
     props = build.places.iloc[index][list(PROPERTY_COLUMNS)]
     props = props.astype(object).where(props.notna(), None)
