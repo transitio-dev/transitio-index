@@ -130,9 +130,11 @@ def area(division_id, wkb, sources, *, is_land=True, country=None):
     }
 
 
-def write_area_dataset(path, rows):
-    """Write ``division_area`` ``rows`` as parquet and return a dataset."""
-    pq.write_table(pa.Table.from_pylist(rows, schema=AREA_SCHEMA), path)
+def write_area_dataset(path, rows, row_group_size=None):
+    """Write ``division_area`` ``rows`` as parquet and return a dataset;
+    ``row_group_size`` splits the rows into row groups of that many."""
+    table = pa.Table.from_pylist(rows, schema=AREA_SCHEMA)
+    pq.write_table(table, path, row_group_size=row_group_size)
     return pa_ds.dataset(path)
 
 

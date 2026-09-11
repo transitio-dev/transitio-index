@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 pytest.importorskip("pyarrow")
@@ -54,6 +56,8 @@ AREAS = [
     # must be ignored despite matching the bbox pushdown.
     fx.area("fi-sea", _wkb(24.0, 59.0, 25.5, 60.3), CC0, is_land=False, country="FI"),
     fx.area("fi-bad", b"not wkb", CC0, country="FI"),
+    # A usable polygon naming no division is not evidence for anything.
+    fx.area("", _wkb(24.8, 60.1, 25.3, 60.35), CC0, country="FI"),
     # Parseable but not usable as containment evidence: a line and a bowtie.
     fx.area(
         "fi-line",
@@ -131,14 +135,14 @@ def test_an_uncovered_box_without_datasets_is_refused(tmp_path):
 def test_covered_boxes_are_not_rescanned(tmp_path):
     cache = tmp_path / "cache"
 
-    class Counting:
+    class Counting:  # every read starts by listing the dataset's fragments
         def __init__(self, dataset):
             self._dataset = dataset
             self.scans = 0
 
-        def to_batches(self, **kw):
+        def get_fragments(self):
             self.scans += 1
-            return self._dataset.to_batches(**kw)
+            return self._dataset.get_fragments()
 
     divisions, areas = _datasets(tmp_path)
     counting = Counting(areas)
@@ -154,6 +158,40 @@ def test_covered_boxes_are_not_rescanned(tmp_path):
         lookup.ensure([HEL_BOX])
         lookup.ensure([(24.92, 60.16, 24.96, 60.18)])  # inside the covered box
         assert counting.scans == first
+    finally:
+        lookup.close()
+
+
+def test_a_stalled_box_scan_is_retried_on_a_fresh_connection(tmp_path, monkeypatch):
+    """A tile scan that yields nothing for the deadline is abandoned and retried
+    on the dataset ``reopen_area`` returns, which then serves the boxes that
+    follow without another reopen."""
+    from transitio_index import geometry
+
+    monkeypatch.setattr(geometry, "AREA_READ_DEADLINE", 0.2)
+    divisions, areas = _datasets(tmp_path)
+    opened = []
+
+    class Hanging:  # a connection the proxy dropped: nothing ever arrives
+        def get_fragments(self):
+            threading.Event().wait(3)
+            return iter(())
+
+    def reopen():
+        opened.append(1)
+        return areas
+
+    lookup = boundaries.BoundaryLookup(
+        tmp_path / "cache",
+        release="test-release",
+        area_dataset=Hanging(),
+        division_dataset=divisions,
+        reopen_area=reopen,
+    )
+    try:
+        assert lookup.ensure([HEL_BOX]) > 0  # served by the reopened dataset
+        lookup.ensure([(23.0, 60.0, 24.0, 61.0)])  # a further box: no second reopen
+        assert opened == [1]
     finally:
         lookup.close()
 
@@ -190,11 +228,6 @@ def test_geometries_never_duplicate_across_boxes(tmp_path):
         assert len(record["geoms"]) == 1
 
 
-def test_overlapping_boxes_merge_into_one_scan():
-    merged = boundaries._merge_boxes([(0, 0, 2, 2), (1, 1, 3, 3), (10, 10, 11, 11)])
-    assert sorted(merged) == [(0, 0, 3, 3), (10, 10, 11, 11)]
-
-
 def test_a_point_outside_everything_finds_nothing(tmp_path):
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
@@ -210,7 +243,7 @@ def test_a_stale_memo_entry_is_not_trusted(tmp_path):
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
         lookup.ensure([HEL_BOX])
-    memo = cache / "boundary_lookup" / "test-release" / "divisions.parquet"
+    memo = cache / "boundary_lookup" / "test-release" / "divisions-0001.parquet"
     frame = gpd.read_parquet(memo)
     line = shapely.LineString([(24.9, 60.12), (25.0, 60.18)])
     geoms = [
@@ -237,8 +270,9 @@ def test_the_memo_is_keyed_by_release(tmp_path):
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
         lookup.ensure([HEL_BOX])
-    assert (cache / "boundary_lookup" / "test-release" / "divisions.parquet").is_file()
-    assert (cache / "boundary_lookup" / "test-release" / "covered.jsonl").is_file()
+    memo = cache / "boundary_lookup" / "test-release"
+    assert (memo / "divisions-0001.parquet").is_file()
+    assert (memo / "covered.jsonl").is_file()
 
 
 def test_memoized_geometry_is_simplified(tmp_path):

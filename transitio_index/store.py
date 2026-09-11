@@ -513,12 +513,13 @@ def open_regular_path(path):
     return handle
 
 
-def open_regular(directory, name):
+def open_regular(directory, name, limit=MAX_ARTIFACT_BYTES):
     """Open ``name`` for reading, refusing anything but a regular file.
 
     ``O_NONBLOCK`` so a FIFO substituted for an artifact cannot wedge the
     open, and the ``fstat`` happens on the descriptor rather than the name,
-    so nothing can be swapped in between.
+    so nothing can be swapped in between. ``limit`` is the size ceiling;
+    ``None`` for a file that is not a generation artifact.
     """
     flags = os.O_RDONLY | O_BINARY | getattr(os, "O_NONBLOCK", 0)
     try:
@@ -529,7 +530,7 @@ def open_regular(directory, name):
         info = os.fstat(handle)
         if not stat.S_ISREG(info.st_mode):
             raise StoreError(f"{directory.path / name}: not a regular file")
-        if info.st_size > MAX_ARTIFACT_BYTES:
+        if limit is not None and info.st_size > limit:
             raise StoreError(f"{directory.path / name}: larger than the ceiling")
     except BaseException:
         os.close(handle)
@@ -949,6 +950,10 @@ class Generation:
     @property
     def name(self):
         return self.path.name
+
+    def has(self, name):
+        """Whether the manifest declared, and resolution verified, ``name``."""
+        return name in self._contents
 
     def read_bytes(self, name):
         """Exactly the bytes verification hashed.

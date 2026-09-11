@@ -476,9 +476,7 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
                 for p in places
                 if p.get("kind") == "city" and p.get("overture_id")
             }
-            if wanted and dataset is None:
-                dataset = geometry.division_area_dataset()
-            areas = geometry.read_areas(dataset, wanted) if wanted else {}
+            areas = geometry.place_areas(cache_dir, dataset, places, wanted)
             # Names are a derived use of the UCDB: attached only while its
             # allowlist entry stands; the report goes out unnamed otherwise.
             names, names_manifest = ucdb.load_names(cache_dir, expected=ucdb_pins)

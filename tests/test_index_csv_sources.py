@@ -394,10 +394,24 @@ def test_row_count_over_the_cap_is_refused(tmp_path, monkeypatch):
         mdb.ingest(tmp_path / "cache", csv_path=csv)
 
 
-def test_empty_csv_is_an_error(tmp_path):
+def test_an_empty_csv_fails_a_required_source_and_publishes_an_optional_one(
+    tmp_path, caplog
+):
+    """A header-only export is a broken catalogue for the MDB, which every build
+    needs, but a legitimate one for GBFS — a country with no bike-share systems
+    — which then publishes an empty generation with a warning."""
+    from transitio_index import gbfs
+
     csv = write(tmp_path / "feeds_v2.csv", ",".join(COLUMNS) + "\n")
     with pytest.raises(csv_source.IngestError, match="no rows"):
         mdb.ingest(tmp_path / "cache", csv_path=csv)
+    systems = write(
+        tmp_path / "systems.csv", ",".join(sorted(gbfs.REQUIRED_HEADERS)) + "\n"
+    )
+    with caplog.at_level("WARNING"):
+        manifest = gbfs.ingest(tmp_path / "cache", csv_path=systems)
+    assert manifest["records"] == 0
+    assert any("gbfs: no rows found" in m for m in caplog.messages)
 
 
 @pytest.mark.parametrize("bad", ["a/b", "a\\b", "..", "x\ty"])

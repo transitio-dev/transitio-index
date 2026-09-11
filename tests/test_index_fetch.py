@@ -564,6 +564,47 @@ def test_the_token_bucket_spaces_requests_per_host():
     assert waits == [1.0, 1.0]
 
 
+def test_a_host_that_keeps_failing_to_connect_is_not_asked_again():
+    """After ``host_failures`` consecutive transport failures a host is refused
+    up front, so a dead host no longer costs every later feed on it a full
+    timeout; an answer of any status resets the count, and other hosts are
+    unaffected."""
+    calls = []
+
+    class Stalling(httpx.SyncByteStream):
+        def __iter__(self):
+            raise httpx.ReadTimeout("stalled")
+
+    def handler(request):  # the dead host answers b.zip only, and hangs otherwise
+        calls.append(request.url.host)
+        if request.url.host == "dead.example" and request.url.path != "/b.zip":
+            raise httpx.ConnectTimeout("hang", request=request)
+        if request.url.host == "stall.example":  # answers, then stalls mid-body
+            return httpx.Response(
+                206, headers={"Content-Range": "bytes 0-3/4"}, stream=Stalling()
+            )
+        return httpx.Response(200, headers={"Content-Length": "0"})
+
+    fetcher = _fetcher(httpx.MockTransport(handler), host_failures=2)
+    with pytest.raises(fetch.FetchError, match="hang"):
+        fetcher.head("https://dead.example/a.zip")
+    fetcher.head("https://dead.example/b.zip")  # answers: the count resets
+    for _ in range(2):
+        with pytest.raises(fetch.FetchError, match="hang"):
+            fetcher.head("https://dead.example/c.zip")
+    with pytest.raises(fetch.FetchError, match="unreachable this run.*not tried"):
+        fetcher.head("https://dead.example/d.zip")
+    assert calls.count("dead.example") == 4  # d.zip never reached the transport
+    fetcher.head("https://alive.example/e.zip")  # another host is unaffected
+    # A failure while streaming the body counts like a failure to connect.
+    for _ in range(2):
+        with pytest.raises(fetch.FetchError, match="stalled"):
+            fetcher.read_range("https://stall.example/f.zip", 0, 4)
+    with pytest.raises(fetch.FetchError, match="not tried"):
+        fetcher.read_range("https://stall.example/g.zip", 0, 4)
+    assert calls.count("stall.example") == 2
+
+
 def test_requests_are_throttled_by_host():
     slept = []
     with _fetcher(

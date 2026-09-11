@@ -16,6 +16,7 @@ to end.
 """
 
 import datetime
+import functools
 
 import shapely
 
@@ -225,11 +226,36 @@ def _attach_metros(places_by_id, new_cities, wikidata, report, registry=None):
     return added, touched
 
 
+def dropped_qids(generation):
+    """The QIDs of the discoveries the expansion report in ``generation`` — a
+    resolved ``expanded.json`` — lists as conflicts: placed nowhere, so a stop
+    inside one is a known miss for the stages measuring stops, not a sign of
+    a stale expansion. An expansion published without a report dropped
+    nothing."""
+    if not generation.has(REPORT_ARTIFACT):
+        return set()
+    return {
+        row["place_id"]
+        for row in store.parse_jsonl(generation.read_bytes(REPORT_ARTIFACT))
+        if row.get("kind") == "conflict" and row.get("place_id")
+    }
+
+
 def _discover(
-    cache_dir, places_by_id, lookup, wikidata, area_dataset, report, registry, digest
+    cache_dir,
+    places_by_id,
+    lookup,
+    wikidata,
+    area_dataset,
+    report,
+    registry,
+    digest,
+    release,
+    reopen=None,
 ):
     """Resolve crawled stops and fold the missing places in; returns counts.
-    With ``registry``, every discovered place is identified through it."""
+    With ``registry``, every discovered place is identified through it;
+    ``reopen`` reopens ``area_dataset`` when its S3 scan stalls."""
     # Two passes, one feed's stops in memory at a time — never every crawled
     # feed's stops at once: first the lookup boxes, then, with the boxes
     # ensured, the per-point division resolution.
@@ -263,6 +289,20 @@ def _discover(
 
     candidates = [dict(record) for record in divisions.values() if record.get("kind")]
     seed._resolve_candidates(candidates, wikidata)
+    # A district or region whose QID a city-level division also carries is a
+    # city that is its own district (Augsburg, Ulm, Wien): only the district
+    # has an area, so the stop reached it, but the place is the city — the
+    # kind the seed gives the same QID from its declared name.
+    shared = {c["qid"] for c in candidates if c["kind"] == "region" and c["qid"]}
+    cities = set()
+    if shared:
+        # A memo-only lookup answered the stops from its cache; the theme is
+        # opened here for the one scan.
+        dataset = lookup.division_dataset() or overture.overture_dataset(release)
+        cities = seed.city_qids(dataset, shared)
+    for record in candidates:
+        if record["kind"] == "region" and record["qid"] in cities:
+            record["kind"] = "city"
     skeleton = {}
     for record in candidates:
         if record["qid"] or overture.qidless_place(record):
@@ -323,6 +363,17 @@ def _discover(
     for qid in conflicts:
         del discovered[qid]
         del canonical[qid]
+    identified = 0
+    if registry is not None:
+        # Every resolved signal, a seeded place reached through a new
+        # division included: the concordance enriches the row, or conflicts,
+        # and read-only refuses. A discovery the registry refuses is dropped
+        # here, before it can stand in for its aliases, read a boundary, or
+        # seed a metro's membership — and reported, so the coverage stage
+        # knows a stop landing on it is not proof of a stale expansion.
+        identified = seed._identify_places(discovered, registry, digest, report=report)
+        for qid in set(canonical) - set(discovered):
+            del canonical[qid]
     new_ids = []
     taken = set()
     for qid in discovered:
@@ -333,7 +384,12 @@ def _discover(
     # Boundaries come from a complete, id-filtered area read, so a multi-part
     # place ships whole even when its stops touched only one component.
     areas = geometry.read_areas(
-        area_dataset, {discovered[qid]["overture_id"] for qid in new_ids}
+        area_dataset,
+        {discovered[qid]["overture_id"] for qid in new_ids},
+        simplify=geometry.SIMPLIFY_TOLERANCE_DEG,
+        cache=(cache_dir, release),
+        reopen=reopen,
+        countries={discovered[qid].get("country_code") for qid in new_ids} - {None},
     )
     for qid in new_ids:
         place = discovered[qid]
@@ -346,12 +402,8 @@ def _discover(
     new_metros, metro_pairs = _attach_metros(
         places_by_id, new_cities, wikidata, report, registry
     )
-    identified = 0
     if registry is not None:
-        # Every resolved signal, a seeded place reached through a new
-        # division and a seeded metro named by a CBSA pair included: the
-        # concordance enriches the row, or conflicts, and read-only refuses.
-        identified = seed._identify_places(discovered, registry, digest)
+        # A seeded metro a discovered CBSA pair names is enriched too.
         identified += metros._identify_metros(
             {qid: places_by_id[qid] for qid in metro_pairs}, registry, None
         )
@@ -414,14 +466,21 @@ def _expanded(
             mode = "expanded"
             if wikidata is None:
                 wikidata = overture.WikidataClient()
+            reopen = None
             if area_dataset is None:
                 area_dataset = geometry.division_area_dataset(release)
+                # A fresh connection when the S3 area scan stalls.
+                reopen = functools.partial(geometry.division_area_dataset, release)
             if lookup is None:
                 opened_lookup = boundaries.BoundaryLookup(
                     cache_dir,
                     release=release,
                     area_dataset=area_dataset,
                     division_dataset=overture.overture_dataset(release),
+                    reopen_area=reopen,
+                    reopen_division=functools.partial(
+                        overture.overture_dataset, release
+                    ),
                 )
                 lookup = opened_lookup
             counts = _discover(
@@ -433,6 +492,8 @@ def _expanded(
                 report,
                 registry,
                 digest,
+                release,
+                reopen,
             )
     finally:
         if opened_lookup is not None:

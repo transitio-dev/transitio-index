@@ -52,6 +52,7 @@ DEFAULT_COUNTRIES = ("FI", "EE")
 
 # ISO country_code lives in these columns of the two CSV exports.
 MDB_COUNTRY = "location.country_code"
+MDB_SUBDIVISION = "location.subdivision_name"
 MDB_DOWNLOAD = "urls.direct_download"
 GBFS_COUNTRY = "Country Code"
 
@@ -106,19 +107,54 @@ def _unrecognized_countries(requested):
     )
 
 
-def _limit_per_country(rows, field, limit):
+def _limit_per_country(rows, field, limit, within=None):
     """At most ``limit`` rows per country, in input order — a small, deterministic
-    sample so a large country's full catalogue does not overwhelm the build. With
-    ``limit`` None the rows pass through unchanged."""
+    sample so a large country's full catalogue does not overwhelm the build; with
+    ``within`` (a subdivision column) the cap applies per country *and*
+    subdivision, so a requested spread of states is sampled evenly rather than
+    from whichever state the catalogue lists first. With ``limit`` None the rows
+    pass through unchanged."""
     if limit is None:
         return rows
     kept, counts = [], {}
     for row in rows:
-        code = _country_code((row.get(field) or "").strip().upper())
-        if counts.get(code, 0) < limit:
+        key = _country_code((row.get(field) or "").strip().upper())
+        if within is not None:
+            key = (key, (row.get(within) or "").strip().upper())
+        if counts.get(key, 0) < limit:
             kept.append(row)
-            counts[code] = counts.get(code, 0) + 1
+            counts[key] = counts.get(key, 0) + 1
     return kept
+
+
+def _select_subdivisions(rows, field, subdivisions):
+    """Rows whose ``field`` names one of ``subdivisions`` (upper-cased, like the
+    countries); with none requested the rows pass through unchanged."""
+    if not subdivisions:
+        return rows
+    return [
+        row for row in rows if (row.get(field) or "").strip().upper() in subdivisions
+    ]
+
+
+def _narrow(mdb_rows, gbfs_rows, countries, subdivisions, limit):
+    """The sample's rows: MDB narrowed to the requested ``subdivisions``, every
+    requested country and subdivision confirmed present, then both catalogues
+    capped. The country check runs after the subdivision filter, so a country
+    whose feeds all lie outside the requested subdivisions is refused rather
+    than silently dropped from a multi-country sample."""
+    mdb_rows = _select_subdivisions(mdb_rows, MDB_SUBDIVISION, subdivisions)
+    missing = _missing(mdb_rows, MDB_COUNTRY, countries)
+    if missing:
+        raise SystemExit(f"no MDB feeds for {missing}")
+    absent = _unmatched(mdb_rows, MDB_SUBDIVISION, subdivisions)
+    if absent:
+        raise SystemExit(f"no MDB feeds in subdivisions {absent}")
+    within = MDB_SUBDIVISION if subdivisions else None
+    return (
+        _limit_per_country(mdb_rows, MDB_COUNTRY, limit, within=within),
+        _limit_per_country(gbfs_rows, GBFS_COUNTRY, limit),
+    )
 
 
 def _chunks(rows, size):
@@ -285,15 +321,19 @@ def _by_country(rows, field):
     return counts
 
 
-def _missing(rows, field, countries):
-    """Requested countries with no row in ``rows`` — a typo or unsupported code.
-
-    A country is present when a row carries its ISO code or its full name; a
-    multi-country request must not silently drop one that matched nothing just
-    because another matched.
-    """
+def _unmatched(rows, field, wanted, values=lambda wanted: {wanted}):
+    """Requested ``wanted`` entries no row's ``field`` carries — a typo or an
+    unsupported value; ``values`` gives the field values that count as a match
+    for an entry. A multi-entry request must not silently drop one that matched
+    nothing just because another matched."""
     present = {(row.get(field) or "").strip().upper() for row in rows}
-    return sorted(code for code in countries if not (_match_values(code) & present))
+    return sorted(entry for entry in wanted if not (values(entry) & present))
+
+
+def _missing(rows, field, countries):
+    """Requested countries with no row in ``rows``; a country is present when a
+    row carries its ISO code or its full name."""
+    return _unmatched(rows, field, countries, _match_values)
 
 
 def _build_command(atlas_out, mdb_out, gbfs_out, commit):
@@ -382,7 +422,20 @@ def main(argv=None):
         type=int,
         default=None,
         help="keep at most this many MDB feeds and GBFS systems per country — a "
-        "small sample for a large country (default: no cap)",
+        "small sample for a large country (default: no cap); with --subdivision "
+        "the MDB cap applies per requested subdivision",
+    )
+    parser.add_argument(
+        "--subdivision",
+        dest="subdivisions",
+        action="append",
+        metavar="NAME",
+        help="keep only MDB feeds located in this subdivision (state, province; "
+        "repeatable, matched case-insensitively against "
+        f"{MDB_SUBDIVISION}) — pick a spread of a large country's states, or a "
+        "territory the catalogue files under its parent (Puerto Rico under US, "
+        "Hong Kong under CN); GBFS systems carry no subdivision and stay "
+        "filtered by country",
     )
     parser.add_argument(
         "--batch-size",
@@ -413,23 +466,28 @@ def main(argv=None):
     # Canonicalise to codes, and match rows carrying either form.
     countries = {_country_code(token.upper()) for token in raw}
     match_values = set().union(*(_match_values(code) for code in countries))
+    subdivisions = {s.strip().upper() for s in args.subdivisions or ()}
+    if "" in subdivisions:
+        # A blank would match every row whose subdivision field is empty.
+        parser.error("--subdivision must name a subdivision")
 
     # Fetch and validate everything before publishing any output, so a schema
     # drift or an unsupported country fails loudly instead of leaving a
     # plausible-looking but unusable sample.
     with tempfile.TemporaryDirectory(prefix="sample-catalogues-") as tmp:
         atlas_full, mdb_full, gbfs_full = _download(Path(tmp), args.commit)
+        required = (MDB_COUNTRY, MDB_DOWNLOAD) + (
+            (MDB_SUBDIVISION,) if subdivisions else ()
+        )
         mdb_fields, mdb_rows = _select_csv(
-            mdb_full, MDB_COUNTRY, (MDB_COUNTRY, MDB_DOWNLOAD), match_values
+            mdb_full, MDB_COUNTRY, required, match_values
         )
         gbfs_fields, gbfs_rows = _select_csv(
             gbfs_full, GBFS_COUNTRY, (GBFS_COUNTRY,), match_values
         )
-        missing = _missing(mdb_rows, MDB_COUNTRY, countries)
-        if missing:
-            raise SystemExit(f"no MDB feeds for {missing}")
-        mdb_rows = _limit_per_country(mdb_rows, MDB_COUNTRY, args.limit)
-        gbfs_rows = _limit_per_country(gbfs_rows, GBFS_COUNTRY, args.limit)
+        mdb_rows, gbfs_rows = _narrow(
+            mdb_rows, gbfs_rows, countries, subdivisions, args.limit
+        )
         # Plan the sets while the downloaded catalogues still exist: one set, or
         # consecutive MDB slices, each with a proportional GBFS share and the
         # Atlas trimmed to that slice's matching feeds.
