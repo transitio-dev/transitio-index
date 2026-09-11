@@ -56,6 +56,8 @@ AREAS = [
     # must be ignored despite matching the bbox pushdown.
     fx.area("fi-sea", _wkb(24.0, 59.0, 25.5, 60.3), CC0, is_land=False, country="FI"),
     fx.area("fi-bad", b"not wkb", CC0, country="FI"),
+    # A usable polygon naming no division is not evidence for anything.
+    fx.area("", _wkb(24.8, 60.1, 25.3, 60.35), CC0, country="FI"),
     # Parseable but not usable as containment evidence: a line and a bowtie.
     fx.area(
         "fi-line",
@@ -246,7 +248,7 @@ def test_a_stale_memo_entry_is_not_trusted(tmp_path):
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
         lookup.ensure([HEL_BOX])
-    memo = cache / "boundary_lookup" / "test-release" / "divisions.parquet"
+    memo = cache / "boundary_lookup" / "test-release" / "divisions-0001.parquet"
     frame = gpd.read_parquet(memo)
     line = shapely.LineString([(24.9, 60.12), (25.0, 60.18)])
     geoms = [
@@ -273,8 +275,9 @@ def test_the_memo_is_keyed_by_release(tmp_path):
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
         lookup.ensure([HEL_BOX])
-    assert (cache / "boundary_lookup" / "test-release" / "divisions.parquet").is_file()
-    assert (cache / "boundary_lookup" / "test-release" / "covered.jsonl").is_file()
+    memo = cache / "boundary_lookup" / "test-release"
+    assert (memo / "divisions-0001.parquet").is_file()
+    assert (memo / "covered.jsonl").is_file()
 
 
 def test_memoized_geometry_is_simplified(tmp_path):

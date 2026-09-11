@@ -5,6 +5,7 @@ Fixtures are imported from the stage test modules rather than duplicated.
 
 import http.client
 import logging
+import os
 
 import pytest
 
@@ -12,6 +13,7 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
+import test_index_boundaries as bt  # noqa: E402
 from transitio_index import boundaries, coverage, overture, registry, seed  # noqa: E402
 
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
@@ -385,3 +387,91 @@ def test_a_seed_place_conflicting_with_a_registry_place_is_skipped_not_fatal(
     assert places["Q5"]["parent_id"] == "Q1" and places["Q5"]["metro_ids"] == []
     assert places["Q6"]["parent_id"] is None
     assert sum("not identified" in m and "skipped" in m for m in caplog.messages) == 3
+
+
+def test_the_boundary_memo_grows_by_appended_parts(tmp_path, monkeypatch):
+    """The memo used to be one file rewritten whole on every ensure(), so a
+    memo accumulated over enough countries crossed the store's artifact
+    ceiling and aborted the build. It now appends parts split under
+    PART_BYTES; a damaged part clears coverage rather than answering with
+    false negatives, is salvaged without duplicating a healthy part's
+    polygons, and is replaced under a fresh name, never its own."""
+    import geopandas as gpd
+    import pandas as pd
+
+    monkeypatch.setattr(boundaries, "PART_BYTES", 1)  # every row its own part
+    cache = tmp_path / "cache"
+    memo = cache / "boundary_lookup" / "test-release"
+    divisions = fx.write_dataset(tmp_path / "d.parquet", bt.DIVISIONS)
+    areas = fx.write_area_dataset(
+        tmp_path / "a.parquet",
+        bt.AREAS[:3]
+        + [fx.area("fi-hel", _wkb(30.0, 65.0, 31.0, 66.0), GOOD, country="FI")],
+    )
+    far = (30.4, 65.4, 30.6, 65.6)  # Helsinki's second, disjoint component
+
+    def parts():
+        return sorted(p.name for p in memo.glob("divisions-*.parquet"))
+
+    def lookup():
+        return boundaries.BoundaryLookup(
+            cache,
+            release="test-release",
+            area_dataset=areas,
+            division_dataset=divisions,
+        )
+
+    with lookup() as fresh:
+        fresh.ensure([bt.HEL_BOX])
+        first = parts()
+        before = [(memo / name).read_bytes() for name in first]
+        fresh.ensure([far])
+    # Three divisions, three parts; the new component appended a fourth and
+    # left the first three untouched.
+    assert len(first) == 3 and len(parts()) == 4
+    assert [(memo / name).read_bytes() for name in first] == before
+    reopened = boundaries.BoundaryLookup(cache, release="test-release")
+    try:
+        assert reopened.ensure([bt.HEL_BOX, far]) == 0
+        found = reopened.divisions_at(30.5, 65.5)
+        assert [r["division_id"] for r in found] == ["fi-hel", "fi"]
+    finally:
+        reopened.close()
+
+    def repair():
+        # Coverage was cleared: the lost component is refetched.
+        with lookup() as repaired:
+            assert [r["division_id"] for r in repaired.divisions_at(30.5, 65.5)] == [
+                "fi"
+            ]
+            repaired.ensure([far])
+            found = repaired.divisions_at(30.5, 65.5)
+            assert [r["division_id"] for r in found] == ["fi-hel", "fi"]
+        return repaired
+
+    # A listed part that is gone; its replacement takes a fresh name.
+    (memo / parts()[-1]).unlink()
+    repair()
+    assert parts() == first + ["divisions-0005.parquet"]
+    # A damaged part — a copy of a healthy part's row beside a row whose
+    # geometry is not a polygon — is salvaged without duplicating the healthy
+    # polygon (one new row, so one new part) and its name is not reused.
+    healthy = gpd.read_parquet(memo / first[0])
+    junk = healthy.set_geometry(
+        gpd.GeoSeries([shapely.LineString([(0, 0), (1, 1)])], crs=healthy.crs)
+    )
+    pd.concat([healthy, junk]).to_parquet(memo / parts()[-1])
+    repaired = repair()
+    (duplicated,) = healthy["division_id"]
+    assert len(repaired._records[duplicated]["geoms"]) == 1
+    assert parts() == first + ["divisions-0006.parquet"]
+    # A listed part replaced by a symlink is refused like any unreadable part;
+    # one replaced by a directory is too, and stays in place with its name.
+    (memo / parts()[-1]).unlink()
+    os.symlink(memo / first[0], memo / "divisions-0006.parquet")
+    repair()
+    assert parts() == first + ["divisions-0007.parquet"]
+    (memo / parts()[-1]).unlink()
+    (memo / "divisions-0007.parquet").mkdir()
+    repair()
+    assert parts() == first + ["divisions-0007.parquet", "divisions-0008.parquet"]

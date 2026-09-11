@@ -8,18 +8,23 @@ groups carry ``bbox`` statistics, so a spatial query reads the file footers and
 only the row groups whose boxes intersect the query — the COG access pattern —
 and the divisions theme supplies the matching subtype/hierarchy metadata.
 
-What a query touches is memoized under ``cache/boundary_lookup/<release>/`` as a
-GeoParquet of the division polygons (simplified to the shipping tolerance) plus
-their metadata, keyed by the release, so repeated queries within and across
-builds read locally and both consumers see the same geometry. Containment runs
-locally over the memoized polygons; the cloud filter only selects candidates by
-bounding box.
+What a query touches is memoized under ``cache/boundary_lookup/<release>/`` as
+GeoParquet parts of the division polygons (simplified to the shipping
+tolerance) plus their metadata, keyed by the release, so repeated queries
+within and across builds read locally and both consumers see the same
+geometry. The memo accumulates across builds and only ever grows by appending
+a part; the coverage file names the parts it was computed with. Containment
+runs locally over the memoized polygons; the cloud filter only selects
+candidates by bounding box.
 """
 
 import functools
 import io
+import itertools
 import json
 import math
+import os
+import re
 
 import numpy as np
 import pyarrow.dataset as ds
@@ -28,7 +33,11 @@ from shapely.strtree import STRtree
 
 from transitio_index import geometry, overture, store
 
+# The single-file memo written before parts existed; read as one part.
 DIVISIONS_FILE = "divisions.parquet"
+PART_PATTERN = re.compile(r"divisions-(\d{4,})\.parquet")
+# A part is split until it is well under the store's artifact ceiling.
+PART_BYTES = store.MAX_ARTIFACT_BYTES // 2
 COVERED_FILE = "covered.jsonl"
 MEMO_CRS = "EPSG:4326"
 
@@ -74,16 +83,22 @@ def _record_from_row(attrs):
     return record
 
 
-def _read_memo(path):
-    """``(records, damaged)`` from the GeoParquet memo at ``path``.
+def _read_memo(directory, name):
+    """``(records, damaged)`` from the GeoParquet memo part ``name``.
 
-    A row with a missing id or a geometry that is not a valid polygon is
-    dropped and flags the memo damaged, the same validation the fresh scan
-    applies, so a memo written before validation existed cannot seed the index.
+    Opened through the store like any cache entry — a symlink or anything but
+    a regular file is refused — and parsed from that descriptor. A row with a
+    missing id or a geometry that is not a valid polygon is dropped and flags
+    the memo damaged, the same validation the fresh scan applies, so a memo
+    written before validation existed cannot seed the index.
     """
     import geopandas as gpd
 
-    frame = gpd.read_parquet(path)
+    # No size ceiling: a memo from before parts existed can exceed the store's
+    # artifact limit, which is what the parts are for.
+    handle = store.open_regular(directory, name, limit=None)
+    with os.fdopen(handle, "rb") as opened:
+        frame = gpd.read_parquet(opened)
     geoms = list(frame.geometry)
     non_geom = frame.drop(columns=frame.geometry.name)
     # A null scalar column reads back as NaN, and a NaN wikidata or name is
@@ -108,6 +123,45 @@ def _read_memo(path):
             records[division_id] = record
         record["geoms"].append(geom)
     return records, damaged
+
+
+def _part_name(part):
+    return part == DIVISIONS_FILE or bool(PART_PATTERN.fullmatch(part))
+
+
+def _next_part_name(parts):
+    """The part name after the highest numbered one in ``parts``."""
+    numbers = (PART_PATTERN.fullmatch(name) for name in parts)
+    last = max((int(match.group(1)) for match in numbers if match), default=0)
+    return f"divisions-{last + 1:04d}.parquet"
+
+
+def _part_chunks(gdf):
+    """``gdf`` serialized as GeoParquet in pieces under ``PART_BYTES``.
+
+    The rows are halved until a piece fits; a single row is written as it is.
+    """
+    sink = io.BytesIO()
+    gdf.to_parquet(sink)
+    data = sink.getvalue()
+    if len(data) <= PART_BYTES or len(gdf) <= 1:
+        yield data
+        return
+    half = len(gdf) // 2
+    yield from _part_chunks(gdf.iloc[:half])
+    yield from _part_chunks(gdf.iloc[half:])
+
+
+def _wkb_set(geoms):
+    return set(shapely.to_wkb(np.asarray(geoms, dtype=object)))
+
+
+def _valid_box(box):
+    return (
+        isinstance(box, list)
+        and len(box) == 4
+        and all(isinstance(v, (int, float)) and math.isfinite(v) for v in box)
+    )
 
 
 def _box_contains(outer, inner):
@@ -181,6 +235,9 @@ class BoundaryLookup:
             root.close()
         self._records = {}
         self._covered = []
+        self._parts = []
+        self._listed = []
+        self._pending = {}
         self._tree = None
         self._tree_entries = []
         self._load()
@@ -202,48 +259,97 @@ class BoundaryLookup:
             self._read_state()
 
     def _read_state(self):
-        """Read the memo from disk into ``_records`` / ``_covered``.
+        """Read the memo from disk into ``_records`` / ``_covered`` / ``_parts``.
 
         Resets the in-memory state first, so it doubles as a reload. Must be
         called while holding the writer lock (see :meth:`_load`, :meth:`ensure`).
         """
         self._records = {}
         self._covered = []
+        self._parts = []
+        self._listed = []
+        self._pending = {}
         damaged = False
-        path = self._dir.path / DIVISIONS_FILE
-        divisions_present = path.is_file()
-        if divisions_present:
-            # An unreadable memo (a corrupt or partial parquet) is damage, not
-            # fatal: coverage is cleared below and the next ensure() refetches.
+        listed = None
+        rows = []
+        try:
+            handle = store.open_regular(self._dir, COVERED_FILE)
+        except store.MissingEntry:
+            pass
+        except store.StoreError:
+            damaged = True
+        else:
             try:
-                self._records, damaged = _read_memo(path)
-            except Exception:  # noqa: B902 - geopandas/pyarrow raise their own
-                self._records, damaged = {}, True
-        path = self._dir.path / COVERED_FILE
-        if path.is_file():
-            for row in store.parse_jsonl(path.read_bytes()):
-                box = row.get("box") if isinstance(row, dict) else None
+                rows = store.parse_jsonl(store.read_all(handle))
+            finally:
+                os.close(handle)
+        for row in rows:
+            if not isinstance(row, dict):
+                damaged = True
+            elif "parts" in row:
+                parts = row["parts"]
                 if (
-                    isinstance(box, list)
-                    and len(box) == 4
-                    and all(
-                        isinstance(v, (int, float)) and math.isfinite(v) for v in box
-                    )
+                    listed is None
+                    and isinstance(parts, list)
+                    and all(isinstance(p, str) and _part_name(p) for p in parts)
                 ):
-                    self._covered.append(tuple(box))
+                    listed = parts
                 else:
                     damaged = True
-        if self._covered and not divisions_present:
-            # The two files persist together; coverage without a divisions
-            # file is not a valid memo. (Coverage with an EMPTY divisions
-            # file is legitimate: an all-ocean box finds no divisions.)
-            damaged = True
+            elif _valid_box(row.get("box")):
+                self._covered.append(tuple(row["box"]))
+            else:
+                damaged = True
+        if listed is None:
+            # A memo from before parts existed is the one file, named nowhere;
+            # coverage without it is damage like any listed part gone. (An
+            # EMPTY memo is legitimate: an all-ocean box finds no divisions.)
+            listed = [DIVISIONS_FILE]
+        self._listed = listed
+        loaded = []
+        for name in listed:
+            try:
+                loaded.append((name, *_read_memo(self._dir, name)))
+            except store.MissingEntry:
+                # A listed part that is gone would leave its boxes covered
+                # with nothing to answer them.
+                damaged = True
+            except Exception:  # noqa: B902 - geopandas/pyarrow raise their own
+                # An unreadable part (a corrupt or partial parquet, a symlink)
+                # is damage, not fatal: coverage is cleared below and the
+                # next ensure() refetches.
+                loaded.append((name, {}, True))
+        # The healthy parts first, so what a damaged part still holds is
+        # deduplicated against them; it is dropped from the list, written
+        # into a fresh part at the next persist, and the file reclaimed.
+        for name, records, bad in sorted(loaded, key=lambda item: item[2]):
+            if bad:
+                damaged = True
+            else:
+                self._parts.append(name)
+            self._merge(records, pending=bad)
         if damaged:
             # Damage must not count as covered: the dropped entries would
             # become permanent false negatives, so coverage is cleared and
             # the next ensure() refetches and repairs the memo.
             self._covered = []
         self._tree = None
+
+    def _merge(self, records, pending=False):
+        """Add a part's records to ``_records``, each polygon once by WKB;
+        with ``pending`` the polygons taken are also queued for re-writing."""
+        for division_id, record in records.items():
+            known = self._records.get(division_id)
+            if known is None:
+                self._records[division_id] = record
+                new = record["geoms"]
+            else:
+                existing = _wkb_set(known["geoms"])
+                keys = shapely.to_wkb(np.asarray(record["geoms"], dtype=object))
+                new = [g for g, k in zip(record["geoms"], keys) if k not in existing]
+                known["geoms"].extend(new)
+            if pending and new:
+                self._pending.setdefault(division_id, []).extend(new)
 
     def _uncovered(self, boxes):
         """The boxes not already inside a covered box."""
@@ -253,26 +359,56 @@ class BoundaryLookup:
             if not any(_box_contains(done, box) for done in self._covered)
         ]
 
-    def _persist(self):
+    def _persist(self, added):
+        """Append the geometry ``added`` (``{division_id: [polygon]}``) as new
+        parts, then rewrite the coverage file naming every part.
+
+        The parts already on disk are never rewritten, so a persist costs what
+        it adds, not the size of the memo; what a damaged part still held is
+        appended along with it.
+        """
         import geopandas as gpd
         import pandas as pd
 
+        for division_id, geoms in self._pending.items():
+            added.setdefault(division_id, []).extend(geoms)
+        self._pending = {}
         rows, geoms = [], []
-        for record in self._records.values():
-            fields = _memo_fields(record)
-            for geom in record["geoms"]:
-                rows.append(fields)
-                geoms.append(geom)
-        frame = pd.DataFrame(rows, columns=_MEMO_COLUMNS)
-        gdf = gpd.GeoDataFrame(frame, geometry=gpd.GeoSeries(geoms, crs=MEMO_CRS))
-        sink = io.BytesIO()
-        gdf.to_parquet(sink)
-        store.write_bytes(self._dir, DIVISIONS_FILE, sink.getvalue())
+        for division_id, new in added.items():
+            rows.extend([_memo_fields(self._records[division_id])] * len(new))
+            geoms.extend(new)
+        if rows:
+            frame = pd.DataFrame(rows, columns=_MEMO_COLUMNS)
+            gdf = gpd.GeoDataFrame(frame, geometry=gpd.GeoSeries(geoms, crs=MEMO_CRS))
+            # Named above every part the coverage file names or the directory
+            # holds: a part that file still names — damaged, or gone — is never
+            # given new content before the file stops naming it.
+            taken = set(self._listed).union(
+                self._parts, (n for n in self._dir.listdir() if _part_name(n))
+            )
+            for data in _part_chunks(gdf):
+                name = _next_part_name(taken)
+                store.write_bytes(self._dir, name, data)
+                self._parts.append(name)
+                taken.add(name)
         store.write_file(
             self._dir,
             COVERED_FILE,
-            lambda: (json.dumps({"box": list(b)}) + "\n" for b in self._covered),
+            lambda: itertools.chain(
+                [json.dumps({"parts": self._parts}) + "\n"],
+                (json.dumps({"box": list(b)}) + "\n" for b in self._covered),
+            ),
         )
+        # A part no list names — written by a persist that never reached the
+        # coverage file, or dropped as damaged above — is reclaimed. What
+        # cannot be unlinked (a directory under a part's name) stays, and so
+        # does its claim on the name.
+        for name in self._dir.listdir():
+            if _part_name(name) and name not in self._parts:
+                try:
+                    self._dir.unlink(name)
+                except OSError:
+                    pass
 
     def ensure(self, boxes):
         """Make every box queryable; returns how many new divisions arrived.
@@ -326,6 +462,7 @@ class BoundaryLookup:
                     polygons.setdefault(division_id, {}).update(geoms)
             new_ids = sorted(set(polygons) - set(self._records))
             metadata = self._division_metadata(new_ids)
+            added = {}
             for division_id, found in polygons.items():
                 record = self._records.get(division_id)
                 if record is None:
@@ -343,17 +480,14 @@ class BoundaryLookup:
                     record["division_id"] = division_id
                     record["geoms"] = []
                     self._records[division_id] = record
-                existing = (
-                    set(shapely.to_wkb(np.asarray(record["geoms"], dtype=object)))
-                    if record["geoms"]
-                    else set()
-                )
+                existing = _wkb_set(record["geoms"])
                 for key, geom in found.items():
                     if key not in existing:
                         record["geoms"].append(geom)
+                        added.setdefault(division_id, []).append(geom)
                         existing.add(key)
             self._covered.extend(merged)
-            self._persist()
+            self._persist(added)
         self._tree = None
         return len(new_ids)
 
@@ -384,9 +518,10 @@ class BoundaryLookup:
             division_ids = batch.column("division_id").to_pylist()
             wkb = batch.column("geometry").to_numpy(zero_copy_only=False)
             geoms = shapely.force_2d(shapely.from_wkb(wkb, on_invalid="ignore"))
-            # Empty, invalid or non-polygon geometry must not enter the
-            # containment index as division evidence.
-            index = np.nonzero(geometry._valid_polygons(geoms))[0]
+            # Empty, invalid or non-polygon geometry, or a row naming no
+            # division, must not enter the containment index as evidence.
+            named = np.fromiter(map(bool, division_ids), bool, len(division_ids))
+            index = np.nonzero(geometry._valid_polygons(geoms) & named)[0]
             if index.size == 0:
                 continue
             # Memoize the simplified boundaries (the shipping tolerance): exact
