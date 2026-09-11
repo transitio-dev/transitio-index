@@ -233,16 +233,20 @@ def place_areas(cache_dir, dataset, places, wanted):
     metros and fao stages' read: served from the release-keyed cache, the scan
     narrowed to the places' countries, and the S3 dataset opened (under the
     read's deadline) only when ``dataset`` is None and an id is missing. ``{}``
-    when nothing is wanted."""
+    when nothing is wanted.
+
+    A scan reads every row group of the places' countries whatever ids it asks
+    for, so the fetch covers every seeded division, not only ``wanted``: the
+    geometry stage that follows then reads all of them locally.
+    """
     if not wanted:
         return {}
-    return read_areas(
-        dataset,
-        wanted,
-        cache=(cache_dir, overture.OVERTURE_RELEASE),
-        reopen=division_area_dataset if dataset is None else None,
-        countries={p.get("country_code") for p in places} - {None},
-    )
+    cache = (cache_dir, overture.OVERTURE_RELEASE)
+    reopen = division_area_dataset if dataset is None else None
+    countries = {p.get("country_code") for p in places} - {None}
+    every = ({p.get("overture_id") for p in places} - {None}) | set(wanted)
+    prefetch_areas(dataset, every, cache=cache, reopen=reopen, countries=countries)
+    return read_areas(dataset, wanted, cache=cache, reopen=reopen, countries=countries)
 
 
 def _area_predicate(ids):
@@ -261,16 +265,26 @@ def _area_batches(dataset, ids, cache, reopen=None, countries=None):
     if cache is None:
         yield from progress(_scan(dataset, ids, countries), "areas")
         return
-    cache_dir, release = cache
-    rows_dir = _cache_rows_dir(cache_dir, release)
-    cached = _cached_area_ids(rows_dir, countries)
-    missing = [i for i in ids if i not in cached]
-    if missing:
-        _fetch_into_cache(dataset, missing, rows_dir, reopen, countries)
+    rows_dir = prefetch_areas(
+        dataset, ids, cache=cache, reopen=reopen, countries=countries
+    )
     if _has_cache(rows_dir):
         yield from ds.dataset(rows_dir, format="parquet").to_batches(
             filter=_area_predicate(ids)
         )
+
+
+def prefetch_areas(dataset, division_ids, *, cache, reopen=None, countries=None):
+    """Fetch the rows of ``division_ids`` the local cache lacks into it, reading
+    nothing back; returns the cache's rows directory. ``dataset``, ``reopen``
+    and ``countries`` as in :func:`read_areas`."""
+    cache_dir, release = cache
+    rows_dir = _cache_rows_dir(cache_dir, release)
+    cached = _cached_area_ids(rows_dir, countries)
+    missing = [i for i in sorted(set(division_ids)) if i not in cached]
+    if missing:
+        _fetch_into_cache(dataset, missing, rows_dir, reopen, countries)
+    return rows_dir
 
 
 def _cache_rows_dir(cache_dir, release):

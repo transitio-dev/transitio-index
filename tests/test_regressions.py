@@ -521,3 +521,38 @@ def test_a_division_without_area_rows_is_not_rescanned(tmp_path):
     absent.symlink_to(outside)
     with pytest.raises(ValueError, match="escapes the cache root"):
         read({"ghost"}, {"FI"})
+
+
+def test_the_metros_read_warms_the_area_cache_for_every_seeded_division(tmp_path):
+    """A scan reads every row group of the places' countries whatever ids it
+    asks for, yet the metros/fao read fetched only the cities' areas and the
+    geometry stage then scanned the same country again for the regions. The
+    shared read now fetches every seeded division, so the later read is local."""
+    dataset = fx.write_area_dataset(
+        tmp_path / "a.parquet",
+        [
+            fx.area("city", _wkb(0, 0, 1, 1), GOOD, country="FI"),
+            fx.area("region", _wkb(0, 0, 5, 5), GOOD, country="FI"),
+        ],
+    )
+    scans = {"n": 0}
+
+    class Counting:
+        def to_batches(self, **kwargs):
+            scans["n"] += 1
+            return dataset.to_batches(**kwargs)
+
+    places = [
+        {"overture_id": "city", "kind": "city", "country_code": "FI"},
+        {"overture_id": "region", "kind": "region", "country_code": "FI"},
+    ]
+    cache_dir = tmp_path / "cache"
+    areas = geometry.place_areas(cache_dir, Counting(), places, {"city"})
+    assert set(areas) == {"city"} and scans["n"] == 1
+    later = geometry.read_areas(
+        Counting(),
+        {"region"},
+        cache=(cache_dir, overture.OVERTURE_RELEASE),
+        countries={"FI"},
+    )
+    assert set(later) == {"region"} and scans["n"] == 1  # served from the warmed cache
