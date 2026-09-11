@@ -24,6 +24,7 @@ transitio_index/registry_history.py   the CI registry-history guard
 scripts/sample_catalogues.py  cut a small multi-place catalogue sample
 scripts/export_divisions.py   export the Overture division hierarchy to inspect
 scripts/export_index_layer.py export a produced index as a map layer (feeds/tiers)
+scripts/index_viewer.py       inspect a built index in the browser
 overrides/             the place registry and curated override files
 golden/                the golden feed set the publish stage diffs against
 tests/                 the build's pytest suite and its fixtures
@@ -159,6 +160,24 @@ its geometry, a `served` flag and the feeds serving it — to `cache/index-layer
 `scripts/export_divisions.py` exports the raw Overture hierarchy for chosen
 countries straight from public Overture data, for checking the geography before
 a build.
+
+### Inspect a build in the browser
+
+`scripts/index_viewer.py` serves the built index — `cache/index` and every
+per-country build under `cache/builds/` — to a page on localhost with a map
+of the places. It needs the `viewer` extra:
+
+```
+pip install -e ".[viewer]"
+python scripts/index_viewer.py --cache cache --open
+```
+
+Pick a build in the top bar; the map fits itself to the build's countries and
+regions, hovering names a place, clicking opens its details, and from zoom 7
+the loaded slice follows the viewport. The viewer only reads the parquet and
+JSON files a build publishes and verifies their digests before showing them,
+so a build that is mid-publish is listed but reported unavailable until the
+publish completes.
 
 ### Publish a snapshot
 
