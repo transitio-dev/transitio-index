@@ -28,6 +28,7 @@ import os
 import stat
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shapely
@@ -77,6 +78,16 @@ _OPEN_FLAGS = (
     | getattr(os, "O_NONBLOCK", 0)
     | getattr(os, "O_BINARY", 0)
 )
+DEFAULT_KINDS = ("country", "region")
+# A slice is bounded twice: by feature count and by serialized size. 3,000 is
+# above any build's countries + regions (ES: 1,563) and 8 MB above the measured
+# all-regions overview at the coarsest zoom (7.3 MB for ES).
+MAX_FEATURES = 3000
+MAX_BYTES = 8 * 1024 * 1024
+# (highest zoom, tolerance in degrees) for the coarser views; a zoom past the
+# last entry keeps the stored geometry.
+ZOOM_TOLERANCES = ((6, 0.02), (9, 0.005))
+PROPERTY_COLUMNS = ("place_id", "name", "kind", "parent_id", "country_code", "service")
 
 
 def _is_regular_file(path):
@@ -280,3 +291,126 @@ class BuildCache:
         while len(self._builds) > self.size:
             self._builds.popitem(last=False)
         return build
+
+
+def parse_kinds(value):
+    """The kinds a ``kind=`` parameter names: the default pair, all, or a list."""
+    if value is None:
+        return set(DEFAULT_KINDS)
+    if value == "all":
+        return None
+    return {kind.strip() for kind in value.split(",") if kind.strip()}
+
+
+def parse_bbox(value):
+    parts = [float(part) for part in value.split(",")]
+    if len(parts) != 4:
+        raise ValueError("bbox needs minx,miny,maxx,maxy")
+    return tuple(parts)
+
+
+def filter_places(
+    build,
+    kinds=DEFAULT_KINDS,
+    parent_id=None,
+    bbox=None,
+    served=None,
+    q=None,
+    feed_id=None,
+):
+    """A boolean mask over the build's places for one slice.
+
+    ``kinds`` is a collection of kinds (the default pair when omitted), or
+    None for every kind. A slice that can include
+    cities must be bounded by ``parent_id`` or ``bbox`` (``ValueError``
+    otherwise). ``feed_id`` keeps the places that feed serves, through the
+    edges. Every test is a vectorized mask over the build's arrays.
+    """
+    places = build.places
+    if (kinds is None or "city" in kinds) and parent_id is None and bbox is None:
+        raise ValueError("a slice that includes cities needs parent_id or bbox")
+    mask = np.ones(len(places), dtype=bool)
+    if kinds is not None:
+        mask &= places["kind"].isin(set(kinds)).to_numpy()
+    if parent_id is not None:
+        mask &= (places["parent_id"] == parent_id).to_numpy()
+    if bbox is not None:
+        minx, miny, maxx, maxy = bbox
+        bounds = build.bounds
+        mask &= (
+            (bounds[:, 0] <= maxx)
+            & (bounds[:, 2] >= minx)
+            & (bounds[:, 1] <= maxy)
+            & (bounds[:, 3] >= miny)
+        )
+    if served is not None:
+        mask &= build.served if served else ~build.served
+    if q:
+        mask &= places["name"].str.contains(q, case=False, na=False, regex=False)
+    if feed_id is not None:
+        edges = build.edges
+        serving = set(edges.loc[edges["feed_id"] == feed_id, "place_id"])
+        mask &= places["place_id"].isin(serving).to_numpy()
+    return np.asarray(mask, dtype=bool)
+
+
+def tolerance_for_zoom(zoom):
+    """The simplification tolerance for a map zoom; None keeps the stored geometry."""
+    if zoom is None:
+        return None
+    for highest, tolerance in ZOOM_TOLERANCES:
+        if zoom <= highest:
+            return tolerance
+    return None
+
+
+def _overflow(matched, max_features, **extra):
+    return {"overflow": True, "matched": matched, "limit": max_features, **extra}
+
+
+def places_geojson(
+    build, mask, tolerance=None, max_features=MAX_FEATURES, max_bytes=MAX_BYTES
+):
+    """``(body, overflow)`` for the masked places.
+
+    ``body`` is the UTF-8 GeoJSON FeatureCollection and ``overflow`` None, or
+    ``body`` is None and ``overflow`` the record to send instead. The count is
+    checked before any geometry work; the geometry is simplified over the whole
+    array, serialized in one pass, and the byte budget measured on exactly what
+    would be sent. Properties stay compact; ``service`` is the row's JSON string.
+    """
+    matched = int(np.count_nonzero(mask))
+    if matched > max_features:  # decided before anything is materialized
+        return None, _overflow(matched, max_features)
+    index = np.flatnonzero(mask)
+    geoms = build.geoms[index]
+    if tolerance is not None:
+        geoms = shapely.simplify(geoms, tolerance, preserve_topology=True)
+    geometry = shapely.to_geojson(geoms)
+    props = build.places.iloc[index][list(PROPERTY_COLUMNS)]
+    props = props.astype(object).where(props.notna(), None)
+    features = []
+    for record, feed_count, is_served, geom in zip(
+        props.to_dict(orient="records"),
+        build.feed_count[index].tolist(),
+        build.served[index].tolist(),
+        geometry,
+    ):
+        record["feed_count"] = feed_count
+        record["served"] = is_served
+        features.append(
+            '{"type":"Feature","id":%s,"properties":%s,"geometry":%s}'
+            % (
+                json.dumps(record["place_id"]),
+                json.dumps(record, ensure_ascii=False),
+                geom if geom is not None else "null",
+            )
+        )
+    body = (
+        '{"type":"FeatureCollection","features":[' + ",".join(features) + "]}"
+    ).encode("utf-8")
+    if len(body) > max_bytes:
+        return None, _overflow(
+            matched, max_features, bytes=len(body), byte_limit=max_bytes
+        )
+    return body, None

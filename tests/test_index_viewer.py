@@ -1,4 +1,4 @@
-"""Tests for the index viewer's data layer: verified loading and the build cache.
+"""Tests for the index viewer's data layer: loading, the build cache and slices.
 
 A publish-shaped build is written into a temp cache with real parquet and a
 snapshot whose digests match, then tampered with per case.
@@ -261,3 +261,82 @@ def test_the_cache_reloads_on_digest_change_and_evicts_a_vanished_build(tmp_path
     shutil.rmtree(cache / "builds" / "fi-abc")  # the build vanishes
     assert builds.get("fi-abc") is None and "fi-abc" not in builds._builds
     assert builds.get("nope") is None
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ({}, {"fi", "uus", "lap"}),  # default kinds: countries and regions
+        ({"kinds": None, "bbox": (24, 60, 25, 60.5)}, {"fi", "uus", "hel", "esp"}),
+        ({"kinds": {"city"}, "parent_id": "uus"}, {"hel", "esp"}),
+        ({"served": True}, {"fi", "uus", "lap"} & set()),  # no served region
+        ({"kinds": None, "bbox": (19, 59, 32, 71), "served": True}, {"hel"}),
+        ({"q": "lap"}, {"lap"}),
+        ({"kinds": None, "bbox": (19, 59, 32, 71), "feed_id": "f1"}, {"hel"}),
+        ({"kinds": None}, ValueError),  # cities without a bound
+        ({"kinds": {"city"}}, ValueError),
+    ],
+    ids=[
+        "default",
+        "all-in-bbox",
+        "cities-of-region",
+        "served-regions",
+        "served-anywhere",
+        "name-search",
+        "feed-serves-a-city",
+        "unbounded-all",
+        "unbounded-cities",
+    ],
+)
+def test_filter_places(tmp_path, query, expected):
+    build = iv.load_build("b", write_build(tmp_path) and tmp_path)
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="parent_id or bbox"):
+            iv.filter_places(build, **query)
+        return
+    mask = iv.filter_places(build, **query)
+    assert set(build.places["place_id"][mask]) == expected
+
+
+def test_slices_are_capped_by_count_then_bytes(tmp_path):
+    build = iv.load_build("b", write_build(tmp_path) and tmp_path)
+    mask = iv.filter_places(build)  # 3 features
+    body, overflow = iv.places_geojson(build, mask, max_features=2)
+    assert body is None and overflow == {"overflow": True, "matched": 3, "limit": 2}
+    body, overflow = iv.places_geojson(build, mask, max_bytes=50)
+    assert body is None and overflow["bytes"] > 50 and overflow["byte_limit"] == 50
+    body, overflow = iv.places_geojson(build, mask)
+    assert overflow is None
+    collection = json.loads(body)
+    assert (
+        collection["type"] == "FeatureCollection" and len(collection["features"]) == 3
+    )
+    feature = next(f for f in collection["features"] if f["id"] == "uus")
+    assert feature["properties"] == {
+        "place_id": "uus",
+        "name": "Uusimaa",
+        "kind": "region",
+        "parent_id": "fi",
+        "country_code": "FI",
+        "service": '{"feeds": 1}',
+        "feed_count": 0,
+        "served": False,
+    }
+    assert feature["geometry"]["type"] == "Polygon"
+
+
+@pytest.mark.parametrize(
+    ("zoom", "tolerance"), [(None, None), (5, 0.02), (6, 0.02), (8, 0.005), (12, None)]
+)
+def test_tolerance_for_zoom(zoom, tolerance):
+    assert iv.tolerance_for_zoom(zoom) == tolerance
+
+
+def test_generalization_shrinks_a_slice(tmp_path):
+    dense = shapely.Point(25, 65).buffer(2, quad_segs=200)  # ~800 vertices
+    places = PLACES[:1] + [_place("dense", "region", "Dense", "fi", dense)]
+    build = iv.load_build("b", write_build(tmp_path, places=places) and tmp_path)
+    mask = iv.filter_places(build, kinds={"region"})
+    stored, _ = iv.places_geojson(build, mask)
+    coarse, _ = iv.places_geojson(build, mask, tolerance=0.02)
+    assert len(coarse) < len(stored) / 4
