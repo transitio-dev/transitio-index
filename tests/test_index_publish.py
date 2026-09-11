@@ -26,7 +26,6 @@ from transitio import index as transitio_index  # noqa: E402
 from transitio.exceptions import IncompatibleIndexError  # noqa: E402
 from transitio.exceptions import PlaceNotFoundError  # noqa: E402
 
-
 # The feeds columns schema 7 added; an older shape is recreated by dropping them.
 _SCHEMA_7_FEED_COLUMNS = (
     "home_country",
