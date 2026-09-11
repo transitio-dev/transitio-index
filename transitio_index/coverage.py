@@ -35,9 +35,12 @@ this feed by feed once the crawl exists.
 
 import collections
 import datetime
+import logging
 
 from transitio_index import overrides, store
 from transitio_index.progress import progress
+
+log = logging.getLogger(__name__)
 
 COVERAGE_POINTER = "coverage.json"
 FEEDS_ARTIFACT = "feeds_covered.jsonl"
@@ -304,8 +307,9 @@ def stop_places(lookup, x, y, by_overture, by_qid):
     """``(place_ids, countries, stale)`` for one stop coordinate.
 
     A division is known when its Overture id or its QID maps to a place;
-    ``stale`` holds QID-bearing divisions neither names, which can only mean
-    ``places_expanded`` predates the crawl.
+    ``stale`` holds the QID-bearing divisions neither names — a discovery the
+    expand stage reported as a conflict, or else a sign that
+    ``places_expanded`` predates the crawl; the caller tells them apart.
     """
     from transitio_index import overture
 
@@ -327,7 +331,7 @@ def stop_places(lookup, x, y, by_overture, by_qid):
     return hit, countries, stale
 
 
-def crawled_edges(cache_dir, feeds, places, lookup):
+def crawled_edges(cache_dir, feeds, places, lookup, conflicts=frozenset()):
     """Measured edges for the crawled feeds; ``(edges_by_key, report)``.
 
     Reads each crawled feed's digest-verified stops (the crawl's state.json is
@@ -338,6 +342,12 @@ def crawled_edges(cache_dir, feeds, places, lookup):
     stop lands anywhere — the crawl saw where it stops. Metro edges are
     propagated from member-city edges; a metro's own aggregated evidence
     outranks them.
+
+    ``conflicts`` names the QIDs the expand stage discovered and reported as
+    conflicts rather than placing: a stop inside one of them is a logged
+    miss — the stop counts for the enclosing places it also hit — where any
+    other unknown QID-bearing division means ``places_expanded`` predates the
+    crawl.
     """
     # Heavy deps (shapely/pyarrow via the gazetteer modules) load only when
     # crawl artifacts exist; the declared path stays importable without them.
@@ -437,6 +447,14 @@ def crawled_edges(cache_dir, feeds, places, lookup):
                     edge = _edge(target, feed_id, evidence, "crawl", service)
                     edge["_own"] = own
                     by_key[key] = edge
+    dropped_hit = sorted(stale & set(conflicts))
+    for qid in dropped_hit:
+        log.warning(
+            "coverage: stops fall in %s, which the expand stage dropped as a "
+            "conflict; they count for its enclosing places only",
+            qid,
+        )
+    stale -= set(conflicts)
     if stale:
         raise CoverageError(
             "crawled stops hit QID-bearing divisions the gazetteer does not "
@@ -449,6 +467,7 @@ def crawled_edges(cache_dir, feeds, places, lookup):
         "superseded": superseded,
         "state_mismatches": mismatches,
         "unmatched_crawl_ids": sorted(unmatched),
+        "dropped_divisions_hit": dropped_hit,
         "crawl_fields": crawl_fields,
     }
     return by_key, report
@@ -549,9 +568,28 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             feeds, resolve_manifest = store.read_jsonl(
                 cache_dir / "resolve", "feeds_resolved.json", "feeds_resolved.jsonl"
             )
-            place_rows, expanded_manifest = store.read_jsonl(
-                cache_dir / "gazetteer", "expanded.json", "places_expanded.jsonl"
+            # The places and the report of what expand dropped, from ONE
+            # resolved generation: a concurrent expand publish must not pair a
+            # newer report with older places. A stop inside a dropped
+            # discovery is a known miss, not a stale expansion. (An expansion
+            # published without a report has dropped nothing.)
+            expanded, expanded_manifest = store.resolve(
+                cache_dir / "gazetteer", "expanded.json"
             )
+            with expanded:
+                place_rows = store.parse_jsonl(
+                    expanded.read_bytes("places_expanded.jsonl")
+                )
+                expansion_report = (
+                    store.parse_jsonl(expanded.read_bytes("expansion_report.jsonl"))
+                    if expanded.has("expansion_report.jsonl")
+                    else []
+                )
+            conflicts = {
+                row["place_id"]
+                for row in expansion_report
+                if row.get("kind") == "conflict" and row.get("place_id")
+            }
             placements, seed_manifest = store.read_jsonl(
                 cache_dir / "gazetteer", "seed.json", "feed_places.jsonl"
             )
@@ -575,6 +613,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "superseded": set(),
                 "state_mismatches": 0,
                 "unmatched_crawl_ids": [],
+                "dropped_divisions_hit": [],
                 "crawl_fields": {},
             }
             opened_lookup = None
@@ -605,6 +644,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                             feeds,
                             places,
                             lookup,
+                            conflicts=conflicts,
                         )
                     except store.StoreError as error:
                         raise CoverageError(
@@ -687,6 +727,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "feeds_crawl_covered": len(superseded),
                 "crawl_state_mismatches": crawl_report["state_mismatches"],
                 "unmatched_crawl_ids": crawl_report["unmatched_crawl_ids"],
+                "dropped_divisions_hit": crawl_report["dropped_divisions_hit"],
                 "edges": len(edges),
                 "edges_by_place_kind": dict(
                     collections.Counter(places[e["place_id"]]["kind"] for e in edges)

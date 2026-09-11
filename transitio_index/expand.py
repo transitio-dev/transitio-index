@@ -340,8 +340,9 @@ def _discover(
         # division included: the concordance enriches the row, or conflicts,
         # and read-only refuses. A discovery the registry refuses is dropped
         # here, before it can stand in for its aliases, read a boundary, or
-        # seed a metro's membership.
-        identified = seed._identify_places(discovered, registry, digest)
+        # seed a metro's membership — and reported, so the coverage stage
+        # knows a stop landing on it is not proof of a stale expansion.
+        identified = seed._identify_places(discovered, registry, digest, report=report)
         for qid in set(canonical) - set(discovered):
             del canonical[qid]
     new_ids = []

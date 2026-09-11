@@ -511,14 +511,15 @@ def _key_concordance(key, registry):
     return {namespace: [value]}
 
 
-def _identify_places(places, registry, places_digest):
+def _identify_places(places, registry, places_digest, report=None):
     """Give every place its registry id — found by its concordances or
     minted — and the QID the registry keys it by; ``rekey_by_own_id`` then
     makes the id the key. A place whose concordances conflict with an
     existing registry place — a name shared across administrative levels,
     e.g. a city that shares its QID with a like-named region — cannot be
-    identified; it is logged and dropped from ``places`` so one collision no
-    longer aborts the gazetteer. Returns the number identified."""
+    identified; it is logged, appended to ``report`` as a ``conflict`` row
+    when one is given, and dropped from ``places`` so one collision no longer
+    aborts the gazetteer. Returns the number identified."""
     if registry is None:
         return 0
     skipped = []
@@ -550,6 +551,16 @@ def _identify_places(places, registry, places_digest):
                 raise
             log.warning("seed: %s not identified (%s); skipped", place_id, exc)
             skipped.append(place_id)
+            if report is not None:
+                report.append(
+                    {
+                        "kind": "conflict",
+                        "place_id": place_id,
+                        "overture_id": row.get("overture_id"),
+                        "name": row.get("name"),
+                        "reason": str(exc),
+                    }
+                )
             continue
         row["wikidata_id"] = registry.canonical_qid(row["tp_id"])
         if row["kind"] == "metro" and not row.get("statistical_area_id"):

@@ -629,3 +629,34 @@ def test_the_boundary_lookup_reads_only_the_row_groups_its_cells_touch(tmp_path)
         assert lookup.ensure(cells) == 0 and len(reads) == 2  # covered per cell
         assert [r["division_id"] for r in lookup.divisions_at(10.5, 10.5)] == ["east"]
         assert lookup.divisions_at(5.5, 5.5) == []
+
+
+def test_a_crawled_division_the_registry_refuses_is_reported_by_expand(tmp_path):
+    """A discovered division whose QID the registry holds under another kind
+    (a city that is its own district, registered as a region from its county)
+    was dropped with only a log line; the coverage stage then read a stop in it
+    as proof of a stale expansion and aborted. The drop is now a ``conflict``
+    row of the expansion report."""
+    import test_index_expand as ex
+
+    cache = tmp_path / "cache"
+    ex._publish_names(cache, ex.SEED_PLACES)
+    ex._write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    path = tmp_path / "places_registry.jsonl"
+    ex._publish_run(cache, ex._seeded_registry(path))
+    with registry.session(path) as reg:
+        # Tampere's QID, held as a region before the crawl discovers the city.
+        reg.identify(
+            {"wikidata": ["Q40840"]},
+            kind="region",
+            country_code="FI",
+            minted_from="t",
+            minted_in="t 1",
+        )
+        manifest, places, report = ex._expand(tmp_path, cache, registry=reg)
+    assert manifest["mode"] == "expanded"
+    # Dropped: no returned row is the discovered division, under any key.
+    assert all(p.get("overture_id") != "fi-tre" for p in places.values())
+    (row,) = [r for r in report if r.get("kind") == "conflict"]
+    assert row["place_id"] == "Q40840" and row["overture_id"] == "fi-tre"
+    assert "not a city" in row["reason"]
