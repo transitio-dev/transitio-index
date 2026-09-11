@@ -4,8 +4,10 @@ Matches each feed's declared municipality (MDB) or ``Location`` (``systems.csv``
 to an Overture locality/localadmin by name within its country — disambiguated by
 the declared subdivision — resolves that division to a QID with the same rules as
 the skeleton stage, and emits the city place plus its administrative ancestors as
-``places_seed.jsonl``. A feed that declares only a subdivision resolves to that
-region instead. A feed whose location does not resolve to a single place — a
+``places_seed.jsonl``. A municipality no locality is named by is matched against
+the skeleton's regions and counties instead — catalogues name districts there —
+and placed at that division. A feed that declares only a subdivision resolves to
+that region. A feed whose location does not resolve to a single place — a
 QID-bearing division, or a named one no QID names, identified by its Overture
 id — is reported, never minted.
 
@@ -207,9 +209,10 @@ def _lookup(index, country, name):
     return list(seen.values())
 
 
-def match(index, country, subdivision, municipality, skeleton):
-    """The single city for a declared location — QID-bearing, or a named
-    division no QID names — or ``(None, why)``.
+def match(index, country, subdivision, municipality, skeleton, what="locality"):
+    """The single division for a declared location — QID-bearing, or a named
+    division no QID names — or ``(None, why)``; ``what`` names the level the
+    index holds, for the reason when nothing carries the name.
 
     A declared subdivision must corroborate the match: it is required to name
     one of the candidate's region/county ancestors, so a lone same-name city in
@@ -217,7 +220,7 @@ def match(index, country, subdivision, municipality, skeleton):
     """
     candidates = _lookup(index, country, municipality)
     if not candidates:
-        return None, "no locality of that name in the declared country"
+        return None, f"no {what} of that name in the declared country"
     if subdivision:
         folded = _norm(subdivision)
         narrowed = [c for c in candidates if folded in _subdivision_names(c, skeleton)]
@@ -627,10 +630,11 @@ def resolve_seed(
     """Build ``places_seed.jsonl`` from the feeds' declared locations.
 
     Reads the crosswalk feeds and the skeleton stage's resolved divisions,
-    matches each feed's declared municipality to a QID-bearing Overture city (its
-    subdivision to a region, or its country to a country, when no finer level is
-    declared), and emits that place with its administrative ancestors; unmatched
-    feeds go to ``seed_report.jsonl``. With a ``registry`` session every place
+    matches each feed's declared municipality to a QID-bearing Overture city — or,
+    when no locality carries the name, to a skeleton region or county, placed at
+    level ``district`` — (its subdivision to a region, or its country to a
+    country, when no finer level is declared), and emits that place with its
+    administrative ancestors; unmatched feeds go to ``seed_report.jsonl``. With a ``registry`` session every place
     also gets its registry id (``tp_id``) and ``wikidata_id``. Returns the
     generation manifest.
     """
@@ -685,6 +689,21 @@ def resolve_seed(
                 location["municipality"],
                 skeleton,
             )
+            if division is None and not _lookup(
+                city_index, location["country"], location["municipality"]
+            ):
+                # A municipality no locality is named by may name a district
+                # or region the skeleton resolved — "Augsburg (district)",
+                # "Kreis Soest" — and places the feed there.
+                level = "district"
+                division, reason = match(
+                    region_index,
+                    location["country"],
+                    location["subdivision"],
+                    location["municipality"],
+                    skeleton,
+                    what="locality or district",
+                )
         elif location["subdivision"]:
             level = "subdivision"
             regions = _lookup(

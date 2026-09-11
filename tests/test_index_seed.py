@@ -3,7 +3,7 @@ import pytest
 pytest.importorskip("pyarrow")
 import overture_fixture as fx  # noqa: E402
 
-from transitio_index import overture, registry, seed, store  # noqa: E402
+from transitio_index import coverage, overture, registry, seed, store  # noqa: E402
 
 # Skeleton (resolved by the 5a stage) + localities (resolved by the seed stage).
 ROWS = [
@@ -140,6 +140,22 @@ ROWS = [
             ("fi-vantaa-x", "locality", "Vantaa"),
         ),
     ),
+    # A district the skeleton resolves (a county, kind region); a feed's
+    # municipality field may name it, in any of its labels.
+    fx.division(
+        "fi-keski",
+        "FI",
+        "county",
+        wikidata="Q999001",
+        name="Keski-Uusimaa",
+        common={"en": "Central Uusimaa (district)"},
+        admin_level=2,
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-keski", "county", "Keski-Uusimaa"),
+        ),
+    ),
     # Turku, reachable only through its Swedish name Åbo.
     fx.division(
         "fi-turku",
@@ -184,6 +200,12 @@ FEEDS = [
     {"feed_id": "f-abo", "mdb": _mdb("FI", "Uusimaa", "Åbo")},
     {"feed_id": "f-wrongsub", "mdb": _mdb("FI", "Lapland", "Espoo")},
     {"feed_id": "f-country", "mdb": _mdb("SE", None, None)},
+    {
+        "feed_id": "f-district",
+        "mdb": _mdb("FI", "Uusimaa", "Central Uusimaa (district)"),
+    },
+    {"feed_id": "f-district-wrongsub", "mdb": _mdb("FI", "Lapland", "Keski-Uusimaa")},
+    {"feed_id": "f-atlantis", "mdb": _mdb("FI", None, "Atlantis")},
 ]
 
 
@@ -359,6 +381,35 @@ def test_a_qidless_same_name_sibling_makes_the_match_ambiguous(tmp_path):
     assert "Q13360" not in places
     entry = next(r for r in report if r["feed_id"] == "f-vantaa")
     assert entry["reason"] == "the name also matches a division without a QID"
+
+
+def test_a_municipality_naming_a_district_places_the_feed_there(tmp_path):
+    # "Central Uusimaa (district)" names no locality; it is the English label
+    # of a county the skeleton resolved, so the feed is placed at the district.
+    _, places, report = _seed(tmp_path)
+    district = places["Q999001"]
+    assert district["kind"] == "region" and district["parent_id"] == "Q1508"
+    placements, _ = store.read_jsonl(
+        tmp_path / "cache" / "gazetteer", "seed.json", "feed_places.jsonl"
+    )
+    by_feed = {p["feed_id"]: p for p in placements}
+    assert by_feed["f-district"] == {
+        "feed_id": "f-district",
+        "place_id": "Q999001",
+        "level": "district",
+    }
+    assert "district" in coverage.DECLARED_LEVELS  # the coverage stage accepts it
+    # The declared subdivision must corroborate a district too, and a name
+    # found at neither level says so.
+    reasons = {r["feed_id"]: r["reason"] for r in report}
+    assert (
+        reasons["f-district-wrongsub"]
+        == "the declared subdivision matches no same-name division"
+    )
+    assert (
+        reasons["f-atlantis"]
+        == "no locality or district of that name in the declared country"
+    )
 
 
 def test_a_lone_city_in_the_wrong_subdivision_is_reported(tmp_path):

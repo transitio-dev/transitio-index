@@ -83,9 +83,17 @@ def _check_lineage(resolve_manifest, seed_manifest, expanded_manifest):
 
 
 # The declared placement levels this stage knows: an exact municipality
-# match, a coarser subdivision/country or bounding-box match, or a
-# >=4-character geohash. Anything else is reported, never guessed at.
-DECLARED_LEVELS = ("municipality", "subdivision", "country", "bbox", "geohash")
+# match, a district the municipality field named, a coarser
+# subdivision/country or bounding-box match, or a >=4-character geohash.
+# Anything else is reported, never guessed at.
+DECLARED_LEVELS = (
+    "municipality",
+    "district",
+    "subdivision",
+    "country",
+    "bbox",
+    "geohash",
+)
 # The tier-confidence cutoff below which a classified edge needs review.
 REVIEW_CUTOFF = 0.70
 
