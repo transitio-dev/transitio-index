@@ -49,6 +49,11 @@ MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
 DOWNLOAD_ATTEMPTS = 3
 REDIRECT_LIMIT = 5
 TIMEOUT = 60.0
+# A connect still pending after this long is a dead host (TCP's SYN retries
+# at 1, 2, 4 and 8 s all fall inside it); slow answers get the full TIMEOUT.
+# Each address a host resolves to is tried with the whole connect timeout, so
+# this also bounds a host with a private or unrouted address among its records.
+CONNECT_TIMEOUT = 15.0
 # Consecutive transport failures after which a host is not asked again this
 # run: an unreachable host otherwise costs every later feed on it a full timeout.
 HOST_FAILURES = 3
@@ -207,6 +212,7 @@ class Fetcher:
         rate=1.0,
         burst=5,
         timeout=TIMEOUT,
+        connect_timeout=CONNECT_TIMEOUT,
         host_failures=HOST_FAILURES,
         clock=time.monotonic,
         sleeper=time.sleep,
@@ -217,7 +223,7 @@ class Fetcher:
         self._client = httpx.Client(
             transport=transport,
             follow_redirects=False,
-            timeout=timeout,
+            timeout=httpx.Timeout(timeout, connect=connect_timeout),
             headers={
                 "User-Agent": overture.USER_AGENT,
                 "Accept-Encoding": "identity",

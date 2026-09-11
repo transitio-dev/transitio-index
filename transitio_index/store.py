@@ -951,6 +951,10 @@ class Generation:
     def name(self):
         return self.path.name
 
+    def has(self, name):
+        """Whether the manifest declared, and resolution verified, ``name``."""
+        return name in self._contents
+
     def read_bytes(self, name):
         """Exactly the bytes verification hashed.
 

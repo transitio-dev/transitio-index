@@ -135,14 +135,14 @@ def test_an_uncovered_box_without_datasets_is_refused(tmp_path):
 def test_covered_boxes_are_not_rescanned(tmp_path):
     cache = tmp_path / "cache"
 
-    class Counting:
+    class Counting:  # every read starts by listing the dataset's fragments
         def __init__(self, dataset):
             self._dataset = dataset
             self.scans = 0
 
-        def to_batches(self, **kw):
+        def get_fragments(self):
             self.scans += 1
-            return self._dataset.to_batches(**kw)
+            return self._dataset.get_fragments()
 
     divisions, areas = _datasets(tmp_path)
     counting = Counting(areas)
@@ -173,7 +173,7 @@ def test_a_stalled_box_scan_is_retried_on_a_fresh_connection(tmp_path, monkeypat
     opened = []
 
     class Hanging:  # a connection the proxy dropped: nothing ever arrives
-        def to_batches(self, **kw):
+        def get_fragments(self):
             threading.Event().wait(3)
             return iter(())
 
@@ -226,11 +226,6 @@ def test_geometries_never_duplicate_across_boxes(tmp_path):
         lookup.ensure([(28.0, 68.0, 28.1, 68.1)])
         record = lookup._records["fi"]
         assert len(record["geoms"]) == 1
-
-
-def test_overlapping_boxes_merge_into_one_scan():
-    merged = boundaries._merge_boxes([(0, 0, 2, 2), (1, 1, 3, 3), (10, 10, 11, 11)])
-    assert sorted(merged) == [(0, 0, 3, 3), (10, 10, 11, 11)]
 
 
 def test_a_point_outside_everything_finds_nothing(tmp_path):

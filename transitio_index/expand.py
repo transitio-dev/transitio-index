@@ -226,6 +226,21 @@ def _attach_metros(places_by_id, new_cities, wikidata, report, registry=None):
     return added, touched
 
 
+def dropped_qids(generation):
+    """The QIDs of the discoveries the expansion report in ``generation`` — a
+    resolved ``expanded.json`` — lists as conflicts: placed nowhere, so a stop
+    inside one is a known miss for the stages measuring stops, not a sign of
+    a stale expansion. An expansion published without a report dropped
+    nothing."""
+    if not generation.has(REPORT_ARTIFACT):
+        return set()
+    return {
+        row["place_id"]
+        for row in store.parse_jsonl(generation.read_bytes(REPORT_ARTIFACT))
+        if row.get("kind") == "conflict" and row.get("place_id")
+    }
+
+
 def _discover(
     cache_dir,
     places_by_id,
@@ -274,6 +289,20 @@ def _discover(
 
     candidates = [dict(record) for record in divisions.values() if record.get("kind")]
     seed._resolve_candidates(candidates, wikidata)
+    # A district or region whose QID a city-level division also carries is a
+    # city that is its own district (Augsburg, Ulm, Wien): only the district
+    # has an area, so the stop reached it, but the place is the city — the
+    # kind the seed gives the same QID from its declared name.
+    shared = {c["qid"] for c in candidates if c["kind"] == "region" and c["qid"]}
+    cities = set()
+    if shared:
+        # A memo-only lookup answered the stops from its cache; the theme is
+        # opened here for the one scan.
+        dataset = lookup.division_dataset() or overture.overture_dataset(release)
+        cities = seed.city_qids(dataset, shared)
+    for record in candidates:
+        if record["kind"] == "region" and record["qid"] in cities:
+            record["kind"] = "city"
     skeleton = {}
     for record in candidates:
         if record["qid"] or overture.qidless_place(record):
@@ -340,8 +369,9 @@ def _discover(
         # division included: the concordance enriches the row, or conflicts,
         # and read-only refuses. A discovery the registry refuses is dropped
         # here, before it can stand in for its aliases, read a boundary, or
-        # seed a metro's membership.
-        identified = seed._identify_places(discovered, registry, digest)
+        # seed a metro's membership — and reported, so the coverage stage
+        # knows a stop landing on it is not proof of a stale expansion.
+        identified = seed._identify_places(discovered, registry, digest, report=report)
         for qid in set(canonical) - set(discovered):
             del canonical[qid]
     new_ids = []

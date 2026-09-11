@@ -6,14 +6,17 @@ import json  # noqa: E402
 from transitio_index import coverage, crawl, overrides, store  # noqa: E402
 
 
-def _publish(cache, subdir, pointer, artifact, records, manifest=None):
+def _publish(cache, subdir, pointer, artifact, records, manifest=None, extra=None):
     directory = store.open_subdir(cache, subdir)
     try:
         with store.exclusive_writer(directory):
+            artifacts = {artifact: store.jsonl_chunks(records)}
+            for name, rows in (extra or {}).items():
+                artifacts[name] = store.jsonl_chunks(rows)
             return store.publish(
                 cache / subdir,
                 pointer,
-                {artifact: store.jsonl_chunks(records)},
+                artifacts,
                 manifest or {"source": subdir},
                 held=directory,
             )
@@ -96,6 +99,7 @@ def _cover(
     lookup=None,
     tamper=None,
     late_crawl=None,
+    report=None,
     **cover_args,
 ):
     cache = tmp_path / "cache"
@@ -143,7 +147,8 @@ def _cover(
         stops = cache / "crawl" / crawl._dir_name(tamper) / "stops.txt"
         stops.write_bytes(stops.read_bytes() + b"sx,1.0,10.0\n")
     if crawls:
-        # The expanded generation must record the crawl it read.
+        # The expanded generation must record the crawl it read — and, when
+        # the test gives one, the report of what expand dropped.
         _publish(
             cache,
             "gazetteer",
@@ -158,6 +163,7 @@ def _cover(
                 "seed_generation": seed_manifest["generation"],
                 "crawl_digest": crawl.states_digest(cache),
             },
+            extra={"expansion_report.jsonl": report} if report is not None else None,
         )
     if late_crawl:
         _write_crawl(cache, late_crawl, _rows(2, 10.0))
@@ -400,14 +406,37 @@ def test_a_state_mismatched_crawl_falls_back_to_declared(tmp_path):
     assert edges["f-city"]["Q-city"]["method"] == "inferred"
 
 
-def test_an_unknown_qid_division_means_a_stale_gazetteer(tmp_path):
+@pytest.mark.parametrize("dropped", [False, True], ids=["unknown", "dropped-by-expand"])
+def test_an_unknown_qid_division_means_a_stale_gazetteer(tmp_path, dropped, caplog):
     # A QID-bearing division the gazetteer does not know can only mean
-    # places_expanded predates this crawl: refuse, never drop edges silently.
+    # places_expanded predates this crawl: refuse, never drop edges silently —
+    # unless the expansion report says expand dropped it as a conflict, in
+    # which case the stops in it are a logged miss and the build goes on.
     lookup = StubLookup(
-        {30.0: [{"kind": "city", "wikidata": "Q999999", "overture_id": "xx"}]}
+        {
+            30.0: [
+                {"kind": "city", "wikidata": "Q999999", "overture_id": "xx"},
+                {"kind": "region", "wikidata": "Q-reg"},
+                {"kind": "country", "wikidata": "Q-c"},
+            ]
+        }
     )
-    with pytest.raises(coverage.CoverageError, match="expand stage"):
-        _cover(tmp_path, crawls={"f-city": _rows(6, 30.0)}, lookup=lookup)
+    crawls = {"f-city": _rows(6, 30.0)}
+    if not dropped:
+        with pytest.raises(coverage.CoverageError, match="expand stage"):
+            _cover(tmp_path, crawls=crawls, lookup=lookup)
+        return
+    report = [{"kind": "conflict", "place_id": "Q999999", "reason": "is a region"}]
+    manifest, covered, edges = _cover(
+        tmp_path, crawls=crawls, lookup=lookup, report=report
+    )
+    assert manifest["dropped_divisions_hit"] == ["Q999999"]
+    assert covered["f-city"]["coverage_source"] == "crawl"
+    # The stops still count for the enclosing places they also hit.
+    assert set(edges["f-city"]) == {"Q-reg", "Q-c"}
+    assert edges["f-city"]["Q-reg"]["method"] == "crawl"
+    assert edges["f-city"]["Q-reg"]["service"]["stops"] == 6
+    assert "Q999999" in caplog.text and "dropped as a conflict" in caplog.text
 
 
 def test_an_uncovered_lookup_is_a_stage_order_error(tmp_path):

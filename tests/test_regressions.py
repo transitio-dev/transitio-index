@@ -14,7 +14,15 @@ import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
 import test_index_boundaries as bt  # noqa: E402
-from transitio_index import boundaries, coverage, overture, registry, seed  # noqa: E402
+from transitio_index import (  # noqa: E402
+    boundaries,
+    coverage,
+    fetch,
+    geometry,
+    overture,
+    registry,
+    seed,
+)
 
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
 
@@ -475,3 +483,215 @@ def test_the_boundary_memo_grows_by_appended_parts(tmp_path, monkeypatch):
     (memo / "divisions-0007.parquet").mkdir()
     repair()
     assert parts() == first + ["divisions-0007.parquet", "divisions-0008.parquet"]
+
+
+def test_a_division_without_area_rows_is_not_rescanned(tmp_path):
+    """The area cache kept no negative entries, so a division the theme has no
+    rows for was rescanned by every stage asking for it — and an id filter
+    cannot prune row groups, so each rescan read a whole country's geometry.
+    Absence is now recorded with the scan's country scope and answers a later
+    read whose scope it covers."""
+    dataset = fx.write_area_dataset(
+        tmp_path / "a.parquet", [fx.area("A", _wkb(0, 0, 1, 1), GOOD, country="FI")]
+    )
+    scans = {"n": 0}
+
+    class Counting:
+        def to_batches(self, **kwargs):
+            scans["n"] += 1
+            return dataset.to_batches(**kwargs)
+
+    cache = (tmp_path / "cache", "2026-08-19.0")
+
+    def read(ids, countries):
+        return geometry.read_areas(Counting(), ids, cache=cache, countries=countries)
+
+    assert set(read({"A", "ghost"}, {"FI"})) == {"A"}
+    assert read({"ghost"}, {"FI"}) == {} and scans["n"] == 1  # same scope: answered
+    assert read({"ghost"}, {"FI", "SE"}) == {} and scans["n"] == 2  # wider: scanned
+    assert read({"ghost"}, {"SE"}) == {} and scans["n"] == 2  # covered by the wider
+    assert read({"ghost"}, None) == {} and scans["n"] == 3  # unnarrowed: scanned
+    assert read({"ghost"}, {"DE"}) == {} and scans["n"] == 3  # `*` covers any scope
+    # The absence table is held to the cache root like the rows are.
+    absent = cache[0] / "overture_areas" / cache[1] / "absent"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for entry in absent.iterdir():
+        entry.rename(outside / entry.name)
+    absent.rmdir()
+    absent.symlink_to(outside)
+    with pytest.raises(ValueError, match="escapes the cache root"):
+        read({"ghost"}, {"FI"})
+
+
+def test_the_metros_read_warms_the_area_cache_for_every_seeded_division(tmp_path):
+    """A scan reads every row group of the places' countries whatever ids it
+    asks for, yet the metros/fao read fetched only the cities' areas and the
+    geometry stage then scanned the same country again for the regions. The
+    shared read now fetches every seeded division, so the later read is local."""
+    dataset = fx.write_area_dataset(
+        tmp_path / "a.parquet",
+        [
+            fx.area("city", _wkb(0, 0, 1, 1), GOOD, country="FI"),
+            fx.area("region", _wkb(0, 0, 5, 5), GOOD, country="FI"),
+        ],
+    )
+    scans = {"n": 0}
+
+    class Counting:
+        def to_batches(self, **kwargs):
+            scans["n"] += 1
+            return dataset.to_batches(**kwargs)
+
+    places = [
+        {"overture_id": "city", "kind": "city", "country_code": "FI"},
+        {"overture_id": "region", "kind": "region", "country_code": "FI"},
+    ]
+    cache_dir = tmp_path / "cache"
+    areas = geometry.place_areas(cache_dir, Counting(), places, {"city"})
+    assert set(areas) == {"city"} and scans["n"] == 1
+    later = geometry.read_areas(
+        Counting(),
+        {"region"},
+        cache=(cache_dir, overture.OVERTURE_RELEASE),
+        countries={"FI"},
+    )
+    assert set(later) == {"region"} and scans["n"] == 1  # served from the warmed cache
+
+
+@pytest.mark.parametrize("proxied", [True, False], ids=["proxy", "direct"])
+def test_the_conservative_scan_settings_apply_only_behind_a_proxy(monkeypatch, proxied):
+    """The single-connection scan settings kept a proxied read alive but were
+    applied to every S3 scan, throttling a direct connection to a few rows a
+    second; they now follow the proxy the environment names."""
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    if proxied:
+        monkeypatch.setenv("https_proxy", "http://127.0.0.1:3128")
+    expected = geometry.PROXY_SCAN_OPTIONS if proxied else {}
+    assert geometry.scan_options() == expected
+    assert (overture.proxy_url() is not None) is proxied
+
+
+def test_the_boundary_lookup_reads_only_the_row_groups_its_cells_touch(tmp_path):
+    """Query rectangles used to be merged into their bounding box and scanned
+    as one: a chain of stop cells across a continent read every row group
+    between them, and the memo's box-level coverage never matched the next
+    build's box. Row groups are now chosen by their footer footprints, each
+    read once, and coverage is recorded per rectangle."""
+    areas = fx.write_area_dataset(
+        tmp_path / "a.parquet",
+        [
+            fx.area("west", _wkb(0, 0, 1, 1), GOOD, country="FI"),
+            fx.area("middle", _wkb(5, 5, 6, 6), GOOD, country="FI"),
+            fx.area("east", _wkb(10, 10, 11, 11), GOOD, country="FI"),
+        ],
+        row_group_size=1,
+    )
+    divisions = fx.write_dataset(
+        tmp_path / "d.parquet",
+        [
+            fx.division(
+                name,
+                "FI",
+                "locality",
+                wikidata=f"Q{i}",
+                name=name.title(),
+                hierarchies=fx.chain((name, "locality", name.title())),
+            )
+            for i, name in enumerate(("west", "middle", "east"), start=1)
+        ],
+    )
+    reads = []
+
+    class Counting:  # the dataset, its fragments, and their row-group subsets
+        def __init__(self, target):
+            self._target = target
+
+        def __getattr__(self, name):
+            return getattr(self._target, name)
+
+        def get_fragments(self):
+            return [Counting(f) for f in self._target.get_fragments()]
+
+        def subset(self, **kw):
+            reads.extend(kw["row_group_ids"])
+            return self._target.subset(**kw)
+
+    cells = [(0.2, 0.2, 0.8, 0.8), (10.2, 10.2, 10.8, 10.8)]
+    with boundaries.BoundaryLookup(
+        tmp_path / "cache",
+        release="test-release",
+        area_dataset=Counting(areas),
+        division_dataset=divisions,
+    ) as lookup:
+        assert lookup.ensure(cells) == 2
+        assert sorted(reads) == [0, 2]  # the row group between them: untouched
+        assert lookup.ensure(cells) == 0 and len(reads) == 2  # covered per cell
+        assert [r["division_id"] for r in lookup.divisions_at(10.5, 10.5)] == ["east"]
+        assert lookup.divisions_at(5.5, 5.5) == []
+
+
+def test_a_crawled_division_the_registry_refuses_is_reported_by_expand(tmp_path):
+    """A discovered division whose QID the registry holds under another kind
+    (a city that is its own district, registered as a region from its county)
+    was dropped with only a log line; the coverage stage then read a stop in it
+    as proof of a stale expansion and aborted. The drop is now a ``conflict``
+    row of the expansion report."""
+    import test_index_expand as ex
+
+    cache = tmp_path / "cache"
+    ex._publish_names(cache, ex.SEED_PLACES)
+    ex._write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    path = tmp_path / "places_registry.jsonl"
+    ex._publish_run(cache, ex._seeded_registry(path))
+    with registry.session(path) as reg:
+        # Tampere's QID, held as a region before the crawl discovers the city.
+        reg.identify(
+            {"wikidata": ["Q40840"]},
+            kind="region",
+            country_code="FI",
+            minted_from="t",
+            minted_in="t 1",
+        )
+        manifest, places, report = ex._expand(tmp_path, cache, registry=reg)
+    assert manifest["mode"] == "expanded"
+    # Dropped: no returned row is the discovered division, under any key.
+    assert all(p.get("overture_id") != "fi-tre" for p in places.values())
+    (row,) = [r for r in report if r.get("kind") == "conflict"]
+    assert row["place_id"] == "Q40840" and row["overture_id"] == "fi-tre"
+    assert "not a city" in row["reason"]
+
+
+def test_a_discovered_district_that_is_also_a_city_is_the_city(tmp_path):
+    """Only the district of a city that is its own district carries an area, so
+    a stop discovers the district and expand minted it as a region — while the
+    seed places the same QID as a city from its name, and the two then refused
+    each other's place. A region-kind discovery whose QID a locality also
+    carries is now the city; a district no locality shares stays a region."""
+    import test_index_expand as ex
+
+    cache = tmp_path / "cache"
+    ex._publish_names(cache, ex.SEED_PLACES)
+    ex._write_crawl(cache, "f-tku", ["s1,60.45,22.2\n", "s2,60.45,23.2\n"])
+    _, places, _ = ex._expand(tmp_path, cache)
+    turku = places["Q38511"]
+    assert turku["kind"] == "city" and turku["source_subtype"] == "county"
+    # The district's area and ancestry are kept: the city sits under its region.
+    assert turku["overture_id"] == "fi-tku-county" and turku["parent_id"] == "Q999004"
+    assert places["Q999004"]["kind"] == "region"
+    assert places["Q999003"]["kind"] == "region"
+    assert places["Q999003"]["parent_id"] == "Q999004"
+    # Nothing to look up means no scan: a memo-only lookup opens no dataset.
+    assert seed.city_qids(None, set()) == set()
+
+
+def test_the_fetcher_gives_up_on_a_connect_sooner_than_on_a_read():
+    """One 60 s timeout covered the handshake too, so a host that never answers
+    cost a minute per resolved address per request — six silent minutes for a
+    deprecated feed whose host had a private address among its records. The
+    connect timeout is now bounded separately; reads keep the full budget."""
+    with fetch.Fetcher() as fetcher:
+        timeout = fetcher._client.timeout
+    assert timeout.connect == fetch.CONNECT_TIMEOUT < fetch.TIMEOUT
+    assert timeout.read == timeout.write == timeout.pool == fetch.TIMEOUT

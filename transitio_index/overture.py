@@ -128,16 +128,22 @@ def s3_filesystem(region=OVERTURE_REGION):
         "request_timeout": 120.0,
         "retry_strategy": AwsStandardS3RetryStrategy(max_attempts=8),
     }
-    proxy = (
-        os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY")
-        or os.environ.get("http_proxy")
-    )
+    proxy = proxy_url()
     if proxy:
         options["proxy_options"] = proxy
         _cap_io_threads()
     return S3FileSystem(**options)
+
+
+def proxy_url():
+    """The HTTP proxy the environment names for outbound reads, or ``None``."""
+    return (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+        or None
+    )
 
 
 # pyarrow's IO pool (eight threads by default) opens as many tunnels through a

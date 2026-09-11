@@ -4,8 +4,10 @@ Matches each feed's declared municipality (MDB) or ``Location`` (``systems.csv``
 to an Overture locality/localadmin by name within its country — disambiguated by
 the declared subdivision — resolves that division to a QID with the same rules as
 the skeleton stage, and emits the city place plus its administrative ancestors as
-``places_seed.jsonl``. A feed that declares only a subdivision resolves to that
-region instead. A feed whose location does not resolve to a single place — a
+``places_seed.jsonl``. A municipality no locality is named by is matched against
+the skeleton's regions and counties instead — catalogues name districts there —
+and placed at that division. A feed that declares only a subdivision resolves to
+that region. A feed whose location does not resolve to a single place — a
 QID-bearing division, or a named one no QID names, identified by its Overture
 id — is reported, never minted.
 
@@ -141,6 +143,23 @@ def read_city_candidates(dataset, countries, wanted):
     return kept
 
 
+def city_qids(dataset, qids):
+    """The QIDs among ``qids`` that a locality or localadmin carries in the
+    theme — one scan by QID. A district or region sharing its QID with a
+    city-level division is a city that is its own district; the place is the
+    city, as ``match`` decides for a declared name."""
+    wanted = {qid for qid in qids if qid}
+    if not wanted:
+        return set()
+    predicate = ds.field("subtype").isin(list(CITY_SUBTYPES)) & ds.field(
+        "wikidata"
+    ).isin(sorted(wanted))
+    found = set()
+    for batch in dataset.to_batches(columns=["wikidata"], filter=predicate):
+        found.update(batch.column("wikidata").to_pylist())
+    return found & wanted
+
+
 def _resolve_candidates(candidates, wikidata):
     """Attach a resolved ``qid``/``resolution_method`` to each candidate."""
     pending = {
@@ -170,15 +189,36 @@ def _index(records):
     return index
 
 
+def _principal_qid(candidates):
+    """The one QID carried by both a city-level and a district-level candidate
+    — a city that is its own district (Augsburg, Karlsruhe, Ulm) appears at
+    both levels under its QID, while the other same-name divisions are hamlets
+    — or ``None`` when no QID is, or more than one."""
+    levels = {}
+    for candidate in candidates:
+        if candidate["qid"]:
+            city_level = candidate["subtype"] in CITY_SUBTYPES
+            levels.setdefault(candidate["qid"], set()).add(city_level)
+    shared = [qid for qid, seen in levels.items() if seen == {True, False}]
+    return shared[0] if len(shared) == 1 else None
+
+
 def _unique_identity(candidates):
     """The single division the candidates agree on, or ``(None, why)``.
 
     Candidates that share one QID are the same place (a locality and its
     localadmin, say); the locality is preferred. Two distinct QIDs conflict, and
     a QID-less same-name division leaves the identity unprovable — either way the
-    match is reported rather than minted.
+    match is reported rather than minted — unless one QID is shared by a
+    city-level and a district-level candidate: that is the principal place, and
+    the other same-name divisions are set aside.
     """
     qids = {c["qid"] for c in candidates if c["qid"]}
+    if len(qids) > 1 or (qids and any(not c["qid"] for c in candidates)):
+        principal = _principal_qid(candidates)
+        if principal is not None:
+            candidates = [c for c in candidates if c["qid"] == principal]
+            qids = {principal}
     if len(qids) > 1:
         return None, "the name matches divisions with conflicting QIDs"
     if not qids and len({c["overture_id"] for c in candidates}) > 1:
@@ -207,20 +247,37 @@ def _lookup(index, country, name):
     return list(seen.values())
 
 
-def match(index, country, subdivision, municipality, skeleton):
-    """The single city for a declared location — QID-bearing, or a named
-    division no QID names — or ``(None, why)``.
+def match(
+    index, country, subdivision, municipality, skeleton, what="locality", districts=None
+):
+    """The single division for a declared location — QID-bearing, or a named
+    division no QID names — or ``(None, why)``; ``what`` names the level the
+    index holds, for the reason when nothing carries the name.
+
+    With ``districts`` (the skeleton's region/county index) the same-name
+    districts and regions join the candidates: a QID a city shares with its own
+    district marks the principal place (see ``_unique_identity``), and a
+    municipality field naming a region beside a same-name hamlet is reported
+    rather than placed at the hamlet.
 
     A declared subdivision must corroborate the match: it is required to name
-    one of the candidate's region/county ancestors, so a lone same-name city in
-    a different subdivision is reported rather than accepted.
+    one of the candidate's region/county ancestors — or the candidate itself,
+    for a region — so a lone same-name city in a different subdivision is
+    reported rather than accepted.
     """
     candidates = _lookup(index, country, municipality)
     if not candidates:
-        return None, "no locality of that name in the declared country"
+        return None, f"no {what} of that name in the declared country"
+    if districts is not None:
+        candidates += _lookup(districts, country, municipality)
     if subdivision:
         folded = _norm(subdivision)
-        narrowed = [c for c in candidates if folded in _subdivision_names(c, skeleton)]
+        narrowed = [
+            c
+            for c in candidates
+            if folded in _subdivision_names(c, skeleton)
+            or (c["subtype"] == "region" and folded in _name_variants(c))
+        ]
         if not narrowed:
             return None, "the declared subdivision matches no same-name division"
         candidates = narrowed
@@ -262,15 +319,23 @@ def _ancestor_places(division, skeleton):
     id for a named division no QID names. An ancestor
     the skeleton could not resolve is skipped, and ``parent_id`` links only
     resolved rungs, so the chain never points at an id that was never minted.
+    A rung that is the division itself at another level — a city that is its
+    own district lists its county twin, under the same QID, as an ancestor —
+    or repeats the rung before it is one place, not a parent: it is skipped, so
+    no place is ever its own parent.
     """
     places = []
     parent_id = None
+    own = place_key(division)
     for ancestor in division.get("ancestors", []):
         resolved = skeleton.get(ancestor.get("overture_id"))
         if resolved is None:
             continue
+        key = place_key(resolved)
+        if key in (own, parent_id):
+            continue
         places.append(_place(resolved, parent_id=parent_id))
-        parent_id = place_key(resolved)
+        parent_id = key
     return places, parent_id
 
 
@@ -463,14 +528,15 @@ def _key_concordance(key, registry):
     return {namespace: [value]}
 
 
-def _identify_places(places, registry, places_digest):
+def _identify_places(places, registry, places_digest, report=None):
     """Give every place its registry id — found by its concordances or
     minted — and the QID the registry keys it by; ``rekey_by_own_id`` then
     makes the id the key. A place whose concordances conflict with an
     existing registry place — a name shared across administrative levels,
     e.g. a city that shares its QID with a like-named region — cannot be
-    identified; it is logged and dropped from ``places`` so one collision no
-    longer aborts the gazetteer. Returns the number identified."""
+    identified; it is logged, appended to ``report`` as a ``conflict`` row
+    when one is given, and dropped from ``places`` so one collision no longer
+    aborts the gazetteer. Returns the number identified."""
     if registry is None:
         return 0
     skipped = []
@@ -502,6 +568,16 @@ def _identify_places(places, registry, places_digest):
                 raise
             log.warning("seed: %s not identified (%s); skipped", place_id, exc)
             skipped.append(place_id)
+            if report is not None:
+                report.append(
+                    {
+                        "kind": "conflict",
+                        "place_id": place_id,
+                        "overture_id": row.get("overture_id"),
+                        "name": row.get("name"),
+                        "reason": str(exc),
+                    }
+                )
             continue
         row["wikidata_id"] = registry.canonical_qid(row["tp_id"])
         if row["kind"] == "metro" and not row.get("statistical_area_id"):
@@ -627,10 +703,12 @@ def resolve_seed(
     """Build ``places_seed.jsonl`` from the feeds' declared locations.
 
     Reads the crosswalk feeds and the skeleton stage's resolved divisions,
-    matches each feed's declared municipality to a QID-bearing Overture city (its
-    subdivision to a region, or its country to a country, when no finer level is
-    declared), and emits that place with its administrative ancestors; unmatched
-    feeds go to ``seed_report.jsonl``. With a ``registry`` session every place
+    matches each feed's declared municipality to a QID-bearing Overture city — or,
+    when no locality carries the name, to a skeleton region or county, placed at
+    level ``district`` — (its subdivision to a region, or its country to a
+    country, when no finer level is declared), and emits that place with its
+    administrative ancestors; unmatched feeds go to ``seed_report.jsonl``. With a
+    ``registry`` session every place
     also gets its registry id (``tp_id``) and ``wikidata_id``. Returns the
     generation manifest.
     """
@@ -684,7 +762,23 @@ def resolve_seed(
                 location["subdivision"],
                 location["municipality"],
                 skeleton,
+                districts=region_index,
             )
+            if division is None and not _lookup(
+                city_index, location["country"], location["municipality"]
+            ):
+                # A municipality no locality is named by may name a district
+                # or region the skeleton resolved — "Augsburg (district)",
+                # "Kreis Soest" — and places the feed there.
+                level = "district"
+                division, reason = match(
+                    region_index,
+                    location["country"],
+                    location["subdivision"],
+                    location["municipality"],
+                    skeleton,
+                    what="locality or district",
+                )
         elif location["subdivision"]:
             level = "subdivision"
             regions = _lookup(

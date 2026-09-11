@@ -32,6 +32,7 @@ import shapely
 from shapely.strtree import STRtree
 
 from transitio_index import geometry, overture, store
+from transitio_index.progress import progress
 
 # The single-file memo written before parts existed; read as one part.
 DIVISIONS_FILE = "divisions.parquet"
@@ -57,6 +58,9 @@ _JSON_FIELDS = ("names", "ancestors", "osm_relation_ids", "sources")
 _MEMO_COLUMNS = ["division_id", *_SCALAR_FIELDS, *_JSON_FIELDS]
 
 AREA_COLUMNS = ["division_id", "geometry", "country", "is_land"]
+# The ``bbox`` struct's fields, in the order the footprint and row-box readers
+# take them: the footer statistics of these columns bound each row group.
+_BBOX_FIELDS = ("xmin", "xmax", "ymin", "ymax")
 
 # Most specific first: the order ``divisions_at`` returns containing divisions.
 _SPECIFICITY = {"locality": 0, "localadmin": 1, "county": 2, "region": 3, "country": 4}
@@ -164,42 +168,32 @@ def _valid_box(box):
     )
 
 
-def _box_contains(outer, inner):
-    return (
-        outer[0] <= inner[0]
-        and outer[1] <= inner[1]
-        and outer[2] >= inner[2]
-        and outer[3] >= inner[3]
-    )
+def _boxes(rectangles):
+    """``(xmin, ymin, xmax, ymax)`` tuples as shapely boxes, vectorized."""
+    xmin, ymin, xmax, ymax = np.asarray(rectangles, dtype=float).T
+    return shapely.box(xmin, ymin, xmax, ymax)
 
 
-def _merge_boxes(boxes):
-    """Union intersecting boxes so overlapping queries become one scan."""
-    merged = [tuple(box) for box in boxes]
-    changed = True
-    while changed:
-        changed = False
-        result = []
-        for box in merged:
-            for i, other in enumerate(result):
-                if not (
-                    box[2] < other[0]
-                    or other[2] < box[0]
-                    or box[3] < other[1]
-                    or other[3] < box[1]
-                ):
-                    result[i] = (
-                        min(box[0], other[0]),
-                        min(box[1], other[1]),
-                        max(box[2], other[2]),
-                        max(box[3], other[3]),
-                    )
-                    changed = True
-                    break
-            else:
-                result.append(box)
-        merged = result
-    return merged
+def _row_boxes(bbox):
+    """The rows' own bounding boxes from a ``bbox`` struct column."""
+    fields = [bbox.field(name).to_numpy(zero_copy_only=False) for name in _BBOX_FIELDS]
+    xmin, xmax, ymin, ymax = fields
+    return shapely.box(xmin, ymin, xmax, ymax)
+
+
+def _footprint(row_group, columns):
+    """A row group's spatial footprint from its ``bbox`` column statistics as a
+    shapely box, or ``None`` when a statistic is missing."""
+    bounds = []
+    for name, side in zip(_BBOX_FIELDS, ("min", "max", "min", "max")):
+        if f"bbox.{name}" not in columns:
+            return None
+        statistics = row_group.column(columns[f"bbox.{name}"]).statistics
+        if statistics is None or not statistics.has_min_max:
+            return None
+        bounds.append(getattr(statistics, side))
+    xmin, xmax, ymin, ymax = bounds
+    return shapely.box(xmin, ymin, xmax, ymax)
 
 
 class BoundaryLookup:
@@ -235,6 +229,7 @@ class BoundaryLookup:
             root.close()
         self._records = {}
         self._covered = []
+        self._covered_tree = None
         self._parts = []
         self._listed = []
         self._pending = {}
@@ -266,6 +261,7 @@ class BoundaryLookup:
         """
         self._records = {}
         self._covered = []
+        self._covered_tree = None
         self._parts = []
         self._listed = []
         self._pending = {}
@@ -352,12 +348,15 @@ class BoundaryLookup:
                 self._pending.setdefault(division_id, []).extend(new)
 
     def _uncovered(self, boxes):
-        """The boxes not already inside a covered box."""
-        return [
-            box
-            for box in boxes
-            if not any(_box_contains(done, box) for done in self._covered)
-        ]
+        """The boxes not already inside a covered box (an STRtree over the
+        covered ones, rebuilt when coverage changes)."""
+        if not boxes or not self._covered:
+            return list(boxes)
+        if self._covered_tree is None:
+            self._covered_tree = STRtree(_boxes(self._covered))
+        hits = self._covered_tree.query(_boxes(boxes), predicate="covered_by")
+        inside = set(hits[0].tolist())
+        return [box for i, box in enumerate(boxes) if i not in inside]
 
     def _persist(self, added):
         """Append the geometry ``added`` (``{division_id: [polygon]}``) as new
@@ -413,10 +412,11 @@ class BoundaryLookup:
     def ensure(self, boxes):
         """Make every box queryable; returns how many new divisions arrived.
 
-        Boxes already inside a covered box cost nothing. The rest are merged
-        and scanned against the release with a bbox filter, their land
-        polygons parsed (malformed WKB skipped) and their divisions' metadata
-        resolved, then memoized.
+        Boxes already inside a covered box cost nothing. The rest select, from
+        the files' footer statistics, the row groups whose footprint they
+        touch; each is read once, its land polygons whose own bbox touches a
+        box parsed (malformed WKB skipped) and their divisions' metadata
+        resolved, then memoized, and every box is recorded as covered.
         """
         boxes = [tuple(box) for box in boxes]
         if not self._uncovered(boxes):
@@ -432,31 +432,31 @@ class BoundaryLookup:
             needed = self._uncovered(boxes)
             if not needed:
                 return 0
-            merged = _merge_boxes(needed)
-            # Deduplicated by canonical WKB: disjoint boxes each return the
-            # same country polygon, and a division already cached may surface a
-            # further component in a later box — merged in, never discarded.
-            # Geometry is processed per batch with the vectorized shapely API,
-            # not one polygon at a time.
+            cells = STRtree(_boxes(needed))
+            # The row groups whose footprint touches a needed rectangle, each
+            # read once whatever rectangles touch it: the rectangles are never
+            # widened into their bounding box, so a chain of cells across a
+            # continent reads the geometry under the cells, not the continent.
+            # Deduplicated by canonical WKB: a division already cached may
+            # surface a further component in a later read — merged in, never
+            # discarded. Geometry is processed per batch with the vectorized
+            # shapely API, not one polygon at a time.
+            self._area_dataset, groups = geometry.retrying(
+                self._open_area,
+                self._reopen_area,
+                functools.partial(self._row_groups, cells=cells),
+            )
             polygons = {}
-            for xmin, ymin, xmax, ymax in merged:
-                predicate = (
-                    (ds.field(("bbox", "xmin")) <= xmax)
-                    & (ds.field(("bbox", "xmax")) >= xmin)
-                    & (ds.field(("bbox", "ymin")) <= ymax)
-                    & (ds.field(("bbox", "ymax")) >= ymin)
-                    & ds.field("is_land")
-                )
-                # One box per attempt, restartable: a stalled scan is retried
-                # on a fresh connection and its partial result discarded; the
-                # merge below is keyed by WKB, so a re-read adds nothing twice.
-                # The dataset the successful attempt opened serves the boxes
-                # that follow — adopted here, on this thread, never from inside
-                # an attempt a deadline may have abandoned.
+            for group in progress(groups, "boundary"):
+                # One row group per attempt, restartable: a stalled read is
+                # retried on a fresh connection and its partial result
+                # discarded. The dataset the successful attempt opened serves
+                # the reads that follow — adopted here, on this thread, never
+                # from inside an attempt a deadline may have abandoned.
                 self._area_dataset, found = geometry.retrying(
                     self._open_area,
                     self._reopen_area,
-                    functools.partial(self._box_polygons, predicate=predicate),
+                    functools.partial(self._group_polygons, group=group, cells=cells),
                 )
                 for division_id, geoms in found.items():
                     polygons.setdefault(division_id, {}).update(geoms)
@@ -486,7 +486,8 @@ class BoundaryLookup:
                         record["geoms"].append(geom)
                         added.setdefault(division_id, []).append(geom)
                         existing.add(key)
-            self._covered.extend(merged)
+            self._covered.extend(needed)
+            self._covered_tree = None
             self._persist(added)
         self._tree = None
         return len(new_ids)
@@ -497,18 +498,55 @@ class BoundaryLookup:
     def _open_division(self):
         return self._division_dataset
 
+    def division_dataset(self):
+        """The divisions dataset the lookup reads metadata from, for the stage
+        that owns the lookup (``None`` for a memo-only lookup)."""
+        return self._division_dataset
+
     @staticmethod
-    def _box_polygons(open_dataset, predicate):
-        """``(dataset, {division_id: {wkb: simplified polygon}})`` for one box's
-        land areas — the dataset the attempt opened and scanned, both under the
-        stall deadline — so the caller can adopt that dataset once the whole
-        attempt has succeeded."""
+    def _row_groups(open_dataset, cells):
+        """``(dataset, [(fragment path, row group index), ...])``: the row
+        groups whose footprint — the ``bbox`` columns' min/max in the file's
+        footer — intersects one of the ``cells``, the footers read under the
+        stall deadline. A row group without statistics is kept: it cannot be
+        ruled out."""
         opened = []
 
         def scan():
             opened.append(open_dataset())
-            return opened[0].to_batches(
-                columns=AREA_COLUMNS, filter=predicate, **geometry.SCAN_OPTIONS
+            for fragment in opened[0].get_fragments():
+                yield fragment.path, fragment.metadata
+
+        groups = []
+        for path, metadata in geometry.with_deadline(scan, geometry.AREA_READ_DEADLINE):
+            columns = {
+                metadata.schema.column(i).path: i for i in range(metadata.num_columns)
+            }
+            for index in range(metadata.num_row_groups):
+                footprint = _footprint(metadata.row_group(index), columns)
+                if (
+                    footprint is None
+                    or cells.query(footprint, predicate="intersects").size
+                ):
+                    groups.append((path, index))
+        return opened[0], groups
+
+    @staticmethod
+    def _group_polygons(open_dataset, group, cells):
+        """``(dataset, {division_id: {wkb: simplified polygon}})`` for the land
+        areas of one row group whose own bbox touches a cell — the dataset the
+        attempt opened and read, both under the stall deadline — so the caller
+        can adopt that dataset once the whole attempt has succeeded."""
+        path, index = group
+        opened = []
+
+        def scan():
+            opened.append(open_dataset())
+            fragment = next(f for f in opened[0].get_fragments() if f.path == path)
+            return fragment.subset(row_group_ids=[index]).to_batches(
+                columns=AREA_COLUMNS + ["bbox"],
+                filter=ds.field("is_land"),
+                **geometry.scan_options(),
             )
 
         polygons = {}
@@ -519,9 +557,13 @@ class BoundaryLookup:
             wkb = batch.column("geometry").to_numpy(zero_copy_only=False)
             geoms = shapely.force_2d(shapely.from_wkb(wkb, on_invalid="ignore"))
             # Empty, invalid or non-polygon geometry, or a row naming no
-            # division, must not enter the containment index as evidence.
+            # division, must not enter the containment index as evidence; nor
+            # does a row whose bbox touches no cell — the rest of the row group.
             named = np.fromiter(map(bool, division_ids), bool, len(division_ids))
-            index = np.nonzero(geometry._valid_polygons(geoms) & named)[0]
+            touching = np.zeros(batch.num_rows, dtype=bool)
+            hits = cells.query(_row_boxes(batch.column("bbox")), predicate="intersects")
+            touching[hits[0]] = True
+            index = np.nonzero(geometry._valid_polygons(geoms) & named & touching)[0]
             if index.size == 0:
                 continue
             # Memoize the simplified boundaries (the shipping tolerance): exact
@@ -545,7 +587,9 @@ class BoundaryLookup:
             def scan():
                 opened.append(open_dataset())
                 return opened[0].to_batches(
-                    columns=overture.PROJECT, filter=predicate, **geometry.SCAN_OPTIONS
+                    columns=overture.PROJECT,
+                    filter=predicate,
+                    **geometry.scan_options(),
                 )
 
             found = {}
