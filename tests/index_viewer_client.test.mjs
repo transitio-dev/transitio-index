@@ -7,8 +7,15 @@ import {
   bboxParam,
   crumbs,
   detailsHtml,
+  edgeRowHtml,
+  feedDetailsHtml,
+  feedFilter,
+  feedRowHtml,
+  feedSliceParams,
   headerHtml,
+  kindOptionsHtml,
   kindRank,
+  legendHtml,
   buildLabel,
   collectionBounds,
   overflowText,
@@ -19,9 +26,11 @@ import {
   revealPath,
   rowHtml,
   sliceParams,
+  sortRows,
   summaryLabel,
   tableState,
   tableUrl,
+  tierColorExpression,
   treeNodeHtml,
 } from "../scripts/index_viewer.mjs";
 
@@ -214,4 +223,68 @@ test("the reveal path runs from the root to the place itself", () => {
   };
   assert.deepEqual(revealPath(record), ["fi", "uus", "hel"]);
   assert.deepEqual(revealPath({ properties: { place_id: "fi", ancestors: [] } }), ["fi"]);
+});
+
+test("feed rows sort by number or text with nulls last, and filter by name or id", () => {
+  const rows = [
+    { feed_id: "b", name: "Beta", stop_count: 10 },
+    { feed_id: "a", name: null, stop_count: null },
+    { feed_id: "c", name: "alpha", stop_count: 200 },
+  ];
+  assert.deepEqual(sortRows(rows, "stop_count", "desc").map((r) => r.feed_id), ["c", "b", "a"]);
+  assert.deepEqual(sortRows(rows, "stop_count", "asc").map((r) => r.feed_id), ["b", "c", "a"]);
+  assert.deepEqual(sortRows(rows, "name", "asc").map((r) => r.feed_id), ["c", "b", "a"]);
+  assert.deepEqual(sortRows(rows, "name", "desc").map((r) => r.feed_id), ["b", "c", "a"]); // nulls last
+  // One fixed collation on every client: accents and case do not split the order.
+  const accented = [{ name: "Zaragoza" }, { name: "Évora" }, { name: "alpha" }, { name: "eger" }];
+  assert.deepEqual(sortRows(accented, "name").map((r) => r.name), ["alpha", "eger", "Évora", "Zaragoza"]);
+  assert.deepEqual(feedFilter(rows, " ALPHA").map((r) => r.feed_id), ["c"]);
+  assert.deepEqual(feedFilter(rows, "a").map((r) => r.feed_id), ["b", "a", "c"]);
+  assert.equal(feedFilter(rows, ""), rows);
+});
+
+test("feed and edge rows render names, dashes and the review flag", () => {
+  const html = feedRowHtml({ feed_id: "f<1", name: null, spec: "gtfs", source: null, stop_count: 12, crawl_status: "ok", places_served: 3, tier_local: 2, tier_regional: 0, tier_national: 1, tier_international: 0, tier_unknown: 0 });
+  assert.match(html, /^<tr data-id="f&lt;1"><td>f&lt;1<\/td><td>gtfs<\/td><td>—<\/td><td>12<\/td><td>ok<\/td><td>3<\/td><td>2<\/td><td>0<\/td><td>1<\/td>/);
+  // Hostile text in every textual field is escaped, none of it survives raw.
+  const hostileFeed = { feed_id: "<f>", name: "<n>", spec: "<s>", source: "<o>", stop_count: 1, crawl_status: "<c>", places_served: 0, tier_local: 0, tier_regional: 0, tier_national: 0, tier_international: 0, tier_unknown: 0 };
+  const hostileHtml = feedRowHtml(hostileFeed);
+  assert.doesNotMatch(hostileHtml, /<f>|<n>|<s>|<o>|<c>/);
+  assert.match(hostileHtml, /^<tr data-id="&lt;f&gt;"><td>&lt;n&gt;<\/td><td>&lt;s&gt;<\/td><td>&lt;o&gt;<\/td><td>1<\/td><td>&lt;c&gt;<\/td>/);
+  const edge = { place_id: "hel", place_name: "Helsinki", kind: "city", feed_id: "f1", feed_name: "HSL", tier: "local", tier_confidence: 0.85, method: "crawl", needs_review: true };
+  assert.equal(edgeRowHtml(edge, "place"), "<tr><td>HSL</td><td>local</td><td>0.85</td><td>crawl</td><td>review</td></tr>");
+  assert.match(edgeRowHtml({ ...edge, needs_review: false, tier_confidence: null }, "feed"), /^<tr><td>Helsinki \(city\)<\/td><td>local<\/td><td>—<\/td><td>crawl<\/td><td><\/td>/);
+  const hostileEdge = { place_id: "p", place_name: "<b>P", kind: "<i>", feed_id: "f", feed_name: "<u>F", tier: "<t>", tier_confidence: null, method: "<m>", needs_review: false };
+  for (const side of ["place", "feed"]) {
+    const html = edgeRowHtml(hostileEdge, side);
+    assert.doesNotMatch(html, /<b>|<i>|<u>|<t>|<m>/);
+    assert.match(html, side === "place" ? /&lt;u&gt;F/ : /&lt;b&gt;P \(&lt;i&gt;\)/);
+    assert.match(html, /<td>&lt;t&gt;<\/td><td>—<\/td><td>&lt;m&gt;<\/td>/);
+  }
+});
+
+test("a feed's details, served-places slice and legend follow its tiers", () => {
+  const record = { geometry: null, properties: { feed_id: "f1", name: "HSL", spec: "gtfs", source: "atlas", places_served: 1, tiers: { local: 1, regional: 0 }, stop_count: 649, crawl_status: "ok", last_crawled: "2026-09-10T12:00:00+00:00" } };
+  const html = feedDetailsHtml(record);
+  assert.match(html, /<strong>HSL<\/strong>/);
+  assert.match(html, /1 place served \(1 local\) · 649 stops · no coverage hull/);
+  assert.match(html, /crawl: ok \(2026-09-10\)/);
+  assert.deepEqual(feedSliceParams("f1", 9.7, bounds), {
+    zoom: 9.7,
+    kind: "all",
+    feed_id: "f1",
+    bbox: "12.68518,53.00000,38.43827,77.00000",
+  });
+  assert.equal(tierColorExpression()[0], "match");
+  assert.match(legendHtml(), /style="background:#16a34a"><\/span>local/);
+});
+
+test("the kind filter lists the build's own kinds in tree order with counts", () => {
+  assert.equal(
+    kindOptionsHtml({ city: 4689, metro: 3, country: 13, region: 1007 }),
+    '<option value="">any kind</option><option value="country">country (13)</option>' +
+      '<option value="region">region (1007)</option><option value="city">city (4689)</option>' +
+      '<option value="metro">metro (3)</option>',
+  );
+  assert.equal(kindOptionsHtml(undefined), '<option value="">any kind</option>');
 });

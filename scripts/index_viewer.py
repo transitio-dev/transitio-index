@@ -808,6 +808,7 @@ def places_geojson(
     max_features=MAX_FEATURES,
     max_bytes=MAX_BYTES,
     clip=None,
+    extra=None,
 ):
     """``(body, overflow)`` for the masked places.
 
@@ -817,7 +818,8 @@ def places_geojson(
     cut to the box and a place whose geometry does not reach into it is
     dropped; the geometry is generalized over the whole array, serialized in
     one pass, and the byte budget measured on exactly what would be sent.
-    Properties stay compact; ``service`` is the row's JSON string.
+    Properties stay compact; ``service`` is the row's JSON string; ``extra``
+    maps a property name to a ``place_id``-indexed Series to add.
     """
     matched = int(np.count_nonzero(mask))
     if matched > max_features:  # decided before anything is materialized
@@ -832,6 +834,8 @@ def places_geojson(
         geoms = generalize(geoms, tolerance)
     geometry = shapely.to_geojson(geoms)
     props = build.places.iloc[index][list(PROPERTY_COLUMNS)]
+    for key, by_place in (extra or {}).items():  # e.g. a feed's tier per place
+        props[key] = props["place_id"].map(by_place)
     props = props.astype(object).where(props.notna(), None)
     features = []
     for record, feed_count, is_served, geom in zip(
@@ -942,8 +946,23 @@ def create_app(cache, size=CACHED_BUILDS):
             )
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
+        extra = None
+        if feed_id is not None:  # the tier at which this feed serves each place
+            edges = build.edges
+            mine = edges.loc[
+                (edges["feed_id"] == feed_id).to_numpy(), ["place_id", "tier"]
+            ]
+            extra = {
+                "tier": mine.drop_duplicates("place_id").set_index("place_id")["tier"]
+            }
         body, overflow = places_geojson(
-            build, mask, tolerance_for_zoom(zoom), MAX_FEATURES, MAX_BYTES, clip=box
+            build,
+            mask,
+            tolerance_for_zoom(zoom),
+            MAX_FEATURES,
+            MAX_BYTES,
+            clip=box,
+            extra=extra,
         )
         # The slice names the snapshot it came from, so the page can tell
         # when ``latest`` was republished between its summary and a slice.

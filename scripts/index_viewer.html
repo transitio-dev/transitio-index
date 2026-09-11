@@ -40,6 +40,10 @@
   .tree .node { border: none; background: none; font: inherit; cursor: pointer; padding: 0 0.2rem; }
   .tree .node.unserved { color: #777; }
   .tree .kind { color: #888; margin-left: 0.3rem; }
+  .legend { margin-left: auto; font-size: 12px; color: #444; }
+  .swatch { display: inline-block; width: 0.8rem; height: 0.8rem; margin: 0 0.25rem 0 0.6rem; vertical-align: middle; border-radius: 0.15rem; }
+  #feeds-table tbody tr { cursor: pointer; }
+  #feeds-table tbody tr[aria-selected] { background: #ccfbf1; }
   .maplibregl-popup-content { font: 13px/1.4 system-ui, sans-serif; }
   .maplibregl-popup-content ul { margin: 0.3rem 0 0; padding-left: 1.1rem; }
 </style>
@@ -49,6 +53,7 @@
   <label>Build <select id="build"></select></label>
   <span id="stats"></span>
   <span id="hint" hidden></span>
+  <span id="legend" class="legend"></span>
 </header>
 <div id="body">
   <div id="map"></div>
@@ -57,18 +62,28 @@
       <button type="button" data-tab="details" class="active">Details</button>
       <button type="button" data-tab="places">Places</button>
       <button type="button" data-tab="tree">Tree</button>
+      <button type="button" data-tab="feeds">Feeds</button>
+      <button type="button" data-tab="edges">Edges</button>
     </nav>
     <section id="details" class="tab"><p class="muted">Click a place on the map, or a row under Places.</p></section>
     <section id="places" class="tab" hidden>
       <div class="filters">
         <input id="places-search" type="search" placeholder="Name contains…">
-        <select id="places-kind"><option value="">any kind</option><option value="country">country</option><option value="region">region</option><option value="city">city</option></select>
+        <select id="places-kind"><option value="">any kind</option></select>
         <select id="places-served"><option value="">served or not</option><option value="true">served</option><option value="false">unserved</option></select>
       </div>
       <div class="table-wrap"><table id="places-table"><thead><tr></tr></thead><tbody></tbody></table></div>
       <div class="pager"><button type="button" id="places-prev">‹</button><span id="places-count"></span><button type="button" id="places-next">›</button></div>
     </section>
     <section id="tree" class="tab" hidden><ul id="tree-root" class="tree"></ul></section>
+    <section id="feeds" class="tab" hidden>
+      <div class="filters"><input id="feeds-search" type="search" placeholder="Feed name or id contains…"></div>
+      <div class="table-wrap"><table id="feeds-table"><thead><tr></tr></thead><tbody></tbody></table></div>
+    </section>
+    <section id="edges" class="tab" hidden>
+      <p id="edges-title" class="muted">Nothing selected.</p>
+      <div class="table-wrap"><table id="edges-table"><thead><tr></tr></thead><tbody></tbody></table></div>
+    </section>
   </aside>
 </div>
 <script type="module" src="/static/index_viewer.mjs"></script>

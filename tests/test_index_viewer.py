@@ -415,6 +415,7 @@ def test_the_api_serves_the_listing_summaries_and_bounded_slices(tmp_path, monke
     assert {f["id"] for f in cities["features"]} == {"hel", "esp"}
     fed = client.get(base, params={"feed_id": "f1", "bbox": "19,59,32,71"}).json()
     assert [f["id"] for f in fed["features"]] == ["hel"]  # kind defaulted to all
+    assert fed["features"][0]["properties"]["tier"] == "local"  # this feed's tier
     clipped = client.get(base, params={"bbox": "24,60,25,60.5"}).json()["features"]
     assert {f["id"] for f in clipped} == {"fi", "uus"}  # cut to the box
     assert all(
