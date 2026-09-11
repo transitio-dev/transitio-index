@@ -3,28 +3,35 @@
 """Export a produced index as an editor-ready geospatial layer.
 
 A maintainer tool, not part of the package: it reads a produced index directory
-(``places.parquet``, ``edges.parquet`` and ``feeds.parquet`` — what the
-``publish`` stage writes) and re-emits the places as GeoParquet and GeoJSON for
-transitio-editor. Each place keeps its boundary geometry, name, identity and
-hierarchy from the index and gains the feeds serving it (each feed's id, name
-and tier(s), joined from the membership edges) plus a ``served`` flag and a feed
-count. Every place is kept — the served places and their region/country
-ancestors and metros — so the whole hierarchy is on the map and the editor can
-filter on ``served``.
+(the country partitions and ``links`` the ``publish`` stage writes, listed in
+``snapshot.json``) and re-emits each partition's places as GeoParquet and
+GeoJSON for transitio-editor, one layer per country. Each place keeps its
+boundary geometry, name, identity and hierarchy from the index and gains the
+feeds serving it (each feed's id, name, tier(s) and relevance categories,
+joined from the partition's edges and the links to its places) plus a
+``served`` flag and a feed count. Every place is kept — the served places and
+their region/country ancestors and metros — so the whole hierarchy is on the
+map and the editor can filter on ``served``.
 
 Run the build through ``publish`` first (the sample build writes ``cache/index``,
 the default here); outputs go into a fresh per-run subdirectory of ``--out-dir``
-(default ``cache/index-layer``, gitignored). The heavy dependencies (pyarrow,
+(default ``cache/index-layer``, gitignored), one subdirectory per partition. The
+heavy dependencies (pyarrow,
 shapely, geopandas) are imported lazily so the join and row-shaping stay
 unit-testable without them.
 """
 
 import argparse
+import hashlib
+import io
 import json
+import re
 import tempfile
 from pathlib import Path
 
 DEFAULT_INDEX = Path("cache/index")
+# A partition is a country code, ``international`` or ``links``.
+_PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 
 
 def _feed_names(feeds):
@@ -97,13 +104,44 @@ def _enrich(places, feeds_by_place):
 
 
 def _read_index(index_dir):
-    """The place, edge and feed records of a produced index directory."""
+    """``{partition: (places, edges, feeds)}`` for every country partition of a
+    produced index: its places, the edges touching them — its domestic edges
+    and the ``links`` edges to its places — and every feed of the index (the
+    names come from whichever partition holds the feed)."""
     import pyarrow.parquet as pq
 
-    def rows(name):
-        return pq.read_table(index_dir / name).to_pylist()
+    snapshot = json.loads((index_dir / "snapshot.json").read_text(encoding="utf-8"))
+    partitions = snapshot["partitions"]
+    for partition in partitions:
+        # Names become path components on both sides: only the layout's own.
+        if not _PARTITION_NAME.fullmatch(partition):
+            raise SystemExit(f"{index_dir}: unexpected partition name {partition!r}")
 
-    return rows("places.parquet"), rows("edges.parquet"), rows("feeds.parquet")
+    def rows(partition, table):
+        listed = partitions.get(partition, {}).get(table)
+        if listed is None:
+            return []
+        path = index_dir / partition / f"{table}.parquet"
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != listed.get("sha256"):
+            raise SystemExit(f"{path}: does not match the snapshot's digest")
+        return pq.read_table(io.BytesIO(data)).to_pylist()
+
+    feeds = [
+        feed for partition in sorted(partitions) for feed in rows(partition, "feeds")
+    ]
+    links = rows("links", "edges")
+    layers = {}
+    for partition in sorted(partitions):
+        places = rows(partition, "places")
+        if not places:
+            continue
+        here = {place["place_id"] for place in places}
+        edges = rows(partition, "edges") + [
+            edge for edge in links if edge["place_id"] in here
+        ]
+        layers[partition] = (places, edges, feeds)
+    return layers
 
 
 def _write(rows, geom_by_place, out_dir):
@@ -146,20 +184,22 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    places, edges, feeds = _read_index(args.index)
-    if not places:
+    layers = _read_index(args.index)
+    if not layers:
         raise SystemExit(f"no places in {args.index}")
-    rows = _enrich(places, _feeds_by_place(edges, _feed_names(feeds)))
-    geom_by_place = {place["place_id"]: place.get("geometry") for place in places}
-
     args.out_dir.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=args.out_dir))
-    parquet, geojson = _write(rows, geom_by_place, run_dir)
-
-    served = sum(1 for row in rows if row["served"])
-    print(f"places: {len(rows)} ({served} served)")
-    print(f"wrote: {parquet}")
-    print(f"wrote: {geojson}")
+    # One layer per country partition, in its own subdirectory.
+    for partition, (places, edges, feeds) in layers.items():
+        rows = _enrich(places, _feeds_by_place(edges, _feed_names(feeds)))
+        geom_by_place = {place["place_id"]: place.get("geometry") for place in places}
+        out = run_dir / partition
+        out.mkdir()
+        parquet, geojson = _write(rows, geom_by_place, out)
+        served = sum(1 for row in rows if row["served"])
+        print(f"{partition}: {len(rows)} places ({served} served)")
+        print(f"wrote: {parquet}")
+        print(f"wrote: {geojson}")
     return 0
 
 

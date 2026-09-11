@@ -4,8 +4,11 @@ The tool imports pyarrow/shapely/geopandas lazily, so importing it and
 exercising the pure helpers needs none of them.
 """
 
+import hashlib
 import importlib.util
 import json
+
+import pytest
 from pathlib import Path
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "export_index_layer.py"
@@ -68,3 +71,54 @@ def test_enrich_marks_an_unserved_ancestor():
     assert row["served"] is False
     assert row["feed_count"] == 0
     assert json.loads(row["feeds"]) == []
+
+
+def test_read_index_builds_one_layer_per_country_partition(tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    import pyarrow as pa
+
+    listing = {}
+
+    def write(partition, table, rows):
+        (tmp_path / partition).mkdir(exist_ok=True)
+        path = tmp_path / partition / table
+        pq.write_table(pa.Table.from_pylist(rows), path)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        listing.setdefault(partition, {})[table.split(".")[0]] = {"sha256": digest}
+
+    write("FI", "places.parquet", [{"place_id": "hel", "kind": "city"}])
+    write("FI", "feeds.parquet", [{"feed_id": "hsl", "name": "HSL"}])
+    write("FI", "edges.parquet", [{"place_id": "hel", "feed_id": "hsl", "tier": "a"}])
+    write("EE", "places.parquet", [{"place_id": "tll", "kind": "city"}])
+    write("international", "feeds.parquet", [{"feed_id": "ferry", "name": "Ferry"}])
+    write(
+        "links",
+        "edges.parquet",
+        [
+            {"place_id": "hel", "feed_id": "ferry", "tier": "b"},
+            {"place_id": "tll", "feed_id": "hsl", "tier": "b"},
+        ],
+    )
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps({"partitions": listing}))
+    layers = eil._read_index(tmp_path)
+    # One layer per partition with places; each holds the partition's places,
+    # its domestic edges plus the links to its places, and every feed.
+    assert list(layers) == ["EE", "FI"]
+    places, edges, feeds = layers["FI"]
+    assert [p["place_id"] for p in places] == ["hel"]
+    assert sorted((e["feed_id"], e["tier"]) for e in edges) == [
+        ("ferry", "b"),
+        ("hsl", "a"),
+    ]
+    assert sorted(f["feed_id"] for f in feeds) == ["ferry", "hsl"]
+    _, ee_edges, _ = layers["EE"]
+    assert [(e["feed_id"], e["place_id"]) for e in ee_edges] == [("hsl", "tll")]
+    # A table that does not match its digest, or a partition name that is not
+    # the layout's own, stops the export.
+    (tmp_path / "EE" / "places.parquet").write_bytes(b"replaced")
+    with pytest.raises(SystemExit, match="digest"):
+        eil._read_index(tmp_path)
+    snapshot.write_text(json.dumps({"partitions": {"../x": {}}}))
+    with pytest.raises(SystemExit, match="partition name"):
+        eil._read_index(tmp_path)
