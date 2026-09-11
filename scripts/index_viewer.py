@@ -29,6 +29,8 @@ import math
 import os
 import stat
 import threading
+import time
+import webbrowser
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +94,7 @@ MAX_BYTES = 8 * 1024 * 1024
 # last entry keeps the stored geometry.
 ZOOM_TOLERANCES = ((6, 0.02), (9, 0.005))
 PROPERTY_COLUMNS = ("place_id", "name", "kind", "parent_id", "country_code", "service")
+_HERE = Path(__file__).resolve().parent  # the page and its module live here
 
 
 def _is_regular_file(path):
@@ -142,6 +145,11 @@ class Build:
         self.path = path
         self.snapshot = snapshot
         self.digests = digests
+        # One id for the whole verified snapshot: every file's digest, so a
+        # republish that changes only the edges still changes it.
+        self.snapshot_id = hashlib.sha256(
+            "".join(digests[name] for name in INDEX_FILES).encode()
+        ).hexdigest()
         places = tables["places.parquet"].to_pandas()
         self.geoms = shapely.from_wkb(places["geometry"].to_numpy())
         self.bounds = shapely.bounds(self.geoms)
@@ -478,15 +486,27 @@ def create_app(cache, size=CACHED_BUILDS):
     slices import and test without the ``viewer`` extra.
     """
     from fastapi import FastAPI, HTTPException, Response
+    from fastapi.responses import JSONResponse
 
     builds = BuildCache(cache, size)
     app = FastAPI(title="transitio index viewer", docs_url=None, redoc_url=None)
+    page = (_HERE / "index_viewer.html").read_bytes()
+    module = (_HERE / "index_viewer.mjs").read_bytes()
 
     def opened(build_id):
         build = builds.get(build_id)
         if build is None:
             raise HTTPException(404, f"{build_id}: not an available build")
         return build
+
+    @app.get("/")
+    def index():
+        return Response(page, media_type="text/html; charset=utf-8")
+
+    @app.get("/static/index_viewer.mjs")
+    def client_module():
+        # Explicit: the platform's mimetypes table may not know .mjs.
+        return Response(module, media_type="text/javascript; charset=utf-8")
 
     @app.get("/api/builds")
     def list_builds():
@@ -498,6 +518,7 @@ def create_app(cache, size=CACHED_BUILDS):
         return {
             **build.snapshot,
             "id": build.id,
+            "snapshot_id": build.snapshot_id,
             "served_places": int(build.served.sum()),
         }
 
@@ -532,11 +553,44 @@ def create_app(cache, size=CACHED_BUILDS):
         body, overflow = places_geojson(
             build, mask, tolerance_for_zoom(zoom), MAX_FEATURES, MAX_BYTES, clip=box
         )
+        # The slice names the snapshot it came from, so the page can tell
+        # when ``latest`` was republished between its summary and a slice.
+        headers = {"X-Snapshot": build.snapshot_id}
         if overflow is not None:
-            return overflow
-        return Response(body, media_type="application/geo+json")
+            return JSONResponse(overflow, headers=headers)
+        return Response(body, media_type="application/geo+json", headers=headers)
 
     return app
+
+
+def _browser_url(host, port):
+    """A URL a browser can open for a bind address.
+
+    A wildcard bind (``0.0.0.0``, ``::``, empty) is reached through loopback,
+    and an IPv6 literal is bracketed.
+    """
+    if host in ("", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    elif ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{port}/"
+
+
+def _open_when_started(server, url, opener=webbrowser.open, attempts=40, delay=0.25):
+    """Open ``url`` once *this* uvicorn server reports it has started.
+
+    Polls ``server.started`` and gives up quietly when the server asks to exit
+    (a failed bind) or never starts within ``attempts`` polls — so another
+    service already on the port can never make the browser open.
+    """
+    for _ in range(attempts):
+        if server.started:
+            opener(url)
+            return True
+        if server.should_exit:
+            return False
+        time.sleep(delay)
+    return False
 
 
 def main(argv=None):
@@ -546,11 +600,22 @@ def main(argv=None):
     parser.add_argument("--cache", default="cache", help="the build cache directory")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--open", action="store_true", help="open the page in the browser"
+    )
     args = parser.parse_args(argv)
     import uvicorn
 
-    print(f"index viewer at http://{args.host}:{args.port}/ over {args.cache}")
-    uvicorn.run(create_app(args.cache), host=args.host, port=args.port)
+    url = _browser_url(args.host, args.port)
+    print(f"index viewer at {url} over {args.cache}")
+    server = uvicorn.Server(
+        uvicorn.Config(create_app(args.cache), host=args.host, port=args.port)
+    )
+    if args.open:
+        threading.Thread(
+            target=_open_when_started, args=(server, url), daemon=True
+        ).start()
+    server.run()
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -380,6 +381,12 @@ def test_the_api_serves_the_listing_summaries_and_bounded_slices(tmp_path, monke
     write_build(cache / "builds" / "fi-abc" / "index")
     _tamper_places(cache / "builds" / "fi-abc" / "index")
     client = TestClient(iv.create_app(cache))
+    page = client.get("/")
+    assert page.headers["content-type"].startswith("text/html")
+    assert '<script type="module" src="/static/index_viewer.mjs">' in page.text
+    module = client.get("/static/index_viewer.mjs")
+    assert module.headers["content-type"].startswith("text/javascript")
+    assert module.text.startswith("//")
     assert [row["id"] for row in client.get("/api/builds").json()] == [
         iv.LATEST,
         "fi-abc",
@@ -392,6 +399,14 @@ def test_the_api_serves_the_listing_summaries_and_bounded_slices(tmp_path, monke
     base = f"/api/builds/{iv.LATEST}/places"
     overview = client.get(base)
     assert overview.headers["content-type"].startswith("application/geo+json")
+    assert overview.headers["x-snapshot"] == summary["snapshot_id"]
+    # The snapshot id covers every file: new edges over identical places
+    # change it, so a republish can never pass as the same snapshot.
+    other_edges = [{"place_id": "esp", "feed_id": "f2", "tier": "local"}]
+    write_build(cache / "builds" / "fi-edges" / "index", edges=other_edges)
+    other = client.get("/api/builds/fi-edges/summary").json()
+    assert other["places_sha256"] == summary["places_sha256"]
+    assert other["snapshot_id"] != summary["snapshot_id"]
     assert {f["id"] for f in overview.json()["features"]} == {"fi", "uus", "lap"}
     cities = client.get(base, params={"kind": "city", "parent_id": "uus"}).json()
     assert {f["id"] for f in cities["features"]} == {"hel", "esp"}
@@ -453,3 +468,54 @@ def test_the_cache_serves_concurrent_requests_without_losing_entries(tmp_path):
     for thread in threads:
         thread.join()
     assert failures == [] and len(builds._builds) == 1
+
+
+def test_the_browser_url_and_the_wait_for_this_server_to_start():
+    assert iv._browser_url("127.0.0.1", 8765) == "http://127.0.0.1:8765/"
+    assert iv._browser_url("localhost", 1) == "http://localhost:1/"
+    assert iv._browser_url("0.0.0.0", 1) == "http://127.0.0.1:1/"  # wildcard
+    assert iv._browser_url("::", 1) == "http://127.0.0.1:1/"
+    assert iv._browser_url("::1", 1) == "http://[::1]:1/"  # bracketed
+
+    class Later:  # reports started on the third poll
+        should_exit = False
+        polls = 0
+
+        @property
+        def started(self):
+            self.polls += 1
+            return self.polls >= 3
+
+    class Failed:  # the bind failed: uvicorn asks to exit
+        started = False
+        should_exit = True
+
+    class Never:
+        started = False
+        should_exit = False
+
+    opened = []
+    assert iv._open_when_started(Later(), "http://x/", opener=opened.append, delay=0)
+    assert not iv._open_when_started(
+        Failed(), "http://x/", opener=opened.append, delay=0
+    )
+    assert not iv._open_when_started(
+        Never(), "http://x/", opener=opened.append, attempts=2, delay=0
+    )
+    assert opened == ["http://x/"]  # once, and never for a server that is not up
+
+
+def test_the_page_module_parses_as_esm_and_its_unit_tests_pass():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    root = _SCRIPT.parent.parent
+    subprocess.run([node, "--check", str(_SCRIPT.with_suffix(".mjs"))], check=True)
+    result = subprocess.run(
+        [node, "--test", "--test-reporter=tap", "tests/index_viewer_client.test.mjs"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

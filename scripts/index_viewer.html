@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>transitio index viewer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css"
+      integrity="sha384-MinO0mNliZ3vwppuPOUnGa+iq619pfMhLVUXfC4LHwSCvF9H+6P/KO4Q7qBOYV5V" crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"
+        integrity="sha384-SYKAG6cglRMN0RVvhNeBY0r3FYKNOJtznwA0v7B5Vp9tr31xAHsZC0DqkQ/pZDmj" crossorigin="anonymous"></script>
+<style>
+  html, body { height: 100%; margin: 0; font: 14px/1.4 system-ui, sans-serif; color: #111; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; padding: 0.5rem 1rem; border-bottom: 1px solid #ddd; background: #fafafa; }
+  header label { font-weight: 600; }
+  header select { margin-left: 0.5rem; max-width: 24rem; }
+  #stats { color: #444; }
+  #hint { padding: 0.15rem 0.6rem; border-radius: 0.3rem; background: #fde68a; color: #4a3600; }
+  #map { flex: 1; min-height: 0; }
+  .maplibregl-popup-content { font: 13px/1.4 system-ui, sans-serif; }
+  .maplibregl-popup-content ul { margin: 0.3rem 0 0; padding-left: 1.1rem; }
+</style>
+</head>
+<body>
+<header>
+  <label>Build <select id="build"></select></label>
+  <span id="stats"></span>
+  <span id="hint" hidden></span>
+</header>
+<div id="map"></div>
+<script type="module" src="/static/index_viewer.mjs"></script>
+</body>
+</html>
