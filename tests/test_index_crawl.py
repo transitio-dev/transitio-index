@@ -953,3 +953,32 @@ def test_manifest_list_rejects_non_list_and_mixed_types():
     assert crawl._manifest_list("shapes.txt") is None  # a string is not a manifest
     assert crawl._manifest_list(["shapes.txt", 1]) is None  # mixed types re-fetch
     assert crawl._manifest_list(None) is None
+
+
+def test_the_crawl_log_records_each_feed_source(tmp_path):
+    # A crawled feed carries its catalogue source (mdb/atlas/both/systems_csv)
+    # into the crawl log, so provenance — e.g. which feeds come via the
+    # Transitland Atlas — is answerable from the log alone.
+    cache = tmp_path / "cache"
+    feed = _feed("f-a", "https://feeds.example/a.zip")
+    feed["source"] = "atlas"
+    _publish_resolved(cache, [feed])
+    _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_members()), '"v1"')}))
+    assert log["f-a"]["source"] == "atlas"
+
+
+def test_the_crawl_log_records_source_even_when_a_feed_errors(tmp_path, monkeypatch):
+    # The unexpected-error fallback record must carry source too, so provenance
+    # is present on every crawl-log path, not just the successful one.
+    cache = tmp_path / "cache"
+    feed = _feed("f-a", "https://feeds.example/a.zip")
+    feed["source"] = "atlas"
+    _publish_resolved(cache, [feed])
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(crawl, "_crawl_one", boom)
+    _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_members()), '"v1"')}))
+    assert log["f-a"]["method"] == "skipped"
+    assert log["f-a"]["source"] == "atlas"

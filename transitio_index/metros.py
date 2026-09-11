@@ -436,9 +436,7 @@ def _apply_fao(
     wanted = {
         p["overture_id"] for p in places if p["kind"] == "city" and p.get("overture_id")
     }
-    if wanted and dataset is None:
-        dataset = geometry.division_area_dataset()
-    areas = geometry.read_areas(dataset, wanted) if wanted else {}
+    areas = geometry.place_areas(cache_dir, dataset, places, wanted)
     grouped, _, countries, _, _ = fao.place_cities(
         places, areas, regions, patches, assignments, report
     )
@@ -586,9 +584,7 @@ def _attach_eurostat(
         for p in places
         if p["kind"] == "city" and p["country_code"] in covered and p.get("overture_id")
     }
-    if wanted and dataset is None:
-        dataset = geometry.division_area_dataset()
-    areas = geometry.read_areas(dataset, wanted) if wanted else {}
+    areas = geometry.place_areas(cache_dir, dataset, places, wanted)
     assignments = eurostat.assign(places, areas, composition, boundaries)
     members = {}
     for row in assignments:

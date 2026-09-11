@@ -94,5 +94,8 @@ def ingest(cache_dir, *, csv_path=None, label=DEFAULT_LABEL, expected_sha256=Non
         parse_rows=parse_rows,
         required_headers=REQUIRED_HEADERS,
         csv_path=csv_path,
+        # GBFS is optional: a country with no bike-share systems is a valid
+        # sample, not a broken export.
+        allow_empty=True,
         expected_sha256=expected_sha256,
     )

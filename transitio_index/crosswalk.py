@@ -21,12 +21,15 @@ verbatim under ``atlas`` / ``mdb`` so nothing downstream must re-read raw.
 
 import collections
 import itertools
+import logging
 import re
 import unicodedata
 import urllib.parse
 
 from transitio_index import store
 from transitio_index.progress import progress
+
+log = logging.getLogger(__name__)
 
 FEEDS_POINTER = "feeds.json"
 FEEDS_ARTIFACT = "feeds.jsonl"
@@ -866,14 +869,6 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
             return None
         return minted
 
-    def orphan_feed_id(system):
-        minted = _usable_mint(system)
-        if minted is None:
-            raise CrosswalkError(
-                f"gbfs system {system['system_id']!r}: no unambiguous id to mint"
-            )
-        return minted
-
     records = [
         _both_record(atlas_feed, mdb_feed, method="url_exact", confidence=1.0)
         for atlas_feed, mdb_feed in url_pairs
@@ -898,9 +893,20 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
     records.extend(
         _mdb_record(feed) for feed in mdb_feeds if feed["mdb_id"] not in matched_mdb
     )
-    records.extend(
-        _gbfs_system_record(system, orphan_feed_id(system)) for system in orphan_systems
-    )
+    skipped_orphans = []
+    for system in orphan_systems:
+        minted = _usable_mint(system)
+        if minted is None:
+            # A duplicated system_id with no country code (or a mint colliding
+            # with a feed's id) has no unambiguous id: the orphan GBFS system is
+            # dropped with a warning rather than aborting the crosswalk.
+            log.warning(
+                "crosswalk: gbfs system %r has no unambiguous id; skipped",
+                system["system_id"],
+            )
+            skipped_orphans.append(system["system_id"])
+            continue
+        records.append(_gbfs_system_record(system, minted))
     _require_unique_namespace(records)
     rt_static_links = _apply_static_links(records, atlas_feeds, operators)
 
@@ -924,7 +930,8 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         "same_host_pairs": len(name_pairs),
         "geohash_pairs": len(geohash_pairs),
         "gbfs_linked": len(gbfs_pairs),
-        "gbfs_minted": len(orphan_systems),
+        "gbfs_minted": len(orphan_systems) - len(skipped_orphans),
+        "gbfs_skipped": len(skipped_orphans),
         "gbfs_system_id_collisions": sorted(duplicate_ids),
         "rt_static_links": dict(rt_static_links),
         "provisional_links": provisional,

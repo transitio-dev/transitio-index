@@ -698,12 +698,22 @@ def _stops_inside(route, place_id, place):
 
 
 def _classify_feed(
-    candidates, feed_dir, state, lookup, places, by_overture, route_min_stops
+    candidates,
+    feed_dir,
+    state,
+    lookup,
+    places,
+    by_qid,
+    by_overture,
+    route_min_stops,
+    conflicts=frozenset(),
 ):
     """The classified edges for one crawled feed; ``(edges, status, routes,
     dropped, join_gaps)`` — ``dropped`` counting candidate places no route
     serves, ``join_gaps`` the trips and stop_times rows the feed failed to
-    join (None without route evidence).
+    join (None without route evidence). ``conflicts`` names the divisions the
+    expand stage dropped: a stop in one is a logged miss, any other unknown
+    QID-bearing division a stale expansion.
 
     ``candidates`` is ``{place_id: candidate edge}``. The stop_times state
     decides the mode: ``complete`` measures each route; ``skipped`` is the
@@ -732,17 +742,14 @@ def _classify_feed(
     stale = set()
     for stop_id, (x, y) in coords.items():
         hit, countries, stale_here = coverage.stop_places(
-            lookup, x, y, places, by_overture
+            lookup, x, y, by_overture, by_qid
         )
         stop_places[stop_id] = hit
         stop_countries[stop_id] = countries
         stale.update(stale_here)
+    _, stale = coverage.known_misses(stale, conflicts, "classify")
     if stale:
-        raise ClassifyError(
-            "crawled stops hit QID-bearing divisions the gazetteer does not "
-            f"know ({', '.join(sorted(stale)[:5])}); places_expanded predates "
-            "the crawl — re-run the expand stage"
-        )
+        raise ClassifyError(coverage.stale_expansion(stale))
 
     if mode == "skipped":
         # Single place, single country, geography-free tiers: every route
@@ -1199,9 +1206,18 @@ def classify(
                 "feeds.yaml",
                 "coverage",
             )
-            place_rows, expanded_manifest = store.read_jsonl(
-                cache_dir / "gazetteer", "expanded.json", "places_expanded.jsonl"
+            # The places and the divisions expand dropped, from one resolved
+            # generation: a stop in a dropped division is a known miss.
+            from transitio_index import expand
+
+            expanded, expanded_manifest = store.resolve(
+                cache_dir / "gazetteer", "expanded.json"
             )
+            with expanded:
+                place_rows = store.parse_jsonl(
+                    expanded.read_bytes("places_expanded.jsonl")
+                )
+                conflicts = expand.dropped_qids(expanded)
             if coverage_manifest.get("expanded_generation") != expanded_manifest.get(
                 "generation"
             ):
@@ -1211,6 +1227,7 @@ def classify(
                 )
             places = {place["place_id"]: place for place in place_rows}
             by_overture = coverage.place_index(places)
+            by_qid = coverage.place_qids(places)
             canonical = coverage._canonical_ids(feeds)
             crawl_lock = crawl.reading(cache_dir)
             crawl_lock.__enter__()
@@ -1256,8 +1273,10 @@ def classify(
                         state,
                         lookup,
                         places,
+                        by_qid,
                         by_overture,
                         route_min_stops,
+                        conflicts=conflicts,
                     )
                     routes_classified += routes
                     edges_dropped += dropped

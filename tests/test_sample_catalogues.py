@@ -112,3 +112,147 @@ def test_build_command_runs_full_pipeline_pinned_to_the_commit():
     assert "--stage ingest --downstream" in cmd
     assert f"--commit {commit}" in cmd
     assert str(atlas_out) in cmd  # path separator is platform-dependent
+
+
+def test_limit_per_country_caps_each_country_in_order():
+    rows = [
+        {"c": "ES", "id": "a"},
+        {"c": "ES", "id": "b"},
+        {"c": "ES", "id": "c"},
+        {"c": "FR", "id": "d"},
+        {"c": "FR", "id": "e"},
+    ]
+    capped = sc._limit_per_country(rows, "c", 2)
+    assert [r["id"] for r in capped] == ["a", "b", "d", "e"]
+    # A full country name counts against the same cap as its ISO code.
+    mixed = [
+        {"c": "ES", "id": "a"},
+        {"c": "SPAIN", "id": "b"},
+        {"c": "ES", "id": "c"},
+    ]
+    assert [r["id"] for r in sc._limit_per_country(mixed, "c", 2)] == ["a", "b"]
+    # None passes the rows through unchanged.
+    assert sc._limit_per_country(rows, "c", None) is rows
+    # With a subdivision column the cap is per country *and* subdivision, so a
+    # requested spread of states is sampled evenly, not from the first-listed.
+    states = [
+        {"c": "US", "s": "California", "id": "a"},
+        {"c": "US", "s": "California", "id": "b"},
+        {"c": "US", "s": "New York", "id": "c"},
+        {"c": "US", "s": "Puerto Rico", "id": "d"},
+    ]
+    capped = sc._limit_per_country(states, "c", 1, within="s")
+    assert [r["id"] for r in capped] == ["a", "c", "d"]
+
+
+@pytest.mark.parametrize(
+    "countries, subdivisions, outcome",
+    [
+        ({"US"}, {"PUERTO RICO", "CALIFORNIA"}, ["a", "c"]),
+        ({"US", "CA"}, {"PUERTO RICO"}, r"no MDB feeds for \['CA'\]"),
+        ({"US"}, {"PUERTO RICO", "GUAM"}, r"no MDB feeds in subdivisions \['GUAM'\]"),
+        ({"US", "CA"}, set(), ["a", "d"]),
+    ],
+    ids=["spread", "country-outside-subdivisions", "absent-subdivision", "no-filter"],
+)
+def test_narrow_spreads_the_cap_and_refuses_what_nothing_carries(
+    countries, subdivisions, outcome
+):
+    """With subdivisions the MDB cap is per subdivision (GBFS stays per country);
+    a requested country whose feeds all lie outside them, or a subdivision no row
+    carries, stops the cut instead of silently thinning the sample. Without
+    subdivisions the cap is per country, as before."""
+    rows = [
+        {sc.MDB_COUNTRY: "US", sc.MDB_SUBDIVISION: "California", "id": "a"},
+        {sc.MDB_COUNTRY: "US", sc.MDB_SUBDIVISION: "California", "id": "b"},
+        {sc.MDB_COUNTRY: "US", sc.MDB_SUBDIVISION: "Puerto Rico", "id": "c"},
+        {sc.MDB_COUNTRY: "CA", sc.MDB_SUBDIVISION: "Ontario", "id": "d"},
+    ]
+    gbfs = [{sc.GBFS_COUNTRY: "US"}] * 3
+    if isinstance(outcome, str):
+        with pytest.raises(SystemExit, match=outcome):
+            sc._narrow(rows, gbfs, countries, subdivisions, 1)
+        return
+    mdb, kept_gbfs = sc._narrow(rows, gbfs, countries, subdivisions, 1)
+    assert [r["id"] for r in mdb] == outcome and len(kept_gbfs) == 1
+
+
+def test_a_blank_subdivision_is_refused_before_any_download(monkeypatch):
+    monkeypatch.setattr(sc, "_download", lambda *a, **k: pytest.fail("downloaded"))
+    with pytest.raises(SystemExit):
+        sc.main(["--country", "US", "--subdivision", "  "])
+
+
+def test_atlas_limit_trims_to_matching_feeds_and_caps_the_total(tmp_path):
+    match_url = "https://match.example/gtfs.zip"
+    also_url = "https://also.example/gtfs.zip"
+    urls, hosts = {match_url, also_url}, set()
+    dense = {
+        "feeds": [
+            {"id": "f-match", "spec": "gtfs", "urls": {"static_current": match_url}},
+            {"id": "f-also", "spec": "gtfs", "urls": {"static_current": also_url}},
+            {
+                "id": "f-other",
+                "spec": "gtfs",
+                "urls": {"static_current": "https://x.example/gtfs.zip"},
+            },
+        ]
+    }
+    archive = tmp_path / "atlas.tar.gz"
+    _archive(archive, [("r/feeds/dense.dmfr.json", dense)])
+    # Without a limit the whole feed-dense file is kept.
+    whole = sc._select_atlas(archive, urls, hosts)
+    assert sum(len(payload["feeds"]) for _, payload in whole) == 3
+    # With a limit only matching feeds survive, capped to the limit.
+    trimmed = sc._select_atlas(archive, urls, hosts, limit=1)
+    assert [f["id"] for _, payload in trimmed for f in payload["feeds"]] == ["f-match"]
+
+
+def test_chunks_and_even_split_partition_rows():
+    assert sc._chunks([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]
+    assert sc._chunks([], 3) == [[]]  # an empty country still yields one batch
+    # even_split spreads the remainder across the leading groups, in order.
+    assert sc._even_split([1, 2, 3, 4, 5], 3) == [[1, 2], [3, 4], [5]]
+    assert sc._even_split([1, 2], 3) == [[1], [2], []]  # more parts than rows
+    assert sc._even_split([1, 2, 3], 1) == [[1, 2, 3]]
+
+
+def test_emit_writes_an_mdb_only_sample_when_no_atlas_overlaps(tmp_path, capsys):
+    out = tmp_path / "batch-000"
+    out.mkdir()
+    sample = (
+        [{"id": "m1", "location.country_code": "NL"}],
+        [{"system_id": "g1", "Country Code": "NL"}],
+        [],  # no Atlas DMFR file overlaps the kept feeds
+    )
+    sc._emit(
+        out,
+        ["id", "location.country_code"],
+        ["system_id", "Country Code"],
+        sample,
+        {"NL"},
+        "c" * 40,
+    )
+    err = capsys.readouterr().err
+    assert "MDB-only" in err  # the fallback note is printed, not an abort
+    assert (out / "mdb_sample.csv").exists()
+    assert (out / "gbfs_sample.csv").exists()
+    # An (empty) archive is still written so the build command's --archive is valid.
+    with tarfile.open(out / "atlas_sample.tar.gz") as tar:
+        assert tar.getmembers() == []
+
+
+def test_country_selection_matches_code_and_curated_name_and_rejects_others():
+    assert sc._country_code("NETHERLANDS") == "NL"  # a curated name canonicalises
+    assert sc._country_code("NL") == "NL"
+    # rows carrying the code or the full name both match; a bare code matches
+    # only itself.
+    assert sc._match_values("NL") == {"NL", "NETHERLANDS"}
+    assert sc._match_values("FR") == {"FR"}
+    # a full name outside the curated set, or a non-ASCII look-alike, is refused
+    # up front rather than passed through as a match value
+    assert sc._unrecognized_countries({"NL", "FR", "FRANCE"}) == ["FRANCE"]
+    assert sc._unrecognized_countries({"NL", "NETHERLANDS", "MX"}) == []
+    assert sc._unrecognized_countries({"ÑL"}) == ["ÑL"]  # non-ASCII, not a code
+    # a non-ASCII char must not case-fold into a code ("ß".upper() == "SS")
+    assert sc._unrecognized_countries({"ß"}) == ["ß"]

@@ -10,17 +10,19 @@ import csv
 import datetime
 import hashlib
 import io
+import logging
 import os
-import urllib.request
 
-from transitio_index import store
+from transitio_index import download, store
+
+log = logging.getLogger(__name__)
 
 
 class IngestError(RuntimeError):
     """A CSV source could not be ingested as specified."""
 
 
-DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_ATTEMPTS = 6
 DOWNLOAD_TIMEOUT = 120
 
 # The real catalogues are a few MB (MDB ~2.6 MB, GBFS ~0.2 MB). The ceilings
@@ -31,56 +33,22 @@ MAX_CSV_BYTES = 32 * 1024 * 1024
 MAX_ROWS = 500_000
 
 
-def _copy_bounded(response, opened_file, limit):
-    """Copy at most ``limit`` bytes, returning their digest.
-
-    ``Content-Length`` is the server's claim, so the ceiling is enforced on
-    what actually arrives; the digest is taken from the same bytes so the
-    trusted value never depends on re-reading the file afterwards.
-    """
-    digest = hashlib.sha256()
-    written = 0
-    for chunk in iter(lambda: response.read(1024 * 1024), b""):
-        written += len(chunk)
-        if written > limit:
-            raise IngestError(f"download exceeds the {limit}-byte ceiling")
-        digest.update(chunk)
-        opened_file.write(chunk)
-    return digest.hexdigest(), written
-
-
 def download_file(directory, name, url, limit=MAX_CSV_BYTES):
     """Download ``url`` to ``name`` in ``directory``; return its SHA-256.
 
-    Each attempt owns an exclusively created temporary file, replaced into
-    place only once the body is complete — an interrupted run must not leave
-    a truncated file a later run reads as cached.
+    Resumable and completeness-checked (see :mod:`transitio_index.download`), so
+    a proxy that truncates a transfer resumes rather than publishing a partial
+    catalogue.
     """
-    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
-        handle, partial = store.create_temporary(directory)
-        try:
-            opened = urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT)
-            with opened as response, os.fdopen(handle, "wb") as opened_file:
-                handle = None
-                declared = response.headers.get("Content-Length")
-                digest, written = _copy_bounded(response, opened_file, limit)
-                opened_file.flush()
-                os.fsync(opened_file.fileno())
-            if declared is not None and written != int(declared):
-                # A body that ended short of its Content-Length is truncated,
-                # not complete; raise so the attempt is retried rather than
-                # publishing a partial catalogue.
-                raise IngestError(f"{name}: got {written} bytes, expected {declared}")
-            directory.replace(partial, name)
-            return digest
-        except (OSError, IngestError):
-            if attempt == DOWNLOAD_ATTEMPTS:
-                raise
-        finally:
-            if handle is not None:
-                os.close(handle)
-            store.unlink(directory, partial)
-    return None
+    return download.to_file(
+        directory,
+        name,
+        url,
+        limit=limit,
+        attempts=DOWNLOAD_ATTEMPTS,
+        timeout=DOWNLOAD_TIMEOUT,
+        error=IngestError,
+    )
 
 
 def read_rows(text, required_headers):
@@ -198,12 +166,15 @@ def ingest_csv(
     required_headers,
     csv_path=None,
     expected_sha256=None,
+    allow_empty=False,
 ):
     """Fetch (or reuse) the source CSV, normalize it, and publish a generation.
 
     ``parse_rows`` takes ``(rows, source_file)`` and returns
     ``(records, summary_extra)``. With ``csv_path`` the local CSV is used and
-    nothing is downloaded, which is how the tests run offline.
+    nothing is downloaded, which is how the tests run offline. A CSV with a
+    valid header but no rows is an error unless ``allow_empty`` — set for an
+    optional source — in which case an empty generation is published.
 
     The export at ``url`` is always-latest — it carries no immutable version
     — so the content SHA-256 is the real identity: ``csv_sha256`` records the
@@ -242,7 +213,12 @@ def ingest_csv(
             rows = read_rows(text, required_headers)
             records, extra = parse_rows(rows, source)
             if not records:
-                raise IngestError(f"{source}: no rows found")
+                # A required source with nothing in it is a broken export; an
+                # optional one (the GBFS systems of a country that has none)
+                # legitimately publishes an empty generation.
+                if not allow_empty:
+                    raise IngestError(f"{source}: no rows found")
+                log.warning("%s: no rows found; publishing an empty catalogue", source)
 
             manifest = {
                 "source": source,

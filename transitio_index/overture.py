@@ -16,8 +16,14 @@ stage runs offline with no network and no live counts.
 """
 
 import datetime
+import http.client
 import json
+import logging
+import os
 import re
+import socket
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -25,6 +31,22 @@ import pyarrow.dataset as ds
 
 from transitio_index import store
 from transitio_index.progress import progress
+
+log = logging.getLogger(__name__)
+
+# Transient transport failures worth retrying: a dropped connection, a reset, a
+# read timeout, or one of those wrapped in ``URLError`` (how urllib surfaces a
+# connect-phase socket error). An HTTP status error (``HTTPError``, a URLError
+# subclass) is caught with them and sorted by ``_transient``: a 5xx is the
+# server's or a gateway's failure and is retried, a 4xx is ours and stays
+# fatal. A truncated body (``IncompleteRead``) is not here either: it signals
+# an oversized response the batch loop bisects rather than re-reads whole.
+_TRANSIENT_ERRORS = (
+    http.client.RemoteDisconnected,
+    ConnectionError,
+    socket.timeout,
+    urllib.error.URLError,
+)
 
 OVERTURE_RELEASE = "2026-08-19.0"
 OVERTURE_BUCKET = "overturemaps-us-west-2"
@@ -85,13 +107,68 @@ class GazetteerError(RuntimeError):
     """The gazetteer stage could not resolve its inputs."""
 
 
+def s3_filesystem(region=OVERTURE_REGION):
+    """An anonymous S3 filesystem for the public Overture bucket.
+
+    Honours the standard ``HTTPS_PROXY``/``HTTP_PROXY`` environment variables so
+    the read works behind an HTTP proxy; with none set it connects directly, as
+    before. The AWS SDK behind ``S3FileSystem`` does not read those variables on
+    its own, unlike ``urllib``.
+
+    The timeouts and retry budget are widened well past the SDK's ~3s default:
+    a proxied connection is slower, and many small reads (a chunked area scan)
+    would otherwise let one transient slow response abort the whole gazetteer.
+    """
+    from pyarrow.fs import AwsStandardS3RetryStrategy, S3FileSystem
+
+    options = {
+        "anonymous": True,
+        "region": region,
+        "connect_timeout": 30.0,
+        "request_timeout": 120.0,
+        "retry_strategy": AwsStandardS3RetryStrategy(max_attempts=8),
+    }
+    proxy = proxy_url()
+    if proxy:
+        options["proxy_options"] = proxy
+        _cap_io_threads()
+    return S3FileSystem(**options)
+
+
+def proxy_url():
+    """The HTTP proxy the environment names for outbound reads, or ``None``."""
+    return (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+        or None
+    )
+
+
+# pyarrow's IO pool (eight threads by default) opens as many tunnels through a
+# proxy at once; a proxy that drops several of them leaves the SDK waiting on
+# them forever. Two at a time survive. Capped once, on the first proxied open:
+# a stalled read's retry enlarges the pool (geometry.retrying) and reopens the
+# filesystem, and that reopen must never shrink it back.
+PROXY_IO_THREADS = 2
+_io_threads_capped = False
+
+
+def _cap_io_threads():
+    global _io_threads_capped
+    if _io_threads_capped:
+        return
+    import pyarrow as pa
+
+    pa.set_io_thread_count(min(pa.io_thread_count(), PROXY_IO_THREADS))
+    _io_threads_capped = True
+
+
 def overture_dataset(release=OVERTURE_RELEASE):
     """The pinned Overture ``division`` theme as a pyarrow dataset over S3."""
-    from pyarrow.fs import S3FileSystem
-
-    filesystem = S3FileSystem(anonymous=True, region=OVERTURE_REGION)
     path = f"{OVERTURE_BUCKET}/{DIVISION_PATH.format(release=release)}"
-    return ds.dataset(path, filesystem=filesystem, format="parquet")
+    return ds.dataset(path, filesystem=s3_filesystem(), format="parquet")
 
 
 def read_divisions(dataset, *, subtypes=SKELETON_SUBTYPES):
@@ -195,6 +272,19 @@ def normalize_division(row):
     }
 
 
+def _transient(error):
+    """Whether a Wikidata failure is the transport's or a gateway's rather than
+    our request's: every transient error, and an HTTP 5xx — a proxy's 502 on a
+    dropped tunnel included. A 4xx is a hard error."""
+    return not isinstance(error, urllib.error.HTTPError) or error.code >= 500
+
+
+def _label(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return f"HTTP {error.code}"
+    return type(error).__name__
+
+
 class WikidataClient:
     """Batched lookups against the Wikidata SPARQL endpoint.
 
@@ -207,10 +297,14 @@ class WikidataClient:
     network.
     """
 
-    def __init__(self, endpoint=WIKIDATA_SPARQL, *, timeout=60, batch_size=200):
+    def __init__(
+        self, endpoint=WIKIDATA_SPARQL, *, timeout=60, batch_size=200, attempts=4
+    ):
         self.endpoint = endpoint
         self.timeout = timeout
         self.batch_size = batch_size
+        # Total tries per request (>=1), not retries-after-the-first.
+        self.attempts = max(1, attempts)
 
     def p402(self, osm_relation_ids):
         """``{osm_relation_id: qid}``; an ambiguous id maps to ``None``.
@@ -337,8 +431,38 @@ class WikidataClient:
         ids = sorted({str(q) for q in qids if q and QID_PATTERN.match(str(q))})
         out = {}
         for start in progress(range(0, len(ids), 50), "wikidata labels"):
-            self._entities_batch(ids[start : start + 50], out)
+            self._fetch_bisecting(
+                ids[start : start + 50],
+                lambda batch: self._entities_batch(batch, out),
+                "wikidata labels",
+            )
         return out
+
+    def _fetch_bisecting(self, batch, apply, what):
+        """Run ``apply(batch)``, halving the batch when the transport truncates
+        or drops the response — even after ``_get_json``'s own retries — so one
+        oversized or repeatedly-dropped reply degrades to smaller reads instead
+        of aborting the build. A single id that still fails is logged and
+        skipped: its labels stay un-enriched, never fatal, since this is an
+        optional enrichment."""
+        try:
+            apply(batch)
+        except (http.client.IncompleteRead, *_TRANSIENT_ERRORS) as error:
+            if not _transient(error):
+                # A 4xx is our request's fault, not a transport hiccup, and stays
+                # fatal even though HTTPError is a urllib.error.URLError subclass.
+                raise
+            if len(batch) <= 1:
+                log.warning(
+                    "%s: %s failed (%s); labels skipped",
+                    what,
+                    ",".join(batch) or "(empty)",
+                    _label(error),
+                )
+                return
+            mid = len(batch) // 2
+            self._fetch_bisecting(batch[:mid], apply, what)
+            self._fetch_bisecting(batch[mid:], apply, what)
 
     def _entities_batch(self, batch, out):
         url = (
@@ -391,12 +515,31 @@ class WikidataClient:
         return results["bindings"]
 
     def _get_json(self, url, *, accept="application/json"):
-        """The parsed JSON body of ``url`` (GET), with the descriptive agent."""
+        """The parsed JSON body of ``url`` (GET), with the descriptive agent.
+
+        A transient transport failure (a dropped connection, reset or read
+        timeout) or an HTTP 5xx — the server's or a gateway's failure to answer —
+        is retried with a short back-off, so one network hiccup does not abort a
+        build; the last failure is raised once the attempts run out. A 4xx is
+        our request's fault and is raised at once, and a truncated body
+        (``IncompleteRead``) is left to the caller's batch bisection."""
         request = urllib.request.Request(
             url, headers={"Accept": accept, "User-Agent": USER_AGENT}
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+        for attempt in range(self.attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except _TRANSIENT_ERRORS as error:  # an HTTPError is a URLError too
+                if not _transient(error) or attempt + 1 >= self.attempts:
+                    raise
+                log.warning(
+                    "wikidata: %s (attempt %d/%d); retrying",
+                    _label(error),
+                    attempt + 1,
+                    self.attempts,
+                )
+                time.sleep(min(2**attempt, 8))
 
 
 def resolve_qid(record, p402_map):

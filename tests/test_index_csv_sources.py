@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -393,10 +394,24 @@ def test_row_count_over_the_cap_is_refused(tmp_path, monkeypatch):
         mdb.ingest(tmp_path / "cache", csv_path=csv)
 
 
-def test_empty_csv_is_an_error(tmp_path):
+def test_an_empty_csv_fails_a_required_source_and_publishes_an_optional_one(
+    tmp_path, caplog
+):
+    """A header-only export is a broken catalogue for the MDB, which every build
+    needs, but a legitimate one for GBFS — a country with no bike-share systems
+    — which then publishes an empty generation with a warning."""
+    from transitio_index import gbfs
+
     csv = write(tmp_path / "feeds_v2.csv", ",".join(COLUMNS) + "\n")
     with pytest.raises(csv_source.IngestError, match="no rows"):
         mdb.ingest(tmp_path / "cache", csv_path=csv)
+    systems = write(
+        tmp_path / "systems.csv", ",".join(sorted(gbfs.REQUIRED_HEADERS)) + "\n"
+    )
+    with caplog.at_level("WARNING"):
+        manifest = gbfs.ingest(tmp_path / "cache", csv_path=systems)
+    assert manifest["records"] == 0
+    assert any("gbfs: no rows found" in m for m in caplog.messages)
 
 
 @pytest.mark.parametrize("bad", ["a/b", "a\\b", "..", "x\ty"])
@@ -433,7 +448,7 @@ def test_a_truncated_download_is_refused_and_retried(tmp_path, monkeypatch):
         calls.append(url)
         return _ShortResponse(b"id,data_type\n", declared=9999)
 
-    monkeypatch.setattr(csv_source.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(csv_source.download.urllib.request, "urlopen", urlopen)
     directory = store.open_directory(tmp_path)
     try:
         with pytest.raises(csv_source.IngestError, match="expected 9999"):
@@ -596,3 +611,151 @@ def _json_blocks(text):
             depth -= 1
             if depth == 0:
                 yield text[start : index + 1]
+
+
+def test_a_truncated_download_resumes_from_where_it_stopped(tmp_path, monkeypatch):
+    full = b"id,data_type,name\n" + b"agency,gtfs,x\n" * 60
+    calls = []
+
+    class _Resp:
+        def __init__(self, start, stop):
+            self._start = start
+            self._body = io.BytesIO(full[start:stop] if stop else full[start:])
+            self.status = 206 if start else 200
+
+        @property
+        def headers(self):
+            if self._start:
+                return {
+                    "Content-Range": f"bytes {self._start}-{len(full) - 1}/{len(full)}"
+                }
+            return {"Content-Length": str(len(full))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, size=-1):
+            return self._body.read(size)
+
+    def urlopen(request, timeout=None):
+        rng = request.get_header("Range")
+        calls.append(rng)
+        if rng is None:
+            return _Resp(0, stop=20)  # first transfer truncates at 20 bytes
+        start = int(rng.split("=")[1].split("-")[0])
+        return _Resp(start, stop=None)  # the resume serves the rest
+
+    monkeypatch.setattr(csv_source.download.urllib.request, "urlopen", urlopen)
+    directory = store.open_directory(tmp_path)
+    try:
+        digest = csv_source.download_file(directory, "x.csv", "https://example/x.csv")
+    finally:
+        directory.close()
+    assert calls == [None, "bytes=20-"]  # one truncated fetch, then a resume
+    assert (tmp_path / "x.csv").read_bytes() == full
+    assert digest == hashlib.sha256(full).hexdigest()
+
+
+def test_a_206_that_resumes_at_the_wrong_offset_is_refetched(tmp_path, monkeypatch):
+    """A 206 whose Content-Range does not begin at the requested offset would
+    stitch a hybrid file; it is discarded and the body refetched whole."""
+    full = b"id,data_type,name\n" + b"agency,gtfs,x\n" * 60
+    calls = []
+    full_calls = [0]
+
+    class _Resp:
+        def __init__(self, body, status, headers):
+            self._body = io.BytesIO(body)
+            self.status = status
+            self._headers = headers
+
+        @property
+        def headers(self):
+            return self._headers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, size=-1):
+            return self._body.read(size)
+
+    def urlopen(request, timeout=None):
+        rng = request.get_header("Range")
+        calls.append(rng)
+        if rng is None:
+            full_calls[0] += 1
+            if full_calls[0] == 1:  # first full transfer truncates at 20 bytes
+                return _Resp(full[:20], 200, {"Content-Length": str(len(full))})
+            return _Resp(full, 200, {"Content-Length": str(len(full))})
+        # a misbehaving 206 that restarts at 0 instead of the requested offset
+        return _Resp(
+            full, 206, {"Content-Range": f"bytes 0-{len(full) - 1}/{len(full)}"}
+        )
+
+    monkeypatch.setattr(csv_source.download.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(csv_source.download.time, "sleep", lambda *a, **k: None)
+    directory = store.open_directory(tmp_path)
+    try:
+        digest = csv_source.download_file(directory, "x.csv", "https://example/x.csv")
+    finally:
+        directory.close()
+    assert calls == [None, "bytes=20-", None]  # truncate, bad resume, clean refetch
+    assert (tmp_path / "x.csv").read_bytes() == full
+    assert digest == hashlib.sha256(full).hexdigest()
+
+
+def test_a_resume_pins_the_representation_with_if_range(tmp_path, monkeypatch):
+    """A resume carries If-Range with the first response's validator, so a
+    resource that changes mid-transfer is served whole, not stitched."""
+    full = b"id,data_type,name\n" + b"agency,gtfs,x\n" * 60
+    etag = '"v1-abc"'
+    if_ranges = []
+
+    class _Resp:
+        def __init__(self, body, status, headers):
+            self._body = io.BytesIO(body)
+            self.status = status
+            self._headers = headers
+
+        @property
+        def headers(self):
+            return self._headers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, size=-1):
+            return self._body.read(size)
+
+    def urlopen(request, timeout=None):
+        rng = request.get_header("Range")
+        if rng is None:  # first transfer truncates, and carries an ETag
+            return _Resp(
+                full[:20], 200, {"Content-Length": str(len(full)), "ETag": etag}
+            )
+        if_ranges.append(request.get_header("If-range"))
+        start = int(rng.split("=")[1].split("-")[0])
+        return _Resp(
+            full[start:],
+            206,
+            {"Content-Range": f"bytes {start}-{len(full) - 1}/{len(full)}"},
+        )
+
+    monkeypatch.setattr(csv_source.download.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(csv_source.download.time, "sleep", lambda *a, **k: None)
+    directory = store.open_directory(tmp_path)
+    try:
+        csv_source.download_file(directory, "x.csv", "https://example/x.csv")
+    finally:
+        directory.close()
+    assert if_ranges == [etag]
+    assert (tmp_path / "x.csv").read_bytes() == full
