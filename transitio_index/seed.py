@@ -172,15 +172,36 @@ def _index(records):
     return index
 
 
+def _principal_qid(candidates):
+    """The one QID carried by both a city-level and a district-level candidate
+    — a city that is its own district (Augsburg, Karlsruhe, Ulm) appears at
+    both levels under its QID, while the other same-name divisions are hamlets
+    — or ``None`` when no QID is, or more than one."""
+    levels = {}
+    for candidate in candidates:
+        if candidate["qid"]:
+            city_level = candidate["subtype"] in CITY_SUBTYPES
+            levels.setdefault(candidate["qid"], set()).add(city_level)
+    shared = [qid for qid, seen in levels.items() if seen == {True, False}]
+    return shared[0] if len(shared) == 1 else None
+
+
 def _unique_identity(candidates):
     """The single division the candidates agree on, or ``(None, why)``.
 
     Candidates that share one QID are the same place (a locality and its
     localadmin, say); the locality is preferred. Two distinct QIDs conflict, and
     a QID-less same-name division leaves the identity unprovable — either way the
-    match is reported rather than minted.
+    match is reported rather than minted — unless one QID is shared by a
+    city-level and a district-level candidate: that is the principal place, and
+    the other same-name divisions are set aside.
     """
     qids = {c["qid"] for c in candidates if c["qid"]}
+    if len(qids) > 1 or (qids and any(not c["qid"] for c in candidates)):
+        principal = _principal_qid(candidates)
+        if principal is not None:
+            candidates = [c for c in candidates if c["qid"] == principal]
+            qids = {principal}
     if len(qids) > 1:
         return None, "the name matches divisions with conflicting QIDs"
     if not qids and len({c["overture_id"] for c in candidates}) > 1:
@@ -209,21 +230,37 @@ def _lookup(index, country, name):
     return list(seen.values())
 
 
-def match(index, country, subdivision, municipality, skeleton, what="locality"):
+def match(
+    index, country, subdivision, municipality, skeleton, what="locality", districts=None
+):
     """The single division for a declared location — QID-bearing, or a named
     division no QID names — or ``(None, why)``; ``what`` names the level the
     index holds, for the reason when nothing carries the name.
 
+    With ``districts`` (the skeleton's region/county index) the same-name
+    districts and regions join the candidates: a QID a city shares with its own
+    district marks the principal place (see ``_unique_identity``), and a
+    municipality field naming a region beside a same-name hamlet is reported
+    rather than placed at the hamlet.
+
     A declared subdivision must corroborate the match: it is required to name
-    one of the candidate's region/county ancestors, so a lone same-name city in
-    a different subdivision is reported rather than accepted.
+    one of the candidate's region/county ancestors — or the candidate itself,
+    for a region — so a lone same-name city in a different subdivision is
+    reported rather than accepted.
     """
     candidates = _lookup(index, country, municipality)
     if not candidates:
         return None, f"no {what} of that name in the declared country"
+    if districts is not None:
+        candidates += _lookup(districts, country, municipality)
     if subdivision:
         folded = _norm(subdivision)
-        narrowed = [c for c in candidates if folded in _subdivision_names(c, skeleton)]
+        narrowed = [
+            c
+            for c in candidates
+            if folded in _subdivision_names(c, skeleton)
+            or (c["subtype"] == "region" and folded in _name_variants(c))
+        ]
         if not narrowed:
             return None, "the declared subdivision matches no same-name division"
         candidates = narrowed
@@ -697,6 +734,7 @@ def resolve_seed(
                 location["subdivision"],
                 location["municipality"],
                 skeleton,
+                districts=region_index,
             )
             if division is None and not _lookup(
                 city_index, location["country"], location["municipality"]

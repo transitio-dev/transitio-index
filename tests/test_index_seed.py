@@ -172,6 +172,83 @@ ROWS = [
             ("fi-keski", "county", "Keski-Uusimaa"),
         ),
     ),
+    # Lahti: a city that is its own district — a locality and a county under
+    # one QID — beside a same-name locality with another QID and a QID-less
+    # one. The shared QID marks the city.
+    fx.division(
+        "fi-lahti",
+        "FI",
+        "locality",
+        wikidata="Q2143",
+        name="Lahti",
+        admin_level=2,
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-lahti-county", "county", "Lahti"),
+            ("fi-lahti", "locality", "Lahti"),
+        ),
+    ),
+    fx.division(
+        "fi-lahti-county",
+        "FI",
+        "county",
+        wikidata="Q2143",
+        name="Lahti",
+        admin_level=2,
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-lahti-county", "county", "Lahti"),
+        ),
+    ),
+    fx.division(
+        "fi-lahti-other",
+        "FI",
+        "locality",
+        wikidata="Q999002",
+        name="Lahti",
+        admin_level=2,
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-lahti-other", "locality", "Lahti"),
+        ),
+    ),
+    fx.division(
+        "fi-lahti-x",
+        "FI",
+        "locality",
+        wikidata=None,
+        name="Lahti",
+        admin_level=2,
+        sources=[
+            {"dataset": "geoBoundaries", "license": "CC-BY-4.0", "record_id": "Z"}
+        ],
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-lahti-x", "locality", "Lahti"),
+        ),
+    ),
+    # A QID-less hamlet named like the region: a municipality field naming
+    # "Uusimaa" must not be placed here.
+    fx.division(
+        "fi-uusimaa-x",
+        "FI",
+        "locality",
+        wikidata=None,
+        name="Uusimaa",
+        admin_level=2,
+        sources=[
+            {"dataset": "geoBoundaries", "license": "CC-BY-4.0", "record_id": "W"}
+        ],
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-uusimaa-x", "locality", "Uusimaa"),
+        ),
+    ),
     # Turku, reachable only through its Swedish name Åbo.
     fx.division(
         "fi-turku",
@@ -222,6 +299,8 @@ FEEDS = [
     },
     {"feed_id": "f-district-wrongsub", "mdb": _mdb("FI", "Lapland", "Keski-Uusimaa")},
     {"feed_id": "f-atlantis", "mdb": _mdb("FI", None, "Atlantis")},
+    {"feed_id": "f-lahti", "mdb": _mdb("FI", None, "Lahti")},
+    {"feed_id": "f-uusimaa-muni", "mdb": _mdb("FI", "Uusimaa", "Uusimaa")},
 ]
 
 
@@ -429,6 +508,25 @@ def test_a_municipality_naming_a_district_places_the_feed_there(tmp_path):
         reasons["f-atlantis"]
         == "no locality or district of that name in the declared country"
     )
+
+
+def test_a_name_shared_by_a_city_and_its_own_district_is_the_city(tmp_path):
+    # Lahti's locality and county carry one QID; the same-name locality with
+    # another QID and the QID-less one are hamlets, so the city places — while
+    # Vantaa (a lone QID beside a QID-less sibling, no district twin) and the
+    # two Springfields (no shared QID) are still reported.
+    _, places, report = _seed(tmp_path)
+    assert places["Q2143"]["overture_id"] == "fi-lahti"
+    assert places["Q2143"]["kind"] == "city"
+    assert places["Q2143"]["parent_id"] == "Q1508"  # the region, not the county twin
+    assert "Q999002" not in places
+    reasons = {r["feed_id"]: r["reason"] for r in report}
+    assert "f-lahti" not in reasons
+    # A municipality field naming the region, beside a QID-less hamlet of that
+    # name, is reported rather than placed at the hamlet; the declared
+    # subdivision corroborates the region by its own name.
+    assert reasons["f-uusimaa-muni"] == "the name also matches a division without a QID"
+    assert "overture:fi-uusimaa-x" not in places
 
 
 def test_a_lone_city_in_the_wrong_subdivision_is_reported(tmp_path):
