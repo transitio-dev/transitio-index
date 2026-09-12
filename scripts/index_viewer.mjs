@@ -4,6 +4,19 @@
 const VIEWPORT_ZOOM = 7; // from here the slice follows the viewport
 export const CITY_ZOOM = 9; // from here the slice includes cities
 const KIND_COLORS = { country: "#6b7280", region: "#2563eb", city: "#f59e0b", metro: "#db2777" };
+const KIND_MATCH = ["match", ["get", "kind"], ...Object.entries(KIND_COLORS).flat(), "#999"];
+
+// --- level and spec: the top bar's two selectors, applied to every request
+// A level names its place kinds and the edge classes that count on the
+// server; the page only passes it on. At the defaults nothing is added.
+export const INITIAL_VIEW = { level: "", spec: "all" };
+
+export function viewParams(view) {
+  const params = {};
+  if (view.level) params.level = view.level;
+  if (view.spec && view.spec !== "all") params.spec = view.spec;
+  return params;
+}
 
 export function placesUrl(build, params = {}) {
   const query = new URLSearchParams();
@@ -39,18 +52,20 @@ export function paddedBounds(bounds, factor = 0.5) {
   };
 }
 
-export function sliceParams(zoom, bounds) {
-  const params = { zoom };
-  if (zoom >= VIEWPORT_ZOOM) params.bbox = bboxParam(paddedBounds(bounds));
-  if (zoom >= CITY_ZOOM) params.kind = "all";
+export function sliceParams(zoom, bounds, view = INITIAL_VIEW) {
+  const params = { zoom, ...viewParams(view) };
+  // The city level shows cities at any zoom, and a slice with cities is bounded.
+  if (zoom >= VIEWPORT_ZOOM || view.level === "city") params.bbox = bboxParam(paddedBounds(bounds));
+  if (zoom >= CITY_ZOOM && !view.level) params.kind = "all";
   return params;
 }
 
 // The whole-build overview a build change loads before fitting the map to
 // it: no bbox, and never finer than the coarsest zoom band, so a large build
-// stays under the byte cap whatever the current zoom.
-export function overviewParams(zoom) {
-  return { zoom: Math.min(zoom, VIEWPORT_ZOOM - 1) };
+// stays under the byte cap whatever the current zoom. No level: the fit spans
+// the build, whatever the selectors say; the spec still colours it.
+export function overviewParams(zoom, view = INITIAL_VIEW) {
+  return { zoom: Math.min(zoom, VIEWPORT_ZOOM - 1), ...viewParams({ ...view, level: "" }) };
 }
 
 export function buildLabel(row) {
@@ -64,7 +79,10 @@ export function buildLabel(row) {
 
 export function summaryLabel(summary) {
   const counts = summary.counts || {};
-  return `${counts.places ?? "?"} places · ${counts.feeds ?? "?"} feeds · ${
+  const specs = Object.entries(summary.feeds_by_spec || {})
+    .map(([spec, n]) => `${n} ${spec}`)
+    .join(", ");
+  return `${counts.places ?? "?"} places · ${counts.feeds ?? "?"} feeds${specs ? ` (${specs})` : ""} · ${
     counts.edges ?? "?"
   } edges · ${summary.served_places ?? "?"} served`;
 }
@@ -147,12 +165,13 @@ export function tableState(state, action) {
   }
 }
 
-export function tableUrl(build, state) {
+export function tableUrl(build, state, view = INITIAL_VIEW) {
   const params = new URLSearchParams({
     sort: state.sort,
     order: state.order,
     offset: String(state.offset),
     limit: String(TABLE_PAGE),
+    ...viewParams(view),
   });
   if (state.query) params.set("q", state.query);
   if (state.kind) params.set("kind", state.kind);
@@ -179,8 +198,16 @@ export const TABLE_COLUMNS = [
   ["departures_per_day", "Departures/day"],
 ];
 
-export function rowHtml(row) {
-  const cells = TABLE_COLUMNS.map(([column]) => {
+// The class column follows the build: relevance ``category`` on schema 7,
+// ``tier`` before it. The server names the field in its summary.
+export function tableColumns(field = "tier") {
+  const columns = [...TABLE_COLUMNS];
+  columns.splice(6, 0, [field, "Class"]);
+  return columns;
+}
+
+export function rowHtml(row, columns = TABLE_COLUMNS) {
+  const cells = columns.map(([column]) => {
     const value = row[column];
     if (column === "served") return value ? "yes" : "no";
     return typeof value === "number" ? formatStat(value) : escapeHtml(value ?? DASH);
@@ -208,7 +235,15 @@ const EXTERNAL_IDS = [
   ["overture_id", "Overture", null],
 ];
 
-export function detailsHtml(record) {
+// An edge's class: the relevance category on schema 7, else its tier.
+const EDGE_CLASS = { category: "relevance_category", tier: "tier" };
+const edgeClass = (edge, field) => edge[EDGE_CLASS[field] ?? "tier"] ?? DASH;
+const specLine = (bySpec) =>
+  Object.entries(bySpec || {})
+    .map(([spec, n]) => `${escapeHtml(n)} ${escapeHtml(spec)}`)
+    .join(", ");
+
+export function detailsHtml(record, field = "tier") {
   const p = record.properties;
   const chain = crumbs(record)
     .map((c, i, all) =>
@@ -217,7 +252,10 @@ export function detailsHtml(record) {
         : `<button type="button" class="crumb" data-id="${escapeHtml(c.place_id)}">${escapeHtml(c.name)}</button>`,
     )
     .join(" › ");
-  const served = p.served ? `served by ${p.feed_count} feed${p.feed_count === 1 ? "" : "s"}` : "not served";
+  const specs = specLine(p.feeds_by_spec);
+  const served = p.served
+    ? `served by ${p.feed_count} feed${p.feed_count === 1 ? "" : "s"}${specs ? ` (${specs})` : ""}`
+    : "not served";
   const stats = Object.entries(p.service || {})
     .map(([key, value]) => `<li>${escapeHtml(key)}: ${escapeHtml(formatStat(value))}</li>`)
     .join("");
@@ -229,9 +267,10 @@ export function detailsHtml(record) {
   const feeds = (p.edges || [])
     .map(
       (e) =>
-        `<tr><td>${escapeHtml(e.feed_name ?? e.feed_id)}</td><td>${escapeHtml(e.tier ?? DASH)}</td>` +
+        `<tr><td>${escapeHtml(e.feed_name ?? e.feed_id)}</td><td>${escapeHtml(edgeClass(e, field))}</td>` +
+        `<td>${e.relevance == null ? DASH : e.relevance.toFixed(2)}</td>` +
         `<td>${e.tier_confidence == null ? DASH : e.tier_confidence.toFixed(2)}</td>` +
-        `<td>${escapeHtml(e.method ?? DASH)}</td></tr>`,
+        `<td>${escapeHtml(e.method ?? DASH)}${e.cross_border ? " · cross-border" : ""}</td></tr>`,
     )
     .join("");
   const ids = EXTERNAL_IDS.filter(([key]) => p[key])
@@ -243,11 +282,11 @@ export function detailsHtml(record) {
     .join("");
   return (
     `<p class="chain">${chain}</p>` +
-    `<p><small>${escapeHtml(p.kind)} · ${escapeHtml(p.place_id)}</small> · ${escapeHtml(served)}</p>` +
+    `<p><small>${escapeHtml(p.kind)} · ${escapeHtml(p.place_id)}</small> · ${served}</p>` +
     (stats ? `<ul class="stats">${stats}</ul>` : "") +
     children +
     (feeds
-      ? `<table class="feeds"><thead><tr><th>Feed</th><th>Tier</th><th>Conf.</th><th>Method</th></tr></thead><tbody>${feeds}</tbody></table>`
+      ? `<table class="feeds"><thead><tr><th>Feed</th><th>Class</th><th>Rel.</th><th>Conf.</th><th>Method</th></tr></thead><tbody>${feeds}</tbody></table>`
       : "") +
     (ids ? `<ul class="ids">${ids}</ul>` : "")
   );
@@ -295,23 +334,33 @@ export function revealPath(record) {
 
 // --- feeds and coverage: the feeds table, a feed's served places by tier, edges
 
-export const TIER_COLORS = {
-  local: "#16a34a",
-  regional: "#2563eb",
-  national: "#9333ea",
-  international: "#dc2626",
-  unknown: "#6b7280",
+// The classes of each field in rank order, and one palette for both: the
+// first class of either field is the strongest.
+export const CLASSES = {
+  category: ["primary", "secondary", "tertiary", "international", "unknown"],
+  tier: ["local", "regional", "national", "international", "unknown"],
 };
+const CLASS_COLORS = ["#16a34a", "#2563eb", "#9333ea", "#dc2626", "#6b7280"];
+const CLASS_SHORT = { category: ["P", "S", "T", "I", "?"], tier: ["L", "R", "N", "I", "?"] };
 
-// The colour expression for a served-place outline: the tier the slice
-// carries for the selected feed.
-export function tierColorExpression() {
-  return ["match", ["get", "tier"], ...Object.entries(TIER_COLORS).flat(), TIER_COLORS.unknown];
+export function classColors(field = "tier") {
+  return Object.fromEntries(CLASSES[field].map((name, i) => [name, CLASS_COLORS[i]]));
 }
 
-export function legendHtml() {
-  return Object.entries(TIER_COLORS)
-    .map(([tier, color]) => `<span class="swatch" style="background:${color}"></span>${tier}`)
+// The colour expression for a class the slice carries: the place's own class
+// under the level and spec, or the tier of the selected feed's outline.
+export function classColorExpression(field = "tier") {
+  return ["match", ["get", field], ...Object.entries(classColors(field)).flat(), CLASS_COLORS[4]];
+}
+
+// A served place in its class colour, an unserved one in its kind colour.
+export function fillColorExpression(field = "tier") {
+  return ["case", ["to-boolean", ["get", "served"]], classColorExpression(field), KIND_MATCH];
+}
+
+export function legendHtml(field = "tier") {
+  return Object.entries(classColors(field))
+    .map(([name, color]) => `<span class="swatch" style="background:${color}"></span>${name}`)
     .join(" ");
 }
 
@@ -344,18 +393,20 @@ export const FEED_COLUMNS = [
   ["name", "Feed"],
   ["spec", "Spec"],
   ["source", "Source"],
+  ["home_country", "Home"],
+  ["scope", "Scope"],
   ["stop_count", "Stops"],
   ["crawl_status", "Crawl"],
   ["places_served", "Places"],
-  ["tier_local", "L"],
-  ["tier_regional", "R"],
-  ["tier_national", "N"],
-  ["tier_international", "I"],
-  ["tier_unknown", "?"],
 ];
 
-export function feedRowHtml(row) {
-  const cells = FEED_COLUMNS.map(([column]) => {
+// The feed table's columns end with the edge counts per class of ``field``.
+export function feedColumns(field = "tier") {
+  return [...FEED_COLUMNS, ...CLASSES[field].map((name, i) => [`${field}_${name}`, CLASS_SHORT[field][i]])];
+}
+
+export function feedRowHtml(row, columns = FEED_COLUMNS) {
+  const cells = columns.map(([column]) => {
     const value = column === "name" ? (row.name ?? row.feed_id) : row[column];
     return typeof value === "number" ? formatStat(value) : escapeHtml(value ?? DASH);
   });
@@ -363,25 +414,29 @@ export function feedRowHtml(row) {
 }
 
 // One edge row seen from a place (the feed side) or from a feed (the place side).
-export function edgeRowHtml(row, side) {
+export function edgeRowHtml(row, side, field = "tier") {
   const other = side === "place" ? (row.feed_name ?? row.feed_id) : `${row.place_name ?? row.place_id} (${row.kind ?? DASH})`;
   const confidence = row.tier_confidence == null ? DASH : row.tier_confidence.toFixed(2);
+  const flags = [row.cross_border ? "cross-border" : null, row.needs_review ? "review" : null].filter(Boolean);
   return (
-    `<tr><td>${escapeHtml(other)}</td><td>${escapeHtml(row.tier ?? DASH)}</td>` +
+    `<tr><td>${escapeHtml(other)}</td><td>${escapeHtml(edgeClass(row, field))}</td>` +
+    `<td>${row.relevance == null ? DASH : row.relevance.toFixed(2)}</td>` +
     `<td>${confidence}</td><td>${escapeHtml(row.method ?? DASH)}</td>` +
-    `<td>${row.needs_review ? "review" : ""}</td></tr>`
+    `<td>${flags.join(" · ")}</td></tr>`
   );
 }
+export const EDGE_HEADERS = "<th>Class</th><th>Rel.</th><th>Conf.</th><th>Method</th><th></th>";
 
 export function feedDetailsHtml(record) {
   const p = record.properties;
-  const tiers = Object.entries(p.tiers || {})
+  const tiers = Object.entries(p.categories || p.tiers || {})
     .filter(([, n]) => n)
-    .map(([tier, n]) => `${escapeHtml(n)} ${escapeHtml(tier)}`)
+    .map(([name, n]) => `${escapeHtml(n)} ${escapeHtml(name)}`)
     .join(", ");
   return (
     `<p class="chain"><strong>${escapeHtml(p.name ?? p.feed_id)}</strong></p>` +
-    `<p><small>${escapeHtml(p.spec ?? DASH)} · ${escapeHtml(p.source ?? DASH)} · ${escapeHtml(p.feed_id)}</small></p>` +
+    `<p><small>${escapeHtml(p.spec ?? DASH)} · ${escapeHtml(p.source ?? DASH)} · ${escapeHtml(p.feed_id)}` +
+    `${p.home_country ? ` · home ${escapeHtml(p.home_country)}` : ""}${p.scope ? ` · ${escapeHtml(p.scope)}` : ""}</small></p>` +
     `<p>${escapeHtml(p.places_served)} place${p.places_served === 1 ? "" : "s"} served${tiers ? ` (${tiers})` : ""}` +
     `${p.stop_count == null ? "" : ` · ${formatStat(p.stop_count)} stops`}` +
     `${record.geometry ? "" : " · no coverage hull"}</p>` +
@@ -404,8 +459,8 @@ export function kindOptionsHtml(byKind) {
 }
 
 // The slice that outlines a feed's served places within the padded viewport.
-export function feedSliceParams(feedId, zoom, bounds) {
-  return { zoom, kind: "all", feed_id: feedId, bbox: bboxParam(paddedBounds(bounds)) };
+export function feedSliceParams(feedId, zoom, bounds, view = INITIAL_VIEW) {
+  return { zoom, kind: "all", feed_id: feedId, bbox: bboxParam(paddedBounds(bounds)), ...viewParams(view) };
 }
 
 const OSM_STYLE = {
@@ -422,13 +477,10 @@ const OSM_STYLE = {
 };
 const EMPTY = { type: "FeatureCollection", features: [] };
 const FILL_PAINT = {
-  "fill-color": ["match", ["get", "kind"], ...Object.entries(KIND_COLORS).flat(), "#999"],
+  "fill-color": fillColorExpression(),
   "fill-opacity": ["case", ["get", "served"], 0.45, 0.12],
 };
-const LINE_PAINT = {
-  "line-color": ["match", ["get", "kind"], ...Object.entries(KIND_COLORS).flat(), "#999"],
-  "line-width": 1,
-};
+const LINE_PAINT = { "line-color": KIND_MATCH, "line-width": 1 };
 
 async function fetchJson(url) {
   const response = await fetch(url);
@@ -467,6 +519,10 @@ async function main() {
   const edgesHead = document.querySelector("#edges-table thead tr");
   const edgesBody = document.querySelector("#edges-table tbody");
   const treeSection = document.getElementById("tree");
+  const levelSelect = document.getElementById("level");
+  const specSelect = document.getElementById("spec");
+  let view = { ...INITIAL_VIEW }; // the level and spec every request carries
+  let classField = "tier"; // the build's class field, from its summary
   let selectedId = null; // the selected place, marked in the tree
   let selectedRecord = null; // `{ record, mine }`: revealed once the tree has loaded
   let pendingScroll = null; // the tree item to scroll to when the Tree tab is next shown
@@ -521,7 +577,7 @@ async function main() {
   // fits the map to it; the fit's moveend then requests the viewport slice.
   async function refresh(build, gen, fit) {
     const mine = ++sequence;
-    const params = fit ? overviewParams(map.getZoom()) : sliceParams(map.getZoom(), boundsOf());
+    const params = fit ? overviewParams(map.getZoom(), view) : sliceParams(map.getZoom(), boundsOf(), view);
     let slice;
     try {
       slice = await fetchSlice(placesUrl(build, params));
@@ -615,6 +671,9 @@ async function main() {
     if (gen !== generation) return;
     snapshot = summary.snapshot_id;
     stats.textContent = summaryLabel(summary);
+    classField = summary.category_field ?? "tier";
+    legend.innerHTML = legendHtml(classField);
+    map.setPaintProperty("places-fill", "fill-color", fillColorExpression(classField));
     tableKind.innerHTML = kindOptionsHtml((summary.counts || {}).places_by_kind);
     loadTable().catch(console.error);
     loadTree().catch(console.error);
@@ -691,9 +750,9 @@ async function main() {
     selectedId = record.properties.place_id;
     loadEdges({ place_id: id }, record.properties.name, mine).catch(console.error);
     selectedRecord = { record, mine }; // with the sequence it was accepted under
-    details.innerHTML = detailsHtml(record);
+    details.innerHTML = detailsHtml(record, classField);
     revealInTree(record, mine).catch(console.error);
-    if (fromPopup && popup === fromPopup && popup.isOpen()) popup.setHTML(detailsHtml(record));
+    if (fromPopup && popup === fromPopup && popup.isOpen()) popup.setHTML(detailsHtml(record, classField));
     showTab("details");
     map.getSource("selected").setData(record);
     map.getSource("ancestors").setData(EMPTY); // the old chain goes with the old selection
@@ -722,10 +781,11 @@ async function main() {
     const build = current;
     const gen = generation;
     const mine = ++tableSequence;
-    tableHead.innerHTML = headerHtml(table);
+    const columns = tableColumns(classField);
+    tableHead.innerHTML = headerHtml(table, columns);
     let page;
     try {
-      page = await fetchSlice(tableUrl(build, table));
+      page = await fetchSlice(tableUrl(build, table, view));
     } catch (error) {
       if (gen === generation && mine === tableSequence) showHint(String(error));
       return;
@@ -736,7 +796,7 @@ async function main() {
       return;
     }
     page = page.data;
-    tableBody.innerHTML = page.rows.map(rowHtml).join("");
+    tableBody.innerHTML = page.rows.map((row) => rowHtml(row, columns)).join("");
     const last = page.offset + page.rows.length;
     tableCount.textContent = `${page.total ? page.offset + 1 : 0}–${last} of ${page.total}`;
     tablePrev.disabled = page.offset === 0;
@@ -885,6 +945,7 @@ async function main() {
   // --- the Feeds tab: the whole table, sorted and filtered here; a feed's
   // hull and, within the viewport, the places it serves in tier colours
   let feedRows = [];
+  let feedSequence = 0; // bumped on every feeds request: only the newest lands
   let feedSort = { sort: "name", order: "asc" };
   let feedQuery = "";
   let selectedFeed = null;
@@ -912,9 +973,10 @@ async function main() {
   };
 
   function renderFeeds() {
-    feedsHead.innerHTML = headerHtml(feedSort, FEED_COLUMNS);
+    const columns = feedColumns(classField);
+    feedsHead.innerHTML = headerHtml(feedSort, columns);
     const rows = sortRows(feedFilter(feedRows, feedQuery), feedSort.sort, feedSort.order);
-    feedsBody.innerHTML = rows.map(feedRowHtml).join("");
+    feedsBody.innerHTML = rows.map((row) => feedRowHtml(row, columns)).join("");
     for (const row of feedsBody.querySelectorAll("tr")) {
       row.toggleAttribute("aria-selected", row.dataset.id === selectedFeed);
     }
@@ -923,14 +985,16 @@ async function main() {
   async function loadFeeds() {
     const build = current;
     const gen = generation;
+    const mine = ++feedSequence;
     let reply;
     try {
-      reply = await fetchSlice(`/api/builds/${encodeURIComponent(build)}/feeds`);
+      const params = new URLSearchParams(viewParams(view));
+      reply = await fetchSlice(`/api/builds/${encodeURIComponent(build)}/feeds?${params}`);
     } catch (error) {
-      if (gen === generation) showHint(String(error));
+      if (gen === generation && mine === feedSequence) showHint(String(error));
       return;
     }
-    if (gen !== generation) return;
+    if (gen !== generation || mine !== feedSequence) return;
     if (reply.snapshot !== snapshot) {
       startLoad(build); // ``latest`` was republished: one snapshot for all
       return;
@@ -955,7 +1019,7 @@ async function main() {
       gen === generation && mine === servedSequence && selectedFeed === feed && selectionSequence === token;
     let slice;
     try {
-      slice = await fetchSlice(placesUrl(build, feedSliceParams(feed, map.getZoom(), boundsOf())));
+      slice = await fetchSlice(placesUrl(build, feedSliceParams(feed, map.getZoom(), boundsOf(), view)));
     } catch (error) {
       if (wanted()) {
         map.getSource("served").setData(EMPTY);
@@ -982,7 +1046,7 @@ async function main() {
     const build = current;
     const gen = generation;
     const wanted = () => gen === generation && mine === selectionSequence;
-    const params = new URLSearchParams(scope);
+    const params = new URLSearchParams({ ...scope, ...viewParams(view) });
     let reply;
     try {
       reply = await fetchSlice(`/api/builds/${encodeURIComponent(build)}/edges?${params}`);
@@ -999,8 +1063,8 @@ async function main() {
     const side = "place_id" in scope ? "place" : "feed";
     const shown = rows.truncated ? ` (first ${rows.rows.length} shown)` : "";
     edgesTitle.textContent = `${title}: ${rows.total} edge${rows.total === 1 ? "" : "s"}${shown}`;
-    edgesHead.innerHTML = `<th>${side === "place" ? "Feed" : "Place"}</th><th>Tier</th><th>Conf.</th><th>Method</th><th></th>`;
-    edgesBody.innerHTML = rows.rows.map((row) => edgeRowHtml(row, side)).join("");
+    edgesHead.innerHTML = `<th>${side === "place" ? "Feed" : "Place"}</th>${EDGE_HEADERS}`;
+    edgesBody.innerHTML = rows.rows.map((row) => edgeRowHtml(row, side, classField)).join("");
   }
 
   const clearFeedSelection = () => {
@@ -1090,6 +1154,28 @@ async function main() {
   });
   legend.innerHTML = legendHtml();
 
+  // A new level or spec: every view of the build follows — the map slice and
+  // the served outline, the tables, and the edges of what is selected.
+  const changeView = () => {
+    view = { level: levelSelect.value, spec: specSelect.value };
+    if (!current) return;
+    // While a build fit is in flight its own moveend requests the viewport
+    // slice, and reads the view then.
+    if (!fitting) refresh(current, generation, false).catch(console.error);
+    table = { ...table, offset: 0 }; // another result set: back to its first page
+    loadTable().catch(console.error);
+    loadFeeds().catch(console.error);
+    refreshServed().catch(console.error);
+    if (selectedFeed) {
+      loadEdges({ feed_id: selectedFeed }, selectedFeed, selectionSequence).catch(console.error);
+    } else if (selectedRecord && selectedRecord.mine === selectionSequence) {
+      const { record } = selectedRecord;
+      loadEdges({ place_id: record.properties.place_id }, record.properties.name, selectionSequence).catch(console.error);
+    }
+  };
+  levelSelect.addEventListener("change", changeView);
+  specSelect.addEventListener("change", changeView);
+
   map.on("load", () => {
     map.addSource("places", { type: "geojson", data: EMPTY });
     map.addLayer({ id: "places-fill", type: "fill", source: "places", paint: FILL_PAINT });
@@ -1105,7 +1191,7 @@ async function main() {
     map.addLayer({ id: "hull-fill", type: "fill", source: "hull", paint: { "fill-color": "#0d9488", "fill-opacity": 0.12 } });
     map.addLayer({ id: "hull-line", type: "line", source: "hull", paint: { "line-color": "#0d9488", "line-width": 2 } });
     map.addSource("served", { type: "geojson", data: EMPTY });
-    map.addLayer({ id: "served-line", type: "line", source: "served", paint: { "line-color": tierColorExpression(), "line-width": 2 } });
+    map.addLayer({ id: "served-line", type: "line", source: "served", paint: { "line-color": classColorExpression("tier"), "line-width": 2 } });
     map.addSource("selected", { type: "geojson", data: EMPTY });
     map.addLayer({ id: "selected-line", type: "line", source: "selected", paint: { "line-color": "#111", "line-width": 2.5 } });
     map.on("mousemove", "places-fill", (event) => {
