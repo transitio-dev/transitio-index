@@ -274,6 +274,7 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
                 "snapshot_id": "abc",
                 "schema_version": 7,
                 "classifier": {"rules_version": 1},
+                "stop_artefacts": {"border_stops": 1},
                 "built_at": "2026-09-12T00:00:00+00:00",
                 "generations": generations,
             }
@@ -297,6 +298,7 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
     assert summary["build"]["snapshot_id"] == "abc"
     assert summary["build"]["schema_version"] == 7
     assert summary["build"]["classifier"] == {"rules_version": 1}
+    assert summary["build"]["stop_artefacts"] == {"border_stops": 1}
     assert summary["build"]["catalogue_rows"] == {"mdb": 4, "atlas": 2, "gbfs": 2}
     assert summary["build"]["catalogue_dates"]["mdb"] == "2026-09-01"
     # Every ingest read a local file: a cut sample, not the full catalogues.

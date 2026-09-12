@@ -7,8 +7,13 @@ much service that is. For every crawled feed with complete
 ``stop_times.txt`` the stage rebuilds each route's geography from the crawl —
 its stops, span (greatest distance between any two stops), median inter-stop
 distance and the countries its stops fall in — and runs the plan's decision
-table over it, first match wins, with the margin penalty for a route decided
-within 20 % of a threshold. A route serves a place when enough of its stops lie
+table over it, with the margin penalty for a route decided within 20 % of a
+threshold. A route is ``international`` only past the border gate — at least
+``BORDER_STOPS`` and ``BORDER_SHARE`` of its located stops outside its majority
+country — so one stop across a simplified boundary decides nothing; every
+decision records the route's scale, and each feed counts the boundary
+artefacts among its stops (in several countries, in none, on a route's
+minority side). A route serves a place when enough of its stops lie
 inside it; a feed then gets one edge per ``(place, tier)`` for which a serving
 route classifies to that tier, its ``tier_confidence`` the stop-share-weighted
 mean of those routes. A feed that skipped ``stop_times.txt`` under the crawl
@@ -81,6 +86,11 @@ HOME_SHARE = 0.80
 # multiplied by the penalty.
 MARGIN = 0.20
 MARGIN_PENALTY = 0.7
+# A route crosses a border when the stops outside its majority country are at
+# least this share of its located stops and at least this many: one stop on
+# the wrong side of a simplified boundary decides nothing.
+BORDER_SHARE = 0.10
+BORDER_STOPS = 2
 
 RAIL_SPAN_KM = 150.0
 WATER_SPAN_KM = 50.0
@@ -101,8 +111,9 @@ PATTERN_SAMPLE = 8
 # signal feeds a rule changes, so two snapshots' tiers can be told apart from
 # their manifests alone. 1 was the table shipped in schemas 6–9; 2 decides
 # extended types by family, covers basic types 5–7, 11 and 12, and marks air,
-# taxi and miscellaneous services unclassifiable (rule 10).
-RULES_VERSION = 2
+# taxi and miscellaneous services unclassifiable (rule 10); 3 gates rule 1 on
+# the border share and records every route's scale.
+RULES_VERSION = 3
 
 EARTH_RADIUS_KM = 6371.0088
 
@@ -118,6 +129,8 @@ def classifier_settings(route_min_stops=ROUTE_MIN_STOPS):
         "home_share": HOME_SHARE,
         "margin": MARGIN,
         "margin_penalty": MARGIN_PENALTY,
+        "border_share": BORDER_SHARE,
+        "border_stops": BORDER_STOPS,
         "rail_span_km": RAIL_SPAN_KM,
         "water_span_km": WATER_SPAN_KM,
         "bus_local_median_km": BUS_LOCAL_MEDIAN_KM,
@@ -184,9 +197,26 @@ _LOCAL_FAMILIES = (4, 5, 6, 7, 8, 9, 13, 14)
 _WATER_FAMILIES = (10, 12)
 
 
+def _border(countries):
+    """``(majority, minority)`` over ``{code: stop ids}``: the code holding the
+    most stops (ties by code) and the distinct stops absent from it. A stop
+    resolving to the majority country and a neighbour is not a minority stop."""
+    majority = min(countries, key=lambda code: (-len(countries[code]), code))
+    minority = set().union(*countries.values()) - countries[majority]
+    return majority, minority
+
+
 def classify_route(route_type, countries, span_km, median_km):
-    """The decision table, first match wins; ``{tier, tier_confidence, rule,
-    margin}``.
+    """The decision table; ``{tier, tier_confidence, rule, margin, scale_tier,
+    scale_rule, border_stops}``.
+
+    The scale decision — the type rules over the route's own geometry — is
+    always taken and recorded as ``scale_tier`` and ``scale_rule``. Rule 1
+    then overrides it with ``international`` when ``countries`` (each code's
+    located stop ids on the route, or None) puts at least ``BORDER_STOPS``
+    and ``BORDER_SHARE`` of the distinct located stops outside the majority
+    country; below that gate the scale decision stands and ``border_stops``
+    counts the minority stops per country.
 
     A rule whose signal is missing (``None``) is skipped rather than decided;
     rules 6–8 are guarded on both bus signals being known, so an unmeasured
@@ -195,8 +225,32 @@ def classify_route(route_type, countries, span_km, median_km):
     Air, taxi and miscellaneous services are out of scope by design (rule 10),
     unlike a type the table does not know (rule 9).
     """
-    if countries is not None and len(countries) >= 2:
-        return _decide("international", 0.95, 1)
+    decision = _scale(route_type, span_km, median_km)
+    decision.update(
+        scale_tier=decision["tier"], scale_rule=decision["rule"], border_stops={}
+    )
+    if not countries:
+        return decision
+    majority, minority = _border(countries)
+    total = len(minority) + len(countries[majority])
+    if len(minority) >= BORDER_STOPS and len(minority) >= BORDER_SHARE * total:
+        return {
+            **_decide("international", 0.95, 1),
+            "scale_tier": decision["tier"],
+            "scale_rule": decision["rule"],
+            "border_stops": {},
+        }
+    held = countries[majority]
+    decision["border_stops"] = {
+        code: len(stops - held)
+        for code, stops in sorted(countries.items())
+        if code != majority and stops - held
+    }
+    return decision
+
+
+def _scale(route_type, span_km, median_km):
+    """The scale decision: rules 2–10 over the route's type and geometry."""
     if route_type is not None and route_type >= 100:
         family = route_type // 100
         if family in _RAIL_FAMILIES:
@@ -731,6 +785,29 @@ def _country_evidence(stop_ids, stop_countries, basis):
     return counts, basis if counts else None
 
 
+def _country_sets(stop_ids, stop_countries):
+    """``{code: frozenset(stop ids)}`` over ``stop_ids`` — the shape rule 1
+    judges — or None when no stop resolved to a country."""
+    sets = collections.defaultdict(set)
+    for stop_id in stop_ids:
+        for code in stop_countries.get(stop_id, ()):
+            sets[code].add(stop_id)
+    return {code: frozenset(ids) for code, ids in sets.items()} or None
+
+
+def _stop_artefacts(stop_countries, border=0):
+    """The boundary artefacts among a feed's located stops: stops resolving to
+    several countries (an overlap sliver), to none (a gap), and the distinct
+    stops that were minority stops of a route (``border``)."""
+    return {
+        "stops_in_several_countries": sum(
+            1 for c in stop_countries.values() if len(c) > 1
+        ),
+        "stops_without_country": sum(1 for c in stop_countries.values() if not c),
+        "border_stops": border,
+    }
+
+
 def declared_countries(feed):
     """The country codes the catalogues claim for ``feed`` — MDB
     ``location.country_code``, GBFS ``country_code``; Atlas records carry
@@ -815,7 +892,16 @@ def _tier_edges(
         spans = [i["span_km"] for i in items if i["span_km"] is not None]
         types = {i["route_type"] for i in items if i["route_type"] is not None}
         near = any(item["decision"]["margin"] for item in items)
+        # The scale behind the tier (equal to it unless rule 1 overrode it),
+        # and the stops the contributing routes had outside their majority
+        # country, below the border gate.
+        scales = {i["decision"].get("scale_tier", i["decision"]["tier"]) for i in items}
+        border = collections.Counter()
+        for item in items:
+            border.update(item["decision"].get("border_stops") or {})
         evidence = dict(candidate.get("evidence") or {})
+        if border:
+            evidence["border_stops"] = dict(sorted(border.items()))
         evidence.update(
             {
                 "matched_route_types": sorted(t for t in types if t < 100),
@@ -824,6 +910,7 @@ def _tier_edges(
                 "spread_km": max(spans) if spans else None,
                 "serving_routes": len(items),
                 "rules": sorted({item["decision"]["rule"] for item in items}),
+                "scale_tiers": sorted(scales),
                 "route_min_stops": route_min_stops,
                 "review_cutoff": REVIEW_CUTOFF,
                 "near_threshold": near,
@@ -929,6 +1016,7 @@ def _classify_feed(
             None,
             {},
             None,
+            _stop_artefacts({}),
         )
     coords = parsed["coords"]
     routes = parsed["routes"]
@@ -962,6 +1050,7 @@ def _classify_feed(
                 0,
                 None,
                 *_country_evidence(coords, stop_countries, "located"),
+                _stop_artefacts(stop_countries),
             )
         # The crawl's skip rested on single-tier, single-country, single-city
         # conditions judged against the boundary memo of ITS time; judge the
@@ -973,6 +1062,10 @@ def _classify_feed(
             parsed["stops_dropped"],
             lookup,
         )
+        # The feed as one route: its minority stops are counted whether the
+        # skip still holds or a foreign stop is what broke it.
+        feed_countries = _country_sets(coords, stop_countries)
+        border = len(_border(feed_countries)[1]) if feed_countries else 0
         if not still_skipped:
             return (
                 [
@@ -985,10 +1078,8 @@ def _classify_feed(
                 None,
                 {},
                 None,
+                _stop_artefacts(stop_countries, border),
             )
-        feed_countries = (
-            set().union(*stop_countries.values()) if stop_countries else set()
-        )
         contributing = [
             {
                 "decision": classify_route(route_type, feed_countries, None, None),
@@ -1033,6 +1124,7 @@ def _classify_feed(
             0,
             None,
             *_country_evidence(coords, stop_countries, "located"),
+            _stop_artefacts(stop_countries, border),
         )
 
     if mode != "complete":
@@ -1047,6 +1139,7 @@ def _classify_feed(
             None,
             {},
             None,
+            _stop_artefacts(stop_countries),
         )
 
     if not routes or not parsed["scheduled"]:
@@ -1062,20 +1155,23 @@ def _classify_feed(
             0,
             parsed.get("join_gaps"),
             *_country_evidence(coords, stop_countries, "located"),
+            _stop_artefacts(stop_countries),
         )
 
     # Per-route measurement, then service to each candidate place.
     measured = {}
+    minority_stops = set()
     for route_id, info in routes.items():
         route_type = info["route_type"]
         stop_ids = parsed["stops"].get(route_id, set())
         span, median, count = _route_geography(
             stop_ids, parsed["sequences"].get(route_id, []), coords
         )
-        countries = set()
+        countries = _country_sets(stop_ids, stop_countries)
+        if countries:
+            minority_stops |= _border(countries)[1]
         place_stops = collections.defaultdict(set)
         for stop_id in stop_ids:
-            countries.update(stop_countries.get(stop_id, ()))
             for hit in stop_places.get(stop_id, ()):
                 place_stops[hit].add(stop_id)
         measured[route_id] = {
@@ -1140,6 +1236,7 @@ def _classify_feed(
         dropped,
         parsed.get("join_gaps"),
         *_country_evidence(parsed["scheduled"], stop_countries, "scheduled"),
+        _stop_artefacts(stop_countries, len(minority_stops)),
     )
 
 
@@ -1534,6 +1631,7 @@ def classify(
             stale_skips = []
             country_stops = {}
             country_basis = {}
+            artefacts = {}
             spans = {}
             for feed_id in progress(sorted(by_feed), "classify"):
                 feed_candidates = by_feed[feed_id]
@@ -1543,7 +1641,7 @@ def classify(
                     # span the feed record carries.
                     calendar = _calendar(feed_dir, state)
                     spans[feed_id] = _service_span(calendar)
-                    classified, status, routes, dropped, gaps, stops, basis = (
+                    classified, status, routes, dropped, gaps, stops, basis, marks = (
                         _classify_feed(
                             feed_candidates,
                             feed_dir,
@@ -1565,6 +1663,7 @@ def classify(
                         stale_skips.append(feed_id)
                     country_stops[feed_id] = stops
                     country_basis[feed_id] = basis
+                    artefacts[feed_id] = marks
                 else:
                     classified = [
                         _unknown_edge(c, "declared", route_min_stops)
@@ -1581,9 +1680,12 @@ def classify(
             scopes = collections.Counter()
             bases = collections.Counter()
             agreement = collections.Counter()
+            artefact_totals = collections.Counter()
             for feed in feeds:
                 stops = country_stops.get(feed["feed_id"], {})
                 basis = country_basis.get(feed["feed_id"])
+                marks = artefacts.get(feed["feed_id"]) or _stop_artefacts({})
+                artefact_totals.update(marks)
                 declared = declared_countries(feed)
                 shares, home, scope = feed_scope(stops, declared)
                 start, end = spans.get(feed["feed_id"], (None, None))
@@ -1595,6 +1697,9 @@ def classify(
                         # stops of declared trips (route-level), or null
                         # when they are empty.
                         "country_basis": basis,
+                        # Boundary artefacts among the located stops: in
+                        # several countries, in none, or a route's minority.
+                        **marks,
                         "country_shares": shares,
                         "home_country": home,
                         "declared_countries": declared,
@@ -1647,6 +1752,7 @@ def classify(
                 "home_share": HOME_SHARE,
                 "feeds_by_scope": dict(scopes),
                 "feeds_by_country_basis": dict(bases),
+                "stop_artefacts": {k: artefact_totals[k] for k in _stop_artefacts({})},
                 "home_country_agreement": dict(agreement),
                 "unknown_share": (by_tier["unknown"] / len(edges)) if edges else 0.0,
                 "needs_review": sum(1 for e in edges if e["needs_review"]),

@@ -435,6 +435,7 @@ def stats(cache_dir):
                 "schema_version": snapshot.get("schema_version"),
                 "overture_release": snapshot.get("overture_release"),
                 "classifier": snapshot.get("classifier"),
+                "stop_artefacts": snapshot.get("stop_artefacts"),
                 "sources": crosswalk.get("sources"),
                 "catalogue_dates": {
                     s: m.get("csv_label") or m.get("commit")

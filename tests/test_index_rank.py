@@ -144,6 +144,7 @@ def test_the_stage_ranks_the_curated_edges_and_is_the_final_edge_stage(tmp_path)
     assert 0.0 <= manifest["unknown_share"] < 1.0 and "edges_by_tier" in manifest
     assert manifest["classifier"] == classify.classifier_settings()
     assert manifest["edges_near_threshold"] == 0
+    assert manifest["stop_artefacts"]["border_stops"] == 0
     feeds, edges, read_manifest = classify.read_edges(cache)
     assert read_manifest["source"] == "rank" and len(edges) == manifest["edges"]
     assert {e["relevance_category"] for e in edges} >= {"primary", "tertiary"}

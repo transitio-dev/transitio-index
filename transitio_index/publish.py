@@ -1515,6 +1515,7 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             # The thresholds the tiers were decided by, and how many of the
             # shipped edges were decided within MARGIN of one of them.
             manifest["classifier"] = coverage.get("classifier")
+            manifest["stop_artefacts"] = coverage.get("stop_artefacts")
             if edges is not None:
                 from transitio_index import classify
 
