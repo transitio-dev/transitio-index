@@ -92,8 +92,11 @@ matching registry together.
 6. `expand` — add the places a feed's crawled stops actually fall in that the
    declared seed missed.
 7. `coverage` — derive the membership edges: which places each feed serves.
-8. `classify` — give each candidate edge a tier (the feed's service level for
-   that place).
+8. `classify` — give each candidate edge a tier. Tier is a property of routes,
+   surfaced per place: the edge carries the tier of the routes serving the
+   place, so a national coach stopping once in a town gives that town a
+   national edge, and the edge's `service` struct says how much service that
+   is.
 9. `curate` — apply the curated edge overrides on top of the classified edges.
 10. `prune` — drop the places that no kept edge needs.
 11. `license` — record each shipped feed's licence and lineage, and write the

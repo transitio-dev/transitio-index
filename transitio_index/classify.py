@@ -1,6 +1,9 @@
 """Stage 5: tier classification of the candidate edges.
 
-Tier is a property of routes. For every crawled feed with complete
+Tier is a property of routes, surfaced per place: a place's edge carries the
+tier of the routes serving it, so a national coach stopping once in a town
+gives that town a national edge, and the edge's ``service`` struct says how
+much service that is. For every crawled feed with complete
 ``stop_times.txt`` the stage rebuilds each route's geography from the crawl —
 its stops, span (greatest distance between any two stops), median inter-stop
 distance and the countries its stops fall in — and runs the plan's decision
