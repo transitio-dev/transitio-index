@@ -906,6 +906,10 @@ DEFINITIONS = {
         "Edges by tier and relevance category, and relevance quantiles, per "
         "country and per place kind."
     ),
+    "places": (
+        "The published places per kind, the share with a primary feed, feeds "
+        "per place and their departures per day (aggregated builds)."
+    ),
 }
 REPORT_SECTIONS = (
     "build",
@@ -1075,12 +1079,14 @@ def render_report(summary):
         f"schema {build.get('schema_version')}, Overture "
         f"{build.get('overture_release')}."
     )
-    for section in REPORT_SECTIONS:
+    extra = sorted(key for key in summary if key not in REPORT_SECTIONS)
+    for section in (*REPORT_SECTIONS, *extra):
         content = summary.get(section)
         if not content:
             continue
         lines += ["", f"## {section.replace('_', ' ').capitalize()}", ""]
-        lines += [DEFINITIONS[section], ""]
+        if section in DEFINITIONS:
+            lines += [DEFINITIONS[section], ""]
         scalars = [
             {"metric": k, "value": v}
             for k, v in content.items()

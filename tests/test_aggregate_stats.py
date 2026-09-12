@@ -150,8 +150,14 @@ def test_archives_are_merged_on_their_keys_and_the_summary_recomputed(tmp_path):
         "fi-a": {"tiers_by_kind": {"city": {"local": 1}}},
         "ee-b": {"tiers_by_kind": {"city": {"local": 1}}},
     }
+    assert summary["places"]["places"] == 2 and summary["places"]["with_primary"] == 2
+    assert summary["places"]["by_kind"] == {"city": 2}
     report = (out / "report.md").read_text()
     assert report.startswith("# Build statistics") and "## Availability" in report
+    assert "## Places" in report
+    # The output directory may not be one of the inputs.
+    with pytest.raises(SystemExit, match="is an input archive"):
+        agg.main([str(first), str(second), "--out-dir", str(first / "stats")])
 
 
 @pytest.mark.parametrize(
@@ -204,3 +210,10 @@ def test_mixed_snapshots_and_duplicate_labels_are_refused(tmp_path):
     same = _archive(tmp_path / "twin", "mixed", {**tables, "feeds": []})
     with pytest.raises(SystemExit, match="not unique"):
         agg.main([str(same), str(same / "stats"), "--out-dir", str(tmp_path / "o")])
+    # A summary without its per-build sections cannot be repeated.
+    summary_path = same / "stats" / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    del summary["distributions"]
+    summary_path.write_text(json.dumps(summary))
+    with pytest.raises(SystemExit, match="lacks the distributions"):
+        agg.main([str(same), "--out-dir", str(tmp_path / "o")])

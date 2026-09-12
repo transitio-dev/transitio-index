@@ -22,6 +22,7 @@ aggregate.
 """
 
 import argparse
+import collections
 import json
 import sys
 from pathlib import Path
@@ -45,18 +46,26 @@ PER_BUILD = ("duplicate_coverage", "distributions")
 def read_archive(path):
     """``(summary, {table: rows})`` of one archive's ``stats`` directory;
     every row must carry the summary's snapshot id, else the directory mixes
-    generations."""
+    generations, and the per-build sections must be there to repeat."""
     summary = json.loads((path / "summary.json").read_text(encoding="utf-8"))
-    snapshot = summary["build"].get("snapshot_id")
+    snapshot = summary.get("build", {}).get("snapshot_id")
+    if not snapshot:
+        raise SystemExit(f"{path}: summary.json names no snapshot")
+    for field in COMPATIBILITY:
+        if summary["build"].get(field) is None:
+            raise SystemExit(f"{path}: summary.json lacks {field}")
+    for section in PER_BUILD:
+        if not isinstance(summary.get(section), dict):
+            raise SystemExit(f"{path}: summary.json lacks the {section} section")
     tables = {
         table: pq.read_table(path / f"{table}.parquet").to_pylist() for table in TABLES
     }
     for table, rows in tables.items():
         found = {row.get("snapshot_id") for row in rows}
-        if found - {snapshot}:
+        if rows and found != {snapshot}:
             raise SystemExit(
-                f"{path / table}.parquet: rows of snapshot "
-                f"{sorted(found - {snapshot})} under a summary of {snapshot!r}"
+                f"{path / table}.parquet: rows of snapshot {sorted(map(str, found))} "
+                f"under a summary of {snapshot!r}"
             )
     return summary, tables
 
@@ -72,6 +81,30 @@ def check_compatible(summaries):
                     f"{label}: {field} {summary['build'].get(field)!r} differs from "
                     f"{first_label}'s {first.get(field)!r}"
                 )
+
+
+def place_section(rows):
+    """The place-level section from the deduplicated place rows: places per
+    kind, the share with a primary feed, and the feeds and departures they
+    carry."""
+    by_kind = collections.Counter(row["kind"] for row in rows)
+    departures = [
+        row["departures_per_day"]
+        for row in rows
+        if row.get("departures_per_day") is not None
+    ]
+    return {
+        "places": len(rows),
+        "by_kind": dict(by_kind),
+        "with_primary": sum(1 for row in rows if row.get("has_primary")),
+        "with_primary_share": (
+            sum(1 for row in rows if row.get("has_primary")) / len(rows)
+            if rows
+            else None
+        ),
+        "feeds_per_place": stats._quantiles([row.get("feeds") for row in rows]),
+        "departures_per_day": sum(departures) if departures else None,
+    }
 
 
 def merge(archives):
@@ -135,6 +168,7 @@ def aggregate(archives):
         "declared_places": stats.declared_places(rows["catalogue"]),
         "identity": stats.identity(rows["catalogue"], rows["feeds"]),
         **stats.feed_sections(rows["feeds"]),
+        "places": place_section(rows["places"]),
     }
     for section in PER_BUILD:
         summary[section] = {
@@ -164,11 +198,12 @@ def main(argv=None):
         "(default: cache/stats-aggregate)",
     )
     args = parser.parse_args(argv)
-    archives = []
+    archives, inputs = [], set()
     for path in args.archives:
         directory = path / "stats" if (path / "stats").is_dir() else path
         if not (directory / "summary.json").is_file():
             raise SystemExit(f"{path}: no stats artifacts")
+        inputs.add(directory.resolve())
         # The archive's label: its directory, or the parent of a stats/ path.
         label = (path.parent if path.name == "stats" else path).resolve().name
         if label in {existing for existing, _, _ in archives}:
@@ -176,6 +211,9 @@ def main(argv=None):
         summary, tables = read_archive(directory)
         archives.append((label, summary, tables))
     summary, report = aggregate(archives)
+    out_dir = args.out_dir.resolve()
+    if out_dir in inputs:
+        raise SystemExit(f"{args.out_dir}: the output directory is an input archive")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
