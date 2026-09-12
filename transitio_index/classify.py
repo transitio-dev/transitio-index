@@ -259,15 +259,19 @@ def _read_trips(opened, routes):
 
 
 def _read_calendar(calendar, calendar_dates):
-    """``(active_days, span_days)``: per service id, the number of dates it
-    runs over the feed's calendar span, and that span in days.
+    """``(active_days, span_days, service_span)``: per service id, the number
+    of dates it runs over the feed's calendar span, that span in days, and
+    the first and last date any service actually runs (None without one).
 
     Weekday flags apply over each service's own date range; ``calendar_dates``
     adds (type 1) or removes (type 2) single dates. The span is the whole
     calendar's extent, so a service running only on Sundays counts one day
     in seven. ``calendar`` may be None (a feed with only exceptions). Days
     are counted arithmetically — a legal row may span year 1 to 9999, and
-    walking it date by date would be millions of steps per service.
+    walking it date by date would be millions of steps per service. The
+    service span is effective: a window's end that the weekday flags or a
+    removal skip is walked past, so it is the first and last date with
+    service, not the declared bounds.
     """
     windows = {}
     if calendar is not None:
@@ -307,9 +311,21 @@ def _read_calendar(calendar, calendar_dates):
     for exceptions in added.values():
         dates.extend(exceptions)
     if not dates:
-        return {}, 0
+        return {}, 0, None
     first, last = min(dates), max(dates)
     span_days = (last - first).days + 1
+    running = []
+    for service_id in set(windows) | set(added):
+        gone = removed.get(service_id, set())
+        running.extend(d for d in added.get(service_id, ()) if d not in gone)
+        window = windows.get(service_id)
+        if window is not None:
+            running.extend(
+                d
+                for d in (_running(window, gone, 1), _running(window, gone, -1))
+                if d is not None
+            )
+    service_span = (min(running), max(running)) if running else None
     active_days = {}
     for service_id in set(windows) | set(added):
         window = windows.get(service_id)
@@ -325,7 +341,24 @@ def _read_calendar(calendar, calendar_dates):
             if date in extra or _in_window(window, date)
         )
         active_days[service_id] = count
-    return active_days, span_days
+    return active_days, span_days, service_span
+
+
+def _running(window, removed, step):
+    """The first (``step`` 1) or last (``-1``) date in ``window`` that runs:
+    a flagged weekday no exception removes. Walks from the window's edge,
+    stopping at the first such date, so the work is a week per removed
+    date at most; None when nothing in the window runs."""
+    start, end, flags = window
+    if not any(flags):
+        return None
+    date, edge = (start, end) if step > 0 else (end, start)
+    while True:
+        if flags[date.weekday()] and date not in removed:
+            return date
+        if date == edge:  # the far edge: no arithmetic past date.min or max
+            return None
+        date += datetime.timedelta(days=step)
 
 
 def _window_days(window):
@@ -513,10 +546,9 @@ def _route_geography(stop_ids, sequences, coords):
     return span, median, len(points)
 
 
-def _calendar_weights(feed_dir, state):
-    """``{service_id: share of calendar days it runs}`` from the crawled
-    calendar members, streamed under their digests; None when the feed has
-    neither file, so no departure count can be measured.
+def _calendar(feed_dir, state):
+    """:func:`_read_calendar` over the crawled calendar members, streamed
+    under their digests; None when the feed has neither file.
 
     A calendar member the state records but that fails verification is a
     state mismatch, raised like any other unverifiable member.
@@ -532,15 +564,31 @@ def _calendar_weights(feed_dir, state):
             if member is None:
                 raise ValueError(f"{name}: not the member the state recorded")
             opened[name] = member
-        active_days, span_days = _read_calendar(
+        return _read_calendar(
             opened.get("calendar.txt"), opened.get("calendar_dates.txt")
         )
-    if not span_days:
+
+
+def _calendar_weights(calendar):
+    """``{service_id: share of calendar days it runs}`` from a read
+    calendar; None without one or without a span, so no departure count
+    can be measured."""
+    if calendar is None or not calendar[1]:
         return None
+    active_days, span_days, _ = calendar
     return {service: days / span_days for service, days in active_days.items()}
 
 
-def _members(feed_dir, state, names):
+def _service_span(calendar):
+    """``(service_start, service_end)`` as ISO dates from a read calendar;
+    two Nones without one or without an effective service date."""
+    if calendar is None or calendar[2] is None:
+        return None, None
+    first, last = calendar[2]
+    return first.isoformat(), last.isoformat()
+
+
+def _members(feed_dir, state, names, calendar=None):
     """The digest-verified members parsed, or None on an unverifiable or
     unparsable member — one feed's problem, never the run's. Only data
     errors are caught; a programming defect surfaces."""
@@ -570,9 +618,9 @@ def _members(feed_dir, state, names):
                 trip_routes, trip_services, orphans = _read_trips(
                     opened, parsed["routes"]
                 )
-            # The calendar comes first so each stop-event is weighted as it
+            # The calendar's weights so each stop-event is weighted as it
             # streams by: one float per stop, never an event table.
-            weights = _calendar_weights(feed_dir, state)
+            weights = _calendar_weights(calendar)
             with crawl.verified_member(feed_dir, state, "stop_times.txt") as opened:
                 if opened is None:
                     return None
@@ -777,6 +825,7 @@ def _classify_feed(
     by_overture,
     route_min_stops,
     conflicts=frozenset(),
+    calendar=None,
 ):
     """The classified edges for one crawled feed; ``(edges, status, routes,
     dropped, join_gaps, country_stops)`` — ``dropped`` counting candidate
@@ -794,7 +843,7 @@ def _classify_feed(
     """
     mode = (state.get("stop_times") or {}).get("state")
     names = ("trips.txt",) if mode == "complete" else ()
-    parsed = _members(feed_dir, state, names)
+    parsed = _members(feed_dir, state, names, calendar)
     if parsed is None:
         return (
             [
@@ -1393,10 +1442,15 @@ def classify(
             join_gaps = collections.Counter()
             stale_skips = []
             country_stops = {}
+            spans = {}
             for feed_id in progress(sorted(by_feed), "classify"):
                 feed_candidates = by_feed[feed_id]
                 if sources.get(feed_id) == "crawl" and feed_id in crawled:
                     feed_dir, state = crawled[feed_id]
+                    # Read once: the weights for the stop-events, and the
+                    # span the feed record carries.
+                    calendar = _calendar(feed_dir, state)
+                    spans[feed_id] = _service_span(calendar)
                     classified, status, routes, dropped, gaps, stops = _classify_feed(
                         feed_candidates,
                         feed_dir,
@@ -1407,6 +1461,7 @@ def classify(
                         by_overture,
                         route_min_stops,
                         conflicts=conflicts,
+                        calendar=calendar,
                     )
                     routes_classified += routes
                     edges_dropped += dropped
@@ -1423,6 +1478,10 @@ def classify(
                     status = "declared"
                 statuses[status] += 1
                 edges.extend(classified)
+            # A crawled feed with no candidate place still carries its span.
+            for feed_id, (feed_dir, state) in crawled.items():
+                if feed_id not in spans and sources.get(feed_id) == "crawl":
+                    spans[feed_id] = _service_span(_calendar(feed_dir, state))
             edges.sort(key=lambda e: (e["place_id"], e["feed_id"], e["tier"]))
             scopes = collections.Counter()
             agreement = collections.Counter()
@@ -1430,6 +1489,7 @@ def classify(
                 stops = country_stops.get(feed["feed_id"], {})
                 declared = declared_countries(feed)
                 shares, home, scope = feed_scope(stops, declared)
+                start, end = spans.get(feed["feed_id"], (None, None))
                 feed.update(
                     {
                         "country_stops": stops,
@@ -1437,6 +1497,10 @@ def classify(
                         "home_country": home,
                         "declared_countries": declared,
                         "scope": scope,
+                        # The first and last date any of its services runs,
+                        # from the crawled calendar; null without one.
+                        "service_start": start,
+                        "service_end": end,
                     }
                 )
                 scopes[scope] += 1
@@ -1460,6 +1524,7 @@ def classify(
                 "stale_feed_overrides": coverage_manifest.get("stale_feed_overrides"),
                 "expanded_generation": expanded_manifest.get("generation"),
                 "feeds": len(feeds),
+                "feeds_dated": sum(1 for f in feeds if f.get("service_start")),
                 "feeds_by_status": dict(statuses),
                 "routes_classified": routes_classified,
                 "route_min_stops": route_min_stops,
