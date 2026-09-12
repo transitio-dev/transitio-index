@@ -19,8 +19,9 @@ generation's places with another's edges: a digest that does not match means
 the build is mid-publish, and it is reported unavailable rather than cached.
 A partitioned build's tables are joined into the frames the viewer reads
 (feeds with their ``partition``, places, edges with ``feed_partition`` on the
-links, and from schema 8 the realtime companions keyed by static feed). Per-country builds are written once and never rewritten; only
-``cache/index`` churns.
+links, and from schema 8 the realtime companions keyed by static feed).
+Per-country builds are written once and never rewritten; only ``cache/index``
+churns.
 
 The bounded map slices and the web app that serves them build on this
 loader; ``python scripts/index_viewer.py --cache cache`` runs the app.
