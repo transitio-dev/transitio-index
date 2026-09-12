@@ -86,7 +86,7 @@ ARCHIVE_FILE = "feed.zip"
 DOWNLOAD_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 
 
-def _feed_url(feed):
+def feed_url(feed):
     """The URL to crawl: the Atlas static feed, else the MDB direct download."""
     atlas = feed.get("atlas") or {}
     mdb = feed.get("mdb") or {}
@@ -620,7 +620,7 @@ def _extract_members(feed_dir, decide):
 def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
     """Crawl one feed; returns its log record (never raises)."""
     feed_id = feed["feed_id"]
-    url = _feed_url(feed)
+    url = feed_url(feed)
     record = {
         "feed_id": feed_id,
         "source": feed.get("source"),
@@ -846,7 +846,7 @@ def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup)
         return {
             "feed_id": feed["feed_id"],
             "source": feed.get("source"),
-            "url": _feed_url(feed),
+            "url": feed_url(feed),
             "directory": _dir_name(feed["feed_id"]),
             "method": "skipped",
             "bytes_fetched": 0,

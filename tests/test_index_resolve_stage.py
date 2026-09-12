@@ -67,15 +67,39 @@ def test_no_overrides_pass_feeds_through_as_crawlable(tmp_path):
     assert manifest["uncrawlable"] == 0
 
 
-def test_rt_and_gbfs_feeds_default_to_not_crawlable(tmp_path):
-    # Indexed but never fetched in v1; only static GTFS is crawled.
+def test_only_open_static_gtfs_defaults_to_crawlable(tmp_path):
+    # Realtime and GBFS are indexed but never fetched; a GTFS feed whose download
+    # URL needs a key is refused up front, judged by the record that supplies
+    # the URL (the Atlas static URL first, else the MDB download).
+    gated = {"requires_auth": True, "urls": {"direct_download": "https://x/a.zip"}}
+    open_atlas = {"requires_auth": False, "urls": {"static_current": "https://y/a.zip"}}
+    cases = [
+        (_feed("f-rt", spec="gtfs-rt"), False, None),
+        (_feed("f-bike", spec="gbfs"), False, None),
+        (dict(_feed("f-key"), mdb=gated), False, resolve.AUTH_REASON),
+        (dict(_feed("f-both"), atlas=open_atlas, mdb=gated), True, None),
+        (
+            dict(_feed("f-atlas"), atlas=dict(open_atlas, requires_auth=True)),
+            False,
+            resolve.AUTH_REASON,
+        ),
+        (_feed("f-open"), True, None),
+        # An upstream decision stands; an override's reason wins over the default.
+        (dict(_feed("f-forced"), mdb=gated, crawlable=True), True, None),
+        (dict(_feed("f-said"), mdb=gated), False, "closed"),
+    ]
     cache = tmp_path / "cache"
-    _crosswalk(cache, [_feed("f-rt", spec="gtfs-rt"), _feed("f-bike", spec="gbfs")])
-    resolve.resolve(cache, overrides_dir=None)
+    _crosswalk(cache, [feed for feed, _, _ in cases])
+    overrides_dir = _overrides_dir(
+        tmp_path, [{"feed": "f-said", "mark_uncrawlable": {"reason": "closed"}}]
+    )
+    resolve.resolve(cache, overrides_dir=overrides_dir)
     feeds, manifest = _resolved(cache)
-    assert feeds["f-rt"]["crawlable"] is False
-    assert feeds["f-bike"]["crawlable"] is False
-    assert manifest["uncrawlable"] == 2
+    for feed, crawlable, reason in cases:
+        assert feeds[feed["feed_id"]]["crawlable"] is crawlable, feed["feed_id"]
+        assert feeds[feed["feed_id"]]["uncrawlable_reason"] == reason, feed["feed_id"]
+    assert manifest["uncrawlable"] == 5
+    assert manifest["requires_auth"] == 3
 
 
 def test_set_identity_rewrites_the_named_fields(tmp_path):
