@@ -82,9 +82,16 @@ export function summaryLabel(summary) {
   const specs = Object.entries(summary.feeds_by_spec || {})
     .map(([spec, n]) => `${n} ${spec}`)
     .join(", ");
-  return `${counts.places ?? "?"} places · ${counts.feeds ?? "?"} feeds${specs ? ` (${specs})` : ""} · ${
+  const realtime = summary.realtime && summary.realtime.feeds ? ` · ${summary.realtime.feeds} realtime` : "";
+  return `${counts.places ?? "?"} places · ${counts.feeds ?? "?"} feeds${specs ? ` (${specs})` : ""}${realtime} · ${
     counts.edges ?? "?"
   } edges · ${summary.served_places ?? "?"} served`;
+}
+
+// From schema 8 the feeds table is GTFS only and the realtime companions
+// ride in their own table: the spec selector has nothing to choose.
+export function specSelectable(summary) {
+  return (summary.schema_version ?? 0) < 8;
 }
 
 export function collectionBounds(collection) {
@@ -419,6 +426,7 @@ export const FEED_COLUMNS = [
   ["stop_count", "Stops"],
   ["crawl_status", "Crawl"],
   ["places_served", "Places"],
+  ["realtime", "RT"],
 ];
 
 // The feed table's columns end with the edge counts per class of ``field``.
@@ -467,8 +475,28 @@ export function feedDetailsHtml(record) {
     `<p>${escapeHtml(p.places_served)} place${p.places_served === 1 ? "" : "s"} served${tiers ? ` (${tiers})` : ""}` +
     `${p.stop_count == null ? "" : ` · ${formatStat(p.stop_count)} stops`}` +
     `${record.geometry ? "" : " · no coverage hull"}</p>` +
-    `${p.crawl_status ? `<p>crawl: ${escapeHtml(p.crawl_status)}${p.last_crawled ? ` (${escapeHtml(String(p.last_crawled).slice(0, 10))})` : ""}</p>` : ""}`
+    `${p.crawl_status ? `<p>crawl: ${escapeHtml(p.crawl_status)}${p.last_crawled ? ` (${escapeHtml(String(p.last_crawled).slice(0, 10))})` : ""}</p>` : ""}` +
+    realtimeHtml(p.realtime)
   );
+}
+
+// A static feed's GTFS-RT companions: one line each with its entity types
+// and endpoints (links only for http(s) urls).
+export function realtimeHtml(companions) {
+  if (!Array.isArray(companions) || !companions.length) return "";
+  const items = companions.map((c) => {
+    const urls = Object.entries(c.urls || {}).map(([key, url]) =>
+      /^https?:\/\//.test(String(url))
+        ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(key)}</a>`
+        : escapeHtml(key),
+    );
+    const types = (c.entity_types || []).map(escapeHtml).join(", ");
+    return (
+      `<li><strong>${escapeHtml(c.name ?? c.feed_id)}</strong> <small>${escapeHtml(c.source ?? DASH)} · ` +
+      `${escapeHtml(c.static_link_method ?? DASH)}</small>${types ? ` · ${types}` : ""}${urls.length ? ` · ${urls.join(" ")}` : ""}</li>`
+    );
+  });
+  return `<p>realtime: ${companions.length} companion${companions.length === 1 ? "" : "s"}</p><ul class="realtime">${items.join("")}</ul>`;
 }
 
 // The kind filter's options from the build's own kinds (a build may carry
@@ -699,6 +727,11 @@ async function main() {
     snapshot = summary.snapshot_id;
     stats.textContent = summaryLabel(summary);
     classField = summary.category_field ?? "tier";
+    specSelect.parentElement.hidden = !specSelectable(summary);
+    if (specSelect.parentElement.hidden && view.spec !== "all") {
+      specSelect.value = "all";
+      view = { ...view, spec: "all" };
+    }
     paintClasses();
     tableKind.innerHTML = kindOptionsHtml((summary.counts || {}).places_by_kind);
     loadTable().catch(console.error);

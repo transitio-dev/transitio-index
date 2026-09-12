@@ -17,9 +17,9 @@ memory exactly once, hashed, and — for the parquet files — parsed from those
 same bytes, so a republish landing between two reads can never pair one
 generation's places with another's edges: a digest that does not match means
 the build is mid-publish, and it is reported unavailable rather than cached.
-A partitioned build's tables are joined into the three frames the viewer
-reads (feeds with their ``partition``, places, edges with ``feed_partition``
-on the links). Per-country builds are written once and never rewritten; only
+A partitioned build's tables are joined into the frames the viewer reads
+(feeds with their ``partition``, places, edges with ``feed_partition`` on the
+links, and from schema 8 the realtime companions keyed by static feed). Per-country builds are written once and never rewritten; only
 ``cache/index`` churns.
 
 The bounded map slices and the web app that serves them build on this
@@ -60,15 +60,36 @@ DIGEST_KEYS = {
 # under ``partitions`` in the snapshot with their rows and digest.
 PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 PARTITION_TABLES = ("feeds", "places", "edges")
-# The tables a partition kind may carry; a country partition any of the three.
-PARTITION_LAYOUT = {"international": {"feeds"}, "links": {"edges"}}
+# Schema 8 adds ``realtime``: the GTFS-RT companions of a partition's feeds,
+# keyed by ``static_feed_id``; optional, never under ``links``.
+REALTIME = "realtime"
+# The tables a partition kind may carry; a country partition any of them.
+PARTITION_LAYOUT = {"international": {"feeds", REALTIME}, "links": {"edges"}}
 LINKS = "links"
 # What a schema-7 build carries on top of the flat columns: the classify
 # stage's country fields and the rank stage's relevance.
 SCHEMA_7_COLUMNS = {
     "feeds.parquet": {"spec", "home_country", "scope", "declared_countries"},
     "edges.parquet": {"relevance_category", "relevance", "cross_border"},
+    "realtime.parquet": {
+        "feed_id",
+        "name",
+        "source",
+        "static_feed_id",
+        "static_link_method",
+        "entity_types",
+        "urls",
+    },
 }
+REALTIME_COLUMNS = (
+    "feed_id",
+    "name",
+    "source",
+    "static_link_method",
+    "entity_types",
+    "urls",
+    "partition",
+)
 LATEST = "latest"  # the id of the build at cache/index
 CACHED_BUILDS = 4  # verified builds kept in memory
 # What a published index carries and the viewer reads; a verified set of
@@ -219,6 +240,7 @@ FEED_RECORD_COLUMNS = (
     "home_country",
     "scope",
     "declared_countries",
+    "realtime_feed_ids",
     "partition",
 )
 
@@ -287,7 +309,7 @@ def snapshot_files(snapshot):
             return None
         if not isinstance(tables, dict) or not tables:
             return None
-        allowed = PARTITION_LAYOUT.get(partition, set(PARTITION_TABLES))
+        allowed = PARTITION_LAYOUT.get(partition, {*PARTITION_TABLES, REALTIME})
         for table, entry in tables.items():
             if table not in allowed or not isinstance(entry, dict):
                 return None
@@ -322,11 +344,11 @@ def _join_partitions(tables):
     """The three viewer frames of a partitioned build from its parquet
     tables by path: feeds with their ``partition``, places, and the domestic
     edges with the links (``feed_partition`` on the links, null elsewhere)."""
-    parts = {name: [] for name in PARTITION_TABLES}
+    parts = {name: [] for name in (*PARTITION_TABLES, REALTIME)}
     for path, table in tables.items():
         partition, _, file = path.partition("/")
         kind = file[: -len(".parquet")]
-        if kind == "feeds":
+        if kind in ("feeds", REALTIME):
             column = pa.array([partition] * len(table), pa.string())
             table = table.append_column("partition", column)
         elif kind == "edges" and "feed_partition" not in table.column_names:
@@ -337,6 +359,8 @@ def _join_partitions(tables):
     joined = {}
     for kind, found in parts.items():
         if not found:
+            if kind == REALTIME:
+                continue  # before schema 8, or a build with no companions
             return None  # a feeds-only build is not a build the viewer shows
         joined[f"{kind}.parquet"] = pa.concat_tables(found, promote_options="default")
     return joined
@@ -359,10 +383,10 @@ class Build:
         self.path = path
         self.snapshot = snapshot
         self.digests = digests
-        # One id for the whole verified snapshot: every file's digest, so a
-        # republish that changes only the edges still changes it.
+        # One id for the whole verified snapshot, metadata included: a
+        # republish that changes only the edges, or only a count, changes it.
         self.snapshot_id = hashlib.sha256(
-            "".join(f"{name}:{digests[name]}" for name in sorted(digests)).encode()
+            json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         places = tables["places.parquet"].to_pandas()
         self.geoms = shapely.from_wkb(places["geometry"].to_numpy())
@@ -372,6 +396,18 @@ class Build:
         self.places = places.drop(columns=["geometry"]).reset_index(drop=True)
         self.edges = tables["edges.parquet"].to_pandas().reset_index(drop=True)
         self.feeds = tables["feeds.parquet"].to_pandas().reset_index(drop=True)
+        realtime = tables.get("realtime.parquet")
+        self.realtime = (
+            realtime.to_pandas().reset_index(drop=True)
+            if realtime is not None
+            else pd.DataFrame(columns=list(REALTIME_COLUMNS) + ["static_feed_id"])
+        )
+        # The companions' endpoints parsed once, like ``service``: malformed
+        # JSON or a non-list entity_types makes the build unavailable.
+        self.realtime_urls = [_loads(v) for v in self.realtime["urls"].to_numpy()]
+        for types in self.realtime["entity_types"].to_numpy():
+            if not isinstance(types, (list, np.ndarray)):
+                raise TypeError("entity_types is not a list")
         self._row_of = pd.Series(
             np.arange(len(self.places)), index=self.places["place_id"].to_numpy()
         )
@@ -977,6 +1013,10 @@ def _feed_table(build, keep):
     table["places_served"] = (
         table["feed_id"].map(served).fillna(0).astype(int).to_numpy()
     )
+    companions = build.realtime.groupby("static_feed_id").size()
+    table["realtime"] = (
+        table["feed_id"].map(companions).fillna(0).astype(int).to_numpy()
+    )
     counted = [("tier", "tier", TIERS)]
     if build.ranked:
         counted.append(("category", "relevance_category", CATEGORIES))
@@ -1042,6 +1082,7 @@ def feed_record(build, feed_id):
     props["tiers"] = {tier: int(counts[f"tier_{tier}"]) for tier in TIERS}
     if build.ranked:
         props["categories"] = {c: int(counts[f"category_{c}"]) for c in CATEGORIES}
+    props["realtime"] = realtime_of(build, feed_id)
     served = build.edges[(build.edges["feed_id"] == feed_id).to_numpy()].merge(
         build.table[["place_id", "name", "kind"]], on="place_id", how="left"
     )
@@ -1063,6 +1104,17 @@ def feed_record(build, feed_id):
         json.dumps(props, ensure_ascii=False),
     )
     return body.encode("utf-8")
+
+
+def realtime_of(build, feed_id):
+    """The GTFS-RT companions of a static feed, as records with their
+    endpoints (``urls`` parsed) and entity types; empty before schema 8."""
+    positions = np.flatnonzero((build.realtime["static_feed_id"] == feed_id).to_numpy())
+    rows = build.realtime.iloc[positions][list(REALTIME_COLUMNS)]
+    records = [{k: _cell(v) for k, v in r.items()} for r in _json_ready(rows)]
+    for record, position in zip(records, positions):
+        record["urls"] = build.realtime_urls[position] or {}
+    return records
 
 
 def edges_of(build, place_id=None, feed_id=None, view=None):
@@ -1245,6 +1297,14 @@ def create_app(cache, size=CACHED_BUILDS):
             "snapshot_id": build.snapshot_id,
             "served_places": int(build.served.sum()),
             "category_field": build.class_column,
+            "realtime": {
+                "feeds": int(len(build.realtime)),
+                "linked": int(
+                    build.realtime["static_feed_id"]
+                    .isin(set(build.feeds["feed_id"]))
+                    .sum()
+                ),
+            },
             "edges_by_category": {
                 k: int(v) for k, v in build.classes.value_counts().items()
             },

@@ -28,6 +28,8 @@ import {
   placesUrl,
   popupHtml,
   reachColorExpression,
+  realtimeHtml,
+  specSelectable,
   revealPath,
   rowHtml,
   sliceParams,
@@ -85,6 +87,13 @@ test("labels name a build by id, date and count, and mark an incomplete one", ()
     summaryLabel({ counts: { places: 6, feeds: 3, edges: 3 }, served_places: 1, feeds_by_spec: { gtfs: 2, gbfs: 1 } }),
     "6 places · 3 feeds (2 gtfs, 1 gbfs) · 3 edges · 1 served",
   );
+  assert.equal(
+    summaryLabel({ counts: { places: 6, feeds: 3, edges: 3 }, served_places: 1, realtime: { feeds: 2, linked: 1 } }),
+    "6 places · 3 feeds · 2 realtime · 3 edges · 1 served",
+  );
+  // From schema 8 the feeds are GTFS only: nothing for the spec selector to do.
+  assert.equal(specSelectable({ schema_version: 7 }), true);
+  assert.equal(specSelectable({ schema_version: 8 }), false);
 });
 
 test("a collection's extent spans every geometry and is null when empty", () => {
@@ -277,10 +286,10 @@ test("feed rows sort by number or text with nulls last, and filter by name or id
 test("feed and edge rows render names, dashes and the review flag", () => {
   const feed = { feed_id: "f<1", name: null, spec: "gtfs", source: null, home_country: "FI", scope: "domestic", stop_count: 12, crawl_status: "ok", places_served: 3, tier_local: 2, tier_regional: 0, tier_national: 1, tier_international: 0, tier_unknown: 0 };
   const html = feedRowHtml(feed, feedColumns("tier"));
-  assert.match(html, /^<tr data-id="f&lt;1"><td>f&lt;1<\/td><td>gtfs<\/td><td>—<\/td><td>FI<\/td><td>domestic<\/td><td>—<\/td><td>12<\/td><td>ok<\/td><td>3<\/td><td>2<\/td><td>0<\/td><td>1<\/td>/);
+  assert.match(html, /^<tr data-id="f&lt;1"><td>f&lt;1<\/td><td>gtfs<\/td><td>—<\/td><td>FI<\/td><td>domestic<\/td><td>—<\/td><td>12<\/td><td>ok<\/td><td>3<\/td><td>—<\/td><td>2<\/td><td>0<\/td><td>1<\/td>/);
   // The count columns follow the field: categories on schema 7, tiers before.
   assert.deepEqual(feedColumns("category").slice(-5).map(([column]) => column), ["category_primary", "category_secondary", "category_tertiary", "category_international", "category_unknown"]);
-  assert.match(feedRowHtml({ ...feed, category_primary: 4 }, feedColumns("category")), /<td>3<\/td><td>4<\/td><td>—<\/td>/);
+  assert.match(feedRowHtml({ ...feed, realtime: 1, category_primary: 4 }, feedColumns("category")), /<td>3<\/td><td>1<\/td><td>4<\/td><td>—<\/td>/);
   // Hostile text in every textual field is escaped, none of it survives raw.
   const hostileFeed = { feed_id: "<f>", name: "<n>", spec: "<s>", source: "<o>", stop_count: 1, crawl_status: "<c>", places_served: 0, tier_local: 0, tier_regional: 0, tier_national: 0, tier_international: 0, tier_unknown: 0 };
   const hostileHtml = feedRowHtml(hostileFeed);
@@ -328,6 +337,16 @@ test("a feed's details, served-places slice and legend follow its tiers", () => 
   const rankedFeed = { geometry: null, properties: { ...record.properties, home_country: "FI", scope: "domestic", categories: { primary: 1, secondary: 0 } } };
   assert.match(feedDetailsHtml(rankedFeed), /1 place served \(1 primary\)/);
   assert.match(feedDetailsHtml(rankedFeed), /home FI · domestic<\/small>/);
+  // Realtime companions: entity types, and endpoints as links only when http(s).
+  const companions = [
+    { feed_id: "f-rt", name: "<RT>", source: "atlas", static_link_method: "declared", entity_types: ["trip_updates"], urls: { realtime_trip_updates: "https://rt/tu", odd: "javascript:alert(1)" } },
+  ];
+  const rt = realtimeHtml(companions);
+  assert.match(rt, /realtime: 1 companion<\/p>/);
+  assert.match(rt, /<strong>&lt;RT&gt;<\/strong> <small>atlas · declared<\/small> · trip_updates · <a href="https:\/\/rt\/tu"[^>]*>realtime_trip_updates<\/a> odd<\/li>/);
+  assert.doesNotMatch(rt, /javascript:/);
+  assert.equal(realtimeHtml([]), "");
+  assert.match(feedDetailsHtml({ ...rankedFeed, properties: { ...rankedFeed.properties, realtime: companions } }), /realtime: 1 companion/);
 });
 
 test("the kind filter lists the build's own kinds in tree order with counts", () => {
