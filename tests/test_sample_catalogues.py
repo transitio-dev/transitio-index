@@ -183,7 +183,7 @@ def test_a_blank_subdivision_is_refused_before_any_download(monkeypatch):
         sc.main(["--country", "US", "--subdivision", "  "])
 
 
-def test_atlas_limit_trims_to_matching_feeds_and_caps_the_total(tmp_path):
+def test_atlas_selection_keeps_only_matching_feeds_of_a_file(tmp_path):
     match_url = "https://match.example/gtfs.zip"
     also_url = "https://also.example/gtfs.zip"
     urls, hosts = {match_url, also_url}, set()
@@ -200,12 +200,52 @@ def test_atlas_limit_trims_to_matching_feeds_and_caps_the_total(tmp_path):
     }
     archive = tmp_path / "atlas.tar.gz"
     _archive(archive, [("r/feeds/dense.dmfr.json", dense)])
-    # Without a limit the whole feed-dense file is kept.
-    whole = sc._select_atlas(archive, urls, hosts)
-    assert sum(len(payload["feeds"]) for _, payload in whole) == 3
-    # With a limit only matching feeds survive, capped to the limit.
-    trimmed = sc._select_atlas(archive, urls, hosts, limit=1)
-    assert [f["id"] for _, payload in trimmed for f in payload["feeds"]] == ["f-match"]
+    # The file keeps its matching feeds only, never the others.
+    kept = sc._select_atlas(archive, urls, hosts)
+    assert [f["id"] for _, p in kept for f in p["feeds"]] == ["f-match", "f-also"]
+
+
+def test_exclude_drops_named_rows_and_refuses_an_unknown_id():
+    mdb = [{"id": "mdb-1090"}, {"id": "mdb-1"}]
+    gbfs = [{"System ID": "seville"}, {"System ID": "tartu"}]
+    kept_mdb, kept_gbfs = sc._drop_excluded(mdb, gbfs, {"mdb-1090", "tartu"})
+    assert [r["id"] for r in kept_mdb] == ["mdb-1"]
+    assert [r["System ID"] for r in kept_gbfs] == ["seville"]
+    with pytest.raises(SystemExit, match=r"--exclude \['mdb-9'\] matches no"):
+        sc._drop_excluded(mdb, gbfs, {"mdb-9"})
+    assert sc._drop_excluded(mdb, gbfs, set()) == (mdb, gbfs)
+
+
+def _mdb_row(row_id, south, north, west, east):
+    return {
+        "id": row_id,
+        "provider": "P",
+        "location.bounding_box.minimum_latitude": str(south),
+        "location.bounding_box.maximum_latitude": str(north),
+        "location.bounding_box.minimum_longitude": str(west),
+        "location.bounding_box.maximum_longitude": str(east),
+    }
+
+
+def test_foreign_bounding_boxes_are_flagged_with_the_exclude_that_drops_them():
+    rows = [
+        _mdb_row("mdb-1090", 47.3, 55.1, 5.9, 15.0),  # Germany, tagged FI
+        _mdb_row("mdb-fi", 60.0, 61.0, 24.0, 25.5),  # Helsinki
+        _mdb_row("mdb-wide", 40.0, 70.0, -10.0, 40.0),  # Europe-wide, touches FI
+        _mdb_row("mdb-cross", 60.0, 61.0, 170.0, -170.0),  # antimeridian, foreign
+        {"id": "mdb-nobox", "provider": "P"},  # no box: not judged
+    ]
+    err = io.StringIO()
+    flagged = sc._warn_foreign_boxes(rows, {"FI", "EE"}, out=err)
+    assert flagged == ["mdb-1090", "mdb-cross"]
+    assert "--exclude mdb-1090 drops it" in err.getvalue()
+    # A crossing box is judged on both of its longitude ranges (Aleutians, US).
+    aleutians = {"min_lon": 170.0, "max_lon": -160.0, "min_lat": 51.0, "max_lat": 55.0}
+    assert sc._touches(aleutians, [sc.COUNTRY_BOXES["US"]])
+    # A requested country without a curated box skips the check with a note.
+    err = io.StringIO()
+    assert sc._warn_foreign_boxes(rows, {"FI", "XK"}, out=err) == []
+    assert "no country box for ['XK']" in err.getvalue()
 
 
 def test_chunks_and_even_split_partition_rows():

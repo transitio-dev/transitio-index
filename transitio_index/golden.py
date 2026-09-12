@@ -199,7 +199,7 @@ def check(
             actual.setdefault(edge["feed_id"], []).append(edge)
         manifest = manifest or {}
     if assert_tiers is None:
-        assert_tiers = manifest.get("source") in ("classify", "curate")
+        assert_tiers = manifest.get("source") in ("classify", "curate", "rank")
     violations = []
     for entry in entries:
         feed_id = entry["feed_id"]

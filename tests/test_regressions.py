@@ -695,3 +695,76 @@ def test_the_fetcher_gives_up_on_a_connect_sooner_than_on_a_read():
         timeout = fetcher._client.timeout
     assert timeout.connect == fetch.CONNECT_TIMEOUT < fetch.TIMEOUT
     assert timeout.read == timeout.write == timeout.pool == fetch.TIMEOUT
+
+
+def test_sampler_keeps_matching_atlas_feeds_not_files_or_platform_hosts(tmp_path):
+    """The sampler kept a whole DMFR file whenever one feed in it matched a kept
+    MDB feed by host, and host-matched every feed on a shared platform host:
+    the FI+EE sample's Atlas archive held 80 feeds from Remix and gtfs.de for
+    a handful of Finnish matches. Only exact matches stay, plus the other feeds
+    of a host where at least half of its Atlas feeds match by exact URL.
+    """
+    import test_sample_catalogues as sct
+
+    sc = sct.sc
+    hsl = "https://hsl.fi/gtfs.zip"
+    remix_fi = "https://eu-gtfs.remix.com/fi-tku.zip"
+    local_a, local_b = "https://local.fi/a.zip", "https://local.fi/b.zip"
+    mdb_rows = [
+        {"id": "1", sc.MDB_DOWNLOAD: hsl},
+        {"id": "2", sc.MDB_DOWNLOAD: remix_fi},
+        {"id": "3", sc.MDB_DOWNLOAD: local_a},
+        {"id": "4", sc.MDB_DOWNLOAD: local_b},
+        {"id": "5", sc.MDB_DOWNLOAD: "https://rt.example/mdb-only.zip"},
+    ]
+    urls, hosts = sc._mdb_targets(mdb_rows)
+    assert {"hsl.fi", "eu-gtfs.remix.com", "local.fi", "rt.example"} <= hosts
+
+    def feed(feed_id, url, **more):
+        return {"id": feed_id, "spec": "gtfs", "urls": {"static_current": url, **more}}
+
+    remix = {
+        "feeds": [feed("f-fi-tku", remix_fi)]
+        + [
+            feed(f"f-remix-{i}", f"https://eu-gtfs.remix.com/x{i}.zip")
+            for i in range(4)
+        ]
+    }
+    local = {
+        "feeds": [feed("f-a", local_a), feed("f-b", local_b)]
+        + [feed("f-c", "https://local.fi/c.zip")]
+    }
+    # Only the static URL carries identity: the HSL feed's exact match must not
+    # credit the host of its realtime URL, and a realtime URL on a host that
+    # passes the threshold (local.fi) must not pull its feed in.
+    hsl_file = {
+        "feeds": [
+            feed("f-hsl", hsl, realtime_vehicle_positions="https://rt.example/vp"),
+            feed("f-other", "https://other.fi/x"),
+            feed("f-rt", "https://rt.example/other.zip"),
+            feed(
+                "f-rt-local", "https://elsewhere.fi/x", realtime="https://local.fi/rt"
+            ),
+        ]
+    }
+    archive = tmp_path / "atlas.tar.gz"
+    sct._archive(
+        archive,
+        [
+            ("r/feeds/remix.dmfr.json", remix),
+            ("r/feeds/local.dmfr.json", local),
+            ("r/feeds/hsl.dmfr.json", hsl_file),
+        ],
+    )
+    kept = {
+        source: [f["id"] for f in payload["feeds"]]
+        for source, payload in sc._select_atlas(archive, urls, hosts)
+    }
+    # Remix: 1 of 5 feeds matches exactly -> only that feed; local.fi: 2 of 3 ->
+    # the third comes along; the HSL file loses its unrelated feeds, and
+    # rt.example (0 of 2 exact on that host) is not host-matched.
+    assert kept == {
+        "remix.dmfr.json": ["f-fi-tku"],
+        "local.dmfr.json": ["f-a", "f-b", "f-c"],
+        "hsl.dmfr.json": ["f-hsl"],
+    }

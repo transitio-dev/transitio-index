@@ -113,6 +113,9 @@ def normalize_row(row, source_file, position):
             "municipality": csv_source.blank_to_none(row.get("location.municipality")),
         },
         "bounding_box": box,
+        "bounding_box_extracted_on": csv_source.blank_to_none(
+            row.get("location.bounding_box.extracted_on")
+        ),
         "bounding_box_invalid": box_present and box is None,
         "urls": {
             "direct_download": csv_source.blank_to_none(
