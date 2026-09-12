@@ -91,8 +91,39 @@ SPAN_MAX_STOPS = 2048
 # deterministic sample of trips (PATTERN_SAMPLE per distinct length, for
 # the PATTERN_SAMPLE longest lengths).
 PATTERN_SAMPLE = 8
+# The decision table's version: bumped whenever a rule, a range or the way a
+# signal feeds a rule changes, so two snapshots' tiers can be told apart from
+# their manifests alone. 1 is the table as shipped in schemas 6–9.
+RULES_VERSION = 1
 
 EARTH_RADIUS_KM = 6371.0088
+
+
+def classifier_settings(route_min_stops=ROUTE_MIN_STOPS):
+    """Every constant that shaped the decisions, for the manifests: a snapshot
+    records the thresholds its tiers were decided by, so a change to any of
+    them is visible without reading the code."""
+    return {
+        "rules_version": RULES_VERSION,
+        "route_min_stops": route_min_stops,
+        "review_cutoff": REVIEW_CUTOFF,
+        "home_share": HOME_SHARE,
+        "margin": MARGIN,
+        "margin_penalty": MARGIN_PENALTY,
+        "rail_span_km": RAIL_SPAN_KM,
+        "water_span_km": WATER_SPAN_KM,
+        "bus_local_median_km": BUS_LOCAL_MEDIAN_KM,
+        "bus_local_span_km": BUS_LOCAL_SPAN_KM,
+        "bus_regional_median_km": BUS_REGIONAL_MEDIAN_KM,
+        "bus_regional_span_km": BUS_REGIONAL_SPAN_KM,
+        "span_max_stops": SPAN_MAX_STOPS,
+        "pattern_sample": PATTERN_SAMPLE,
+    }
+
+
+def near_threshold_count(edges):
+    """How many edges were decided within ``MARGIN`` of a threshold."""
+    return sum(1 for e in edges if (e.get("evidence") or {}).get("near_threshold"))
 
 
 class ClassifyError(RuntimeError):
@@ -705,6 +736,7 @@ def _unknown_edge(candidate, reason, route_min_stops):
         {
             "route_min_stops": route_min_stops,
             "review_cutoff": REVIEW_CUTOFF,
+            "near_threshold": False,
             "unknown_reason": reason,
         }
     )
@@ -746,6 +778,7 @@ def _tier_edges(
         medians = [i["median_km"] for i in items if i["median_km"] is not None]
         spans = [i["span_km"] for i in items if i["span_km"] is not None]
         types = {i["route_type"] for i in items if i["route_type"] is not None}
+        near = any(item["decision"]["margin"] for item in items)
         evidence = dict(candidate.get("evidence") or {})
         evidence.update(
             {
@@ -756,14 +789,11 @@ def _tier_edges(
                 "serving_routes": len(items),
                 "route_min_stops": route_min_stops,
                 "review_cutoff": REVIEW_CUTOFF,
+                "near_threshold": near,
                 **(extra or {}),
             }
         )
-        needs_review = (
-            tier == "unknown"
-            or tier_confidence < REVIEW_CUTOFF
-            or any(item["decision"]["margin"] for item in items)
-        )
+        needs_review = tier == "unknown" or tier_confidence < REVIEW_CUTOFF or near
         edge = _edge(candidate, tier, tier_confidence, evidence, needs_review)
         if service is not None:
             edge["service"] = service
@@ -1529,6 +1559,7 @@ def classify(
                 "routes_classified": routes_classified,
                 "route_min_stops": route_min_stops,
                 "review_cutoff": REVIEW_CUTOFF,
+                "classifier": classifier_settings(route_min_stops),
                 "edges": len(edges),
                 "edges_dropped_no_serving_route": edges_dropped,
                 "join_gaps": dict(join_gaps),
@@ -1545,6 +1576,7 @@ def classify(
                 "home_country_agreement": dict(agreement),
                 "unknown_share": (by_tier["unknown"] / len(edges)) if edges else 0.0,
                 "needs_review": sum(1 for e in edges if e["needs_review"]),
+                "edges_near_threshold": near_threshold_count(edges),
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),

@@ -640,6 +640,8 @@ def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
     assert {f["service_start"] for f in feeds} == {None}
     assert manifest["feeds_dated"] == 0
     assert manifest["home_share"] == classify.HOME_SHARE
+    assert manifest["classifier"] == classify.classifier_settings()
+    assert manifest["edges_near_threshold"] == 0  # nothing here sits near a threshold
     assert manifest["feeds_by_scope"] == {"domestic": 2, "declared": 1, "unknown": 1}
     assert manifest["home_country_agreement"] == {"undeclared": 2, "unobserved": 2}
 
@@ -1340,3 +1342,92 @@ def test_a_stop_in_a_division_expand_dropped_is_a_logged_miss(
     manifest = classify.classify(cache, lookup=lookup)
     assert manifest["feeds_by_status"] == {"no_route_evidence": 1}  # classified
     assert "Q999999" in caplog.text and "dropped as a conflict" in caplog.text
+
+
+def test_every_decider_constant_is_published_in_the_classifier_settings():
+    # A threshold added to the decision table without being recorded would
+    # leave snapshots that cannot say what decided their tiers.
+    settings = classify.classifier_settings()
+    assert settings["rules_version"] == classify.RULES_VERSION
+    names = set()
+    for decider in (classify.classify_route, classify._decide, classify._near):
+        names |= {name for name in decider.__code__.co_names if name.isupper()}
+    numeric = {
+        name
+        for name in names
+        if isinstance(getattr(classify, name, None), (int, float))
+        and not isinstance(getattr(classify, name), bool)
+    }
+    assert {"RAIL_SPAN_KM", "MARGIN", "MARGIN_PENALTY"} <= numeric
+    assert {name.lower() for name in numeric} <= set(settings)
+    # And every published number is the module's constant, as run.
+    for key, value in settings.items():
+        assert isinstance(value, (int, float)) and not isinstance(value, bool)
+        assert getattr(classify, key.upper()) == value
+
+
+def test_near_threshold_decisions_are_flagged_and_counted(tmp_path):
+    # A bus whose median leg (1.40 km) lies within MARGIN of
+    # BUS_LOCAL_MEDIAN_KM is flagged and penalised; a tram far from every
+    # threshold and a declared-only feed are not; the manifest counts them.
+    cache = tmp_path / "cache"
+    feeds = [
+        {
+            "feed_id": "f-near",
+            "spec": "gtfs",
+            "coverage_source": "crawl",
+            "aliases": [],
+        },
+        {"feed_id": "f-far", "spec": "gtfs", "coverage_source": "crawl", "aliases": []},
+        {
+            "feed_id": "f-dec",
+            "spec": "gtfs",
+            "coverage_source": "declared",
+            "aliases": [],
+            "mdb": {"location": {"country_code": "AA"}},
+        },
+    ]
+    _write_crawl(
+        cache,
+        "f-near",
+        {
+            "stops.txt": (
+                b"stop_id,stop_lat,stop_lon\n"
+                b"n1,1.0,10.0\nn2,1.0126,10.0\nn3,1.0252,10.0\n"
+            ),
+            "routes.txt": b"route_id,route_type\nbus,3\n",
+            "trips.txt": b"trip_id,route_id\nt,bus\n",
+            "stop_times.txt": (
+                b"trip_id,stop_id,stop_sequence\nt,n1,1\nt,n2,2\nt,n3,3\n"
+            ),
+        },
+        "complete",
+    )
+    _write_crawl(
+        cache,
+        "f-far",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": b"trip_id,route_id\nt,tram\n",
+            "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt,s1,1\nt,s2,2\n",
+        },
+        "complete",
+    )
+    candidates = [
+        _candidate("Q-city", "f-near"),
+        _candidate("Q-city", "f-far", 2),
+        _candidate("Q-other", "f-dec"),
+    ]
+    _coverage(cache, feeds, candidates)
+    manifest = classify.classify(cache, lookup=LOOKUP)
+    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    by_feed = {e["feed_id"]: e for e in edges}
+    near = by_feed["f-near"]
+    assert near["tier"] == "local" and near["evidence"]["near_threshold"] is True
+    assert near["tier_confidence"] == pytest.approx(0.85 * classify.MARGIN_PENALTY)
+    assert near["needs_review"] is True
+    far = by_feed["f-far"]
+    assert far["evidence"]["near_threshold"] is False and far["needs_review"] is False
+    assert by_feed["f-dec"]["evidence"]["near_threshold"] is False
+    assert manifest["edges_near_threshold"] == 1
