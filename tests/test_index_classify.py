@@ -864,6 +864,10 @@ def test_tier_confidence_is_weighted_by_stop_share(tmp_path):
     (edge,) = edges
     assert edge["tier"] == "local"
     assert edge["tier_confidence"] == pytest.approx((0.90 * 1.0 + 0.95 * 0.02) / 1.02)
+    # The spread behind the mean: one route per rule, 0.90 to 0.95.
+    assert edge["evidence"]["rules_count"] == {"2": 1, "3": 1}
+    assert edge["evidence"]["confidence_min"] == pytest.approx(0.90)
+    assert edge["evidence"]["confidence_max"] == pytest.approx(0.95)
 
 
 def test_join_gaps_are_counted_not_silent(tmp_path):
