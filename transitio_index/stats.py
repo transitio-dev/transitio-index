@@ -30,7 +30,7 @@ from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host
 
 STATS_POINTER = "stats.json"
 # The shape of the stats artifacts; the aggregation script refuses a mismatch.
-STATS_SCHEMA_VERSION = 2  # 2: the realtime section
+STATS_SCHEMA_VERSION = 3  # 2: the realtime section; 3: validity
 # A partition of the published index: a country code, international or links.
 PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 # The tables a partition kind may carry; a country partition any of them.
@@ -474,6 +474,9 @@ def stats(cache_dir):
         summary.update(feed_sections(feed_table))
         summary["realtime"] = realtime_section(realtime, published)
         place_table = place_rows(places, edges, snapshot_id)
+        summary["validity"] = validity_section(
+            feed_table, place_table, _build_date(snapshot)
+        )
         summary["duplicate_coverage"] = duplicate_coverage(edges, rows)
         summary["distributions"] = distributions(edges, places)
         manifest = {
@@ -540,6 +543,10 @@ FEED_SCHEMA = pa.schema(
         ("relevance_median", pa.float64()),
         ("licence_state", pa.string()),
         ("redistribution_allowed", pa.bool_()),
+        # The span the feed's calendar gives (schema 9), and its length.
+        ("service_start", pa.string()),
+        ("service_end", pa.string()),
+        ("service_days", pa.int64()),
         ("snapshot_id", pa.string()),
     ]
 )
@@ -735,10 +742,68 @@ def feed_rows(
                 "relevance_median": _median(relevance),
                 "licence_state": _licence_state(feed),
                 "redistribution_allowed": feed.get("redistribution_allowed"),
+                "service_start": feed.get("service_start"),
+                "service_end": feed.get("service_end"),
+                "service_days": _service_days(feed),
                 "snapshot_id": snapshot_id,
             }
         )
     return rows
+
+
+def _build_date(snapshot):
+    """The date of the snapshot's ``built_at``: the day validity is measured
+    against, so a rerun on another day reports the same. A snapshot without
+    one is refused rather than measured against today."""
+    built = snapshot.get("built_at")
+    try:
+        return datetime.datetime.fromisoformat(built).date()
+    except (TypeError, ValueError):
+        raise StatsError(
+            f"the snapshot's built_at {built!r} is not a date; validity is "
+            "measured against the build date"
+        ) from None
+
+
+def _service_days(feed):
+    """The length of the feed's service span in days, None when undated."""
+    start, end = feed.get("service_start"), feed.get("service_end")
+    if not start or not end:
+        return None
+    return (
+        datetime.date.fromisoformat(end) - datetime.date.fromisoformat(start)
+    ).days + 1
+
+
+def validity_section(feed_rows, place_rows, build_date):
+    """Feed validity against the build date: the feeds dated, valid on it,
+    expired before it, not started by it, the valid ones ending within 30
+    and 90 days of it (inclusive, the 30-day count within the 90-day one),
+    the span quantiles, and the places whose best window contains it."""
+    dated = [r for r in feed_rows if r["service_start"] and r["service_end"]]
+    day = build_date.isoformat()
+    valid = [r for r in dated if r["service_start"] <= day <= r["service_end"]]
+
+    def ending_within(days):
+        limit = (build_date + datetime.timedelta(days=days)).isoformat()
+        return sum(1 for r in valid if r["service_end"] <= limit)
+
+    return {
+        "build_date": day,
+        "feeds_dated": len(dated),
+        "valid": len(valid),
+        "expired": sum(1 for r in dated if r["service_end"] < day),
+        "not_started": sum(1 for r in dated if r["service_start"] > day),
+        "ending_within_30_days": ending_within(30),
+        "ending_within_90_days": ending_within(90),
+        "service_days": _quantiles([r["service_days"] for r in dated]),
+        "places_with_dated_feeds": sum(1 for r in place_rows if r["feeds_dated"]),
+        "places_best_covers_build_date": sum(
+            1
+            for r in place_rows
+            if r["best_start"] and r["best_start"] <= day <= r["best_end"]
+        ),
+    }
 
 
 # The feed sources that belong to each catalogue (``both`` is in two).
@@ -938,6 +1003,11 @@ PLACE_SCHEMA = pa.schema(
         ("feeds_by_category", pa.string()),
         ("departures_per_day", pa.float64()),
         ("has_primary", pa.bool_()),
+        # The place's validity (schema 9): dated feeds and the best window.
+        ("feeds_dated", pa.int64()),
+        ("best_start", pa.string()),
+        ("best_end", pa.string()),
+        ("best_feeds", pa.int64()),
         ("snapshot_id", pa.string()),
     ]
 )
@@ -960,6 +1030,12 @@ DEFINITIONS = {
         "recorded reason, and outcomes by the row's catalogue status."
     ),
     "licensing": "Licence declarations and the redistribution judgement per feed.",
+    "validity": (
+        "Feed validity against the build date: dated feeds, the ones valid "
+        "on it, expired or not started, the valid ones ending within 30 and "
+        "90 days (cumulative), span quantiles, and the places whose best "
+        "window (most valid feeds) contains the build date."
+    ),
     "realtime": (
         "The GTFS-RT companions shipped beside the GTFS feeds: linked to a "
         "static feed of the index or not, by source, endpoint entity type "
@@ -1000,6 +1076,7 @@ REPORT_SECTIONS = (
     "licensing",
     "realtime",
     "scale",
+    "validity",
     "country_agreement",
     "declared_municipality",
     "duplicate_coverage",
@@ -1035,6 +1112,10 @@ def place_rows(places, edges, snapshot_id=None):
             if per_feed.get(e["feed_id"]) is None:
                 per_feed[e["feed_id"]] = value
         reported = [d for d in per_feed.values() if d is not None]
+        validity = place.get("validity")
+        if isinstance(validity, str):
+            validity = json.loads(validity)
+        best = (validity or {}).get("best") or {}
         rows.append(
             {
                 "place_id": place["place_id"],
@@ -1046,6 +1127,10 @@ def place_rows(places, edges, snapshot_id=None):
                 ),
                 "departures_per_day": sum(reported) if reported else None,
                 "has_primary": bool(categories.get("primary")),
+                "feeds_dated": (validity or {}).get("feeds_dated", 0),
+                "best_start": best.get("start"),
+                "best_end": best.get("end"),
+                "best_feeds": best.get("feeds"),
                 "snapshot_id": snapshot_id,
             }
         )

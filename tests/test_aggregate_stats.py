@@ -109,6 +109,7 @@ def _archive(tmp_path, label, tables, **build):
         "distributions": {"tiers_by_kind": {"city": {"local": len(tables["feeds"])}}},
         "duplicate_coverage": {"pairs": 0},
         "realtime": {"feeds": 0},
+        "validity": {"feeds_dated": 0},
     }
     (directory / "summary.json").write_text(json.dumps(summary))
     return tmp_path / label

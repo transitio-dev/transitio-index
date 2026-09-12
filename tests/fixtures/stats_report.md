@@ -9,7 +9,7 @@ The snapshot the statistics describe and the catalogues it read.
 | metric | value |
 |---|---|
 | snapshot_id | <snapshot> |
-| stats_schema_version | 2 |
+| stats_schema_version | 3 |
 | schema_version | 9 |
 | overture_release |  |
 | sample | sample |
@@ -177,6 +177,28 @@ Stops per crawled feed and places per feed (count, median, 95th percentile, maxi
 | key | value |
 |---|---|
 | 0 | 3 |
+
+## Validity
+
+Feed validity against the build date: dated feeds, the ones valid on it, expired or not started, the valid ones ending within 30 and 90 days (cumulative), span quantiles, and the places whose best window (most valid feeds) contains the build date.
+
+| metric | value |
+|---|---|
+| build_date | 2026-09-12 |
+| feeds_dated | 0 |
+| valid | 0 |
+| expired | 0 |
+| not_started | 0 |
+| ending_within_30_days | 0 |
+| ending_within_90_days | 0 |
+| places_with_dated_feeds | 0 |
+| places_best_covers_build_date | 0 |
+
+### service days
+
+| key | value |
+|---|---|
+| count | 0 |
 
 ## Country agreement
 

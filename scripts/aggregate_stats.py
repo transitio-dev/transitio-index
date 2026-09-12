@@ -46,8 +46,9 @@ COMPATIBILITY = (
     "catalogue_dates",
 )
 # The per-build sections repeated per archive rather than recomputed (the
-# realtime companions have no archived row table of their own).
-PER_BUILD = ("duplicate_coverage", "distributions", "realtime")
+# realtime companions have no archived row table of their own; validity is
+# measured against each build's own date).
+PER_BUILD = ("duplicate_coverage", "distributions", "realtime", "validity")
 
 
 def read_archive(path):

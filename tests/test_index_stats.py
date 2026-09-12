@@ -1,5 +1,6 @@
 """The stats stage: catalogue-level rows and summary sections."""
 
+import datetime
 import json
 import re
 from pathlib import Path
@@ -269,7 +270,12 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
         stats.stats(cache)
     snapshot.write_text(
         json.dumps(
-            {"snapshot_id": "abc", "schema_version": 7, "generations": generations}
+            {
+                "snapshot_id": "abc",
+                "schema_version": 7,
+                "built_at": "2026-09-12T00:00:00+00:00",
+                "generations": generations,
+            }
         )
     )
     manifest = stats.stats(cache)
@@ -297,6 +303,7 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
     assert summary["identity"]["feeds"] == 4
     assert summary["identity"]["gbfs_systems_kept"] == 0  # no artifact: none
     assert summary["realtime"]["feeds"] == 0 and manifest["realtime"] == 0
+    assert summary["validity"]["build_date"] == "2026-09-12"
 
 
 def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
@@ -318,8 +325,12 @@ def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
     assert summary["identity"]["rows_dropped_by_reason"] == {"not_transit": 1}
     assert summary["identity"]["gbfs_systems_kept"] == 1
     assert summary["identity"]["feeds"] == published["counts"]["feeds"]
-    # The published feeds (never crawled here) become the feed table too.
+    # The published feeds (never crawled here) become the feed table too,
+    # undated, with the validity columns in place.
     assert feeds.num_rows == manifest["feeds"] == published["counts"]["feeds"]
+    assert set(feeds.column("service_start").to_pylist()) == {None}
+    assert summary["validity"]["feeds_dated"] == 0
+    assert summary["validity"]["build_date"] == published["built_at"][:10]
     assert set(feeds.column("crawl_outcome").to_pylist()) == {"not_crawled"}
     assert summary["availability"]["crawled"] == 0
 
@@ -735,3 +746,95 @@ def test_the_realtime_companions_have_their_own_section(tmp_path):
     bad["partitions"]["international"]["realtime"]["sha256"] = "0" * 64
     with pytest.raises(stats.StatsError, match="does not match"):
         stats._index_tables(cache, bad)
+
+
+def test_the_validity_section_counts_against_the_build_date():
+    build_date = datetime.date(2026, 9, 12)
+    feeds = [
+        {
+            "service_start": "2026-08-01",
+            "service_end": "2026-09-30",
+            "service_days": 61,
+        },
+        {
+            "service_start": "2026-09-01",
+            "service_end": "2026-12-31",
+            "service_days": 122,
+        },
+        {
+            "service_start": "2026-01-01",
+            "service_end": "2026-09-11",
+            "service_days": 254,
+        },
+        {
+            "service_start": "2026-09-13",
+            "service_end": "2027-01-01",
+            "service_days": 111,
+        },
+        {"service_start": "2026-09-12", "service_end": "2026-09-12", "service_days": 1},
+        {"service_start": None, "service_end": None, "service_days": None},
+    ]
+    places = [
+        {"feeds_dated": 2, "best_start": "2026-09-01", "best_end": "2026-09-30"},
+        {"feeds_dated": 1, "best_start": "2026-10-01", "best_end": "2026-10-31"},
+        {"feeds_dated": 0, "best_start": None, "best_end": None},
+    ]
+    section = stats.validity_section(feeds, places, build_date)
+    # Valid on the day: the first, second and fifth (a span of one day, the
+    # build date itself); ended before: the third; not yet: the fourth. Of
+    # the valid, one ends within 30 days (09-30) and another on the day; the
+    # 90-day count holds them too (12-31 lies beyond).
+    assert section == {
+        "build_date": "2026-09-12",
+        "feeds_dated": 5,
+        "valid": 3,
+        "expired": 1,
+        "not_started": 1,
+        "ending_within_30_days": 2,
+        "ending_within_90_days": 2,
+        "service_days": stats._quantiles([61, 122, 254, 111, 1]),
+        "places_with_dated_feeds": 2,
+        "places_best_covers_build_date": 1,
+    }
+    assert stats._build_date({"built_at": "2026-09-12T10:00:00+00:00"}) == build_date
+    for snapshot in ({}, {"built_at": "yesterday"}, {"built_at": 3}):
+        with pytest.raises(stats.StatsError, match="built_at"):
+            stats._build_date(snapshot)
+    assert stats._service_days(feeds[4]) == 1 and stats._service_days(feeds[5]) is None
+    # The columns as the tables carry them, through Parquet: the feed span
+    # and its length, the place's dated feeds and best window.
+    feed = {"feed_id": "f", "service_start": "2026-09-01", "service_end": "2026-09-14"}
+    rows = stats.feed_rows([feed], [], {}, [], [], {}, "snap")
+    table = pq.read_table(pa_source(stats._parquet(rows, stats.FEED_SCHEMA)))
+    (row,) = table.to_pylist()
+    assert (row["service_start"], row["service_end"], row["service_days"]) == (
+        "2026-09-01",
+        "2026-09-14",
+        14,
+    )
+    validity = {
+        "feeds_dated": 2,
+        "best": {"start": "2026-09-01", "end": "2026-09-30", "feeds": 2},
+    }
+    places = [
+        {"place_id": "hel", "validity": json.dumps(validity)},
+        {"place_id": "esp", "validity": None},
+    ]
+    table = pq.read_table(
+        pa_source(
+            stats._parquet(stats.place_rows(places, [], "snap"), stats.PLACE_SCHEMA)
+        )
+    )
+    hel, esp = table.to_pylist()
+    assert (
+        hel["feeds_dated"],
+        hel["best_start"],
+        hel["best_end"],
+        hel["best_feeds"],
+    ) == (
+        2,
+        "2026-09-01",
+        "2026-09-30",
+        2,
+    )
+    assert (esp["feeds_dated"], esp["best_start"], esp["best_feeds"]) == (0, None, None)
