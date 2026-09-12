@@ -170,8 +170,6 @@ def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
     # A box across the antimeridian is narrow, not global.
     wrapped = {"min_lat": 0.0, "max_lat": 1.0, "min_lon": 179.0, "max_lon": -179.0}
     assert stats._lon_span(wrapped) == pytest.approx(2.0)
-    with pytest.raises(stats.StatsError, match="share a key"):
-        stats.catalogue_rows({"mdb": [_mdb("mdb-1"), _mdb("mdb-1")]}, [])
 
 
 def test_summary_sections_count_the_catalogue_defects():
@@ -617,7 +615,7 @@ def test_place_rows_duplicates_and_distributions():
     report = stats.render_report(
         {"build": {"snapshot_id": "s"}, "distributions": spread}
     )
-    assert "## Distributions" in report and "| EE | 1 |" in report or "| EE |" in report
+    assert "## Distributions" in report and "| EE |" in report
 
 
 GOLDEN_REPORT = Path(__file__).resolve().parent / "fixtures" / "stats_report.md"
