@@ -27,11 +27,14 @@ from transitio.exceptions import IncompatibleIndexError  # noqa: E402
 from transitio.exceptions import PlaceNotFoundError  # noqa: E402
 
 # The feeds columns schema 7 added; an older shape is recreated by dropping them.
+# The feed columns schema 7 and 8 added over the flat layout's; schema 8 also
+# dropped the ``gbfs`` block, which the flat layout still expects.
 _SCHEMA_7_FEED_COLUMNS = (
     "home_country",
     "country_shares",
     "scope",
     "declared_countries",
+    "realtime_feed_ids",
 )
 
 
@@ -62,7 +65,8 @@ def _has_table(manifest, table):
 def _flatten(index_dir, version, drop=()):
     """Recreate the flat layout of a schema before 7 from a partitioned
     index: every partition's tables concatenated at the root, minus the
-    columns schema 7 added (and ``drop``), stamped to ``version``."""
+    columns schema 7 and 8 added (and ``drop``), plus the ``gbfs`` block
+    they still carried, stamped to ``version``."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -77,7 +81,11 @@ def _flatten(index_dir, version, drop=()):
         gone = [c for c in (*_SCHEMA_7_FEED_COLUMNS, *drop) if c in joined.column_names]
         if table == "edges":
             gone += ["relevance_category", "relevance", "cross_border"]
-        pq.write_table(joined.drop_columns(gone), index_dir / f"{table}.parquet")
+        joined = joined.drop_columns(gone)
+        if table == "feeds" and "gbfs" not in drop:
+            at = joined.column_names.index("mdb") + 1
+            joined = joined.add_column(at, "gbfs", pa.nulls(len(joined), pa.string()))
+        pq.write_table(joined, index_dir / f"{table}.parquet")
         snapshot[f"{table}_sha256"] = hashlib.sha256(
             (index_dir / f"{table}.parquet").read_bytes()
         ).hexdigest()
@@ -395,7 +403,7 @@ def test_snapshot_manifest_records_sources_and_counts(tmp_path):
     assert manifest["sources"]["gbfs"]["csv_sha256"]
     assert manifest["counts"]["feeds"] == 3
     assert manifest["counts"]["by_source"] == {"atlas": 1, "both": 1, "mdb": 1}
-    assert manifest["counts"]["by_spec"] == {"gtfs": 3}
+    assert manifest["counts"]["realtime"] == 0 == manifest["counts"]["realtime_linked"]
 
 
 def test_the_snapshot_id_is_deterministic_in_the_sources(tmp_path):
@@ -1428,7 +1436,7 @@ def test_a_place_without_a_qid_publishes_and_reads_back(tmp_path):
     assert tampere.concordances == {"overture": ["fi-tre"]} and tampere.former_ids == []
 
 
-def test_schema_7_ships_the_country_and_relevance_columns(tmp_path):
+def test_the_index_ships_the_country_and_relevance_columns(tmp_path):
     import pyarrow.parquet as pq
 
     # Classify decides the country fields: a declared-only feed with an MDB
@@ -1441,9 +1449,9 @@ def test_schema_7_ships_the_country_and_relevance_columns(tmp_path):
         "cross_border": True,
     }
     cache, manifest = _edges_index(tmp_path, [edge], feeds=[feed])
-    assert manifest["schema_version"] == 7 == publish.SCHEMA_VERSION
+    assert manifest["schema_version"] == 8 == publish.SCHEMA_VERSION
     assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
-        7, publish.MIN_READER_VERSION
+        8, publish.MIN_READER_VERSION
     )
     # Without a home country the feed sits in the international partition and
     # its edge in the links, naming that partition.
@@ -1508,3 +1516,114 @@ def test_partition_routes_by_home_country_and_place_country():
         publish.partition(records, places, [_edge("zz", "fi")])
     with pytest.raises(publish.PublishError, match="feed the index lacks"):
         publish.partition(records, places, [_edge("hel", "ghost")])
+
+
+def _realtime_feed(feed_id, static_feed_id, **kw):
+    return {
+        **_covered_feed(feed_id, spec="gtfs-rt", crawlable=False),
+        "static_feed_id": static_feed_id,
+        "static_link_method": kw.get("method", "declared"),
+        "atlas": {"urls": kw.get("urls", {"realtime_trip_updates": "https://rt/tu"})},
+        "mdb": kw.get("mdb"),
+    }
+
+
+def test_realtime_companions_ride_with_their_static_feed():
+    static = [
+        {**_covered_feed("f-a"), "home_country": "FI"},
+        _covered_feed("f-b"),  # no home country: international
+    ]
+    realtime = [
+        _realtime_feed(
+            "f-rt-a",
+            "f-a",
+            urls={"realtime_vehicle_positions": "https://rt/vp", "realtime_alerts": ""},
+            mdb={"urls": {"direct_download": "https://rt/direct"}},
+        ),
+        _realtime_feed("f-rt-b", "f-b"),
+        _realtime_feed("f-rt-none", None, method="none"),
+        _realtime_feed("f-rt-gone", "f-vanished", method="inferred"),  # dangling
+    ]
+    records, companions = publish.split_specs(static + realtime)
+    # Each static feed names the companions that name it, in sorted order.
+    assert [r["realtime_feed_ids"] for r in records] == [["f-rt-a"], ["f-rt-b"]]
+    assert [c["realtime_linked"] for c in companions] == [True, True, False, False]
+    with pytest.raises(publish.PublishError, match="spec the index does not ship"):
+        publish.split_specs(static + [_covered_feed("f-bikes", spec="gbfs")])
+    places = [{"place_id": "hel", "country_code": "FI"}]
+    edges = [
+        _edge("hel", "f-a"),
+        _edge("hel", "f-rt-a"),  # inherited from f-a: not published
+        _edge("hel", "f-b"),
+    ]
+    # A companion's inherited edges leave before anything counts them; an
+    # edge of a feed the feeds table lacks is then an integrity error.
+    assert publish.static_edges(None, companions) is None
+    with pytest.raises(publish.PublishError, match="feed the index lacks"):
+        publish.partition(records, places, edges, companions)
+    edges = publish.static_edges(edges, companions)
+    parts = publish.partition(records, places, edges, companions)
+    assert set(parts) == {"FI", "international", "links"}
+    # A linked companion sits with its static feed, an unlinked or dangling one
+    # in international; no realtime feed has edges of its own.
+    assert [c["feed_id"] for c in parts["FI"]["realtime"]] == ["f-rt-a"]
+    assert [c["feed_id"] for c in parts["international"]["realtime"]] == [
+        "f-rt-b",
+        "f-rt-none",
+        "f-rt-gone",
+    ]
+    assert [e["feed_id"] for e in parts["FI"]["edges"]] == ["f-a"]
+    assert [e["feed_id"] for e in parts["links"]["edges"]] == ["f-b"]
+    row = publish._realtime_row(companions[0], "snap")
+    # The endpoints the catalogues carry, under the catalogues' own keys, and
+    # the entity types the Atlas ones stand for; an empty url is none.
+    assert json.loads(row["urls"]) == {
+        "realtime_vehicle_positions": "https://rt/vp",
+        "direct_download": "https://rt/direct",
+    }
+    assert row["entity_types"] == ["vehicle_positions"]
+    assert row["static_feed_id"] == "f-a" and row["snapshot"] == "snap"
+    assert publish._counts(records, companions) == {
+        "feeds": 2,
+        "by_source": {"atlas": 2},
+        "realtime": 4,
+        "realtime_linked": 2,
+        "realtime_unlinked": 2,
+    }
+
+
+def test_a_published_index_carries_its_realtime_table(tmp_path):
+    import pyarrow.parquet as pq
+
+    feeds = [_covered_feed("f-a"), _realtime_feed("f-rt", "f-a")]
+    service = {"stops": 10, "routes": 2}
+    edges = [
+        _edge("Q1757", "f-a", service=service),
+        _edge("Q1757", "f-rt", service=service),  # inherited: not counted
+    ]
+    cache, manifest = _edges_index(tmp_path, edges, feeds=feeds)
+    assert manifest["counts"]["realtime"] == 1 == manifest["counts"]["realtime_linked"]
+    assert manifest["counts"]["edges"] == 1
+    assert manifest["unknown_share"] == 1.0  # over the one edge that ships
+    # Declared coverage gives f-a no home: it and its companion are international.
+    listed = manifest["partitions"]["international"]
+    assert listed["realtime"]["rows"] == 1 and listed["feeds"]["rows"] == 1
+    table = pq.read_table(cache / "index" / "international" / "realtime.parquet")
+    (row,) = table.to_pylist()
+    assert row["feed_id"] == "f-rt" and row["static_feed_id"] == "f-a"
+    assert row["entity_types"] == ["trip_updates"]
+    feeds_table = pq.read_table(cache / "index" / "international" / "feeds.parquet")
+    (static,) = feeds_table.to_pylist()
+    assert static["realtime_feed_ids"] == ["f-rt"] and "gbfs" not in static
+    # The companion's inherited edge is not published: the edges are GTFS-only,
+    # and the place's service sums the static feed once.
+    links = pq.read_table(cache / "index" / "links" / "edges.parquet").to_pylist()
+    assert [e["feed_id"] for e in links] == ["f-a"]
+    places = pq.read_table(cache / "index" / "FI" / "places.parquet").to_pylist()
+    (place,) = [p for p in places if p["place_id"] == "Q1757"]
+    assert json.loads(place["service"]) == {
+        "stops": 10,
+        "routes": 2,
+        "departures_per_day": None,
+        "feeds": 1,
+    }

@@ -1,11 +1,13 @@
 """Publish stage: the feeds, places and membership edges as a shippable index.
 
-Writes ``<cache>/index/`` as a directory of partitions (schema 7): under each
-country code ``feeds.parquet`` (one row per feed whose home country it is),
+Writes ``<cache>/index/`` as a directory of partitions (schema 8): under each
+country code ``feeds.parquet`` (one row per GTFS feed whose home country it
+is), ``realtime.parquet`` (the GTFS-RT companions of those feeds),
 ``places.parquet`` (one row per place there, a GeoParquet with the simplified
 boundary) and ``edges.parquet`` (the domestic membership rows, one per
-place/feed/tier); ``international/feeds.parquet`` for the feeds without a
-home country; ``links/edges.parquet`` for every cross-border edge, with
+place/feed/tier); ``international/feeds.parquet`` and ``realtime.parquet``
+for the feeds without a home country and the companions without a static
+feed; ``links/edges.parquet`` for every cross-border edge, with
 ``feed_partition``; and ``snapshot.json`` (the manifest: a deterministic
 snapshot id, the schema version, the source versions, the counts, and every
 partition table's row count and SHA-256). The feeds come from the latest edge
@@ -16,8 +18,13 @@ pruned generation for a curated build, else the expanded generation, else the
 names one. Places and edges are optional: an index built before those stages
 ran is feeds only, and the reader treats the missing tables the same way.
 
-The flat identity and crosswalk fields are their own columns; the verbatim Atlas,
-MDB and GBFS source rows are kept as JSON-string columns, so nothing is lost and
+The feeds table is GTFS only and every edge belongs to a GTFS feed: a GTFS-RT
+feed describes the vehicles of a static feed and has no places of its own, so
+it ships as a companion row keyed by ``static_feed_id``, and each static feed
+lists its companions in ``realtime_feed_ids``. GBFS systems never reach this
+stage (the crosswalk keeps them apart).
+The flat identity and crosswalk fields are their own columns; the verbatim Atlas
+and MDB source rows are kept as JSON-string columns, so nothing is lost and
 the field-level columns a query surface needs can be derived later. A place's
 ``names`` is a ``map<string, string>`` column (language to label), as the plan
 defines it.
@@ -38,18 +45,22 @@ from transitio_index import overture
 from transitio_index import registry as _registry
 from transitio_index import store
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 # The reader release that first reads this schema; the installed reader's own
 # floor table wins once it knows the version.
 MIN_READER_VERSION = "0.12.0"
 # The edge generations that carry curation (curate, and rank on top of it).
 FINAL_SOURCES = ("curate", "rank")
 FEEDS_FILE = "feeds.parquet"
+REALTIME_FILE = "realtime.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
+STATIC_SPEC = "gtfs"
+REALTIME_SPEC = "gtfs-rt"
 SNAPSHOT_FILE = "snapshot.json"
 NOTICE_FILE = "NOTICE"
-# The index is a directory of partitions (schema_version 7): one per country
+# The index is a directory of partitions (schema_version 7, realtime tables
+# from 8): one per country
 # code holding the feeds whose home country it is, its places and their
 # domestic edges; ``international`` holding the feeds without a home country;
 # ``links`` holding every edge whose feed has no home country or whose place
@@ -57,7 +68,12 @@ NOTICE_FILE = "NOTICE"
 # partition that holds the feed.
 INTERNATIONAL_PARTITION = "international"
 LINKS_PARTITION = "links"
-TABLE_FILES = {"feeds": FEEDS_FILE, "places": PLACES_FILE, "edges": EDGES_FILE}
+TABLE_FILES = {
+    "feeds": FEEDS_FILE,
+    "realtime": REALTIME_FILE,
+    "places": PLACES_FILE,
+    "edges": EDGES_FILE,
+}
 
 
 class PublishError(RuntimeError):
@@ -80,7 +96,6 @@ _SCHEMA = pa.schema(
         ("static_link_method", pa.string()),
         ("atlas", pa.string()),
         ("mdb", pa.string()),
-        ("gbfs", pa.string()),
         ("crawlable", pa.bool_()),
         ("uncrawlable_reason", pa.string()),
         ("coverage_source", pa.string()),
@@ -104,9 +119,41 @@ _SCHEMA = pa.schema(
         ("country_shares", pa.string()),
         ("scope", pa.string()),
         ("declared_countries", pa.list_(pa.string())),
+        # The GTFS-RT companions that name this feed (schema_version 8).
+        ("realtime_feed_ids", pa.list_(pa.string())),
         ("snapshot", pa.string()),
     ]
 )
+
+# A GTFS-RT feed: the identity and crosswalk fields, the static feed it
+# describes, and the realtime endpoints the catalogues carry.
+_REALTIME_SCHEMA = pa.schema(
+    [
+        ("feed_id", pa.string()),
+        ("onestop_id", pa.string()),
+        ("mdb_id", pa.string()),
+        ("id_minted", pa.bool_()),
+        ("source", pa.string()),
+        ("name", pa.string()),
+        ("aliases", pa.list_(pa.string())),
+        ("crosswalk_method", pa.string()),
+        ("crosswalk_confidence", pa.float64()),
+        ("static_feed_id", pa.string()),
+        ("static_link_method", pa.string()),
+        ("urls", pa.string()),
+        ("entity_types", pa.list_(pa.string())),
+        ("atlas", pa.string()),
+        ("mdb", pa.string()),
+        ("redistribution_allowed", pa.bool_()),
+        ("snapshot", pa.string()),
+    ]
+)
+# The Atlas url keys of a realtime feed, and the entity type each carries.
+REALTIME_URLS = {
+    "realtime_vehicle_positions": "vehicle_positions",
+    "realtime_trip_updates": "trip_updates",
+    "realtime_alerts": "alerts",
+}
 
 
 def _json_block(block):
@@ -131,7 +178,6 @@ def _row(record, snapshot_id):
         "static_link_method": record.get("static_link_method"),
         "atlas": _json_block(record.get("atlas")),
         "mdb": _json_block(record.get("mdb")),
-        "gbfs": _json_block(record.get("gbfs")),
         "crawlable": record.get("crawlable"),
         "uncrawlable_reason": record.get("uncrawlable_reason"),
         "coverage_source": record.get("coverage_source"),
@@ -147,6 +193,35 @@ def _row(record, snapshot_id):
         "country_shares": _json_block(record.get("country_shares")),
         "scope": record.get("scope"),
         "declared_countries": record.get("declared_countries") or [],
+        "realtime_feed_ids": record.get("realtime_feed_ids") or [],
+        "snapshot": snapshot_id,
+    }
+
+
+def _realtime_row(record, snapshot_id):
+    atlas_urls = ((record.get("atlas") or {}).get("urls") or {}).items()
+    urls = {k: v for k, v in atlas_urls if k in REALTIME_URLS and v}
+    entity_types = sorted(REALTIME_URLS[k] for k in urls)
+    direct = ((record.get("mdb") or {}).get("urls") or {}).get("direct_download")
+    if direct:
+        urls["direct_download"] = direct
+    return {
+        "feed_id": record["feed_id"],
+        "onestop_id": record.get("onestop_id"),
+        "mdb_id": record.get("mdb_id"),
+        "id_minted": record["id_minted"],
+        "source": record["source"],
+        "name": record.get("name"),
+        "aliases": record.get("aliases") or [],
+        "crosswalk_method": record["crosswalk_method"],
+        "crosswalk_confidence": record["crosswalk_confidence"],
+        "static_feed_id": record.get("static_feed_id"),
+        "static_link_method": record.get("static_link_method"),
+        "urls": _json_block(urls),
+        "entity_types": entity_types,
+        "atlas": _json_block(record.get("atlas")),
+        "mdb": _json_block(record.get("mdb")),
+        "redistribution_allowed": record.get("redistribution_allowed"),
         "snapshot": snapshot_id,
     }
 
@@ -319,17 +394,57 @@ def _snapshot_id(sources, overture_release=None, digests=()):
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
-def _counts(records):
+def _counts(records, realtime):
+    linked = sum(1 for r in realtime if r.get("realtime_linked"))
     return {
         "feeds": len(records),
         "by_source": dict(collections.Counter(r["source"] for r in records)),
-        "by_spec": dict(collections.Counter(r["spec"] for r in records)),
+        "realtime": len(realtime),
+        "realtime_linked": linked,
+        "realtime_unlinked": len(realtime) - linked,
     }
 
 
-def _parquet_bytes(records, snapshot_id):
+def split_specs(records):
+    """``(static, realtime)``: the GTFS feeds, each with the
+    ``realtime_feed_ids`` of the companions naming it, and the GTFS-RT feeds,
+    each marked ``realtime_linked`` when its static feed is in the index. A
+    record of any other spec is an integrity error: the crosswalk keeps GBFS
+    apart, and the index ships nothing else."""
+    other = sorted({r["spec"] for r in records} - {STATIC_SPEC, REALTIME_SPEC})
+    if other:
+        raise PublishError(f"feeds of a spec the index does not ship: {other}")
+    static = [r for r in records if r["spec"] == STATIC_SPEC]
+    ids = {r["feed_id"] for r in static}
+    companions = collections.defaultdict(list)
+    realtime = []
+    for record in records:
+        if record["spec"] != REALTIME_SPEC:
+            continue
+        linked = record.get("static_feed_id") in ids
+        if linked:
+            companions[record["static_feed_id"]].append(record["feed_id"])
+        realtime.append({**record, "realtime_linked": linked})
+    static = [
+        {**r, "realtime_feed_ids": sorted(companions.get(r["feed_id"], ()))}
+        for r in static
+    ]
+    return static, realtime
+
+
+def static_edges(edges, realtime):
+    """``edges`` without those of the realtime companions: a companion's
+    places are its static feed's, so its inherited edges are not published,
+    counted, summed into a place's service or diffed against the golden set."""
+    if edges is None:
+        return None
+    companions = {record["feed_id"] for record in realtime}
+    return [edge for edge in edges if edge["feed_id"] not in companions]
+
+
+def _parquet_bytes(records, snapshot_id, row=_row, schema=_SCHEMA):
     table = pa.Table.from_pylist(
-        [_row(record, snapshot_id) for record in records], schema=_SCHEMA
+        [row(record, snapshot_id) for record in records], schema=schema
     )
     sink = io.BytesIO()
     pq.write_table(table, sink)
@@ -501,21 +616,30 @@ def _edges_parquet_bytes(edges, snapshot_id, links=False):
     return sink.getvalue()
 
 
-def partition(records, places, edges):
-    """Route the feeds, places and edges into partitions, as ``{partition:
-    {table: rows}}`` sorted by partition name.
+def partition(records, places, edges, realtime=()):
+    """Route the feeds, companions, places and edges into partitions, as
+    ``{partition: {table: rows}}`` sorted by partition name.
 
-    A feed goes under its ``home_country``, else ``international``; a place
-    under its ``country_code`` — a place without one is an integrity error,
-    as a missing licence is; an edge under the feed's home country when the
-    place lies there, else into ``links`` with ``feed_partition``. Nothing is
-    dropped: the partitions and the links together are the flat tables.
+    A feed goes under its ``home_country``, else ``international``; a
+    realtime companion under its static feed's partition, ``international``
+    when it has none in the index; a place under its ``country_code`` — a
+    place without one is an integrity error, as a missing licence is; an edge
+    under the feed's home country when the place lies there, else into
+    ``links`` with ``feed_partition``. Nothing is dropped: the partitions and
+    the links together are the flat tables (``static_edges`` has already
+    left the companions' edges out).
     """
     home = {record["feed_id"]: record.get("home_country") for record in records}
     parts = collections.defaultdict(dict)
     for record in records:
         name = home[record["feed_id"]] or INTERNATIONAL_PARTITION
         parts[name].setdefault("feeds", []).append(record)
+    for record in realtime:
+        static_id = record.get("static_feed_id")
+        name = (home.get(static_id) if static_id in home else None) or (
+            INTERNATIONAL_PARTITION
+        )
+        parts[name].setdefault("realtime", []).append(record)
     country = {}
     for place in places or ():
         code = place.get("country_code")
@@ -550,6 +674,10 @@ def _partition_tables(partitions, snapshot_id, service, identities):
         for table, rows in tables.items():
             if table == "feeds":
                 data = _parquet_bytes(rows, snapshot_id)
+            elif table == "realtime":
+                data = _parquet_bytes(
+                    rows, snapshot_id, _realtime_row, _REALTIME_SCHEMA
+                )
             elif table == "places":
                 data = _places_parquet_bytes(
                     rows, snapshot_id, service, identities=identities
@@ -1150,8 +1278,10 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
 
         inputs = read_inputs(cache_dir, overrides_dir)
         licensed = _read_licensed(cache_dir, inputs)
-        records = inputs["records"]
-        edges = inputs["edges"]
+        # The companions ride along in their own table; only the static
+        # feeds and their edges are gated, digested, counted and partitioned.
+        records, realtime = split_specs(inputs["records"])
+        edges = static_edges(inputs["edges"], realtime)
         coverage = inputs["coverage"]
         override_digest = inputs["override_digest"]
         resolved = inputs["resolved"]
@@ -1184,18 +1314,20 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             # Resolved, covered and licensed feeds fold in, and edges: the
             # override files and the licensing policy shape them, and no
             # source version pins those.
-            digests.append(_content_digest(records))
+            # The companions too: an endpoint or link that changes without
+            # any static feed changing is still a new snapshot.
+            digests.append(_content_digest([*records, *realtime]))
         if edges is not None:
             digests.append(_content_digest(edges))
         if licensed is not None:
             # The NOTICE ships too: a corrected attribution is a new snapshot.
             digests.append(hashlib.sha256(licensed).hexdigest())
         snapshot_id = _snapshot_id(sources, overture_release, digests)
-        partitions = partition(records, places, edges)
+        partitions = partition(records, places, edges, realtime)
         files, listing = _partition_tables(
             partitions, snapshot_id, _service_by_place(edges), identities
         )
-        counts = _counts(records)
+        counts = _counts(records, realtime)
         manifest = {
             "schema_version": SCHEMA_VERSION,
             # The snapshot pins the data; the discovery semantics and the
@@ -1244,9 +1376,12 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
         if edges is not None:
             manifest["coverage_mode"] = coverage.get("mode")
             manifest["overrides_sha256"] = override_digest
-            if coverage.get("unknown_share") is not None:
-                # Recorded so the next build's golden diff can measure drift.
-                manifest["unknown_share"] = coverage["unknown_share"]
+            if coverage.get("unknown_share") is not None and edges:
+                # Recorded so the next build's golden diff can measure drift;
+                # over the edges that ship, not the stage's (which counted
+                # the companions' inherited edges too).
+                unknown = sum(1 for e in edges if e["tier"] == "unknown")
+                manifest["unknown_share"] = unknown / len(edges)
             if golden_report is not None:
                 manifest["golden_entries"] = golden_report["entries"]
             counts["edges"] = len(edges)
