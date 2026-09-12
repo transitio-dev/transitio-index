@@ -156,11 +156,13 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
 # only with this row and Overture's allowlisted.
 FAO_DERIVED = ("FAO city-regions 2024", "CC-BY-4.0")
 
-# ~100 m near the equator; the deviation in metres shrinks toward the poles, so
-# this never over-simplifies much beyond that. The boundary lookup used for
-# point-in-polygon memoizes geometry at this same tolerance — ample for locating
-# transit stops, which never sit on a border to the metre.
-SIMPLIFY_TOLERANCE_DEG = 0.001
+# ~55 m near the equator, ~28 m at 60° N; the deviation in metres shrinks
+# toward the poles, so this never over-simplifies much beyond that. The boundary
+# lookup used for point-in-polygon memoizes geometry at this same tolerance and
+# keys its memo by it. Neighbouring polygons are simplified independently, so a
+# stop within the tolerance of a border can still land on the wrong side, in
+# both countries or in neither; classify counts those artefacts.
+SIMPLIFY_TOLERANCE_DEG = 0.0005
 
 
 def division_area_dataset(release=overture.OVERTURE_RELEASE):
@@ -883,6 +885,7 @@ def attach_geometry(
                 "sources": metros_manifest.get("sources"),
                 "seed_generation": metros_manifest.get("seed_generation"),
                 "overture_release": overture.OVERTURE_RELEASE,
+                "simplify_tolerance_deg": SIMPLIFY_TOLERANCE_DEG,
                 "with_geometry": with_geometry,
                 "omitted_by_licence": omitted,
                 "invalid_geometry": invalid,

@@ -243,7 +243,12 @@ def test_a_stale_memo_entry_is_not_trusted(tmp_path):
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
         lookup.ensure([HEL_BOX])
-    memo = cache / "boundary_lookup" / "test-release" / "divisions-0001.parquet"
+    memo = (
+        cache
+        / "boundary_lookup"
+        / boundaries.memo_name("test-release")
+        / "divisions-0001.parquet"
+    )
     frame = gpd.read_parquet(memo)
     line = shapely.LineString([(24.9, 60.12), (25.0, 60.18)])
     geoms = [
@@ -270,7 +275,7 @@ def test_the_memo_is_keyed_by_release(tmp_path):
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
         lookup.ensure([HEL_BOX])
-    memo = cache / "boundary_lookup" / "test-release"
+    memo = cache / "boundary_lookup" / boundaries.memo_name("test-release")
     assert (memo / "divisions-0001.parquet").is_file()
     assert (memo / "covered.jsonl").is_file()
 
@@ -303,3 +308,23 @@ def test_memoized_geometry_is_simplified(tmp_path):
         stored = lookup._records["fi-hel"]["geoms"][0]
         assert len(stored.exterior.coords) < len(dense.exterior.coords)
         assert lookup.divisions_at(24.94, 60.17)[0]["division_id"] == "fi-hel"
+
+
+def test_the_memo_is_keyed_by_the_simplification_tolerance(tmp_path, monkeypatch):
+    from transitio_index import geometry
+
+    cache = tmp_path / "cache"
+    with _lookup(tmp_path, cache) as lookup:
+        lookup.ensure([HEL_BOX])
+    current = cache / "boundary_lookup" / boundaries.memo_name("test-release")
+    assert (current / "covered.jsonl").is_file()
+    # Polygons simplified at one tolerance are another tolerance's stale read:
+    # a changed constant opens a fresh memo and leaves the old one alone.
+    monkeypatch.setattr(geometry, "SIMPLIFY_TOLERANCE_DEG", 0.002)
+    other = cache / "boundary_lookup" / boundaries.memo_name("test-release")
+    assert other != current and other.name == "test-release-t0.002"
+    with _lookup(tmp_path, cache) as lookup:
+        assert lookup.divisions_at(24.95, 60.17) == []  # nothing memoized here yet
+        lookup.ensure([HEL_BOX])
+        assert lookup.divisions_at(24.95, 60.17)
+    assert (other / "covered.jsonl").is_file()

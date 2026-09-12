@@ -527,6 +527,16 @@ def expand(
                 cache_dir / "gazetteer", "names.json", "places_seed.jsonl"
             )
             release = names_manifest.get("overture_release")
+            recorded = names_manifest.get("simplify_tolerance_deg")
+            if recorded != geometry.SIMPLIFY_TOLERANCE_DEG:
+                # The seeded boundaries were simplified at another tolerance,
+                # or at one nobody recorded: discovered places must not ship
+                # beside them at this one.
+                raise overture.GazetteerError(
+                    f"the seed geometry was simplified at {recorded}°, not "
+                    f"{geometry.SIMPLIFY_TOLERANCE_DEG}°; re-run the geometry "
+                    "stage before expanding"
+                )
             overrides.expect_digest(
                 names_manifest.get("places_overrides_sha256"),
                 overrides.places_digest(overrides_dir),
@@ -607,6 +617,7 @@ def expand(
                 "mode": mode,
                 "places": len(places_by_id),
                 "overture_release": release,
+                "simplify_tolerance_deg": geometry.SIMPLIFY_TOLERANCE_DEG,
                 "reported": len(report),
                 **counts,
                 "retrieved_at": datetime.datetime.now(

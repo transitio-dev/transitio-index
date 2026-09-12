@@ -892,6 +892,12 @@ def _tier_edges(
         spans = [i["span_km"] for i in items if i["span_km"] is not None]
         types = {i["route_type"] for i in items if i["route_type"] is not None}
         near = any(item["decision"]["margin"] for item in items)
+        # The spread behind the weighted mean: the per-rule confidences are
+        # ordinal, so the extremes and the routes per rule travel with it.
+        confidences = [item["decision"]["tier_confidence"] for item in items]
+        rules_count = collections.Counter(
+            str(item["decision"]["rule"]) for item in items
+        )
         # The scale behind the tier (equal to it unless rule 1 overrode it),
         # and the stops the contributing routes had outside their majority
         # country, below the border gate.
@@ -910,6 +916,9 @@ def _tier_edges(
                 "spread_km": max(spans) if spans else None,
                 "serving_routes": len(items),
                 "rules": sorted({item["decision"]["rule"] for item in items}),
+                "rules_count": dict(sorted(rules_count.items())),
+                "confidence_min": min(confidences),
+                "confidence_max": max(confidences),
                 "scale_tiers": sorted(scales),
                 "route_min_stops": route_min_stops,
                 "review_cutoff": REVIEW_CUTOFF,

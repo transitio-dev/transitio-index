@@ -7,7 +7,14 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
-from transitio_index import boundaries, crawl, expand, overture, store  # noqa: E402
+from transitio_index import (  # noqa: E402
+    boundaries,
+    crawl,
+    expand,
+    geometry,
+    overture,
+    store,
+)
 
 # A source the geometry allowlist accepts, and one it does not.
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
@@ -159,7 +166,7 @@ AREAS = [
 ]
 
 
-def _publish_names(cache, places):
+def _publish_names(cache, places, **manifest):
     directory = store.open_subdir(cache, "gazetteer")
     try:
         with store.exclusive_writer(directory):
@@ -167,7 +174,12 @@ def _publish_names(cache, places):
                 cache / "gazetteer",
                 "names.json",
                 {"places_seed.jsonl": store.jsonl_chunks(places)},
-                {"source": "names", "overture_release": "2026-08-19.0"},
+                {
+                    "source": "names",
+                    "overture_release": "2026-08-19.0",
+                    "simplify_tolerance_deg": geometry.SIMPLIFY_TOLERANCE_DEG,
+                    **manifest,
+                },
                 held=directory,
             )
     finally:
@@ -248,6 +260,7 @@ def test_no_crawl_artifacts_pass_the_seed_through(tmp_path):
     _publish_names(cache, SEED_PLACES)
     manifest, places, report = _expand(tmp_path, cache)
     assert manifest["mode"] == "declared"
+    assert manifest["simplify_tolerance_deg"] == geometry.SIMPLIFY_TOLERANCE_DEG
     assert manifest["places_added"] == 0
     assert set(places) == {"Q33"}
     assert report == []
@@ -706,3 +719,14 @@ def test_a_crawled_qid_for_a_place_known_by_its_division_joins_it(tmp_path):
         places["Q40840"]["place_id"] == "tp_2"
         and "Manse" in places["Q40840"]["aliases"]
     )
+
+
+@pytest.mark.parametrize("recorded", [0.001, None], ids=["other", "unrecorded"])
+def test_seed_geometry_at_another_tolerance_is_refused(tmp_path, recorded):
+    # Discovered places would be simplified at the current tolerance beside
+    # seeded ones at another, or at one nobody recorded: the geometry stage
+    # must run again first.
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES, simplify_tolerance_deg=recorded)
+    with pytest.raises(overture.GazetteerError, match="re-run the geometry"):
+        _expand(tmp_path, cache)

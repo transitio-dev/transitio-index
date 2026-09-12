@@ -114,6 +114,9 @@ def merge_names(
                 # Carried forward so the publish stage reads the pinned release
                 # from the same generation as the places, not a separate pointer.
                 "overture_release": geometry_manifest.get("overture_release"),
+                "simplify_tolerance_deg": geometry_manifest.get(
+                    "simplify_tolerance_deg"
+                ),
                 "places": len(places),
                 "enriched": enriched,
                 "places_overrides_sha256": places_digest,
