@@ -514,12 +514,27 @@ def test_an_encrypted_archive_fails_the_feed_not_the_run(tmp_path):
 
 def test_an_oversized_member_fails_without_leaving_the_archive(tmp_path, monkeypatch):
     cache = tmp_path / "cache"
-    monkeypatch.setattr(crawl, "MAX_MEMBER_BYTES", 10)
+    monkeypatch.setattr(crawl, "DOWNLOAD_MEMBER_BYTES", 10)
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
     _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(), None)}))
     assert log["f-a"]["method"] == "failed"
     assert "ceiling" in log["f-a"]["fallback_reason"]
     assert not (_feed_dir(cache, "f-a") / "feed.zip").exists()
+
+
+def test_a_member_over_the_ranged_buffer_downloads_whole(tmp_path, monkeypatch):
+    # The ranged reader buffers a member in memory, so one over the store's
+    # artifact ceiling is left to the whole download, which streams it.
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(store, "MAX_ARTIFACT_BYTES", 2000)  # stop_times alone is over
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    _, log = _crawl(
+        cache, _server({"/a.zip": (_zip_bytes(), '"v1"')}), range_threshold=1
+    )
+    assert log["f-a"]["method"] == "download"
+    assert "stop_times.txt" in log["f-a"]["fallback_reason"]
+    assert "ceiling" in log["f-a"]["fallback_reason"]
+    assert log["f-a"]["stop_times"] == "complete"
 
 
 def test_a_member_dropped_upstream_is_pruned_locally(tmp_path):
