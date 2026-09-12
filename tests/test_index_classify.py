@@ -8,35 +8,42 @@ import pytest
 from transitio_index import classify, coverage, crawl, publish, store  # noqa: E402
 
 
+def _stops(**counts):
+    """``{code: stop ids}`` with ``counts`` located stops per country."""
+    return {
+        code: frozenset(f"{code}{i}" for i in range(n)) for code, n in counts.items()
+    }
+
+
 @pytest.mark.parametrize(
     ("route_type", "countries", "span", "median", "tier", "confidence", "rule"),
     [
-        (3, {"AA", "BB"}, 5.0, 1.0, "international", 0.95, 1),  # rule 1 wins
-        (109, {"AA"}, 100.0, None, "regional", 0.95, 2),
-        (109, {"AA"}, 400.0, None, "national", 0.95, 2),
-        (109, {"AA"}, None, None, "unknown", 0.0, 9),  # span needed
+        (3, _stops(AA=2, BB=2), 5.0, 1.0, "international", 0.95, 1),  # rule 1 wins
+        (109, _stops(AA=1), 100.0, None, "regional", 0.95, 2),
+        (109, _stops(AA=1), 400.0, None, "national", 0.95, 2),
+        (109, _stops(AA=1), None, None, "unknown", 0.0, 9),  # span needed
         (204, None, None, None, "national", 0.95, 2),
         (715, None, None, None, "local", 0.95, 2),
-        (1000, {"AA"}, 20.0, None, "local", 0.95, 2),
-        (300, {"AA"}, 100.0, None, "regional", 0.95, 2),  # suburban railway
-        (300, {"AA"}, 400.0, None, "national", 0.95, 2),
+        (1000, _stops(AA=1), 20.0, None, "local", 0.95, 2),
+        (300, _stops(AA=1), 100.0, None, "regional", 0.95, 2),  # suburban railway
+        (300, _stops(AA=1), 400.0, None, "national", 0.95, 2),
         (500, None, None, None, "local", 0.95, 2),  # metro service
-        (1200, {"AA"}, 20.0, None, "local", 0.95, 2),  # ferry, as water
-        (1200, {"AA"}, 80.0, None, "regional", 0.95, 2),
+        (1200, _stops(AA=1), 20.0, None, "local", 0.95, 2),  # ferry, as water
+        (1200, _stops(AA=1), 80.0, None, "regional", 0.95, 2),
         (1301, None, None, None, "local", 0.95, 2),  # telecabin sub-type
-        (1100, {"AA"}, 20.0, None, "unknown", 0.0, 10),  # air: out of scope
-        (1501, {"AA"}, 20.0, 1.0, "unknown", 0.0, 10),  # taxi: out of scope
-        (1800, {"AA"}, 20.0, 1.0, "unknown", 0.0, 9),  # not a GTFS type
+        (1100, _stops(AA=1), 20.0, None, "unknown", 0.0, 10),  # air: out of scope
+        (1501, _stops(AA=1), 20.0, 1.0, "unknown", 0.0, 10),  # taxi: out of scope
+        (1800, _stops(AA=1), 20.0, 1.0, "unknown", 0.0, 9),  # not a GTFS type
         (1, None, None, None, "local", 0.90, 3),
         (5, None, None, None, "local", 0.90, 3),  # cable tram
         (11, None, None, None, "local", 0.90, 3),  # trolleybus
-        (2, {"AA"}, 100.0, None, "regional", 0.75, 4),
-        (4, {"AA"}, 80.0, None, "regional", 0.75, 5),
-        (3, {"AA"}, 30.0, 1.0, "local", 0.85, 6),
-        (3, {"AA"}, 150.0, 5.0, "regional", 0.65, 7),
-        (3, {"AA"}, 1000.0, 50.0, "national", 0.60, 8),
-        (3, {"AA"}, None, 1.0, "unknown", 0.0, 9),  # bus without span
-        (None, {"AA"}, 30.0, 1.0, "unknown", 0.0, 9),
+        (2, _stops(AA=1), 100.0, None, "regional", 0.75, 4),
+        (4, _stops(AA=1), 80.0, None, "regional", 0.75, 5),
+        (3, _stops(AA=1), 30.0, 1.0, "local", 0.85, 6),
+        (3, _stops(AA=1), 150.0, 5.0, "regional", 0.65, 7),
+        (3, _stops(AA=1), 1000.0, 50.0, "national", 0.60, 8),
+        (3, _stops(AA=1), None, 1.0, "unknown", 0.0, 9),  # bus without span
+        (None, _stops(AA=1), 30.0, 1.0, "unknown", 0.0, 9),
     ],
 )
 def test_the_decision_table(
@@ -51,12 +58,12 @@ def test_the_decision_table(
 
 def test_the_margin_penalty_applies_within_a_fifth_of_a_threshold():
     # 36 km is within 20 % of the 40 km local span threshold.
-    decision = classify.classify_route(3, {"AA"}, 36.0, 1.0)
+    decision = classify.classify_route(3, _stops(AA=1), 36.0, 1.0)
     assert decision["tier"] == "local"
     assert decision["margin"] is True
     assert decision["tier_confidence"] == pytest.approx(0.85 * 0.7)
     # A rail route right past 150 km is penalised on the other side too.
-    decision = classify.classify_route(2, {"AA"}, 160.0, None)
+    decision = classify.classify_route(2, _stops(AA=1), 160.0, None)
     assert decision["tier"] == "national"
     assert decision["margin"] is True
 
@@ -367,6 +374,12 @@ LOOKUP = StubLookup(
         20.0: _records("Q-other"),
         # A point only the metro's own polygon places.
         40.0: [{"kind": "metro", "wikidata": "Q-metro", "country": "AA"}],
+        # Across a border: country BB only; on an overlap sliver: both countries.
+        60.0: [{"kind": "country", "country": "BB"}],
+        65.0: [
+            {"kind": "country", "country": "AA"},
+            {"kind": "country", "country": "BB"},
+        ],
         # A point inside two overlapping member cities.
         25.0: [
             {
@@ -658,6 +671,11 @@ def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
     assert manifest["home_share"] == classify.HOME_SHARE
     assert manifest["classifier"] == classify.classifier_settings()
     assert manifest["edges_near_threshold"] == 0  # nothing here sits near a threshold
+    assert manifest["stop_artefacts"] == {
+        "stops_in_several_countries": 0,
+        "stops_without_country": 0,
+        "border_stops": 0,
+    }
     assert manifest["feeds_by_scope"] == {"domestic": 2, "declared": 1, "unknown": 1}
     assert manifest["feeds_by_country_basis"] == {
         "scheduled": 1,
@@ -1371,7 +1389,13 @@ def test_every_decider_constant_is_published_in_the_classifier_settings():
     settings = classify.classifier_settings()
     assert settings["rules_version"] == classify.RULES_VERSION
     names = set()
-    for decider in (classify.classify_route, classify._decide, classify._near):
+    deciders = (
+        classify.classify_route,
+        classify._scale,
+        classify._decide,
+        classify._near,
+    )
+    for decider in deciders:
         names |= {name for name in decider.__code__.co_names if name.isupper()}
     numeric = {
         name
@@ -1481,3 +1505,54 @@ def test_scheduled_stops_resolving_to_no_country_leave_no_basis(tmp_path):
     assert feed["country_stops"] == {} and feed["country_basis"] is None
     assert feed["scope"] == "unknown"
     assert manifest["feeds_by_country_basis"] == {"none": 1}
+
+
+def test_the_border_gate_needs_two_minority_stops_and_a_tenth():
+    # One stop abroad among twenty: the scale decision stands and records it.
+    decision = classify.classify_route(0, _stops(AA=19, BB=1), None, None)
+    assert (decision["tier"], decision["rule"]) == ("local", 3)
+    assert decision["border_stops"] == {"BB": 1} and decision["scale_tier"] == "local"
+    # Three among twenty: international, with the scale kept.
+    decision = classify.classify_route(0, _stops(AA=17, BB=3), None, None)
+    assert (decision["tier"], decision["rule"]) == ("international", 1)
+    assert (decision["scale_tier"], decision["scale_rule"]) == ("local", 3)
+    assert decision["border_stops"] == {}
+    # Two of ten is a fifth; two of forty is a twentieth.
+    assert (
+        classify.classify_route(0, _stops(AA=8, BB=2), None, None)["tier"]
+        == "international"
+    )
+    far = classify.classify_route(0, _stops(AA=38, BB=2), None, None)
+    assert far["tier"] == "local" and far["border_stops"] == {"BB": 2}
+    # A stop on a boundary sliver sits in both countries: never a minority stop.
+    sliver = {"AA": frozenset({"a0", "a1", "x"}), "BB": frozenset({"x"})}
+    decision = classify.classify_route(0, sliver, None, None)
+    assert decision["tier"] == "local" and decision["border_stops"] == {}
+
+
+def test_a_foreign_stop_that_breaks_a_skip_is_counted_as_a_border_stop(tmp_path):
+    # The crawl skipped stop_times as single-country; a stop now resolving to
+    # BB breaks the skip, and the feed-as-one-route minority is still counted.
+    cache = tmp_path / "cache"
+    feeds = [
+        {"feed_id": "f-x", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    _write_crawl(
+        cache,
+        "f-x",
+        {
+            "stops.txt": (
+                b"stop_id,stop_lat,stop_lon\nk1,1.0,10.0\nk2,1.0,10.01\nk3,1.0,60.0\n"
+            ),
+            "routes.txt": b"route_id,route_type\nm1,1\n",
+        },
+        "skipped",
+    )
+    _coverage(cache, feeds, [_candidate("Q-city", "f-x")])
+    manifest = classify.classify(cache, lookup=LOOKUP)
+    assert manifest["feeds_by_status"] == {"skip_stale": 1}
+    records, _ = store.read_jsonl(
+        cache / "classify", "edges.json", classify.FEEDS_ARTIFACT
+    )
+    (feed,) = records
+    assert feed["border_stops"] == 1 and feed["stops_in_several_countries"] == 0

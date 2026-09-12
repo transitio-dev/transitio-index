@@ -96,6 +96,7 @@ def test_set_tiers_redefines_the_pair_and_stamps_it(tmp_path):
     # threshold in this fixture.
     assert manifest["classifier"] == classify.classifier_settings()
     assert manifest["edges_near_threshold"] == 0
+    assert manifest["stop_artefacts"]["border_stops"] == 0
     # The other places of the feed are untouched.
     assert a[("Q-other", "national")]["method"] == "crawl"
 

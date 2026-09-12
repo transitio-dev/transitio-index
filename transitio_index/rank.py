@@ -211,6 +211,7 @@ def rank(cache_dir):
             "overrides_sha256",
             "stale_overrides",
             "classifier",
+            "stop_artefacts",
         )
         by_tier = collections.Counter(e["tier"] for e in ranked)
         manifest = {
