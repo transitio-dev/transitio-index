@@ -768,3 +768,36 @@ def test_sampler_keeps_matching_atlas_feeds_not_files_or_platform_hosts(tmp_path
         "local.dmfr.json": ["f-a", "f-b", "f-c"],
         "hsl.dmfr.json": ["f-hsl"],
     }
+
+
+def test_stats_keys_gbfs_systems_sharing_id_and_country_by_ordinal():
+    """The ES build's stats stage refused two GBFS systems both listed as
+    ``seville`` in ES (Cooltra and Sevici): the crosswalk skips both as
+    ambiguous, and the catalogue rows must still carry distinct keys.
+    """
+    from transitio_index import stats
+
+    def system(name, url):
+        return {
+            "source": "gbfs",
+            "system_id": "seville",
+            "spec": "gbfs",
+            "country_code": "ES",
+            "location": "Seville",
+            "name": name,
+            "requires_auth": False,
+            "auto_discovery_url": url,
+        }
+
+    rows = stats.catalogue_rows(
+        {
+            "gbfs": [
+                system("Cooltra", "https://a/gbfs.json"),
+                system("Sevici", "https://b/gbfs.json"),
+            ]
+        },
+        [],
+    )
+    assert [r["source_id"] for r in rows] == ["seville/ES#1", "seville/ES#2"]
+    assert {r["drop_reason"] for r in rows} == {"ambiguous_id"}
+    assert stats.identity(rows, [])["gbfs_duplicate_system_ids"] == 1

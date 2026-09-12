@@ -209,13 +209,25 @@ def catalogue_rows(raw, feeds, snapshot_id=None):
         key = ("gbfs", record["system_id"], record.get("country_code"))
         row["feed_id"] = lookup.get(key)
         if row["feed_id"] is None and record["system_id"] in duplicated:
-            if not record.get("country_code"):
-                row["drop_reason"] = "ambiguous_id"
+            # The crosswalk mints no id for a system the country does not
+            # tell apart (none, or two systems sharing id and country).
+            row["drop_reason"] = "ambiguous_id"
         rows.append(row)
-    keys = collections.Counter((row["source"], row["source_id"]) for row in rows)
-    repeated = sorted(key for key, n in keys.items() if n > 1)
-    if repeated:
-        raise StatsError(f"catalogue rows share a key: {repeated[:5]}")
+    # Two systems sharing id and country still need distinct keys: the
+    # ordinal in catalogue order tells them apart.
+    seen = collections.Counter()
+    repeated = {
+        key
+        for key, n in collections.Counter(
+            (row["source"], row["source_id"]) for row in rows
+        ).items()
+        if n > 1
+    }
+    for row in rows:
+        key = (row["source"], row["source_id"])
+        if key in repeated:
+            seen[key] += 1
+            row["source_id"] = f"{row['source_id']}#{seen[key]}"
     for row in rows:
         row.setdefault("drop_reason", None if row["feed_id"] else "not_in_index")
         row["snapshot_id"] = snapshot_id
@@ -582,8 +594,9 @@ def _municipality_outcome(placement, served, places):
 
 
 def _region_of(place_id, places):
-    """The first region in a place's ancestry (itself when it is one), else
-    its parent — a district's parent may be a city, a region's a country."""
+    """The first region in a place's ancestry (itself when it is one), or
+    None — a district's parent may be a city, and a city parented straight
+    to its country has no region to judge by."""
     seen, current = set(), place_id
     while current is not None and current not in seen:
         place = places.get(current) or {}
@@ -591,7 +604,7 @@ def _region_of(place_id, places):
             return current
         seen.add(current)
         current = place.get("parent_id")
-    return (places.get(place_id) or {}).get("parent_id")
+    return None
 
 
 def _licence_state(feed):
