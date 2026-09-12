@@ -376,9 +376,10 @@ def test_publish_round_trips_through_the_reader(tmp_path):
 
     assert index.snapshot_id == manifest["snapshot_id"]
     assert index.schema_version == publish.SCHEMA_VERSION
-    # f-a is url-matched to mdb-1; f-b, f-mdb-2 and the GBFS system stand alone.
+    # f-a is url-matched to mdb-1; f-b and f-mdb-2 stand alone; the GBFS
+    # system is not a transit feed and never reaches the index.
     feed_ids = set(index.feeds["feed_id"])
-    assert {"f-a", "f-b", "f-mdb-2", "f-gbfs-sys"} <= feed_ids
+    assert {"f-a", "f-b", "f-mdb-2"} <= feed_ids and "f-gbfs-sys" not in feed_ids
     both = index.feeds[index.feeds["feed_id"] == "f-a"].iloc[0]
     assert both["source"] == "both"
     assert both["crosswalk_method"] == "url_exact"
@@ -392,14 +393,9 @@ def test_snapshot_manifest_records_sources_and_counts(tmp_path):
     assert manifest["sources"]["atlas"]["commit"] == "a" * 40
     assert manifest["sources"]["mdb"]["csv_sha256"]
     assert manifest["sources"]["gbfs"]["csv_sha256"]
-    assert manifest["counts"]["feeds"] == 4
-    assert manifest["counts"]["by_source"] == {
-        "atlas": 1,
-        "both": 1,
-        "mdb": 1,
-        "systems_csv": 1,
-    }
-    assert manifest["counts"]["by_spec"] == {"gtfs": 3, "gbfs": 1}
+    assert manifest["counts"]["feeds"] == 3
+    assert manifest["counts"]["by_source"] == {"atlas": 1, "both": 1, "mdb": 1}
+    assert manifest["counts"]["by_spec"] == {"gtfs": 3}
 
 
 def test_the_snapshot_id_is_deterministic_in_the_sources(tmp_path):
@@ -419,8 +415,6 @@ def test_the_verbatim_source_blocks_round_trip_as_json(tmp_path):
     both = index.feeds[index.feeds["feed_id"] == "f-a"].iloc[0]
     assert json.loads(both["atlas"])["onestop_id"] == "f-a"
     assert json.loads(both["mdb"])["mdb_id"] == "mdb-1"
-    system = index.feeds[index.feeds["feed_id"] == "f-gbfs-sys"].iloc[0]
-    assert json.loads(system["gbfs"])["system_id"] == "sys"
 
 
 def test_a_minted_feed_has_a_null_onestop_id(tmp_path):

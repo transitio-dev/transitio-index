@@ -1,14 +1,17 @@
 """Crosswalk stage: resolve the same feed across the ingest catalogues.
 
-Reads the raw Atlas, Mobility Database and GBFS generations and writes one
-``feeds.jsonl`` of unified feed records, each with a stable ``feed_id`` and
-the crosswalk method that produced it. Identity is resolved in a cascade of
-narrowing confidence: url-exact (a GTFS download URL byte-identical in both
-catalogues), then a gated same-host match (feeds sharing a download host whose
-names agree), then geohash-confirm (a same-host candidate whose Onestop-ID
-geohash meets the MDB centroid geohash). GBFS ``systems.csv`` systems are linked
-to their Atlas feed by auto-discovery URL, or minted ``f-gbfs-*`` where no Atlas
-feed carries them. Ambiguous same-host candidates are not merged — they go to a
+Reads the raw Atlas, Mobility Database and GBFS generations and writes
+``feeds.jsonl`` of unified transit feed records (GTFS and GTFS-RT), each with
+a stable ``feed_id`` and the crosswalk method that produced it. Identity is
+resolved in a cascade of narrowing confidence: url-exact (a GTFS download URL
+byte-identical in both catalogues), then a gated same-host match (feeds
+sharing a download host whose names agree), then geohash-confirm (a same-host
+candidate whose Onestop-ID geohash meets the MDB centroid geohash). GBFS
+``systems.csv`` systems are linked to their Atlas feed by auto-discovery URL,
+or minted ``f-gbfs-*`` where no Atlas feed carries them, and written to their
+own ``gbfs_systems.jsonl``: shared-mobility systems are not transit feeds, so
+no later stage of this index reads them; they are kept for a GBFS index of
+their own. Ambiguous same-host candidates are not merged — they go to a
 ``provisional_links`` report for a human to adjudicate. GTFS-RT feeds are not
 merged (their URL match is one-to-many) but are given a ``static_feed_id`` — the
 static feed they belong to, declared on the operator or inferred — which a later
@@ -33,7 +36,9 @@ log = logging.getLogger(__name__)
 
 FEEDS_POINTER = "feeds.json"
 FEEDS_ARTIFACT = "feeds.jsonl"
+GBFS_ARTIFACT = "gbfs_systems.jsonl"
 PROVISIONAL_ARTIFACT = "provisional_links.jsonl"
+GBFS_SPEC = "gbfs"
 
 # url-exact identity is resolved for GTFS static feeds only. An Atlas GTFS-RT
 # feed bundles three endpoint URLs that MDB lists as three separate feeds, so
@@ -624,7 +629,8 @@ def _gbfs_linked_record(atlas_feed, system, minted_alias):
     """An Atlas GBFS feed linked to its ``systems.csv`` system.
 
     Keyed on the Onestop ID like any Atlas feed; the system row is kept verbatim
-    for the placement its ``Location`` + ``Country Code`` later drive. The minted
+    (its ``Location`` + ``Country Code`` are what a GBFS index will place it by).
+    The minted
     ``f-gbfs-*`` id is kept in ``aliases`` so overrides filed against it still
     resolve — unless it is None (the system id was ambiguous) or equals the
     Onestop ID.
@@ -939,8 +945,16 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
     return records, summary
 
 
+def split_transit(records):
+    """``(transit, systems)``: the GTFS and GTFS-RT records, and the GBFS ones."""
+    systems = [record for record in records if record["spec"] == GBFS_SPEC]
+    transit = [record for record in records if record["spec"] != GBFS_SPEC]
+    return transit, systems
+
+
 def crosswalk(cache_dir):
-    """Run the crosswalk stage, publishing a ``feeds.json`` generation."""
+    """Run the crosswalk stage, publishing a ``feeds.json`` generation: the
+    transit feeds in ``feeds.jsonl``, the GBFS systems in their own artifact."""
     atlas_feeds, atlas_operators, atlas_manifest = _read_atlas(cache_dir)
     mdb_feeds, mdb_manifest = store.read_jsonl(
         cache_dir / "raw", "mdb.json", "mdb_feeds.jsonl"
@@ -949,8 +963,14 @@ def crosswalk(cache_dir):
         cache_dir / "raw", "gbfs.json", "gbfs_systems.jsonl"
     )
     records, summary = build_records(atlas_feeds, mdb_feeds, atlas_operators, systems)
+    records, gbfs_records = split_transit(records)
     if not records:
-        raise CrosswalkError("crosswalk produced no feeds")
+        raise CrosswalkError("crosswalk produced no transit feeds")
+    # The summary's feed counts describe the transit feeds the stage ships;
+    # the systems have their own count (the gbfs_* keys describe their linking).
+    summary["feeds"] = len(records)
+    summary["feeds_by_source"] = collections.Counter(r["source"] for r in records)
+    summary["gbfs_systems"] = len(gbfs_records)
 
     # The provisional links are their own artifact, with only their count in the
     # manifest, so the pointer stays small however many accumulate.
@@ -973,6 +993,7 @@ def crosswalk(cache_dir):
                 FEEDS_POINTER,
                 {
                     FEEDS_ARTIFACT: store.jsonl_chunks(records),
+                    GBFS_ARTIFACT: store.jsonl_chunks(gbfs_records),
                     PROVISIONAL_ARTIFACT: store.jsonl_chunks(provisional),
                 },
                 manifest,

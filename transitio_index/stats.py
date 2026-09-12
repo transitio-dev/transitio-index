@@ -25,7 +25,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from transitio_index import store
-from transitio_index.crosswalk import _clean_url, _host
+from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host
 
 STATS_POINTER = "stats.json"
 # The shape of the stats artifacts; the aggregation script refuses a mismatch.
@@ -169,8 +169,8 @@ def _gbfs_row(record, duplicated):
     }
 
 
-def _feed_lookup(feeds):
-    """``{(source, key): feed_id}`` for every catalogue row a feed carries:
+def _feed_lookup(feeds, systems=()):
+    """``{(source, key): feed_id}`` for every catalogue row a record carries:
     MDB rows by id, Atlas feeds by Onestop ID, GBFS systems by id and country
     (a duplicated system id is only unambiguous with its country)."""
     lookup = {}
@@ -179,17 +179,20 @@ def _feed_lookup(feeds):
             lookup[("mdb", feed["mdb_id"])] = feed["feed_id"]
         if feed.get("onestop_id"):
             lookup[("atlas", feed["onestop_id"])] = feed["feed_id"]
-        system = feed.get("gbfs") or {}
+    for record in systems:
+        system = record.get("gbfs") or {}
         if system.get("system_id"):
             key = ("gbfs", system["system_id"], system.get("country_code"))
-            lookup[key] = feed["feed_id"]
+            lookup[key] = record["feed_id"]
     return lookup
 
 
-def catalogue_rows(raw, feeds, snapshot_id=None):
+def catalogue_rows(raw, feeds, snapshot_id=None, systems=()):
     """One row per catalogue row of ``raw`` (``{source: records}``), with the
-    index feed it became, or the reason it did not."""
-    lookup = _feed_lookup(feeds)
+    index feed it became, or the reason it did not. ``systems`` are the GBFS
+    records the crosswalk kept apart: a system it resolved is ``not_transit``,
+    one it could not tell apart ``ambiguous_id``; neither is a feed."""
+    lookup = _feed_lookup(feeds, systems)
     mdb = raw.get("mdb") or []
     status_by_id = {record["mdb_id"]: record.get("status") for record in mdb}
     gbfs = raw.get("gbfs") or []
@@ -202,16 +205,18 @@ def catalogue_rows(raw, feeds, snapshot_id=None):
         rows.append(row)
     for record in raw.get("atlas") or []:
         row = _atlas_row(record)
-        row["feed_id"] = lookup.get(("atlas", record["onestop_id"]))
+        if record.get("spec") == "gbfs":  # an Atlas GBFS feed is a system too
+            row["feed_id"], row["drop_reason"] = None, "not_transit"
+        else:
+            row["feed_id"] = lookup.get(("atlas", record["onestop_id"]))
         rows.append(row)
     for record in gbfs:
         row = _gbfs_row(record, duplicated)
         key = ("gbfs", record["system_id"], record.get("country_code"))
-        row["feed_id"] = lookup.get(key)
-        if row["feed_id"] is None and record["system_id"] in duplicated:
-            # The crosswalk mints no id for a system the country does not
-            # tell apart (none, or two systems sharing id and country).
-            row["drop_reason"] = "ambiguous_id"
+        row["feed_id"] = None
+        # The crosswalk mints no id for a system the country does not tell
+        # apart (none, or two systems sharing id and country).
+        row["drop_reason"] = "not_transit" if key in lookup else "ambiguous_id"
         rows.append(row)
     # Two systems sharing id and country still need distinct keys: the
     # ordinal in catalogue order tells them apart.
@@ -289,10 +294,10 @@ def declared_places(rows):
     }
 
 
-def identity(rows, feeds):
+def identity(rows, feeds, systems=()):
     """The identity-and-duplication section: id namespaces, deprecated rows
     and their redirects, nameless rows, duplicated GBFS ids, and what the
-    crosswalk made of the rows."""
+    crosswalk made of the rows (feeds, and the GBFS systems it kept apart)."""
     mdb = [row for row in rows if row["source"] == "mdb"]
     deprecated = [row for row in mdb if row["status"] == "deprecated"]
     url_by_id = {row["source_id"]: row["download_url"] for row in mdb}
@@ -329,6 +334,7 @@ def identity(rows, feeds):
             if n > 1
         ),
         "rows_into_feeds": sum(1 for r in rows if r["feed_id"]),
+        "gbfs_systems_kept": len(systems),
         "rows_dropped_by_reason": dict(
             collections.Counter(r["drop_reason"] for r in rows if r["drop_reason"])
         ),
@@ -394,15 +400,22 @@ def stats(cache_dir):
             stack.enter_context(store.exclusive_writer(directory))
         if store.current_generation(cache_dir / "crosswalk", "feeds.json") is None:
             raise StatsError("no crosswalk generation to gather statistics from")
-        feeds, crosswalk = store.read_jsonl(
-            cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
-        )
+        generation, crosswalk = store.resolve(cache_dir / "crosswalk", "feeds.json")
+        with generation:
+            # Both artifacts from the one verified generation; one written
+            # before the crosswalk kept the systems apart has no systems.
+            feeds = store.parse_jsonl(generation.read_bytes("feeds.jsonl"))
+            systems = (
+                store.parse_jsonl(generation.read_bytes(GBFS_ARTIFACT))
+                if generation.has(GBFS_ARTIFACT)
+                else []
+            )
         raw, manifests = _read_raw(cache_dir)
         if not raw:
             raise StatsError("no ingest generation to gather statistics from")
         snapshot = _snapshot(cache_dir, crosswalk, manifests)
         snapshot_id = snapshot.get("snapshot_id")
-        rows = catalogue_rows(raw, feeds, snapshot_id)
+        rows = catalogue_rows(raw, feeds, snapshot_id, systems)
         # An ingest that read a local file (no URL) is a cut sample.
         local = [
             s
@@ -425,7 +438,7 @@ def stats(cache_dir):
                 "sample_sources": local,
             },
             "declared_places": declared_places(rows),
-            "identity": identity(rows, feeds),
+            "identity": identity(rows, feeds, systems),
         }
         from transitio_index import crawl
 

@@ -75,7 +75,16 @@ RAW = {
             "license": {"url": "https://l"},
             "requires_auth": False,
             "urls": {"static_current": "https://mdb-1.example/gtfs.zip"},
-        }
+        },
+        {  # an Atlas GBFS feed: a shared-mobility system, not a transit feed
+            "source": "atlas",
+            "onestop_id": "f-bikes",
+            "spec": "gbfs",
+            "name": "Bikes",
+            "license": {},
+            "requires_auth": False,
+            "urls": {"gbfs_auto_discovery": "https://b.example/gbfs.json"},
+        },
     ],
     "gbfs": [
         {
@@ -133,20 +142,20 @@ FEEDS = [
         "onestop_id": None,
         "crosswalk_method": "none",
     },
+]
+# The GBFS systems the crosswalk kept apart from the feeds.
+SYSTEMS = [
     {
         "feed_id": "f-gbfs-bikes-fi",
         "source": "systems_csv",
         "spec": "gbfs",
-        "mdb_id": None,
-        "onestop_id": None,
-        "crosswalk_method": "none",
         "gbfs": {"system_id": "bikes", "country_code": "FI"},
-    },
+    }
 ]
 
 
 def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
-    rows = stats.catalogue_rows(RAW, FEEDS, "snap")
+    rows = stats.catalogue_rows(RAW, FEEDS, "snap", SYSTEMS)
     by_id = {
         (row["source"], row["source_id"], row["declared_country"]): row for row in rows
     }
@@ -162,7 +171,11 @@ def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
     assert by_id[("mdb", "mdb-4", "FI")]["redirect_target"] == "tdg-2"
     assert by_id[("mdb", "mdb-1", "FI")]["redirect_targets"] == []
     assert by_id[("atlas", "f-hsl", None)]["feed_id"] == "f-hsl"
-    assert by_id[("gbfs", "bikes/FI", "FI")]["feed_id"] == "f-gbfs-bikes-fi"
+    bikes = by_id[("atlas", "f-bikes", None)]
+    assert bikes["feed_id"] is None and bikes["drop_reason"] == "not_transit"
+    # A GBFS system is never a feed: kept apart, or not told apart at all.
+    kept = by_id[("gbfs", "bikes/FI", "FI")]
+    assert kept["feed_id"] is None and kept["drop_reason"] == "not_transit"
     dropped = by_id[("gbfs", "bikes/?", None)]
     assert dropped["feed_id"] is None and dropped["drop_reason"] == "ambiguous_id"
     assert all(row["snapshot_id"] == "snap" for row in rows)
@@ -173,7 +186,7 @@ def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
 
 
 def test_summary_sections_count_the_catalogue_defects():
-    rows = stats.catalogue_rows(RAW, FEEDS)
+    rows = stats.catalogue_rows(RAW, FEEDS, systems=SYSTEMS)
     declared = stats.declared_places(rows)
     assert declared["mdb_rows"] == 4
     assert declared["missing_country"] == 1 and declared["missing_municipality"] == 1
@@ -185,10 +198,10 @@ def test_summary_sections_count_the_catalogue_defects():
         declared["bbox_over_15_degrees"] == 1 and declared["bbox_over_40_degrees"] == 1
     )
     assert declared["bbox_by_extracted_year"] == {"2026": 3}
-    assert declared["atlas_rows_without_location"] == 1
+    assert declared["atlas_rows_without_location"] == 2
     assert declared["gbfs_rows_with_free_text_location"] == 2
-    identity = stats.identity(rows, FEEDS)
-    assert identity["rows_by_source"] == {"mdb": 4, "atlas": 1, "gbfs": 2}
+    identity = stats.identity(rows, FEEDS, SYSTEMS)
+    assert identity["rows_by_source"] == {"mdb": 4, "atlas": 2, "gbfs": 2}
     assert identity["id_namespaces"] == {"mdb": 3, "tdg": 1}
     assert identity["deprecated_rows"] == 2 == identity["deprecated_with_redirect"]
     assert identity["redirect_target_present"] == 2
@@ -196,9 +209,9 @@ def test_summary_sections_count_the_catalogue_defects():
     assert identity["redirect_shares_target_url"] == 1
     assert identity["mdb_rows_without_name"] == 3
     assert identity["gbfs_duplicate_system_ids"] == 1
-    assert identity["rows_into_feeds"] == 6
-    assert identity["rows_dropped_by_reason"] == {"ambiguous_id": 1}
-    assert identity["feeds_by_crosswalk_method"] == {"url_exact": 1, "none": 4}
+    assert identity["rows_into_feeds"] == 5 and identity["gbfs_systems_kept"] == 1
+    assert identity["rows_dropped_by_reason"] == {"not_transit": 2, "ambiguous_id": 1}
+    assert identity["feeds_by_crosswalk_method"] == {"url_exact": 1, "none": 3}
 
 
 def _publish(cache, subdir, pointer, artifacts, manifest):
@@ -257,14 +270,14 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
         )
     )
     manifest = stats.stats(cache)
-    assert manifest["catalogue_rows"] == 7 and manifest["snapshot_id"] == "abc"
+    assert manifest["catalogue_rows"] == 8 and manifest["snapshot_id"] == "abc"
     assert manifest["sections"] == sorted(stats.REPORT_SECTIONS)
     assert manifest["feeds"] == 0 and manifest["places"] == 0
     generation, _ = store.resolve(cache / "stats", "stats.json")
     with generation:
         table = pq.read_table(pa_source(generation.read_bytes("catalogue.parquet")))
         summary = json.loads(generation.read_bytes("summary.json"))
-    assert table.num_rows == 7 and table.schema.names == stats.CATALOGUE_SCHEMA.names
+    assert table.num_rows == 8 and table.schema.names == stats.CATALOGUE_SCHEMA.names
     generation, _ = store.resolve(cache / "stats", "stats.json")
     with generation:
         empty = pq.read_table(pa_source(generation.read_bytes("places.parquet")))
@@ -273,12 +286,13 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
     assert report.startswith("# Build statistics") and "## Identity" in report
     assert summary["build"]["snapshot_id"] == "abc"
     assert summary["build"]["schema_version"] == 7
-    assert summary["build"]["catalogue_rows"] == {"mdb": 4, "atlas": 1, "gbfs": 2}
+    assert summary["build"]["catalogue_rows"] == {"mdb": 4, "atlas": 2, "gbfs": 2}
     assert summary["build"]["catalogue_dates"]["mdb"] == "2026-09-01"
     # Every ingest read a local file: a cut sample, not the full catalogues.
     assert summary["build"]["sample"] == "sample"
     assert summary["build"]["sample_sources"] == ["mdb", "atlas", "gbfs"]
-    assert summary["identity"]["feeds"] == 5
+    assert summary["identity"]["feeds"] == 4
+    assert summary["identity"]["gbfs_systems_kept"] == 0  # no artifact: none
 
 
 def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
@@ -295,7 +309,10 @@ def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
     rows = table.to_pylist()
     # The url-matched MDB row and its Atlas feed both name the same feed.
     assert {r["feed_id"] for r in rows if r["source_id"] in ("mdb-1", "f-a")} == {"f-a"}
-    assert summary["identity"]["rows_into_feeds"] == len(rows)
+    # Every row but the GBFS system became a feed; the system is not transit.
+    assert summary["identity"]["rows_into_feeds"] == len(rows) - 1
+    assert summary["identity"]["rows_dropped_by_reason"] == {"not_transit": 1}
+    assert summary["identity"]["gbfs_systems_kept"] == 1
     assert summary["identity"]["feeds"] == published["counts"]["feeds"]
     # The published feeds (never crawled here) become the feed table too.
     assert feeds.num_rows == manifest["feeds"] == published["counts"]["feeds"]
