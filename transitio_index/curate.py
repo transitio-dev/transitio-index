@@ -720,6 +720,7 @@ def curate(cache_dir, *, overrides_dir=None, strict=False, registry=None):
             "stale_feed_overrides": classified.get("stale_feed_overrides"),
             "expanded_generation": classified.get("expanded_generation"),
             "classifier": classified.get("classifier"),
+            "stop_artefacts": classified.get("stop_artefacts"),
             # The digest of the very bytes the entries were parsed from:
             # publish refuses these edges once the file has been edited.
             "overrides_sha256": digest,

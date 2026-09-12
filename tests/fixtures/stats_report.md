@@ -13,6 +13,7 @@ The snapshot the statistics describe and the catalogues it read.
 | schema_version | 9 |
 | overture_release |  |
 | classifier |  |
+| stop_artefacts |  |
 | sample | sample |
 
 ### sources

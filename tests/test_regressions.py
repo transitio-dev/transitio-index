@@ -836,7 +836,9 @@ def test_every_gtfs_route_type_decides_a_tier_or_is_out_of_scope_by_design():
     decides a tier given full signals, or is unclassifiable by design (rule
     10) and lies in the table's out-of-scope ranges."""
     for route_type in (*GTFS_BASIC_ROUTE_TYPES, *GTFS_EXTENDED_ROUTE_TYPES):
-        decision = classify.classify_route(route_type, {"AA"}, 10.0, 1.0)
+        decision = classify.classify_route(
+            route_type, {"AA": frozenset({"s"})}, 10.0, 1.0
+        )
         out_of_scope = any(
             low <= route_type <= high for low, high in classify.UNCLASSIFIABLE_RANGES
         )
@@ -900,3 +902,62 @@ def test_a_complete_crawl_without_a_schedule_keeps_its_edges_and_home(
     assert feed["scope"] == "domestic" and feed["home_country"] == "AA"
     assert manifest["feeds_by_status"] == {status: 1}
     assert manifest["edges_dropped_no_serving_route"] == 0
+
+
+@pytest.mark.parametrize(
+    ("abroad", "tier"), [(1, "local"), (3, "international")], ids=["one-stop", "three"]
+)
+def test_one_stop_across_a_boundary_does_not_make_a_route_international(
+    tmp_path, abroad, tier
+):
+    """Rule 1 fired on any second country among a route's stops, so a stop on
+    the wrong side of a simplified boundary, or on an overlap sliver resolving
+    to two countries, made a city route international at 0.95 and hid its
+    scale. The gate needs two minority stops and a tenth of the route, the
+    scale is recorded either way, and the artefacts are counted per feed."""
+    from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
+
+    cache = tmp_path / "cache"
+    feeds = [
+        {"feed_id": "f-b", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    stops = [(f"h{i}", 1.0 + i / 1000, 10.0) for i in range(17)]  # AA, in Q-city
+    stops += [(f"b{i}", 1.0, 60.0) for i in range(abroad)]  # BB only
+    stops += [("sliver", 1.0, 65.0), ("nowhere", 1.0, 30.0)]  # AA+BB; no country
+    stops_txt = "stop_id,stop_lat,stop_lon\n" + "".join(
+        f"{s},{lat},{lon}\n" for s, lat, lon in stops
+    )
+    times = "trip_id,stop_id,stop_sequence\n" + "".join(
+        f"t,{s},{i}\n" for i, (s, _, _) in enumerate(stops, 1)
+    )
+    _write_crawl(
+        cache,
+        "f-b",
+        {
+            "stops.txt": stops_txt.encode(),
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": b"trip_id,route_id\nt,tram\n",
+            "stop_times.txt": times.encode(),
+        },
+        "complete",
+    )
+    _coverage(cache, feeds, [_candidate("Q-city", "f-b", 17)])
+    manifest = classify.classify(cache, lookup=LOOKUP)
+    edges, _ = store.read_jsonl(
+        cache / "classify", "edges.json", classify.EDGES_ARTIFACT
+    )
+    (edge,) = edges
+    assert edge["tier"] == tier and edge["evidence"]["scale_tiers"] == ["local"]
+    assert edge["evidence"].get("border_stops") == ({"BB": 1} if abroad == 1 else None)
+    records, _ = store.read_jsonl(
+        cache / "classify", "edges.json", classify.FEEDS_ARTIFACT
+    )
+    (feed,) = records
+    assert feed["stops_in_several_countries"] == 1
+    assert feed["stops_without_country"] == 1
+    assert feed["border_stops"] == abroad and feed["home_country"] == "AA"
+    assert manifest["stop_artefacts"] == {
+        "stops_in_several_countries": 1,
+        "stops_without_country": 1,
+        "border_stops": abroad,
+    }

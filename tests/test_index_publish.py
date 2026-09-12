@@ -1614,6 +1614,7 @@ def test_a_published_index_carries_its_realtime_table(tmp_path):
     assert manifest["unknown_share"] == 1.0  # over the one edge that ships
     assert manifest["classifier"] == classify.classifier_settings()
     assert manifest["margin_share"] == 0.0
+    assert set(manifest["stop_artefacts"]) == set(classify._stop_artefacts({}))
     # Declared coverage gives f-a no home: it and its companion are international.
     listed = manifest["partitions"]["international"]
     assert listed["realtime"]["rows"] == 1 and listed["feeds"]["rows"] == 1
