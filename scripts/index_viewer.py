@@ -161,7 +161,19 @@ EDGE_COLUMNS = (
     "service",
 )
 EDGE_FEED_COLUMNS = ("name", "spec", "source", "crawl_status", "stop_count")
+# An edge's class: the rank stage's relevance category (schema 7) or, before
+# it, the classify stage's tier; each in rank order, highest first.
 TIERS = ("local", "regional", "national", "international", "unknown")
+CATEGORIES = ("primary", "secondary", "tertiary", "international", "unknown")
+SPECS = ("gtfs", "gtfs-rt", "gbfs")
+# A level: the place kinds it shows, and the categories (schema 7) or tiers
+# (schema 6) of the edges that count as serving a place at that level.
+LEVELS = {
+    "city": (("city", "metro"), ("primary", "secondary"), ("local", "regional")),
+    "regional": (("region",), ("secondary", "tertiary"), ("regional", "national")),
+    "national": (("country",), ("tertiary",), ("national",)),
+    "international": (("country",), ("international",), ("international",)),
+}
 # A feed record lists at most this many served places, and an edges reply at
 # most this many rows: Germany's busiest feed serves 23,126 places over
 # 33,668 edges (3.9 MB and 9.4 MB unbounded), which nobody reads as a list.
@@ -335,13 +347,6 @@ class Build:
         self.places = places.drop(columns=["geometry"]).reset_index(drop=True)
         self.edges = tables["edges.parquet"].to_pandas().reset_index(drop=True)
         self.feeds = tables["feeds.parquet"].to_pandas().reset_index(drop=True)
-        self.served = (
-            self.places["place_id"].isin(set(self.edges["place_id"])).to_numpy()
-        )
-        per_place = self.edges.groupby("place_id")["feed_id"].nunique()
-        self.feed_count = (
-            self.places["place_id"].map(per_place).fillna(0).astype(int).to_numpy()
-        )
         self._row_of = pd.Series(
             np.arange(len(self.places)), index=self.places["place_id"].to_numpy()
         )
@@ -354,12 +359,68 @@ class Build:
             if "service" in self.edges.columns
             else None
         )
-        self.table = _place_table(self)
+        self.ranked = "relevance_category" in self.edges.columns
+        self.class_column = "category" if self.ranked else "tier"
+        self.classes = self.edges["relevance_category" if self.ranked else "tier"]
+        self.class_names = CATEGORIES if self.ranked else TIERS
+        self._views = {}
+        default = self.view()
+        self.served, self.feed_count = default.served, default.feed_count
+        self.table = _place_table(self, default)
         self.feed_table = _feed_table(self)
         children = self.places["parent_id"].value_counts()
         self.child_count = (
             self.places["place_id"].map(children).fillna(0).astype(int).to_numpy()
         )
+
+    def view(self, spec="all", level=None):
+        """The per-place summaries under one spec and level, derived once."""
+        key = (spec, level)
+        if key not in self._views:
+            self._views[key] = View(self, spec, level)
+        return self._views[key]
+
+
+class View:
+    """What ``spec`` and ``level`` keep of a build's edges, summarized per place.
+
+    ``spec`` keeps the edges of the feeds of that spec (``all`` keeps every
+    feed); ``level`` keeps the edges whose class is one the level counts (None
+    keeps every class). From those edges: the served flag, the distinct feeds
+    per place and the highest class per place (None when unserved): four
+    arrays, kept with the build.
+    """
+
+    def __init__(self, build, spec, level):
+        self.spec, self.level = spec, level
+        edges, feeds, places = build.edges, build.feeds, build.places
+        keep = np.ones(len(edges), dtype=bool)
+        if spec != "all":
+            ids = (
+                set(feeds.loc[feeds["spec"] == spec, "feed_id"])
+                if "spec" in feeds
+                else ()
+            )
+            keep &= edges["feed_id"].isin(ids).to_numpy()
+        if level is not None:
+            keep &= build.classes.isin(
+                LEVELS[level][1 if build.ranked else 2]
+            ).to_numpy()
+            if level == "international" and build.ranked:
+                # The category alone is not enough: the level shows the
+                # edges that cross a border.
+                keep &= edges["cross_border"].fillna(False).astype(bool).to_numpy()
+        self.edge_mask = keep
+        kept = edges[keep]
+        ids = places["place_id"]
+        self.served = ids.isin(set(kept["place_id"])).to_numpy()
+        per_place = kept.groupby("place_id")["feed_id"].nunique()
+        self.feed_count = ids.map(per_place).fillna(0).astype(int).to_numpy()
+        names = build.class_names
+        rank = build.classes[keep].map({name: i for i, name in enumerate(names)})
+        best = ids.map(rank.groupby(kept["place_id"].to_numpy()).min())
+        lookup = np.array(names + (None,), dtype=object)
+        self.category = lookup[best.fillna(len(names)).astype(int).to_numpy()]
 
 
 def _has_columns(table, name, required):
@@ -400,8 +461,12 @@ def load_build(build_id, path, read_bytes=_read_file):
                 table = pq.read_table(io.BytesIO(data))
                 if rows is not None and len(table) != rows:
                     return None
-                if "partitions" in snapshot and not _has_columns(
-                    table, name.rpartition("/")[2], SCHEMA_7_COLUMNS
+                base = name.rpartition("/")[2]
+                # Each partition on its own: a join promotes a column one
+                # partition lacks to nulls, which would hide the gap.
+                if "partitions" in snapshot and not (
+                    _has_columns(table, base, REQUIRED_COLUMNS)
+                    and _has_columns(table, base, SCHEMA_7_COLUMNS)
                 ):
                     return None
                 tables[name] = table
@@ -522,15 +587,17 @@ class BuildCache:
             self._builds.pop(build_id, None)  # gone: never serve the stale copy
             return None
         try:
-            listed = snapshot_files(json.loads(self.read_bytes(path / "snapshot.json")))
-            current = None if listed is None else {n: d for n, (d, _) in listed.items()}
+            snapshot = json.loads(self.read_bytes(path / "snapshot.json"))
+            listed = snapshot_files(snapshot)
         except _SNAPSHOT_ERRORS:
-            current = None
+            listed = None
         cached = self._builds.get(build_id)
-        if cached is not None and current is not None and cached.digests == current:
+        # The whole snapshot: one rewritten with the same digests but other
+        # row counts or metadata is revalidated, not served from memory.
+        if cached is not None and listed is not None and cached.snapshot == snapshot:
             self._builds.move_to_end(build_id)
             return cached
-        build = load_build(build_id, path, self.read_bytes) if current else None
+        build = load_build(build_id, path, self.read_bytes) if listed else None
         if build is None:
             self._builds.pop(build_id, None)
             return None
@@ -569,6 +636,7 @@ def filter_places(
     q=None,
     feed_id=None,
     bounded=True,
+    view=None,
 ):
     """A boolean mask over the build's places for one slice.
 
@@ -577,9 +645,11 @@ def filter_places(
     slice that can include cities must be bounded by ``parent_id`` or
     ``bbox`` (``ValueError`` otherwise); the geometry-free table passes
     ``bounded=False``. ``feed_id`` keeps the places that feed serves, through the
-    edges. Every test is a vectorized mask over the build's arrays.
+    edges. ``served`` and ``feed_id`` read the ``view`` (the build's default
+    when omitted). Every test is a vectorized mask over the build's arrays.
     """
     places = build.places
+    view = view or build.view()
     unbounded = parent_id is None and bbox is None
     if bounded and unbounded and (kinds is None or "city" in kinds):
         raise ValueError("a slice that includes cities needs parent_id or bbox")
@@ -598,11 +668,11 @@ def filter_places(
             & (bounds[:, 3] >= miny)
         )
     if served is not None:
-        mask &= build.served if served else ~build.served
+        mask &= view.served if served else ~view.served
     if q:
         mask &= places["name"].str.contains(q, case=False, na=False, regex=False)
     if feed_id is not None:
-        edges = build.edges
+        edges = build.edges[view.edge_mask]
         serving = set(edges.loc[edges["feed_id"] == feed_id, "place_id"])
         mask &= places["place_id"].isin(serving).to_numpy()
     return np.asarray(mask, dtype=bool)
@@ -644,14 +714,15 @@ def _service_frame(parsed):
     return frame.apply(pd.to_numeric, errors="coerce")
 
 
-def _place_table(build):
-    """The geometry-free table of a build's places, one row per place."""
+def _place_table(build, view):
+    """The geometry-free table of a build's places under ``view``, one row each."""
     places = build.places
     names = pd.Series(places["name"].to_numpy(), index=places["place_id"].to_numpy())
     table = places[["place_id", "name", "kind", "parent_id", "country_code"]].copy()
     table["parent_name"] = places["parent_id"].map(names).to_numpy()
-    table["served"] = build.served
-    table["feed_count"] = build.feed_count
+    table["served"] = view.served
+    table["feed_count"] = view.feed_count
+    table[build.class_column] = view.category
     stats = _service_frame(build.service)
     for column in SERVICE_STATS:
         table[column] = stats[column].to_numpy()
@@ -664,16 +735,25 @@ def _json_ready(frame):
     return frame.where(frame.notna(), None).to_dict(orient="records")
 
 
-def places_table(build, mask, sort="name", order="asc", offset=0, limit=50):
+def places_table(build, mask, sort="name", order="asc", offset=0, limit=50, view=None):
     """``{"total", "offset", "limit", "rows"}``: a page of the masked places."""
-    if sort not in TABLE_SORT_COLUMNS:
-        raise ValueError(f"sort must be one of {', '.join(TABLE_SORT_COLUMNS)}")
+    view = view or build.view()
+    sortable = TABLE_SORT_COLUMNS + (build.class_column,)
+    if sort not in sortable:
+        raise ValueError(f"sort must be one of {', '.join(sortable)}")
     if order not in ("asc", "desc"):
         raise ValueError("order must be asc or desc")
     if offset < 0 or limit < 1:
         raise ValueError("offset must be at least 0 and limit at least 1")
     limit = min(limit, TABLE_LIMIT)
-    rows = build.table[mask].sort_values(
+    table = build.table
+    if view is not build.view():  # the default view's columns are the table's
+        table = table.assign(
+            served=view.served,
+            feed_count=view.feed_count,
+            **{build.class_column: view.category},
+        )
+    rows = table[mask].sort_values(
         sort, ascending=order == "asc", kind="stable", na_position="last"
     )
     page = rows.iloc[offset : offset + limit]
@@ -950,6 +1030,7 @@ def places_geojson(
     max_bytes=MAX_BYTES,
     clip=None,
     extra=None,
+    view=None,
 ):
     """``(body, overflow)`` for the masked places.
 
@@ -959,9 +1040,12 @@ def places_geojson(
     cut to the box and a place whose geometry does not reach into it is
     dropped; the geometry is generalized over the whole array, serialized in
     one pass, and the byte budget measured on exactly what would be sent.
-    Properties stay compact; ``service`` is the row's JSON string; ``extra``
-    maps a property name to a ``place_id``-indexed Series to add.
+    Properties stay compact; ``service`` is the row's JSON string, ``served``,
+    ``feed_count`` and the class (``category``, or ``tier`` on schema 6) come
+    from ``view`` (the build's default when omitted); ``extra`` maps a property
+    name to a ``place_id``-indexed Series to add.
     """
+    view = view or build.view()
     matched = int(np.count_nonzero(mask))
     if matched > max_features:  # decided before anything is materialized
         return None, _overflow(matched, max_features)
@@ -975,14 +1059,15 @@ def places_geojson(
         geoms = generalize(geoms, tolerance)
     geometry = shapely.to_geojson(geoms)
     props = build.places.iloc[index][list(PROPERTY_COLUMNS)]
+    props[build.class_column] = view.category[index]
     for key, by_place in (extra or {}).items():  # e.g. a feed's tier per place
         props[key] = props["place_id"].map(by_place)
     props = props.astype(object).where(props.notna(), None)
     features = []
     for record, feed_count, is_served, geom in zip(
         props.to_dict(orient="records"),
-        build.feed_count[index].tolist(),
-        build.served[index].tolist(),
+        view.feed_count[index].tolist(),
+        view.served[index].tolist(),
         geometry,
     ):
         record["feed_count"] = feed_count
@@ -1003,6 +1088,22 @@ def places_geojson(
             matched, max_features, bytes=len(body), byte_limit=max_bytes
         )
     return body, None
+
+
+def parse_spec(value):
+    """The ``spec=`` parameter: one of SPECS, or ``all`` (the default)."""
+    if value is None or value == "all":
+        return "all"
+    if value not in SPECS:
+        raise ValueError(f"spec must be all or one of {', '.join(SPECS)}")
+    return value
+
+
+def parse_level(value):
+    """The ``level=`` parameter: one of LEVELS, or None (no level filter)."""
+    if value is not None and value not in LEVELS:
+        raise ValueError(f"level must be one of {', '.join(LEVELS)}")
+    return value
 
 
 def _parse_served(value):
@@ -1036,6 +1137,12 @@ def create_app(cache, size=CACHED_BUILDS):
             raise HTTPException(404, f"{build_id}: not an available build")
         return build
 
+    def viewed(build, spec, level):
+        try:
+            return build.view(parse_spec(spec), parse_level(level))
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+
     @app.get("/")
     def index():
         return Response(page, media_type="text/html; charset=utf-8")
@@ -1057,6 +1164,7 @@ def create_app(cache, size=CACHED_BUILDS):
             "id": build.id,
             "snapshot_id": build.snapshot_id,
             "served_places": int(build.served.sum()),
+            "category_field": build.class_column,
         }
 
     @app.get("/api/builds/{build_id}/places")
@@ -1069,12 +1177,20 @@ def create_app(cache, size=CACHED_BUILDS):
         q: str | None = None,
         feed_id: str | None = None,
         zoom: float | None = None,
+        spec: str | None = None,
+        level: str | None = None,
     ):
         build = opened(build_id)
+        view = viewed(build, spec, level)
         try:
             # A feed's served places are mostly cities: with ``feed_id`` and
-            # no ``kind`` the slice covers every kind.
-            kinds = None if kind is None and feed_id is not None else parse_kinds(kind)
+            # no ``kind`` the slice covers every kind; a level names its kinds.
+            if kind is None and level is not None:
+                kinds = set(LEVELS[level][0])
+            elif kind is None and feed_id is not None:
+                kinds = None
+            else:
+                kinds = parse_kinds(kind)
             box = parse_bbox(bbox) if bbox is not None else None
             mask = filter_places(
                 build,
@@ -1084,6 +1200,7 @@ def create_app(cache, size=CACHED_BUILDS):
                 served=_parse_served(served),
                 q=q,
                 feed_id=feed_id,
+                view=view,
             )
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
@@ -1104,6 +1221,7 @@ def create_app(cache, size=CACHED_BUILDS):
             MAX_BYTES,
             clip=box,
             extra=extra,
+            view=view,
         )
         # The slice names the snapshot it came from, so the page can tell
         # when ``latest`` was republished between its summary and a slice.
@@ -1123,19 +1241,27 @@ def create_app(cache, size=CACHED_BUILDS):
         order: str = "asc",
         offset: int = 0,
         limit: int = 50,
+        spec: str | None = None,
+        level: str | None = None,
     ):
         # Geometry-free, so every kind by default and no bound required.
         build = opened(build_id)
+        view = viewed(build, spec, level)
         try:
+            if kind is not None:
+                kinds = parse_kinds(kind)
+            else:
+                kinds = set(LEVELS[level][0]) if level is not None else None
             mask = filter_places(
                 build,
-                kinds=parse_kinds(kind) if kind is not None else None,
+                kinds=kinds,
                 parent_id=parent_id,
                 served=_parse_served(served),
                 q=q,
                 bounded=False,
+                view=view,
             )
-            page = places_table(build, mask, sort, order, offset, limit)
+            page = places_table(build, mask, sort, order, offset, limit, view)
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
         return JSONResponse(page, headers={"X-Snapshot": build.snapshot_id})

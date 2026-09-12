@@ -324,6 +324,7 @@ def test_slices_are_capped_by_count_then_bytes(tmp_path):
         "parent_id": "fi",
         "country_code": "FI",
         "service": '{"feeds": 1}',
+        "tier": None,  # unserved: no class (``category`` on schema 7)
         "feed_count": 0,
         "served": False,
     }
@@ -581,12 +582,14 @@ def test_the_places_table_is_sorted_paged_and_geometry_free(tmp_path):
         "country_code",
         "served",
         "feed_count",
+        "tier",
         "stops",
         "routes",
         "departures_per_day",
     }
     busiest = iv.places_table(build, everything, sort="feed_count", order="desc")
     assert busiest["rows"][0]["place_id"] == "hel" and busiest["rows"][0]["served"]
+    assert busiest["rows"][0]["tier"] == "local"  # the highest class per place
     assert busiest["rows"][0]["parent_name"] == "Uusimaa"
     assert busiest["rows"][0]["stops"] is None  # the fixture's service has none
     paged = iv.places_table(build, everything, limit=2, offset=2)
@@ -1016,3 +1019,65 @@ def test_the_cache_and_the_api_serve_a_partitioned_build(tmp_path):
     summary = client.get(f"/api/builds/{iv.LATEST}/summary").json()
     assert summary["schema_version"] == 7 and set(summary["partitions"]) == {"FI"}
     assert client.get(f"/api/builds/{iv.LATEST}/places").status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("spec", "level", "feed_count", "category"),
+    [
+        ("all", None, 3, "primary"),
+        ("gbfs", None, 1, "primary"),
+        ("gtfs", "city", 1, "primary"),
+        ("gtfs", "international", 1, "international"),
+        ("gtfs", "national", 0, None),
+        ("gbfs", "international", 0, None),
+    ],
+)
+def test_a_view_keeps_the_edges_of_one_spec_at_one_level(
+    tmp_path, spec, level, feed_count, category
+):
+    # A domestic edge in the international category is not a border crossing.
+    domestic = _edge7("hel", "f1", "national", "international", 0.1, False)
+    edges = dict(PARTITIONED_EDGES, FI=PARTITIONED_EDGES["FI"] + [domestic])
+    write_partitioned_build(tmp_path, edges=edges)
+    build = iv.load_build("b", tmp_path)
+    view = build.view(spec, level)
+    assert build.view(spec, level) is view  # derived once per combination
+    hel = list(build.places["place_id"]).index("hel")
+    assert view.feed_count[hel] == feed_count
+    assert bool(view.served[hel]) is (feed_count > 0)
+    assert view.category[hel] == category  # the highest class among kept edges
+    assert view.served.sum() == (1 if feed_count else 0)
+    mask = np.ones(len(build.places), dtype=bool)
+    rows = iv.places_table(build, mask, view=view)["rows"]
+    row = next(r for r in rows if r["place_id"] == "hel")
+    assert row["category"] == category and row["feed_count"] == feed_count
+
+
+def test_the_api_filters_places_by_level_and_spec(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    write_partitioned_build(cache / "index")
+    client = TestClient(iv.create_app(cache))
+    url = f"/api/builds/{iv.LATEST}"
+    # A level names its kinds and the classes that count; a spec its feeds.
+    params = {"level": "city", "spec": "gbfs"}
+    rows = client.get(f"{url}/places/table", params=params).json()["rows"]
+    assert {r["kind"] for r in rows} == {"city"} and len(rows) == 3
+    hel = next(r for r in rows if r["place_id"] == "hel")
+    assert hel["served"] and hel["feed_count"] == 1 and hel["category"] == "primary"
+    params = {"level": "city", "served": "true", "sort": "category"}
+    rows = client.get(f"{url}/places/table", params=params).json()["rows"]
+    assert [r["place_id"] for r in rows] == ["hel"]
+    params = {"level": "city", "spec": "gtfs", "parent_id": "uus"}
+    features = client.get(f"{url}/places", params=params).json()["features"]
+    props = {f["id"]: f["properties"] for f in features}
+    assert props["hel"]["category"] == "primary" and props["hel"]["feed_count"] == 1
+    assert props["esp"]["category"] is None and not props["esp"]["served"]
+    national = client.get(f"{url}/places", params={"level": "national"}).json()
+    assert [f["id"] for f in national["features"]] == ["fi"]
+    assert national["features"][0]["properties"]["feed_count"] == 0
+    assert client.get(f"{url}/summary").json()["category_field"] == "category"
+    for bad in ({"spec": "bikes"}, {"level": "galactic"}):
+        assert client.get(f"{url}/places/table", params=bad).status_code == 400
