@@ -41,8 +41,8 @@ resulting ``scope`` — ``domestic``, ``international`` (stops, no home),
 catalogues' ``declared_countries`` never set the home; they only tell
 ``declared`` from ``unknown`` and feed the statistics. ``country_basis`` says
 which stops the counts came from: every located stop of a whole-feed (skipped)
-feed, the scheduled stops of declared trips of a route-level feed, or null
-whenever the counts are empty.
+feed or of a crawl with stops but no schedule, the scheduled stops of declared
+trips of a route-level feed, or null whenever the counts are empty.
 """
 
 import collections
@@ -900,16 +900,19 @@ def _classify_feed(
     rows the feed failed to join (None without route evidence),
     ``country_stops`` the feed's distinct stops per country and
     ``country_basis`` which stops they are: ``scheduled`` (route mode),
-    ``located`` (whole-feed mode) or None whenever the counts are empty (no
-    stop evidence, or no stop resolving to a country). ``conflicts`` names
-    the divisions the
-    expand stage dropped: a stop in one is a logged miss, any other unknown
-    QID-bearing division a stale expansion.
+    ``located`` (whole-feed mode, and a crawl with stops but no routes or
+    no scheduled stops) or None whenever the counts are empty (no stop
+    evidence, or no stop resolving to a country). ``conflicts`` names the
+    divisions the expand stage dropped: a stop in one is a logged miss, any
+    other unknown QID-bearing division a stale expansion.
 
     ``candidates`` is ``{place_id: candidate edge}``. The stop_times state
     decides the mode: ``complete`` measures each route; ``skipped`` is the
     whole-feed case the crawl predicate proved single-place and fixed-tier;
-    anything else has no route evidence and yields ``unknown`` edges.
+    anything else has no route evidence and yields ``unknown`` edges. A
+    complete crawl with no routes, or with routes but no scheduled stops
+    (header-only trips or stop_times), yields ``unknown`` edges too: no route
+    serves anything, but the feed's membership is not a vanished edge.
     """
     mode = (state.get("stop_times") or {}).get("state")
     names = ("trips.txt",) if mode == "complete" else ()
@@ -958,8 +961,7 @@ def _classify_feed(
                 0,
                 0,
                 None,
-                {},
-                None,
+                *_country_evidence(coords, stop_countries, "located"),
             )
         # The crawl's skip rested on single-tier, single-country, single-city
         # conditions judged against the boundary memo of ITS time; judge the
@@ -1045,6 +1047,21 @@ def _classify_feed(
             None,
             {},
             None,
+        )
+
+    if not routes or not parsed["scheduled"]:
+        # Stops and routes without a schedule (header-only trips or
+        # stop_times): no route serves anything, so the membership stays as
+        # explicit unknown edges, and every located stop is the country
+        # evidence, as in whole-feed mode.
+        reason = "no_routes" if not routes else "no_service"
+        return (
+            [_unknown_edge(c, reason, route_min_stops) for c in candidates.values()],
+            reason,
+            len(routes),
+            0,
+            parsed.get("join_gaps"),
+            *_country_evidence(coords, stop_countries, "located"),
         )
 
     # Per-route measurement, then service to each candidate place.
@@ -1574,8 +1591,9 @@ def classify(
                     {
                         "country_stops": stops,
                         # Which stops the counts came from: every located
-                        # stop (whole-feed), the scheduled stops of declared
-                        # trips (route-level), or null when they are empty.
+                        # stop (whole-feed, or no schedule), the scheduled
+                        # stops of declared trips (route-level), or null
+                        # when they are empty.
                         "country_basis": basis,
                         "country_shares": shares,
                         "home_country": home,
