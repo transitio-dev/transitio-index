@@ -663,3 +663,166 @@ def test_one_host_shares_a_bucket_across_schemes_and_ports():
         fetcher.head("https://feeds.example/a.zip")
         fetcher.head("http://feeds.example:8080/b.zip")
     assert slept  # the second request shared the host's bucket and waited
+
+
+def test_a_host_refusing_identity_is_read_gzip_encoded(tmp_path):
+    import gzip
+
+    encoded = gzip.compress(BODY)
+    seen = []
+
+    def handler(request):
+        accept = request.headers.get("Accept-Encoding")
+        seen.append(accept)
+        if "gzip" not in accept:
+            return httpx.Response(406)
+        return httpx.Response(
+            200,
+            headers={"Content-Length": str(len(encoded)), "Content-Encoding": "gzip"},
+            stream=_RawStream(encoded),
+        )
+
+    directory = store.open_subdir(tmp_path, "crawl")
+    try:
+        with _fetcher(httpx.MockTransport(handler)) as fetcher:
+            result = fetcher.download(
+                "https://feeds.example/gtfs.zip", directory, "feed.zip"
+            )
+            # The wire carried the encoded bytes; the file holds the decoded ones.
+            assert fetcher.bytes_fetched == len(encoded)
+    finally:
+        directory.close()
+    assert seen == ["identity", "gzip"]
+    assert result["status"] == "fetched" and result["bytes"] == len(BODY)
+    assert result["sha256"] == hashlib.sha256(BODY).hexdigest()
+    assert (tmp_path / "crawl" / "feed.zip").read_bytes() == BODY
+
+
+def test_a_host_refusing_gzip_as_well_is_a_failure(tmp_path):
+    def handler(request):
+        return httpx.Response(406)
+
+    directory = store.open_subdir(tmp_path, "crawl")
+    try:
+        with _fetcher(httpx.MockTransport(handler)) as fetcher:
+            with pytest.raises(fetch.FetchError, match="HTTP 406"):
+                fetcher.download(
+                    "https://feeds.example/gtfs.zip", directory, "feed.zip"
+                )
+    finally:
+        directory.close()
+
+
+class _FailingStream(httpx.SyncByteStream):
+    """A body that yields its first ``cut`` bytes, then drops the connection."""
+
+    def __init__(self, data, cut):
+        self._data = data
+        self._cut = cut
+
+    def __iter__(self):
+        yield self._data[: self._cut]
+        raise httpx.ReadError("connection dropped")
+
+
+def test_a_dropped_gzip_body_restarts_from_zero_with_a_clean_file(tmp_path):
+    import gzip
+
+    encoded = gzip.compress(BODY)
+    cut = len(encoded) // 2
+    ranges = []
+
+    def handler(request):
+        if "gzip" not in request.headers.get("Accept-Encoding"):
+            return httpx.Response(406)
+        ranges.append(request.headers.get("Range"))
+        body = _FailingStream(encoded, cut) if len(ranges) == 1 else _RawStream(encoded)
+        return httpx.Response(200, headers={"Content-Encoding": "gzip"}, stream=body)
+
+    directory = store.open_subdir(tmp_path, "crawl")
+    try:
+        with _fetcher(httpx.MockTransport(handler)) as fetcher:
+            result = fetcher.download(
+                "https://feeds.example/gtfs.zip", directory, "feed.zip"
+            )
+            # Both attempts' wire bytes are counted, the dropped one included.
+            assert fetcher.bytes_fetched == cut + len(encoded)
+    finally:
+        directory.close()
+    # An encoded body is never resumed by range: the partial decode was
+    # discarded and the retry started from zero.
+    assert ranges == [None, None]
+    assert result["sha256"] == hashlib.sha256(BODY).hexdigest()
+    assert result["bytes"] == len(BODY)
+    assert (tmp_path / "crawl" / "feed.zip").read_bytes() == BODY
+
+
+def test_a_gzip_body_cut_before_its_trailer_is_not_published(tmp_path):
+    import gzip
+
+    encoded = gzip.compress(BODY)[:-8]  # the CRC and length trailer are gone
+
+    def handler(request):
+        if "gzip" not in request.headers.get("Accept-Encoding"):
+            return httpx.Response(406)
+        return httpx.Response(
+            200, headers={"Content-Encoding": "gzip"}, stream=_RawStream(encoded)
+        )
+
+    directory = store.open_subdir(tmp_path, "crawl")
+    try:
+        with _fetcher(httpx.MockTransport(handler)) as fetcher:
+            with pytest.raises(fetch.FetchError, match="trailer"):
+                fetcher.download(
+                    "https://feeds.example/gtfs.zip", directory, "feed.zip"
+                )
+    finally:
+        directory.close()
+    assert not (tmp_path / "crawl" / "feed.zip").exists()
+
+
+def _gzip_only(body):
+    """A transport that refuses identity and serves ``body`` gzip-encoded as is."""
+
+    def handler(request):
+        if "gzip" not in request.headers.get("Accept-Encoding"):
+            return httpx.Response(406)
+        return httpx.Response(
+            200, headers={"Content-Encoding": "gzip"}, stream=_RawStream(body)
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def test_a_gzip_body_is_bounded_by_the_ceiling_as_it_inflates(tmp_path):
+    import gzip
+
+    # Eight megabytes of zeros compress to a few kilobytes: the ceiling must
+    # bind on the decoded bytes before a chunk is inflated whole.
+    encoded = gzip.compress(b"\0" * (8 * 1024 * 1024))
+    directory = store.open_subdir(tmp_path, "crawl")
+    try:
+        with _fetcher(_gzip_only(encoded)) as fetcher:
+            with pytest.raises(fetch.FetchError, match="ceiling"):
+                fetcher.download(
+                    "https://feeds.example/gtfs.zip",
+                    directory,
+                    "feed.zip",
+                    max_bytes=1024,
+                )
+    finally:
+        directory.close()
+
+
+def test_concatenated_gzip_members_decode_as_one_body(tmp_path):
+    import gzip
+
+    first, second = BODY[: len(BODY) // 2], BODY[len(BODY) // 2 :]
+    directory = store.open_subdir(tmp_path, "crawl")
+    try:
+        with _fetcher(_gzip_only(gzip.compress(first) + gzip.compress(second))) as f:
+            result = f.download("https://feeds.example/gtfs.zip", directory, "feed.zip")
+    finally:
+        directory.close()
+    assert result["sha256"] == hashlib.sha256(BODY).hexdigest()
+    assert (tmp_path / "crawl" / "feed.zip").read_bytes() == BODY
