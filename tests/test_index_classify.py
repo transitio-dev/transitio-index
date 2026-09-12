@@ -641,6 +641,12 @@ def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
     assert by_id["f-a"]["home_country"] == "AA"
     assert by_id["f-a"]["scope"] == "domestic"
     assert by_id["f-skip"]["country_stops"] == {"AA": 2}
+    # Route-level evidence counts scheduled stops, whole-feed every located
+    # stop; without stop evidence there is no basis.
+    assert by_id["f-a"]["country_basis"] == "scheduled"
+    assert by_id["f-skip"]["country_basis"] == "located"
+    assert by_id["f-none"]["country_basis"] is None
+    assert by_id["f-declared"]["country_basis"] is None
     assert by_id["f-none"]["scope"] == "unknown"
     assert by_id["f-none"]["country_stops"] == {}
     assert by_id["f-declared"]["scope"] == "declared"
@@ -653,6 +659,11 @@ def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
     assert manifest["classifier"] == classify.classifier_settings()
     assert manifest["edges_near_threshold"] == 0  # nothing here sits near a threshold
     assert manifest["feeds_by_scope"] == {"domestic": 2, "declared": 1, "unknown": 1}
+    assert manifest["feeds_by_country_basis"] == {
+        "scheduled": 1,
+        "located": 1,
+        "none": 2,
+    }
     assert manifest["home_country_agreement"] == {"undeclared": 2, "unobserved": 2}
 
 
@@ -1441,3 +1452,32 @@ def test_near_threshold_decisions_are_flagged_and_counted(tmp_path):
     assert far["evidence"]["near_threshold"] is False and far["needs_review"] is False
     assert by_feed["f-dec"]["evidence"]["near_threshold"] is False
     assert manifest["edges_near_threshold"] == 1
+
+
+def test_scheduled_stops_resolving_to_no_country_leave_no_basis(tmp_path):
+    # Route-level evidence whose stops fall in no known division counts
+    # nothing, so the record claims no basis for its empty counts.
+    cache = tmp_path / "cache"
+    feeds = [
+        {"feed_id": "f-off", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    _write_crawl(
+        cache,
+        "f-off",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\no1,1.0,30.0\no2,1.0,30.01\n",
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": b"trip_id,route_id\nt,tram\n",
+            "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt,o1,1\nt,o2,2\n",
+        },
+        "complete",
+    )
+    _coverage(cache, feeds, [_candidate("Q-city", "f-off", 2)])
+    manifest = classify.classify(cache, lookup=LOOKUP)
+    records, _ = store.read_jsonl(
+        cache / "classify", "edges.json", classify.FEEDS_ARTIFACT
+    )
+    (feed,) = records
+    assert feed["country_stops"] == {} and feed["country_basis"] is None
+    assert feed["scope"] == "unknown"
+    assert manifest["feeds_by_country_basis"] == {"none": 1}
