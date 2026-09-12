@@ -198,6 +198,16 @@ def _content_range(response):
     )
 
 
+def _attempt_error(url, first, last):
+    """The error a download ends with: the last attempt's, with the first
+    attempt's failure kept in front when it said something different — the
+    breaker's refusal or a short body would otherwise hide the transport error
+    that started it."""
+    if first is None or str(first) == str(last):
+        return FetchError(f"GET {url}: {last}")
+    return FetchError(f"GET {url}: {first}; last attempt: {last}")
+
+
 def _refuse_encoding(response, url, *, gzip_ok=False):
     """Refuse a content-encoded answer: offsets and lengths mean raw bytes.
 
@@ -285,28 +295,35 @@ class Fetcher:
         self._buckets.acquire(host)
 
     def _admit(self, method, url, host):
-        """Refuse a host that has failed ``host_failures`` times in a row."""
+        """Refuse a host on which ``host_failures`` distinct URLs failed in a
+        row: one feed's retries, or several workers retrying it at once, never
+        trip a host by themselves."""
         with self._failures_lock:
-            failures = self._failures.get(host, 0)
+            failures = len(self._failures.get(host, ()))
         if failures >= self._host_failures:
             raise FetchError(
                 f"{method} {url}: host {host} unreachable this run "
-                f"({failures} consecutive transport failures); not tried"
+                f"({failures} URLs failed consecutively); not tried"
             )
 
-    def _note(self, host, *, failed):
+    def _note(self, host, url, *, failed):
         with self._failures_lock:
-            self._failures[host] = self._failures.get(host, 0) + 1 if failed else 0
+            if failed:
+                self._failures.setdefault(host, set()).add(url)
+            else:
+                self._failures.pop(host, None)
 
     def _hops(self, method, url, headers, *, stream=False):
         """The final response, following redirects one checked hop at a time.
 
         A streamed response is returned unread (the caller closes it); every
         hop is URL-checked, admitted, throttled and counted, and more than
-        ``REDIRECT_LIMIT`` hops is an error. A transport failure counts against
-        the hop's host; an answer, whatever its status, clears the count — a
-        streamed one once its body has been read.
+        ``REDIRECT_LIMIT`` hops is an error. A transport failure counts the
+        requested URL against the failing host (a host is refused once
+        ``host_failures`` distinct URLs failed in a row); an answer, whatever its status, clears
+        the count — a streamed one once its body has been read.
         """
+        origin = url  # the breaker counts the feed's URL, not a redirect hop
         for _ in range(REDIRECT_LIMIT + 1):
             _, host = check_url(url)
             # Admitted before throttling, so nobody waits in the bucket for a
@@ -320,14 +337,14 @@ class Fetcher:
                 request = self._client.build_request(method, url, headers=headers)
                 response = self._client.send(request, stream=stream)
             except httpx.TransportError as error:
-                self._note(host, failed=True)
+                self._note(host, origin, failed=True)
                 raise FetchError(f"{method} {url}: {error}")
             except (httpx.HTTPError, httpx.InvalidURL, ValueError) as error:
                 # ValueError covers malformed third-party URLs (a bad port,
                 # say) that httpx surfaces outside its own error tree.
                 raise FetchError(f"{method} {url}: {error}")
             if response.status_code in _REDIRECTS:
-                self._note(host, failed=False)
+                self._note(host, origin, failed=False)
                 location = response.headers.get("Location")
                 if stream:
                     response.close()
@@ -343,7 +360,7 @@ class Fetcher:
             if not stream:
                 # A streamed answer is complete only once its body has been
                 # read; the consumer clears the count then.
-                self._note(host, failed=False)
+                self._note(host, origin, failed=False)
             return url, response
         raise FetchError(f"{method} {url}: more than {REDIRECT_LIMIT} redirects")
 
@@ -391,7 +408,7 @@ class Fetcher:
         try:
             if response.status_code != 206:
                 # A status answer whose body is not read is still an answer.
-                self._note(host, failed=False)
+                self._note(host, url, failed=False)
             if response.status_code == 200:
                 raise RangeUnsupported(f"{url}: server ignored the range request")
             if response.status_code != 206:
@@ -423,12 +440,12 @@ class Fetcher:
             except httpx.TransportError as error:
                 # A host that answers but stalls mid-body counts like one that
                 # never answered.
-                self._note(host, failed=True)
+                self._note(host, url, failed=True)
                 raise FetchError(f"GET {url}: {error}")
             except httpx.HTTPError as error:
                 raise FetchError(f"GET {url}: {error}")
             else:
-                self._note(host, failed=False)
+                self._note(host, url, failed=False)
         finally:
             response.close()
         body = b"".join(chunks)
@@ -489,6 +506,9 @@ class Fetcher:
         # with gzip; its body is decoded as it streams and never resumed by
         # range (offsets into the encoded body mean nothing to the file).
         encoded = False
+        # The first failure is the informative one: a later attempt refused
+        # by the host breaker would otherwise replace it in the record.
+        first_error = None
         try:
             with os.fdopen(handle, "wb") as opened_file:
                 handle = None
@@ -528,12 +548,13 @@ class Fetcher:
                     except (httpx.HTTPError, FetchError) as error:
                         opened_file.seek(written)
                         opened_file.truncate()
+                        first_error = first_error or error
                         if attempt == DOWNLOAD_ATTEMPTS:
-                            raise FetchError(f"GET {url}: {error}")
+                            raise _attempt_error(url, first_error, error)
                         continue
                     if outcome["status"] == "not_acceptable":
                         if encoded or attempt == DOWNLOAD_ATTEMPTS:
-                            raise FetchError(f"GET {url}: HTTP 406")
+                            raise _attempt_error(url, first_error, "HTTP 406")
                         encoded = True
                         continue
                     if outcome["status"] == "not_modified":
@@ -571,10 +592,13 @@ class Fetcher:
                         opened_file.flush()
                         os.fsync(opened_file.fileno())
                         break
+                    first_error = first_error or FetchError("body ended early")
                     if attempt == DOWNLOAD_ATTEMPTS:
-                        raise FetchError(f"GET {url}: body ended early")
+                        raise _attempt_error(url, first_error, "body ended early")
                 else:
-                    raise FetchError(f"GET {url}: could not complete the download")
+                    raise _attempt_error(
+                        url, first_error, "could not complete the download"
+                    )
             directory.replace(partial, name)
             return {
                 "status": "fetched",
@@ -610,7 +634,7 @@ class Fetcher:
                 written and response.status_code != 206
             ):
                 # A status answer whose body is not read is still an answer.
-                self._note(host, failed=False)
+                self._note(host, url, failed=False)
             if response.status_code == 304:
                 return {"status": "not_modified"}
             if response.status_code == 406:
@@ -688,10 +712,10 @@ class Fetcher:
                 raise FetchError(f"gzip body could not be decoded: {error}")
             except httpx.TransportError:
                 # Counted against the host; the caller's retry sees it unchanged.
-                self._note(host, failed=True)
+                self._note(host, url, failed=True)
                 raise
             else:
-                self._note(host, failed=False)
+                self._note(host, url, failed=False)
             validators = {
                 "etag": response.headers.get("ETag"),
                 "last_modified": response.headers.get("Last-Modified"),
