@@ -1,6 +1,6 @@
 """Publish stage: the feeds, places and membership edges as a shippable index.
 
-Writes ``<cache>/index/`` as a directory of partitions (schema 8): under each
+Writes ``<cache>/index/`` as a directory of partitions (schema 9): under each
 country code ``feeds.parquet`` (one row per GTFS feed whose home country it
 is), ``realtime.parquet`` (the GTFS-RT companions of those feeds),
 ``places.parquet`` (one row per place there, a GeoParquet with the simplified
@@ -18,6 +18,8 @@ pruned generation for a curated build, else the expanded generation, else the
 names one. Places and edges are optional: an index built before those stages
 ran is feeds only, and the reader treats the missing tables the same way.
 
+Each feed carries the first and last date its services run and each place
+the windows over which its feeds' spans overlap (schema 9).
 The feeds table is GTFS only and every edge belongs to a GTFS feed: a GTFS-RT
 feed describes the vehicles of a static feed and has no places of its own, so
 it ships as a companion row keyed by ``static_feed_id``, and each static feed
@@ -45,7 +47,7 @@ from transitio_index import overture
 from transitio_index import registry as _registry
 from transitio_index import store
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 # The reader release that first reads this schema; the installed reader's own
 # floor table wins once it knows the version.
 MIN_READER_VERSION = "0.12.0"
@@ -121,6 +123,10 @@ _SCHEMA = pa.schema(
         ("declared_countries", pa.list_(pa.string())),
         # The GTFS-RT companions that name this feed (schema_version 8).
         ("realtime_feed_ids", pa.list_(pa.string())),
+        # The first and last date any of the feed's services runs, from its
+        # crawled calendar (schema_version 9); null without one.
+        ("service_start", pa.string()),
+        ("service_end", pa.string()),
         ("snapshot", pa.string()),
     ]
 )
@@ -163,6 +169,7 @@ def _json_block(block):
 
 
 def _row(record, snapshot_id):
+    span = service_span(record)
     return {
         "feed_id": record["feed_id"],
         "onestop_id": record.get("onestop_id"),
@@ -194,8 +201,26 @@ def _row(record, snapshot_id):
         "scope": record.get("scope"),
         "declared_countries": record.get("declared_countries") or [],
         "realtime_feed_ids": record.get("realtime_feed_ids") or [],
+        "service_start": span[0].isoformat() if span else None,
+        "service_end": span[1].isoformat() if span else None,
         "snapshot": snapshot_id,
     }
+
+
+def service_span(record):
+    """A feed record's ``(service_start, service_end)`` as dates, or None
+    unless both are ISO dates in order: the one reading the dates, the
+    validity and the counts share."""
+    start, end = record.get("service_start"), record.get("service_end")
+    if not isinstance(start, str) or not isinstance(end, str):
+        return None
+    try:
+        first, last = datetime.date.fromisoformat(start), datetime.date.fromisoformat(
+            end
+        )
+    except ValueError:
+        return None
+    return (first, last) if first <= last else None
 
 
 def _realtime_row(record, snapshot_id):
@@ -331,10 +356,11 @@ def _identity_digest(identities):
     return hashlib.sha256(payload).hexdigest()
 
 
-def _place_row(record, snapshot_id, service=None, identity=None):
+def _place_row(record, snapshot_id, service=None, identity=None, validity=None):
     metro_ids = record.get("metro_ids") or []
     return {
         "service": _json_block(service),
+        "validity": _json_block(validity),
         **(identity or _identity(record, None)),
         "place_id": record["place_id"],
         "kind": record["kind"],
@@ -477,6 +503,8 @@ _PLACES_SCHEMA = pa.schema(
         ("wikidata_id", pa.string()),
         ("concordances", pa.string()),
         ("former_ids", pa.list_(pa.string())),
+        # Schema 9: the validity of the place's feeds and their overlap.
+        ("validity", pa.string()),
         ("geometry", pa.binary()),
     ]
 )
@@ -496,6 +524,89 @@ def _geo_metadata():
             },
         }
     ).encode("utf-8")
+
+
+def coverage_windows(intervals):
+    """The maximal windows over which the number of ``intervals`` (closed
+    ``(start, end)`` date pairs) covering a day is constant and positive, as
+    ``[{"start", "end", "feeds"}]`` in date order.
+
+    A sweep over the interval edges in day ordinals (an end is exclusive at
+    the next day, so no arithmetic runs past the calendar's last day);
+    adjacent segments with the same count merge, a day nothing covers
+    separates two windows.
+    """
+    events = collections.Counter()
+    for start, end in intervals:
+        events[start.toordinal()] += 1
+        events[end.toordinal() + 1] -= 1
+    windows = []
+    count = 0
+    previous = None
+    for day in sorted(events):
+        if count > 0 and previous is not None:
+            windows.append([previous, day - 1, count])
+        count += events[day]
+        previous = day
+    merged = []
+    for window in windows:
+        last = merged[-1] if merged else None
+        if last and last[2] == window[2] and last[1] + 1 == window[0]:
+            last[1] = window[1]
+        else:
+            merged.append(window)
+    return [
+        {
+            "start": datetime.date.fromordinal(a).isoformat(),
+            "end": datetime.date.fromordinal(b).isoformat(),
+            "feeds": n,
+        }
+        for a, b, n in merged
+    ]
+
+
+def _best_window(windows):
+    """The window with the most feeds; of equal counts the longest, of equal
+    length the earliest. None without windows."""
+    if not windows:
+        return None
+
+    def key(window):
+        start = datetime.date.fromisoformat(window["start"])
+        end = datetime.date.fromisoformat(window["end"])
+        return (window["feeds"], (end - start).days, -start.toordinal())
+
+    return max(windows, key=key)
+
+
+def _validity_by_place(edges, records):
+    """Each served place's feed validity: how many of its feeds carry a
+    service span, the earliest start and latest end among them, the
+    :func:`coverage_windows` of those spans and the best of them. A place
+    with no dated feed has no windows and null bounds; a place no edge
+    serves is absent.
+    """
+    dated = {}
+    for record in records:
+        span = service_span(record)
+        if span is not None:
+            dated[record["feed_id"]] = span
+    feeds_by_place = collections.defaultdict(set)
+    for edge in edges or []:
+        feeds_by_place[edge["place_id"]].add(edge["feed_id"])
+    validity = {}
+    for place_id, feed_ids in feeds_by_place.items():
+        intervals = [dated[f] for f in feed_ids if f in dated]
+        windows = coverage_windows(intervals)
+        validity[place_id] = {
+            "feeds_dated": len(intervals),
+            "feeds_undated": len(feed_ids) - len(intervals),
+            "start": min(i[0] for i in intervals).isoformat() if intervals else None,
+            "end": max(i[1] for i in intervals).isoformat() if intervals else None,
+            "windows": windows,
+            "best": _best_window(windows),
+        }
+    return validity
 
 
 def _service_by_place(edges):
@@ -523,7 +634,9 @@ def _service_by_place(edges):
     return totals
 
 
-def _places_parquet_bytes(places, snapshot_id, service_by_place=None, identities=None):
+def _places_parquet_bytes(
+    places, snapshot_id, service_by_place=None, identities=None, validity_by_place=None
+):
     """The places as GeoParquet bytes: declared columns plus the WKB boundary.
 
     The schema is declared, not inferred, so an all-null column (``geonames_id``,
@@ -537,6 +650,7 @@ def _places_parquet_bytes(places, snapshot_id, service_by_place=None, identities
             snapshot_id,
             (service_by_place or {}).get(place["place_id"]),
             identity=(identities or {}).get(place["place_id"]),
+            validity=(validity_by_place or {}).get(place["place_id"]),
         )
         wkb = place.get("geometry")
         row["geometry"] = bytes.fromhex(wkb) if wkb else None
@@ -665,7 +779,7 @@ def partition(records, places, edges, realtime=()):
     return dict(sorted(parts.items()))
 
 
-def _partition_tables(partitions, snapshot_id, service, identities):
+def _partition_tables(partitions, snapshot_id, service, identities, validity=None):
     """``({(partition, table): parquet bytes}, manifest listing)`` for every
     partition table; the listing carries each file's row count and digest."""
     files, listing = {}, {}
@@ -680,7 +794,11 @@ def _partition_tables(partitions, snapshot_id, service, identities):
                 )
             elif table == "places":
                 data = _places_parquet_bytes(
-                    rows, snapshot_id, service, identities=identities
+                    rows,
+                    snapshot_id,
+                    service,
+                    identities=identities,
+                    validity_by_place=validity,
                 )
             else:
                 data = _edges_parquet_bytes(
@@ -1325,9 +1443,14 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
         snapshot_id = _snapshot_id(sources, overture_release, digests)
         partitions = partition(records, places, edges, realtime)
         files, listing = _partition_tables(
-            partitions, snapshot_id, _service_by_place(edges), identities
+            partitions,
+            snapshot_id,
+            _service_by_place(edges),
+            identities,
+            _validity_by_place(edges, records),
         )
         counts = _counts(records, realtime)
+        counts["feeds_dated"] = sum(1 for r in records if service_span(r))
         manifest = {
             "schema_version": SCHEMA_VERSION,
             # The snapshot pins the data; the discovery semantics and the

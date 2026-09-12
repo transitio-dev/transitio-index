@@ -1,6 +1,6 @@
 # Build statistics
 
-Snapshot `<snapshot>` (sample); schema 8, Overture None.
+Snapshot `<snapshot>` (sample); schema 9, Overture None.
 
 ## Build
 
@@ -10,7 +10,7 @@ The snapshot the statistics describe and the catalogues it read.
 |---|---|
 | snapshot_id | <snapshot> |
 | stats_schema_version | 2 |
-| schema_version | 8 |
+| schema_version | 9 |
 | overture_release |  |
 | sample | sample |
 

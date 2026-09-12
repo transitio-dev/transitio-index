@@ -1,4 +1,5 @@
 import io
+import datetime
 import hashlib
 import json
 import os
@@ -27,14 +28,18 @@ from transitio.exceptions import IncompatibleIndexError  # noqa: E402
 from transitio.exceptions import PlaceNotFoundError  # noqa: E402
 
 # The feeds columns schema 7 added; an older shape is recreated by dropping them.
-# The feed columns schema 7 and 8 added over the flat layout's; schema 8 also
-# dropped the ``gbfs`` block, which the flat layout still expects.
+# The columns schema 7, 8 and 9 added over the flat layout's (feeds, and the
+# places' ``validity``); schema 8 also dropped the ``gbfs`` block, which the
+# flat layout still expects.
 _SCHEMA_7_FEED_COLUMNS = (
     "home_country",
     "country_shares",
     "scope",
     "declared_countries",
     "realtime_feed_ids",
+    "service_start",
+    "service_end",
+    "validity",
 )
 
 
@@ -1222,7 +1227,9 @@ def _restamp(index_dir, version, places):
     """Recreate the flat layout at ``version`` with ``places`` as its places
     table."""
     _flatten(index_dir, version)
-    places.to_parquet(index_dir / "places.parquet", index=False)
+    # Minus the place columns added since: the flat layout predates them.
+    gone = [c for c in ("validity",) if c in places.columns]
+    places.drop(columns=gone).to_parquet(index_dir / "places.parquet", index=False)
     snapshot = json.loads((index_dir / "snapshot.json").read_text())
     snapshot["places_sha256"] = hashlib.sha256(
         (index_dir / "places.parquet").read_bytes()
@@ -1449,9 +1456,9 @@ def test_the_index_ships_the_country_and_relevance_columns(tmp_path):
         "cross_border": True,
     }
     cache, manifest = _edges_index(tmp_path, [edge], feeds=[feed])
-    assert manifest["schema_version"] == 8 == publish.SCHEMA_VERSION
+    assert manifest["schema_version"] == 9 == publish.SCHEMA_VERSION
     assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
-        8, publish.MIN_READER_VERSION
+        9, publish.MIN_READER_VERSION
     )
     # Without a home country the feed sits in the international partition and
     # its edge in the links, naming that partition.
@@ -1626,4 +1633,156 @@ def test_a_published_index_carries_its_realtime_table(tmp_path):
         "routes": 2,
         "departures_per_day": None,
         "feeds": 1,
+    }
+
+
+def _d(text):
+    return datetime.date.fromisoformat(text)
+
+
+def test_coverage_windows_merge_touching_spans_and_pick_the_best():
+    # Touching spans with the same count are one window; a nested span raises
+    # the count inside it; a gap separates windows; the best is the window
+    # with most feeds, the longest of those, the earliest of equal length.
+    intervals = [
+        (_d("2026-08-01"), _d("2026-09-14")),
+        (_d("2026-09-15"), _d("2026-12-31")),
+        (_d("2026-10-01"), _d("2026-10-31")),
+        (_d("2027-03-01"), _d("2027-03-31")),
+    ]
+    assert publish.coverage_windows(intervals) == [
+        {"start": "2026-08-01", "end": "2026-09-30", "feeds": 1},
+        {"start": "2026-10-01", "end": "2026-10-31", "feeds": 2},
+        {"start": "2026-11-01", "end": "2026-12-31", "feeds": 1},
+        {"start": "2027-03-01", "end": "2027-03-31", "feeds": 1},
+    ]
+    windows = publish.coverage_windows(intervals)
+    assert publish._best_window(windows) == windows[1]
+    tie = [
+        {"start": "2026-01-01", "end": "2026-01-10", "feeds": 2},
+        {"start": "2026-02-01", "end": "2026-02-20", "feeds": 2},
+        {"start": "2026-03-01", "end": "2026-03-20", "feeds": 2},
+    ]
+    assert publish._best_window(tie) == tie[1]  # the longer; of equal, the earlier
+    assert publish.coverage_windows([]) == [] and publish._best_window([]) is None
+    # A span to the calendar's last day: no arithmetic past it.
+    last = publish.coverage_windows([(_d("9999-12-30"), datetime.date.max)])
+    assert last == [{"start": "9999-12-30", "end": "9999-12-31", "feeds": 1}]
+    # Per place: the dated feeds among those serving it, once each, and the
+    # undated ones counted; a place served only by undated feeds has bounds
+    # and best null; a place no edge serves is absent.
+    records = [
+        {"feed_id": "a", "service_start": "2026-08-01", "service_end": "2026-09-14"},
+        {"feed_id": "b", "service_start": "2026-09-15", "service_end": "2026-12-31"},
+        {"feed_id": "u", "service_start": None, "service_end": None},
+    ]
+    edges = [
+        _edge("hel", "a"),
+        _edge("hel", "a", tier="regional"),
+        _edge("hel", "b"),
+        _edge("hel", "u"),
+        _edge("esp", "u"),
+    ]
+    validity = publish._validity_by_place(edges, records)
+    assert set(validity) == {"hel", "esp"}
+    assert validity["hel"] == {
+        "feeds_dated": 2,
+        "feeds_undated": 1,
+        "start": "2026-08-01",
+        "end": "2026-12-31",
+        "windows": [{"start": "2026-08-01", "end": "2026-12-31", "feeds": 1}],
+        "best": {"start": "2026-08-01", "end": "2026-12-31", "feeds": 1},
+    }
+    assert validity["esp"] == {
+        "feeds_dated": 0,
+        "feeds_undated": 1,
+        "start": None,
+        "end": None,
+        "windows": [],
+        "best": None,
+    }
+    # One reading of a span for the dates, the validity and the counts: both
+    # ends, ISO, in order; anything else is undated.
+    row = publish._row({**_covered_feed("a"), **records[0]}, "snap")
+    assert (row["service_start"], row["service_end"]) == ("2026-08-01", "2026-09-14")
+    for broken in (
+        {"service_start": "2026-08-01", "service_end": None},
+        {"service_start": "2026-09-14", "service_end": "2026-08-01"},
+        {"service_start": "2026-13-01", "service_end": "2026-09-14"},
+    ):
+        assert publish.service_span(broken) is None
+        undated = publish._row({**_covered_feed("a"), **broken}, "snap")
+        assert (undated["service_start"], undated["service_end"]) == (None, None)
+    place = publish._place_row(
+        {"place_id": "hel", "kind": "city"}, "snap", validity=validity["hel"]
+    )
+    assert json.loads(place["validity"])["best"]["feeds"] == 1
+
+
+def test_a_published_index_carries_the_feed_dates_and_place_validity(
+    tmp_path, monkeypatch
+):
+    import pyarrow.parquet as pq
+    import test_index_classify as classify_tests
+    from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
+
+    # Through classify: a crawled feed with a two-week calendar is dated, a
+    # declared one is not; the place they both serve has one window. The
+    # coverage names this suite's sources, which the snapshot id needs.
+    monkeypatch.setattr(classify_tests, "SOURCES", SOURCES)
+    cache = tmp_path / "cache"
+    feeds = [
+        _covered_feed("f-cal", coverage_source="crawl"),
+        _covered_feed("f-dec", crawlable=False),
+    ]
+    _write_crawl(
+        cache,
+        "f-cal",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": b"trip_id,route_id,service_id\nt1,tram,wk\n",
+            "calendar.txt": (
+                b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+                b"sunday,start_date,end_date\nwk,1,1,1,1,1,0,0,20260901,20260914\n"
+            ),
+            "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt1,s1,1\nt1,s2,2\n",
+        },
+        "complete",
+    )
+    # Every published place belongs to a country partition.
+    places = [
+        dict(p, country_code=p.get("country_code") or "AA")
+        for p in classify_tests.PLACES
+    ]
+    _coverage(
+        cache,
+        feeds,
+        [_candidate("Q-city", "f-cal", 2), _candidate("Q-city", "f-dec")],
+        places=places,
+    )
+    classify.classify(cache, lookup=LOOKUP)
+    manifest = publish.publish(cache)
+    assert manifest["counts"]["feeds_dated"] == 1
+    feed_rows = {
+        r["feed_id"]: r
+        for part in manifest["partitions"]
+        if "feeds" in manifest["partitions"][part]
+        for r in pq.read_table(cache / "index" / part / "feeds.parquet").to_pylist()
+    }
+    assert (feed_rows["f-cal"]["service_start"], feed_rows["f-cal"]["service_end"]) == (
+        "2026-09-01",
+        "2026-09-14",
+    )
+    assert feed_rows["f-dec"]["service_start"] is None
+    (part,) = [p for p, t in manifest["partitions"].items() if "places" in t]
+    places = pq.read_table(cache / "index" / part / "places.parquet").to_pylist()
+    (city,) = [p for p in places if p["place_id"] == "Q-city"]
+    assert json.loads(city["validity"]) == {
+        "feeds_dated": 1,
+        "feeds_undated": 1,
+        "start": "2026-09-01",
+        "end": "2026-09-14",
+        "windows": [{"start": "2026-09-01", "end": "2026-09-14", "feeds": 1}],
+        "best": {"start": "2026-09-01", "end": "2026-09-14", "feeds": 1},
     }
