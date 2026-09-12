@@ -1,5 +1,6 @@
 """The stats stage: catalogue-level rows and summary sections."""
 
+import datetime
 import json
 import re
 from pathlib import Path
@@ -75,7 +76,16 @@ RAW = {
             "license": {"url": "https://l"},
             "requires_auth": False,
             "urls": {"static_current": "https://mdb-1.example/gtfs.zip"},
-        }
+        },
+        {  # an Atlas GBFS feed: a shared-mobility system, not a transit feed
+            "source": "atlas",
+            "onestop_id": "f-bikes",
+            "spec": "gbfs",
+            "name": "Bikes",
+            "license": {},
+            "requires_auth": False,
+            "urls": {"gbfs_auto_discovery": "https://b.example/gbfs.json"},
+        },
     ],
     "gbfs": [
         {
@@ -133,20 +143,20 @@ FEEDS = [
         "onestop_id": None,
         "crosswalk_method": "none",
     },
+]
+# The GBFS systems the crosswalk kept apart from the feeds.
+SYSTEMS = [
     {
         "feed_id": "f-gbfs-bikes-fi",
         "source": "systems_csv",
         "spec": "gbfs",
-        "mdb_id": None,
-        "onestop_id": None,
-        "crosswalk_method": "none",
         "gbfs": {"system_id": "bikes", "country_code": "FI"},
-    },
+    }
 ]
 
 
 def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
-    rows = stats.catalogue_rows(RAW, FEEDS, "snap")
+    rows = stats.catalogue_rows(RAW, FEEDS, "snap", SYSTEMS)
     by_id = {
         (row["source"], row["source_id"], row["declared_country"]): row for row in rows
     }
@@ -162,7 +172,11 @@ def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
     assert by_id[("mdb", "mdb-4", "FI")]["redirect_target"] == "tdg-2"
     assert by_id[("mdb", "mdb-1", "FI")]["redirect_targets"] == []
     assert by_id[("atlas", "f-hsl", None)]["feed_id"] == "f-hsl"
-    assert by_id[("gbfs", "bikes/FI", "FI")]["feed_id"] == "f-gbfs-bikes-fi"
+    bikes = by_id[("atlas", "f-bikes", None)]
+    assert bikes["feed_id"] is None and bikes["drop_reason"] == "not_transit"
+    # A GBFS system is never a feed: kept apart, or not told apart at all.
+    kept = by_id[("gbfs", "bikes/FI", "FI")]
+    assert kept["feed_id"] is None and kept["drop_reason"] == "not_transit"
     dropped = by_id[("gbfs", "bikes/?", None)]
     assert dropped["feed_id"] is None and dropped["drop_reason"] == "ambiguous_id"
     assert all(row["snapshot_id"] == "snap" for row in rows)
@@ -173,7 +187,7 @@ def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
 
 
 def test_summary_sections_count_the_catalogue_defects():
-    rows = stats.catalogue_rows(RAW, FEEDS)
+    rows = stats.catalogue_rows(RAW, FEEDS, systems=SYSTEMS)
     declared = stats.declared_places(rows)
     assert declared["mdb_rows"] == 4
     assert declared["missing_country"] == 1 and declared["missing_municipality"] == 1
@@ -185,10 +199,10 @@ def test_summary_sections_count_the_catalogue_defects():
         declared["bbox_over_15_degrees"] == 1 and declared["bbox_over_40_degrees"] == 1
     )
     assert declared["bbox_by_extracted_year"] == {"2026": 3}
-    assert declared["atlas_rows_without_location"] == 1
+    assert declared["atlas_rows_without_location"] == 2
     assert declared["gbfs_rows_with_free_text_location"] == 2
-    identity = stats.identity(rows, FEEDS)
-    assert identity["rows_by_source"] == {"mdb": 4, "atlas": 1, "gbfs": 2}
+    identity = stats.identity(rows, FEEDS, SYSTEMS)
+    assert identity["rows_by_source"] == {"mdb": 4, "atlas": 2, "gbfs": 2}
     assert identity["id_namespaces"] == {"mdb": 3, "tdg": 1}
     assert identity["deprecated_rows"] == 2 == identity["deprecated_with_redirect"]
     assert identity["redirect_target_present"] == 2
@@ -196,9 +210,12 @@ def test_summary_sections_count_the_catalogue_defects():
     assert identity["redirect_shares_target_url"] == 1
     assert identity["mdb_rows_without_name"] == 3
     assert identity["gbfs_duplicate_system_ids"] == 1
-    assert identity["rows_into_feeds"] == 6
-    assert identity["rows_dropped_by_reason"] == {"ambiguous_id": 1}
-    assert identity["feeds_by_crosswalk_method"] == {"url_exact": 1, "none": 4}
+    assert identity["rows_into_feeds"] == 5 and identity["gbfs_systems_kept"] == 1
+    # Aggregating archives has no systems artifact: the count is unknown.
+    assert stats.identity(rows, FEEDS)["gbfs_systems_kept"] is None
+    assert stats._cell("a|b\nc") == "a\\|b c"  # a value never breaks a table
+    assert identity["rows_dropped_by_reason"] == {"not_transit": 2, "ambiguous_id": 1}
+    assert identity["feeds_by_crosswalk_method"] == {"url_exact": 1, "none": 3}
 
 
 def _publish(cache, subdir, pointer, artifacts, manifest):
@@ -253,18 +270,23 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
         stats.stats(cache)
     snapshot.write_text(
         json.dumps(
-            {"snapshot_id": "abc", "schema_version": 7, "generations": generations}
+            {
+                "snapshot_id": "abc",
+                "schema_version": 7,
+                "built_at": "2026-09-12T00:00:00+00:00",
+                "generations": generations,
+            }
         )
     )
     manifest = stats.stats(cache)
-    assert manifest["catalogue_rows"] == 7 and manifest["snapshot_id"] == "abc"
+    assert manifest["catalogue_rows"] == 8 and manifest["snapshot_id"] == "abc"
     assert manifest["sections"] == sorted(stats.REPORT_SECTIONS)
     assert manifest["feeds"] == 0 and manifest["places"] == 0
     generation, _ = store.resolve(cache / "stats", "stats.json")
     with generation:
         table = pq.read_table(pa_source(generation.read_bytes("catalogue.parquet")))
         summary = json.loads(generation.read_bytes("summary.json"))
-    assert table.num_rows == 7 and table.schema.names == stats.CATALOGUE_SCHEMA.names
+    assert table.num_rows == 8 and table.schema.names == stats.CATALOGUE_SCHEMA.names
     generation, _ = store.resolve(cache / "stats", "stats.json")
     with generation:
         empty = pq.read_table(pa_source(generation.read_bytes("places.parquet")))
@@ -273,12 +295,15 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
     assert report.startswith("# Build statistics") and "## Identity" in report
     assert summary["build"]["snapshot_id"] == "abc"
     assert summary["build"]["schema_version"] == 7
-    assert summary["build"]["catalogue_rows"] == {"mdb": 4, "atlas": 1, "gbfs": 2}
+    assert summary["build"]["catalogue_rows"] == {"mdb": 4, "atlas": 2, "gbfs": 2}
     assert summary["build"]["catalogue_dates"]["mdb"] == "2026-09-01"
     # Every ingest read a local file: a cut sample, not the full catalogues.
     assert summary["build"]["sample"] == "sample"
     assert summary["build"]["sample_sources"] == ["mdb", "atlas", "gbfs"]
-    assert summary["identity"]["feeds"] == 5
+    assert summary["identity"]["feeds"] == 4
+    assert summary["identity"]["gbfs_systems_kept"] == 0  # no artifact: none
+    assert summary["realtime"]["feeds"] == 0 and manifest["realtime"] == 0
+    assert summary["validity"]["build_date"] == "2026-09-12"
 
 
 def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
@@ -295,10 +320,17 @@ def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
     rows = table.to_pylist()
     # The url-matched MDB row and its Atlas feed both name the same feed.
     assert {r["feed_id"] for r in rows if r["source_id"] in ("mdb-1", "f-a")} == {"f-a"}
-    assert summary["identity"]["rows_into_feeds"] == len(rows)
+    # Every row but the GBFS system became a feed; the system is not transit.
+    assert summary["identity"]["rows_into_feeds"] == len(rows) - 1
+    assert summary["identity"]["rows_dropped_by_reason"] == {"not_transit": 1}
+    assert summary["identity"]["gbfs_systems_kept"] == 1
     assert summary["identity"]["feeds"] == published["counts"]["feeds"]
-    # The published feeds (never crawled here) become the feed table too.
+    # The published feeds (never crawled here) become the feed table too,
+    # undated, with the validity columns in place.
     assert feeds.num_rows == manifest["feeds"] == published["counts"]["feeds"]
+    assert set(feeds.column("service_start").to_pylist()) == {None}
+    assert summary["validity"]["feeds_dated"] == 0
+    assert summary["validity"]["build_date"] == published["built_at"][:10]
     assert set(feeds.column("crawl_outcome").to_pylist()) == {"not_crawled"}
     assert summary["availability"]["crawled"] == 0
 
@@ -638,3 +670,171 @@ def fixture_report(tmp_path):
 
 def test_the_report_of_the_fixture_build_matches_the_golden_file(tmp_path):
     assert fixture_report(tmp_path) == GOLDEN_REPORT.read_text(encoding="utf-8")
+
+
+def test_the_realtime_companions_have_their_own_section(tmp_path):
+    from test_index_publish import _atlas_archive, _build_index
+
+    feeds = [
+        {"feed_id": "f-a", "realtime_feed_ids": ["f-rt-a"]},
+        {"feed_id": "f-b", "realtime_feed_ids": []},
+    ]
+    realtime = [
+        {
+            "feed_id": "f-rt-a",
+            "source": "atlas",
+            "static_feed_id": "f-a",
+            "static_link_method": "declared",
+            "entity_types": ["trip_updates", "alerts"],
+        },
+        {
+            "feed_id": "f-rt-x",
+            "source": "mdb",
+            "static_feed_id": "f-gone",  # dangling: unlinked
+            "static_link_method": "inferred",
+            "entity_types": [],
+        },
+    ]
+    assert stats.realtime_section(realtime, feeds) == {
+        "feeds": 2,
+        "linked": 1,
+        "unlinked": 1,
+        "by_source": {"atlas": 1, "mdb": 1},
+        "by_entity_type": {"trip_updates": 1, "alerts": 1},
+        "by_link_method": {"declared": 1, "inferred": 1},
+        "static_feeds_with_realtime": 1,
+    }
+    # Through the stage: the crosswalk infers the one static feed as the
+    # Atlas GTFS-RT feed's, both without a home country land in the
+    # international tables, which the stage reads and reports.
+    archive = _atlas_archive(
+        tmp_path,
+        [
+            {"id": "f-a", "spec": "gtfs", "urls": {"static_current": "https://a"}},
+            {"id": "f-rt", "spec": "gtfs-rt", "urls": {"realtime_alerts": "https://r"}},
+        ],
+    )
+    cache, published = _build_index(tmp_path, archive=archive)
+    assert published["counts"]["realtime_linked"] == 1
+    manifest = stats.stats(cache)
+    assert manifest["realtime"] == 1 and "realtime" in manifest["sections"]
+    generation, _ = store.resolve(cache / "stats", "stats.json")
+    with generation:
+        summary = json.loads(generation.read_bytes("summary.json"))
+        report = generation.read_bytes("report.md").decode()
+        feeds = pq.read_table(pa_source(generation.read_bytes("feeds.parquet")))
+    # The companion is a transit feed row too, never crawled.
+    (rt,) = [r for r in feeds.to_pylist() if r["spec"] == "gtfs-rt"]
+    assert rt["feed_id"] == "f-rt" and rt["crawl_outcome"] == "not_crawled"
+    assert manifest["feeds"] == 4 == feeds.num_rows
+    assert summary["realtime"]["linked"] == 1 == summary["realtime"]["feeds"]
+    assert summary["realtime"]["by_entity_type"] == {"alerts": 1}
+    assert summary["realtime"]["static_feeds_with_realtime"] == 1
+    assert "## Realtime" in report
+    # A table or partition the layout does not know is refused, never
+    # skipped, and a table that does not match the snapshot is refused too.
+    snapshot = json.loads((cache / "index" / "snapshot.json").read_text())
+    bad = json.loads(json.dumps(snapshot))
+    bad["partitions"]["international"]["vehicles"] = {"rows": 0, "sha256": "x"}
+    with pytest.raises(stats.StatsError, match="not a table of the index"):
+        stats._index_tables(cache, bad)
+    bad = json.loads(json.dumps(snapshot))
+    bad["partitions"]["../x"] = bad["partitions"].pop("international")
+    with pytest.raises(stats.StatsError, match="not a partition"):
+        stats._index_tables(cache, bad)
+    bad = json.loads(json.dumps(snapshot))
+    bad["partitions"]["international"]["realtime"]["sha256"] = "0" * 64
+    with pytest.raises(stats.StatsError, match="does not match"):
+        stats._index_tables(cache, bad)
+
+
+def test_the_validity_section_counts_against_the_build_date():
+    build_date = datetime.date(2026, 9, 12)
+    feeds = [
+        {
+            "service_start": "2026-08-01",
+            "service_end": "2026-09-30",
+            "service_days": 61,
+        },
+        {
+            "service_start": "2026-09-01",
+            "service_end": "2026-12-31",
+            "service_days": 122,
+        },
+        {
+            "service_start": "2026-01-01",
+            "service_end": "2026-09-11",
+            "service_days": 254,
+        },
+        {
+            "service_start": "2026-09-13",
+            "service_end": "2027-01-01",
+            "service_days": 111,
+        },
+        {"service_start": "2026-09-12", "service_end": "2026-09-12", "service_days": 1},
+        {"service_start": None, "service_end": None, "service_days": None},
+    ]
+    places = [
+        {"feeds_dated": 2, "best_start": "2026-09-01", "best_end": "2026-09-30"},
+        {"feeds_dated": 1, "best_start": "2026-10-01", "best_end": "2026-10-31"},
+        {"feeds_dated": 0, "best_start": None, "best_end": None},
+    ]
+    section = stats.validity_section(feeds, places, build_date)
+    # Valid on the day: the first, second and fifth (a span of one day, the
+    # build date itself); ended before: the third; not yet: the fourth. Of
+    # the valid, one ends within 30 days (09-30) and another on the day; the
+    # 90-day count holds them too (12-31 lies beyond).
+    assert section == {
+        "build_date": "2026-09-12",
+        "feeds_dated": 5,
+        "valid": 3,
+        "expired": 1,
+        "not_started": 1,
+        "ending_within_30_days": 2,
+        "ending_within_90_days": 2,
+        "service_days": stats._quantiles([61, 122, 254, 111, 1]),
+        "places_with_dated_feeds": 2,
+        "places_best_covers_build_date": 1,
+    }
+    assert stats._build_date({"built_at": "2026-09-12T10:00:00+00:00"}) == build_date
+    for snapshot in ({}, {"built_at": "yesterday"}, {"built_at": 3}):
+        with pytest.raises(stats.StatsError, match="built_at"):
+            stats._build_date(snapshot)
+    assert stats._service_days(feeds[4]) == 1 and stats._service_days(feeds[5]) is None
+    # The columns as the tables carry them, through Parquet: the feed span
+    # and its length, the place's dated feeds and best window.
+    feed = {"feed_id": "f", "service_start": "2026-09-01", "service_end": "2026-09-14"}
+    rows = stats.feed_rows([feed], [], {}, [], [], {}, "snap")
+    table = pq.read_table(pa_source(stats._parquet(rows, stats.FEED_SCHEMA)))
+    (row,) = table.to_pylist()
+    assert (row["service_start"], row["service_end"], row["service_days"]) == (
+        "2026-09-01",
+        "2026-09-14",
+        14,
+    )
+    validity = {
+        "feeds_dated": 2,
+        "best": {"start": "2026-09-01", "end": "2026-09-30", "feeds": 2},
+    }
+    places = [
+        {"place_id": "hel", "validity": json.dumps(validity)},
+        {"place_id": "esp", "validity": None},
+    ]
+    table = pq.read_table(
+        pa_source(
+            stats._parquet(stats.place_rows(places, [], "snap"), stats.PLACE_SCHEMA)
+        )
+    )
+    hel, esp = table.to_pylist()
+    assert (
+        hel["feeds_dated"],
+        hel["best_start"],
+        hel["best_end"],
+        hel["best_feeds"],
+    ) == (
+        2,
+        "2026-09-01",
+        "2026-09-30",
+        2,
+    )
+    assert (esp["feeds_dated"], esp["best_start"], esp["best_feeds"]) == (0, None, None)

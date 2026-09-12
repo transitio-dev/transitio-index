@@ -1,4 +1,5 @@
 import io
+import datetime
 import hashlib
 import json
 import os
@@ -27,11 +28,18 @@ from transitio.exceptions import IncompatibleIndexError  # noqa: E402
 from transitio.exceptions import PlaceNotFoundError  # noqa: E402
 
 # The feeds columns schema 7 added; an older shape is recreated by dropping them.
+# The columns schema 7, 8 and 9 added over the flat layout's (feeds, and the
+# places' ``validity``); schema 8 also dropped the ``gbfs`` block, which the
+# flat layout still expects.
 _SCHEMA_7_FEED_COLUMNS = (
     "home_country",
     "country_shares",
     "scope",
     "declared_countries",
+    "realtime_feed_ids",
+    "service_start",
+    "service_end",
+    "validity",
 )
 
 
@@ -62,7 +70,8 @@ def _has_table(manifest, table):
 def _flatten(index_dir, version, drop=()):
     """Recreate the flat layout of a schema before 7 from a partitioned
     index: every partition's tables concatenated at the root, minus the
-    columns schema 7 added (and ``drop``), stamped to ``version``."""
+    columns schema 7 and 8 added (and ``drop``), plus the ``gbfs`` block
+    they still carried, stamped to ``version``."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -77,7 +86,11 @@ def _flatten(index_dir, version, drop=()):
         gone = [c for c in (*_SCHEMA_7_FEED_COLUMNS, *drop) if c in joined.column_names]
         if table == "edges":
             gone += ["relevance_category", "relevance", "cross_border"]
-        pq.write_table(joined.drop_columns(gone), index_dir / f"{table}.parquet")
+        joined = joined.drop_columns(gone)
+        if table == "feeds" and "gbfs" not in drop:
+            at = joined.column_names.index("mdb") + 1
+            joined = joined.add_column(at, "gbfs", pa.nulls(len(joined), pa.string()))
+        pq.write_table(joined, index_dir / f"{table}.parquet")
         snapshot[f"{table}_sha256"] = hashlib.sha256(
             (index_dir / f"{table}.parquet").read_bytes()
         ).hexdigest()
@@ -376,9 +389,10 @@ def test_publish_round_trips_through_the_reader(tmp_path):
 
     assert index.snapshot_id == manifest["snapshot_id"]
     assert index.schema_version == publish.SCHEMA_VERSION
-    # f-a is url-matched to mdb-1; f-b, f-mdb-2 and the GBFS system stand alone.
+    # f-a is url-matched to mdb-1; f-b and f-mdb-2 stand alone; the GBFS
+    # system is not a transit feed and never reaches the index.
     feed_ids = set(index.feeds["feed_id"])
-    assert {"f-a", "f-b", "f-mdb-2", "f-gbfs-sys"} <= feed_ids
+    assert {"f-a", "f-b", "f-mdb-2"} <= feed_ids and "f-gbfs-sys" not in feed_ids
     both = index.feeds[index.feeds["feed_id"] == "f-a"].iloc[0]
     assert both["source"] == "both"
     assert both["crosswalk_method"] == "url_exact"
@@ -392,14 +406,9 @@ def test_snapshot_manifest_records_sources_and_counts(tmp_path):
     assert manifest["sources"]["atlas"]["commit"] == "a" * 40
     assert manifest["sources"]["mdb"]["csv_sha256"]
     assert manifest["sources"]["gbfs"]["csv_sha256"]
-    assert manifest["counts"]["feeds"] == 4
-    assert manifest["counts"]["by_source"] == {
-        "atlas": 1,
-        "both": 1,
-        "mdb": 1,
-        "systems_csv": 1,
-    }
-    assert manifest["counts"]["by_spec"] == {"gtfs": 3, "gbfs": 1}
+    assert manifest["counts"]["feeds"] == 3
+    assert manifest["counts"]["by_source"] == {"atlas": 1, "both": 1, "mdb": 1}
+    assert manifest["counts"]["realtime"] == 0 == manifest["counts"]["realtime_linked"]
 
 
 def test_the_snapshot_id_is_deterministic_in_the_sources(tmp_path):
@@ -419,8 +428,6 @@ def test_the_verbatim_source_blocks_round_trip_as_json(tmp_path):
     both = index.feeds[index.feeds["feed_id"] == "f-a"].iloc[0]
     assert json.loads(both["atlas"])["onestop_id"] == "f-a"
     assert json.loads(both["mdb"])["mdb_id"] == "mdb-1"
-    system = index.feeds[index.feeds["feed_id"] == "f-gbfs-sys"].iloc[0]
-    assert json.loads(system["gbfs"])["system_id"] == "sys"
 
 
 def test_a_minted_feed_has_a_null_onestop_id(tmp_path):
@@ -1220,7 +1227,9 @@ def _restamp(index_dir, version, places):
     """Recreate the flat layout at ``version`` with ``places`` as its places
     table."""
     _flatten(index_dir, version)
-    places.to_parquet(index_dir / "places.parquet", index=False)
+    # Minus the place columns added since: the flat layout predates them.
+    gone = [c for c in ("validity",) if c in places.columns]
+    places.drop(columns=gone).to_parquet(index_dir / "places.parquet", index=False)
     snapshot = json.loads((index_dir / "snapshot.json").read_text())
     snapshot["places_sha256"] = hashlib.sha256(
         (index_dir / "places.parquet").read_bytes()
@@ -1434,7 +1443,7 @@ def test_a_place_without_a_qid_publishes_and_reads_back(tmp_path):
     assert tampere.concordances == {"overture": ["fi-tre"]} and tampere.former_ids == []
 
 
-def test_schema_7_ships_the_country_and_relevance_columns(tmp_path):
+def test_the_index_ships_the_country_and_relevance_columns(tmp_path):
     import pyarrow.parquet as pq
 
     # Classify decides the country fields: a declared-only feed with an MDB
@@ -1447,9 +1456,9 @@ def test_schema_7_ships_the_country_and_relevance_columns(tmp_path):
         "cross_border": True,
     }
     cache, manifest = _edges_index(tmp_path, [edge], feeds=[feed])
-    assert manifest["schema_version"] == 7 == publish.SCHEMA_VERSION
+    assert manifest["schema_version"] == 9 == publish.SCHEMA_VERSION
     assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
-        7, publish.MIN_READER_VERSION
+        9, publish.MIN_READER_VERSION
     )
     # Without a home country the feed sits in the international partition and
     # its edge in the links, naming that partition.
@@ -1514,3 +1523,266 @@ def test_partition_routes_by_home_country_and_place_country():
         publish.partition(records, places, [_edge("zz", "fi")])
     with pytest.raises(publish.PublishError, match="feed the index lacks"):
         publish.partition(records, places, [_edge("hel", "ghost")])
+
+
+def _realtime_feed(feed_id, static_feed_id, **kw):
+    return {
+        **_covered_feed(feed_id, spec="gtfs-rt", crawlable=False),
+        "static_feed_id": static_feed_id,
+        "static_link_method": kw.get("method", "declared"),
+        "atlas": {"urls": kw.get("urls", {"realtime_trip_updates": "https://rt/tu"})},
+        "mdb": kw.get("mdb"),
+    }
+
+
+def test_realtime_companions_ride_with_their_static_feed():
+    static = [
+        {**_covered_feed("f-a"), "home_country": "FI"},
+        _covered_feed("f-b"),  # no home country: international
+    ]
+    realtime = [
+        _realtime_feed(
+            "f-rt-a",
+            "f-a",
+            urls={"realtime_vehicle_positions": "https://rt/vp", "realtime_alerts": ""},
+            mdb={"urls": {"direct_download": "https://rt/direct"}},
+        ),
+        _realtime_feed("f-rt-b", "f-b"),
+        _realtime_feed("f-rt-none", None, method="none"),
+        _realtime_feed("f-rt-gone", "f-vanished", method="inferred"),  # dangling
+    ]
+    records, companions = publish.split_specs(static + realtime)
+    # Each static feed names the companions that name it, in sorted order.
+    assert [r["realtime_feed_ids"] for r in records] == [["f-rt-a"], ["f-rt-b"]]
+    assert [c["realtime_linked"] for c in companions] == [True, True, False, False]
+    with pytest.raises(publish.PublishError, match="spec the index does not ship"):
+        publish.split_specs(static + [_covered_feed("f-bikes", spec="gbfs")])
+    places = [{"place_id": "hel", "country_code": "FI"}]
+    edges = [
+        _edge("hel", "f-a"),
+        _edge("hel", "f-rt-a"),  # inherited from f-a: not published
+        _edge("hel", "f-b"),
+    ]
+    # A companion's inherited edges leave before anything counts them; an
+    # edge of a feed the feeds table lacks is then an integrity error.
+    assert publish.static_edges(None, companions) is None
+    with pytest.raises(publish.PublishError, match="feed the index lacks"):
+        publish.partition(records, places, edges, companions)
+    edges = publish.static_edges(edges, companions)
+    parts = publish.partition(records, places, edges, companions)
+    assert set(parts) == {"FI", "international", "links"}
+    # A linked companion sits with its static feed, an unlinked or dangling one
+    # in international; no realtime feed has edges of its own.
+    assert [c["feed_id"] for c in parts["FI"]["realtime"]] == ["f-rt-a"]
+    assert [c["feed_id"] for c in parts["international"]["realtime"]] == [
+        "f-rt-b",
+        "f-rt-none",
+        "f-rt-gone",
+    ]
+    assert [e["feed_id"] for e in parts["FI"]["edges"]] == ["f-a"]
+    assert [e["feed_id"] for e in parts["links"]["edges"]] == ["f-b"]
+    row = publish._realtime_row(companions[0], "snap")
+    # The endpoints the catalogues carry, under the catalogues' own keys, and
+    # the entity types the Atlas ones stand for; an empty url is none.
+    assert json.loads(row["urls"]) == {
+        "realtime_vehicle_positions": "https://rt/vp",
+        "direct_download": "https://rt/direct",
+    }
+    assert row["entity_types"] == ["vehicle_positions"]
+    assert row["static_feed_id"] == "f-a" and row["snapshot"] == "snap"
+    assert publish._counts(records, companions) == {
+        "feeds": 2,
+        "by_source": {"atlas": 2},
+        "realtime": 4,
+        "realtime_linked": 2,
+        "realtime_unlinked": 2,
+    }
+
+
+def test_a_published_index_carries_its_realtime_table(tmp_path):
+    import pyarrow.parquet as pq
+
+    feeds = [_covered_feed("f-a"), _realtime_feed("f-rt", "f-a")]
+    service = {"stops": 10, "routes": 2}
+    edges = [
+        _edge("Q1757", "f-a", service=service),
+        _edge("Q1757", "f-rt", service=service),  # inherited: not counted
+    ]
+    cache, manifest = _edges_index(tmp_path, edges, feeds=feeds)
+    assert manifest["counts"]["realtime"] == 1 == manifest["counts"]["realtime_linked"]
+    assert manifest["counts"]["edges"] == 1
+    assert manifest["unknown_share"] == 1.0  # over the one edge that ships
+    # Declared coverage gives f-a no home: it and its companion are international.
+    listed = manifest["partitions"]["international"]
+    assert listed["realtime"]["rows"] == 1 and listed["feeds"]["rows"] == 1
+    table = pq.read_table(cache / "index" / "international" / "realtime.parquet")
+    (row,) = table.to_pylist()
+    assert row["feed_id"] == "f-rt" and row["static_feed_id"] == "f-a"
+    assert row["entity_types"] == ["trip_updates"]
+    feeds_table = pq.read_table(cache / "index" / "international" / "feeds.parquet")
+    (static,) = feeds_table.to_pylist()
+    assert static["realtime_feed_ids"] == ["f-rt"] and "gbfs" not in static
+    # The companion's inherited edge is not published: the edges are GTFS-only,
+    # and the place's service sums the static feed once.
+    links = pq.read_table(cache / "index" / "links" / "edges.parquet").to_pylist()
+    assert [e["feed_id"] for e in links] == ["f-a"]
+    places = pq.read_table(cache / "index" / "FI" / "places.parquet").to_pylist()
+    (place,) = [p for p in places if p["place_id"] == "Q1757"]
+    assert json.loads(place["service"]) == {
+        "stops": 10,
+        "routes": 2,
+        "departures_per_day": None,
+        "feeds": 1,
+    }
+
+
+def _d(text):
+    return datetime.date.fromisoformat(text)
+
+
+def test_coverage_windows_merge_touching_spans_and_pick_the_best():
+    # Touching spans with the same count are one window; a nested span raises
+    # the count inside it; a gap separates windows; the best is the window
+    # with most feeds, the longest of those, the earliest of equal length.
+    intervals = [
+        (_d("2026-08-01"), _d("2026-09-14")),
+        (_d("2026-09-15"), _d("2026-12-31")),
+        (_d("2026-10-01"), _d("2026-10-31")),
+        (_d("2027-03-01"), _d("2027-03-31")),
+    ]
+    assert publish.coverage_windows(intervals) == [
+        {"start": "2026-08-01", "end": "2026-09-30", "feeds": 1},
+        {"start": "2026-10-01", "end": "2026-10-31", "feeds": 2},
+        {"start": "2026-11-01", "end": "2026-12-31", "feeds": 1},
+        {"start": "2027-03-01", "end": "2027-03-31", "feeds": 1},
+    ]
+    windows = publish.coverage_windows(intervals)
+    assert publish._best_window(windows) == windows[1]
+    tie = [
+        {"start": "2026-01-01", "end": "2026-01-10", "feeds": 2},
+        {"start": "2026-02-01", "end": "2026-02-20", "feeds": 2},
+        {"start": "2026-03-01", "end": "2026-03-20", "feeds": 2},
+    ]
+    assert publish._best_window(tie) == tie[1]  # the longer; of equal, the earlier
+    assert publish.coverage_windows([]) == [] and publish._best_window([]) is None
+    # A span to the calendar's last day: no arithmetic past it.
+    last = publish.coverage_windows([(_d("9999-12-30"), datetime.date.max)])
+    assert last == [{"start": "9999-12-30", "end": "9999-12-31", "feeds": 1}]
+    # Per place: the dated feeds among those serving it, once each, and the
+    # undated ones counted; a place served only by undated feeds has bounds
+    # and best null; a place no edge serves is absent.
+    records = [
+        {"feed_id": "a", "service_start": "2026-08-01", "service_end": "2026-09-14"},
+        {"feed_id": "b", "service_start": "2026-09-15", "service_end": "2026-12-31"},
+        {"feed_id": "u", "service_start": None, "service_end": None},
+    ]
+    edges = [
+        _edge("hel", "a"),
+        _edge("hel", "a", tier="regional"),
+        _edge("hel", "b"),
+        _edge("hel", "u"),
+        _edge("esp", "u"),
+    ]
+    validity = publish._validity_by_place(edges, records)
+    assert set(validity) == {"hel", "esp"}
+    assert validity["hel"] == {
+        "feeds_dated": 2,
+        "feeds_undated": 1,
+        "start": "2026-08-01",
+        "end": "2026-12-31",
+        "windows": [{"start": "2026-08-01", "end": "2026-12-31", "feeds": 1}],
+        "best": {"start": "2026-08-01", "end": "2026-12-31", "feeds": 1},
+    }
+    assert validity["esp"] == {
+        "feeds_dated": 0,
+        "feeds_undated": 1,
+        "start": None,
+        "end": None,
+        "windows": [],
+        "best": None,
+    }
+    # One reading of a span for the dates, the validity and the counts: both
+    # ends, ISO, in order; anything else is undated.
+    row = publish._row({**_covered_feed("a"), **records[0]}, "snap")
+    assert (row["service_start"], row["service_end"]) == ("2026-08-01", "2026-09-14")
+    for broken in (
+        {"service_start": "2026-08-01", "service_end": None},
+        {"service_start": "2026-09-14", "service_end": "2026-08-01"},
+        {"service_start": "2026-13-01", "service_end": "2026-09-14"},
+    ):
+        assert publish.service_span(broken) is None
+        undated = publish._row({**_covered_feed("a"), **broken}, "snap")
+        assert (undated["service_start"], undated["service_end"]) == (None, None)
+    place = publish._place_row(
+        {"place_id": "hel", "kind": "city"}, "snap", validity=validity["hel"]
+    )
+    assert json.loads(place["validity"])["best"]["feeds"] == 1
+
+
+def test_a_published_index_carries_the_feed_dates_and_place_validity(
+    tmp_path, monkeypatch
+):
+    import pyarrow.parquet as pq
+    import test_index_classify as classify_tests
+    from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
+
+    # Through classify: a crawled feed with a two-week calendar is dated, a
+    # declared one is not; the place they both serve has one window. The
+    # coverage names this suite's sources, which the snapshot id needs.
+    monkeypatch.setattr(classify_tests, "SOURCES", SOURCES)
+    cache = tmp_path / "cache"
+    feeds = [
+        _covered_feed("f-cal", coverage_source="crawl"),
+        _covered_feed("f-dec", crawlable=False),
+    ]
+    _write_crawl(
+        cache,
+        "f-cal",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": b"trip_id,route_id,service_id\nt1,tram,wk\n",
+            "calendar.txt": (
+                b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+                b"sunday,start_date,end_date\nwk,1,1,1,1,1,0,0,20260901,20260914\n"
+            ),
+            "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt1,s1,1\nt1,s2,2\n",
+        },
+        "complete",
+    )
+    # Every published place belongs to a country partition.
+    places = [
+        dict(p, country_code=p.get("country_code") or "AA")
+        for p in classify_tests.PLACES
+    ]
+    _coverage(
+        cache,
+        feeds,
+        [_candidate("Q-city", "f-cal", 2), _candidate("Q-city", "f-dec")],
+        places=places,
+    )
+    classify.classify(cache, lookup=LOOKUP)
+    manifest = publish.publish(cache)
+    assert manifest["counts"]["feeds_dated"] == 1
+    feed_rows = {
+        r["feed_id"]: r
+        for part in manifest["partitions"]
+        if "feeds" in manifest["partitions"][part]
+        for r in pq.read_table(cache / "index" / part / "feeds.parquet").to_pylist()
+    }
+    assert (feed_rows["f-cal"]["service_start"], feed_rows["f-cal"]["service_end"]) == (
+        "2026-09-01",
+        "2026-09-14",
+    )
+    assert feed_rows["f-dec"]["service_start"] is None
+    (part,) = [p for p, t in manifest["partitions"].items() if "places" in t]
+    places = pq.read_table(cache / "index" / part / "places.parquet").to_pylist()
+    (city,) = [p for p in places if p["place_id"] == "Q-city"]
+    assert json.loads(city["validity"]) == {
+        "feeds_dated": 1,
+        "feeds_undated": 1,
+        "start": "2026-09-01",
+        "end": "2026-09-14",
+        "windows": [{"start": "2026-09-01", "end": "2026-09-14", "feeds": 1}],
+        "best": {"start": "2026-09-01", "end": "2026-09-14", "feeds": 1},
+    }

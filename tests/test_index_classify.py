@@ -1,4 +1,5 @@
 import hashlib
+import datetime
 import json
 import os
 
@@ -635,6 +636,9 @@ def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
     assert by_id["f-declared"]["scope"] == "declared"
     assert by_id["f-declared"]["declared_countries"] == ["AA"]
     assert by_id["f-declared"]["home_country"] is None
+    # No calendar in these crawls, and no crawl for the declared feed: undated.
+    assert {f["service_start"] for f in feeds} == {None}
+    assert manifest["feeds_dated"] == 0
     assert manifest["home_share"] == classify.HOME_SHARE
     assert manifest["feeds_by_scope"] == {"domestic": 2, "declared": 1, "unknown": 1}
     assert manifest["home_country_agreement"] == {"undeclared": 2, "unobserved": 2}
@@ -1058,9 +1062,58 @@ def test_calendar_days_are_counted_not_walked():
         b"wk,20260920,2\n"  # added and removed: the removal wins
         b"lone,20260903,1\n"  # a service with exceptions only
     )
-    active_days, span_days = classify._read_calendar(calendar, dates)
+    active_days, span_days, span = classify._read_calendar(calendar, dates)
     assert span_days == 3652059
     assert active_days == {"all": 3652059, "wk": 10, "lone": 1}
+    assert span == (datetime.date(1, 1, 1), datetime.date(9999, 12, 31))
+
+
+def test_the_service_span_is_the_effective_first_and_last_date():
+    import io
+
+    # A weekday window whose declared edges do not run: the start falls on
+    # a Saturday and the last Friday and Monday are removed; an added date
+    # beyond the window extends the span; a service with every date removed
+    # or no weekday at all contributes nothing.
+    calendar = io.BytesIO(
+        b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        b"start_date,end_date\n"
+        b"wk,1,1,1,1,1,0,0,20260905,20260914\n"
+        b"none,0,0,0,0,0,0,0,20260101,20261231\n"
+        b"gone,0,0,0,0,0,0,1,20260906,20260906\n"
+    )
+    dates = io.BytesIO(
+        b"service_id,date,exception_type\n"
+        b"wk,20260911,2\n"
+        b"wk,20260914,2\n"
+        b"wk,20260920,1\n"
+        b"gone,20260906,2\n"
+    )
+    _, _, span = classify._read_calendar(calendar, dates)
+    assert span == (datetime.date(2026, 9, 7), datetime.date(2026, 9, 20))
+    assert (
+        classify._read_calendar(None, io.BytesIO(b"service_id,date,exception_type\n"))[
+            2
+        ]
+        is None
+    )
+    assert classify._service_span(None) == (None, None)
+    assert classify._service_span(({}, 0, span)) == ("2026-09-07", "2026-09-20")
+    # A feed with exceptions only spans its added dates, removals aside.
+    only = io.BytesIO(
+        b"service_id,date,exception_type\n"
+        b"x,20260903,1\nx,20260910,1\nx,20260910,2\ny,20260830,1\n"
+    )
+    assert classify._read_calendar(None, only)[2] == (
+        datetime.date(2026, 8, 30),
+        datetime.date(2026, 9, 3),
+    )
+    # A one-day window at either end of the calendar whose weekday does not
+    # run: no date, and no arithmetic past the calendar's bounds.
+    for edge, step in ((datetime.date.max, 1), (datetime.date.min, -1)):
+        flags = [False] * 7
+        flags[(edge.weekday() + 1) % 7] = True
+        assert classify._running((edge, edge, flags), set(), step) is None
 
 
 def test_a_crawl_state_from_a_smaller_member_set_is_refused(tmp_path):
@@ -1196,13 +1249,21 @@ def test_departures_per_day_are_weighted_by_the_calendar(tmp_path):
     )
     _coverage(cache, feeds, [_candidate("Q-city", "f-cal", 2)])
     classify.classify(cache, lookup=LOOKUP)
-    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    edges, manifest = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     (edge,) = edges
     assert edge["service"] == {
         "stops": 2,
         "routes": 1,
         "departures_per_day": pytest.approx(24 / 14),
     }
+    # The feed carries the span the same calendar gives: the added Sunday
+    # opens it, the last weekday closes it.
+    feeds, _ = store.read_jsonl(
+        cache / "classify", "edges.json", "feeds_classified.jsonl"
+    )
+    (feed,) = feeds
+    assert (feed["service_start"], feed["service_end"]) == ("2026-09-01", "2026-09-14")
+    assert manifest["feeds_dated"] == 1
 
 
 def test_publish_refuses_edges_from_another_places_generation(tmp_path):

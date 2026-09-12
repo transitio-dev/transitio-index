@@ -705,6 +705,7 @@ def test_feeds_have_a_table_a_record_with_a_hull_and_edges_both_ways(
         "name": "HSL",
         "has_coverage": True,
         "places_served": 2,
+        "realtime": 0,
         "tier_local": 1,
         "tier_regional": 2,
         "tier_national": 0,
@@ -773,7 +774,7 @@ def test_feeds_have_a_table_a_record_with_a_hull_and_edges_both_ways(
 # ---- schema 7: a partitioned build ----
 
 
-def _feed7(feed_id, name, home, scope, spec="gtfs"):
+def _feed7(feed_id, name, home, scope, spec="gtfs", start=None, end=None):
     return {
         "feed_id": feed_id,
         "name": name,
@@ -782,6 +783,8 @@ def _feed7(feed_id, name, home, scope, spec="gtfs"):
         "home_country": home,
         "scope": scope,
         "declared_countries": ["FI"],
+        "service_start": start,
+        "service_end": end,
     }
 
 
@@ -804,6 +807,24 @@ PARTITIONED_FEEDS = [
     _feed7("f2", "Ferry", None, "international"),
     _feed7("f3", "Bikes", "FI", "domestic", spec="gbfs"),
 ]
+
+
+def _rt(feed_id, static, urls, method="declared"):
+    return {
+        "feed_id": feed_id,
+        "name": None,
+        "source": "atlas",
+        "static_feed_id": static,
+        "static_link_method": method,
+        "entity_types": sorted(k.removeprefix("realtime_") for k in urls),
+        "urls": json.dumps(urls),
+    }
+
+
+REALTIME_ROWS = {
+    "FI": [_rt("f1-rt", "f1", {"realtime_trip_updates": "https://rt/tu"})],
+    "international": [_rt("f-rt-lost", None, {}, method="none")],
+}
 PARTITIONED_EDGES = {
     "FI": [
         _edge7("hel", "f1", "local", "primary", 0.9, False),
@@ -823,6 +844,7 @@ def write_partitioned_build(
     feeds=PARTITIONED_FEEDS,
     edges=PARTITIONED_EDGES,
     notice=b"NOTICE\n",
+    realtime=None,
 ):
     """A schema-7 build: FI places and domestic edges, feeds by home country
     (``international`` without one), the cross-border edges under ``links``,
@@ -836,6 +858,8 @@ def write_partitioned_build(
         tables.setdefault(key, []).append(feed)
     for partition, rows in edges.items():
         tables[f"{partition}/edges.parquet"] = pa.Table.from_pylist(rows)
+    for partition, rows in (realtime or {}).items():  # schema 8
+        tables[f"{partition}/realtime.parquet"] = pa.Table.from_pylist(rows)
     listing = {}
     for name, table in tables.items():
         if isinstance(table, list):
@@ -850,7 +874,7 @@ def write_partitioned_build(
             "sha256": _sha(sink.getvalue()),
         }
     snapshot = {
-        "schema_version": 7,
+        "schema_version": 8 if realtime else 7,
         "built_at": "2026-09-12T00:00:00+00:00",
         "counts": {"places": len(places)},
         "partitions": listing,
@@ -882,6 +906,11 @@ def _bad_partition_name(path):
         s["partitions"]["../x"] = s["partitions"].pop("international")
 
     _rewrite_snapshot(path, change)
+
+
+def _realtime_in_links(path):
+    # The layout: companions ride with feeds, never with the links.
+    write_partitioned_build(path, realtime={"links": REALTIME_ROWS["FI"]})
 
 
 def _links_holding_places(path):
@@ -931,6 +960,7 @@ def _licensed_without_notice(path):
         (_wrong_rows, False),
         (_bad_partition_name, False),
         (_links_holding_places, False),
+        (_realtime_in_links, False),
         (_edges_without_relevance, False),
         (_symlinked_partition, False),
         (_notice_listed_but_gone, False),
@@ -942,6 +972,7 @@ def _licensed_without_notice(path):
         "wrong-row-count",
         "bad-partition-name",
         "tables-outside-the-layout",
+        "realtime-in-links",
         "schema-7-columns-missing",
         "symlinked-partition",
         "notice-missing",
@@ -1160,3 +1191,101 @@ def test_the_feed_side_api_filters_by_spec_level_and_country(tmp_path):
     assert (
         "category_primary" not in client.get("/api/builds/flat/feeds").json()["rows"][0]
     )
+
+
+def test_a_schema_8_build_carries_its_realtime_companions(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    # Publish-shaped: GTFS feeds only, each naming its companions.
+    feeds = [
+        {**PARTITIONED_FEEDS[0], "realtime_feed_ids": ["f1-rt"]},
+        {**PARTITIONED_FEEDS[1], "realtime_feed_ids": []},
+    ]
+    edges = {"FI": PARTITIONED_EDGES["FI"][:1], "links": PARTITIONED_EDGES["links"]}
+    write_partitioned_build(
+        cache / "index", feeds=feeds, edges=edges, realtime=REALTIME_ROWS
+    )
+    build = iv.load_build("b", cache / "index")
+    assert list(build.realtime["partition"]) == ["FI", "international"]
+    assert set(build.feeds["spec"]) == {"gtfs"}
+    # A feed row counts its companions; a record lists them with their
+    # endpoints parsed, the ids agreeing with what the feed names; an
+    # unlinked companion belongs to no feed.
+    rows = iv.feeds_table(build)["rows"]
+    assert {r["feed_id"]: r["realtime"] for r in rows} == {"f1": 1, "f2": 0}
+    record = json.loads(iv.feed_record(build, "f1"))["properties"]
+    assert record["realtime_feed_ids"] == [c["feed_id"] for c in record["realtime"]]
+    assert record["realtime"] == [
+        {
+            "feed_id": "f1-rt",
+            "name": None,
+            "source": "atlas",
+            "static_link_method": "declared",
+            "entity_types": ["trip_updates"],
+            "urls": {"realtime_trip_updates": "https://rt/tu"},
+            "partition": "FI",
+        }
+    ]
+    assert json.loads(iv.feed_record(build, "f2"))["properties"]["realtime"] == []
+    client = TestClient(iv.create_app(cache))
+    summary = client.get(f"/api/builds/{iv.LATEST}/summary").json()
+    assert summary["schema_version"] == 8
+    assert summary["realtime"] == {"feeds": 2, "linked": 1}
+    assert summary["partitions"]["FI"]["realtime"]["rows"] == 1
+    # A schema-7 build (no realtime tables) has none, and still loads.
+    write_partitioned_build(tmp_path / "seven")
+    seven = iv.load_build("s", tmp_path / "seven")
+    assert len(seven.realtime) == 0 and iv.realtime_of(seven, "f1") == []
+    # A companion whose endpoints are not JSON, or whose entity types are
+    # not a list, or a table missing a consumed column, is refused at load.
+    broken = dict(REALTIME_ROWS["FI"][0], urls="{not json")
+    write_partitioned_build(tmp_path / "bad-urls", realtime={"FI": [broken]})
+    assert iv.load_build("x", tmp_path / "bad-urls") is None
+    broken = dict(REALTIME_ROWS["FI"][0], entity_types="trip_updates")
+    write_partitioned_build(tmp_path / "bad-types", realtime={"FI": [broken]})
+    assert iv.load_build("x", tmp_path / "bad-types") is None
+    broken = {k: v for k, v in REALTIME_ROWS["FI"][0].items() if k != "urls"}
+    write_partitioned_build(tmp_path / "no-urls", realtime={"FI": [broken]})
+    assert iv.load_build("x", tmp_path / "no-urls") is None
+
+
+def test_a_schema_9_build_carries_the_feed_dates_and_place_validity(tmp_path):
+    validity = {
+        "feeds_dated": 1,
+        "feeds_undated": 1,
+        "start": "2026-09-01",
+        "end": "2026-09-14",
+        "windows": [{"start": "2026-09-01", "end": "2026-09-14", "feeds": 1}],
+        "best": {"start": "2026-09-01", "end": "2026-09-14", "feeds": 1},
+    }
+    places = [
+        dict(p, validity=json.dumps(validity) if p["place_id"] == "hel" else None)
+        for p in PLACES
+    ]
+    feeds = [
+        _feed7("f1", "HSL", "FI", "domestic", start="2026-09-01", end="2026-09-14"),
+        _feed7("f2", "Ferry", None, "international"),
+    ]
+    edges = {"FI": PARTITIONED_EDGES["FI"][:1], "links": PARTITIONED_EDGES["links"]}
+    write_partitioned_build(tmp_path, places=places, feeds=feeds, edges=edges)
+    build = iv.load_build("b", tmp_path)
+    # The dates ride on feed rows and records; the place record carries its
+    # parsed validity, None where the build has none for the place.
+    rows = {r["feed_id"]: r for r in iv.feeds_table(build)["rows"]}
+    assert (rows["f1"]["service_start"], rows["f1"]["service_end"]) == (
+        "2026-09-01",
+        "2026-09-14",
+    )
+    assert rows["f2"]["service_start"] is None
+    record = json.loads(iv.feed_record(build, "f1"))["properties"]
+    assert record["service_end"] == "2026-09-14"
+    hel = json.loads(iv.place_record(build, "hel"))["properties"]
+    assert hel["validity"] == validity
+    assert json.loads(iv.place_record(build, "esp"))["properties"]["validity"] is None
+    # Before schema 9 a place record has no validity at all.
+    write_partitioned_build(tmp_path / "eight")
+    eight = iv.load_build("e", tmp_path / "eight")
+    assert eight.validity is None
+    assert "validity" not in json.loads(iv.place_record(eight, "hel"))["properties"]

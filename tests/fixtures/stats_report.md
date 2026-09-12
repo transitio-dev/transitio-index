@@ -1,6 +1,6 @@
 # Build statistics
 
-Snapshot `<snapshot>` (sample); schema 7, Overture None.
+Snapshot `<snapshot>` (sample); schema 9, Overture None.
 
 ## Build
 
@@ -9,8 +9,8 @@ The snapshot the statistics describe and the catalogues it read.
 | metric | value |
 |---|---|
 | snapshot_id | <snapshot> |
-| stats_schema_version | 1 |
-| schema_version | 7 |
+| stats_schema_version | 3 |
+| schema_version | 9 |
 | overture_release |  |
 | sample | sample |
 
@@ -69,8 +69,9 @@ Catalogue ids, deprecated rows and their redirects, and what the crosswalk made 
 | redirect_shares_target_url | 0 |
 | mdb_rows_without_name | 2 |
 | gbfs_duplicate_system_ids | 0 |
-| rows_into_feeds | 5 |
-| feeds | 4 |
+| rows_into_feeds | 4 |
+| gbfs_systems_kept | 1 |
+| feeds | 3 |
 
 ### rows by source
 
@@ -86,6 +87,12 @@ Catalogue ids, deprecated rows and their redirects, and what the crosswalk made 
 |---|---|
 | mdb | 2 |
 
+### rows dropped by reason
+
+| key | value |
+|---|---|
+| not_transit | 1 |
+
 ### feeds by source
 
 | key | value |
@@ -93,14 +100,13 @@ Catalogue ids, deprecated rows and their redirects, and what the crosswalk made 
 | both | 1 |
 | atlas | 1 |
 | mdb | 1 |
-| systems_csv | 1 |
 
 ### feeds by crosswalk method
 
 | key | value |
 |---|---|
 | url_exact | 1 |
-| none | 3 |
+| none | 2 |
 
 ## Availability
 
@@ -108,7 +114,7 @@ Crawl outcomes per feed, the failure classes from the fetcher's recorded reason,
 
 | metric | value |
 |---|---|
-| feeds | 4 |
+| feeds | 3 |
 | crawled | 0 |
 | with_calendar | 0 |
 
@@ -116,7 +122,7 @@ Crawl outcomes per feed, the failure classes from the fetcher's recorded reason,
 
 | key | value |
 |---|---|
-| not_crawled | 4 |
+| not_crawled | 3 |
 
 ## Licensing
 
@@ -127,13 +133,24 @@ Licence declarations and the redistribution judgement per feed.
 
 | key | value |
 |---|---|
-| none | 4 |
+| none | 3 |
 
 ### redistribution allowed
 
 | key | value |
 |---|---|
-| unknown | 4 |
+| unknown | 3 |
+
+## Realtime
+
+The GTFS-RT companions shipped beside the GTFS feeds: linked to a static feed of the index or not, by source, endpoint entity type and link method, and the static feeds that have one.
+
+| metric | value |
+|---|---|
+| feeds | 0 |
+| linked | 0 |
+| unlinked | 0 |
+| static_feeds_with_realtime | 0 |
 
 ## Scale
 
@@ -150,7 +167,7 @@ Stops per crawled feed and places per feed (count, median, 95th percentile, maxi
 
 | key | value |
 |---|---|
-| count | 4 |
+| count | 3 |
 | median | 0 |
 | p95 | 0 |
 | max | 0 |
@@ -159,7 +176,29 @@ Stops per crawled feed and places per feed (count, median, 95th percentile, maxi
 
 | key | value |
 |---|---|
-| 0 | 4 |
+| 0 | 3 |
+
+## Validity
+
+Feed validity against the build date: dated feeds, the ones valid on it, expired or not started, the valid ones ending within 30 and 90 days (cumulative), span quantiles, and the places whose best window (most valid feeds) contains the build date.
+
+| metric | value |
+|---|---|
+| build_date | 2026-09-12 |
+| feeds_dated | 0 |
+| valid | 0 |
+| expired | 0 |
+| not_started | 0 |
+| ending_within_30_days | 0 |
+| ending_within_90_days | 0 |
+| places_with_dated_feeds | 0 |
+| places_best_covers_build_date | 0 |
+
+### service days
+
+| key | value |
+|---|---|
+| count | 0 |
 
 ## Country agreement
 
@@ -170,7 +209,7 @@ The catalogues' declared country against the home country classify found from th
 
 | key | value |
 |---|---|
-| unobserved | 4 |
+| unobserved | 3 |
 
 ### by catalogue
 
@@ -178,7 +217,7 @@ The catalogues' declared country against the home country classify found from th
 |---|---|---|
 | mdb |  | 2 |
 | atlas |  | 2 |
-| gbfs |  | 1 |
+| gbfs |  |  |
 
 ## Declared municipality
 

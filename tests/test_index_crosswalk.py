@@ -1129,9 +1129,12 @@ def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
         ),
     )
 
-    ingest_gbfs(cache, tmp_path)
+    ingest_gbfs(cache, tmp_path, {"System ID": "s"}, {"System ID": "t"})
     manifest = crosswalk.crosswalk(cache)
     assert manifest["url_exact_pairs"] == 1
+    # The feed counts describe the transit feeds; the systems have their own.
+    assert manifest["feeds"] == 3 and manifest["gbfs_systems"] == 2
+    assert manifest["feeds_by_source"] == {"both": 1, "atlas": 1, "mdb": 1}
 
     generation, _ = store.resolve(cache / "crosswalk", "feeds.json")
     with generation:
@@ -1139,11 +1142,21 @@ def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
             json.loads(line)
             for line in generation.read_bytes("feeds.jsonl").decode().splitlines()
         ]
+        systems = [
+            json.loads(line)
+            for line in generation.read_bytes("gbfs_systems.jsonl")
+            .decode()
+            .splitlines()
+        ]
     found = by_feed_id(records)
     assert found["f-a"]["source"] == "both"
     assert found["f-a"]["mdb_id"] == "mdb-1"
     assert "f-mdb-2" in found
     assert "f-b" in found
+    # GBFS systems are not transit feeds: they leave the pipeline here, in
+    # their own artifact, and never reach feeds.jsonl.
+    assert {r["spec"] for r in records} == {"gtfs"}
+    assert sorted(s["feed_id"] for s in systems) == ["f-gbfs-s", "f-gbfs-t"]
 
 
 def test_crosswalk_stage_publishes_provisional_links(tmp_path):

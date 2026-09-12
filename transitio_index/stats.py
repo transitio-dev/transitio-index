@@ -15,6 +15,7 @@ summary records the build's snapshot id and source versions.
 """
 
 import collections
+import hashlib
 import contextlib
 import datetime
 import io
@@ -25,11 +26,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from transitio_index import store
-from transitio_index.crosswalk import _clean_url, _host
+from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host
 
 STATS_POINTER = "stats.json"
 # The shape of the stats artifacts; the aggregation script refuses a mismatch.
-STATS_SCHEMA_VERSION = 1
+STATS_SCHEMA_VERSION = 3  # 2: the realtime section; 3: validity
+# A partition of the published index: a country code, international or links.
+PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
+# The tables a partition kind may carry; a country partition any of them.
+PARTITION_LAYOUT = {"international": {"feeds", "realtime"}, "links": {"edges"}}
 CATALOGUE_ARTIFACT = "catalogue.parquet"
 FEEDS_ARTIFACT = "feeds.parquet"
 PLACES_ARTIFACT = "places.parquet"
@@ -169,8 +174,8 @@ def _gbfs_row(record, duplicated):
     }
 
 
-def _feed_lookup(feeds):
-    """``{(source, key): feed_id}`` for every catalogue row a feed carries:
+def _feed_lookup(feeds, systems=()):
+    """``{(source, key): feed_id}`` for every catalogue row a record carries:
     MDB rows by id, Atlas feeds by Onestop ID, GBFS systems by id and country
     (a duplicated system id is only unambiguous with its country)."""
     lookup = {}
@@ -179,17 +184,20 @@ def _feed_lookup(feeds):
             lookup[("mdb", feed["mdb_id"])] = feed["feed_id"]
         if feed.get("onestop_id"):
             lookup[("atlas", feed["onestop_id"])] = feed["feed_id"]
-        system = feed.get("gbfs") or {}
+    for record in systems:
+        system = record.get("gbfs") or {}
         if system.get("system_id"):
             key = ("gbfs", system["system_id"], system.get("country_code"))
-            lookup[key] = feed["feed_id"]
+            lookup[key] = record["feed_id"]
     return lookup
 
 
-def catalogue_rows(raw, feeds, snapshot_id=None):
+def catalogue_rows(raw, feeds, snapshot_id=None, systems=()):
     """One row per catalogue row of ``raw`` (``{source: records}``), with the
-    index feed it became, or the reason it did not."""
-    lookup = _feed_lookup(feeds)
+    index feed it became, or the reason it did not. ``systems`` are the GBFS
+    records the crosswalk kept apart: a system it resolved is ``not_transit``,
+    one it could not tell apart ``ambiguous_id``; neither is a feed."""
+    lookup = _feed_lookup(feeds, systems)
     mdb = raw.get("mdb") or []
     status_by_id = {record["mdb_id"]: record.get("status") for record in mdb}
     gbfs = raw.get("gbfs") or []
@@ -202,16 +210,18 @@ def catalogue_rows(raw, feeds, snapshot_id=None):
         rows.append(row)
     for record in raw.get("atlas") or []:
         row = _atlas_row(record)
-        row["feed_id"] = lookup.get(("atlas", record["onestop_id"]))
+        if record.get("spec") == "gbfs":  # an Atlas GBFS feed is a system too
+            row["feed_id"], row["drop_reason"] = None, "not_transit"
+        else:
+            row["feed_id"] = lookup.get(("atlas", record["onestop_id"]))
         rows.append(row)
     for record in gbfs:
         row = _gbfs_row(record, duplicated)
         key = ("gbfs", record["system_id"], record.get("country_code"))
-        row["feed_id"] = lookup.get(key)
-        if row["feed_id"] is None and record["system_id"] in duplicated:
-            # The crosswalk mints no id for a system the country does not
-            # tell apart (none, or two systems sharing id and country).
-            row["drop_reason"] = "ambiguous_id"
+        row["feed_id"] = None
+        # The crosswalk mints no id for a system the country does not tell
+        # apart (none, or two systems sharing id and country).
+        row["drop_reason"] = "not_transit" if key in lookup else "ambiguous_id"
         rows.append(row)
     # Two systems sharing id and country still need distinct keys: the
     # ordinal in catalogue order tells them apart.
@@ -289,10 +299,11 @@ def declared_places(rows):
     }
 
 
-def identity(rows, feeds):
+def identity(rows, feeds, systems=None):
     """The identity-and-duplication section: id namespaces, deprecated rows
     and their redirects, nameless rows, duplicated GBFS ids, and what the
-    crosswalk made of the rows."""
+    crosswalk made of the rows: feeds, and the GBFS systems it kept apart
+    (``systems``, a per-build count; None when aggregating archives)."""
     mdb = [row for row in rows if row["source"] == "mdb"]
     deprecated = [row for row in mdb if row["status"] == "deprecated"]
     url_by_id = {row["source_id"]: row["download_url"] for row in mdb}
@@ -329,6 +340,7 @@ def identity(rows, feeds):
             if n > 1
         ),
         "rows_into_feeds": sum(1 for r in rows if r["feed_id"]),
+        "gbfs_systems_kept": None if systems is None else len(systems),
         "rows_dropped_by_reason": dict(
             collections.Counter(r["drop_reason"] for r in rows if r["drop_reason"])
         ),
@@ -394,15 +406,22 @@ def stats(cache_dir):
             stack.enter_context(store.exclusive_writer(directory))
         if store.current_generation(cache_dir / "crosswalk", "feeds.json") is None:
             raise StatsError("no crosswalk generation to gather statistics from")
-        feeds, crosswalk = store.read_jsonl(
-            cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
-        )
+        generation, crosswalk = store.resolve(cache_dir / "crosswalk", "feeds.json")
+        with generation:
+            # Both artifacts from the one verified generation; one written
+            # before the crosswalk kept the systems apart has no systems.
+            feeds = store.parse_jsonl(generation.read_bytes("feeds.jsonl"))
+            systems = (
+                store.parse_jsonl(generation.read_bytes(GBFS_ARTIFACT))
+                if generation.has(GBFS_ARTIFACT)
+                else []
+            )
         raw, manifests = _read_raw(cache_dir)
         if not raw:
             raise StatsError("no ingest generation to gather statistics from")
         snapshot = _snapshot(cache_dir, crosswalk, manifests)
         snapshot_id = snapshot.get("snapshot_id")
-        rows = catalogue_rows(raw, feeds, snapshot_id)
+        rows = catalogue_rows(raw, feeds, snapshot_id, systems)
         # An ingest that read a local file (no URL) is a cut sample.
         local = [
             s
@@ -425,7 +444,7 @@ def stats(cache_dir):
                 "sample_sources": local,
             },
             "declared_places": declared_places(rows),
-            "identity": identity(rows, feeds),
+            "identity": identity(rows, feeds, systems),
         }
         from transitio_index import crawl
 
@@ -436,13 +455,15 @@ def stats(cache_dir):
                     "the crawl changed since the index was published; re-run "
                     "the pipeline in stage order"
                 )
-            published, edges, places = _index_tables(cache_dir, snapshot)
+            published, realtime, edges, places = _index_tables(cache_dir, snapshot)
             by_place = {place["place_id"]: place for place in places}
             statuses = {
                 r["source_id"]: r["status"] for r in rows if r["source"] == "mdb"
             }
+            # The companions are transit feeds too: one row each, never
+            # crawled, so the table matches the crosswalk's feeds.
             feed_table = feed_rows(
-                published,
+                published + [{**r, "spec": "gtfs-rt"} for r in realtime],
                 edges,
                 by_place,
                 _crawl_log(cache_dir),
@@ -451,7 +472,11 @@ def stats(cache_dir):
                 snapshot_id,
             )
         summary.update(feed_sections(feed_table))
+        summary["realtime"] = realtime_section(realtime, published)
         place_table = place_rows(places, edges, snapshot_id)
+        summary["validity"] = validity_section(
+            feed_table, place_table, _build_date(snapshot)
+        )
         summary["duplicate_coverage"] = duplicate_coverage(edges, rows)
         summary["distributions"] = distributions(edges, places)
         manifest = {
@@ -465,6 +490,7 @@ def stats(cache_dir):
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         manifest["feeds"] = len(feed_table)
+        manifest["realtime"] = len(realtime)
         manifest["places"] = len(place_table)
         manifest["sections"] = sorted(summary)
         data = _parquet(rows)
@@ -517,6 +543,10 @@ FEED_SCHEMA = pa.schema(
         ("relevance_median", pa.float64()),
         ("licence_state", pa.string()),
         ("redistribution_allowed", pa.bool_()),
+        # The span the feed's calendar gives (schema 9), and its length.
+        ("service_start", pa.string()),
+        ("service_end", pa.string()),
+        ("service_days", pa.int64()),
         ("snapshot_id", pa.string()),
     ]
 )
@@ -712,10 +742,68 @@ def feed_rows(
                 "relevance_median": _median(relevance),
                 "licence_state": _licence_state(feed),
                 "redistribution_allowed": feed.get("redistribution_allowed"),
+                "service_start": feed.get("service_start"),
+                "service_end": feed.get("service_end"),
+                "service_days": _service_days(feed),
                 "snapshot_id": snapshot_id,
             }
         )
     return rows
+
+
+def _build_date(snapshot):
+    """The date of the snapshot's ``built_at``: the day validity is measured
+    against, so a rerun on another day reports the same. A snapshot without
+    one is refused rather than measured against today."""
+    built = snapshot.get("built_at")
+    try:
+        return datetime.datetime.fromisoformat(built).date()
+    except (TypeError, ValueError):
+        raise StatsError(
+            f"the snapshot's built_at {built!r} is not a date; validity is "
+            "measured against the build date"
+        ) from None
+
+
+def _service_days(feed):
+    """The length of the feed's service span in days, None when undated."""
+    start, end = feed.get("service_start"), feed.get("service_end")
+    if not start or not end:
+        return None
+    return (
+        datetime.date.fromisoformat(end) - datetime.date.fromisoformat(start)
+    ).days + 1
+
+
+def validity_section(feed_rows, place_rows, build_date):
+    """Feed validity against the build date: the feeds dated, valid on it,
+    expired before it, not started by it, the valid ones ending within 30
+    and 90 days of it (inclusive, the 30-day count within the 90-day one),
+    the span quantiles, and the places whose best window contains it."""
+    dated = [r for r in feed_rows if r["service_start"] and r["service_end"]]
+    day = build_date.isoformat()
+    valid = [r for r in dated if r["service_start"] <= day <= r["service_end"]]
+
+    def ending_within(days):
+        limit = (build_date + datetime.timedelta(days=days)).isoformat()
+        return sum(1 for r in valid if r["service_end"] <= limit)
+
+    return {
+        "build_date": day,
+        "feeds_dated": len(dated),
+        "valid": len(valid),
+        "expired": sum(1 for r in dated if r["service_end"] < day),
+        "not_started": sum(1 for r in dated if r["service_start"] > day),
+        "ending_within_30_days": ending_within(30),
+        "ending_within_90_days": ending_within(90),
+        "service_days": _quantiles([r["service_days"] for r in dated]),
+        "places_with_dated_feeds": sum(1 for r in place_rows if r["feeds_dated"]),
+        "places_best_covers_build_date": sum(
+            1
+            for r in place_rows
+            if r["best_start"] and r["best_start"] <= day <= r["best_end"]
+        ),
+    }
 
 
 # The feed sources that belong to each catalogue (``both`` is in two).
@@ -813,18 +901,58 @@ def feed_sections(rows):
 
 
 def _index_tables(cache_dir, snapshot):
-    """``(feeds, edges, places)`` of the published index, its partitions
-    joined; JSON columns decoded."""
-    tables = {"feeds": [], "edges": [], "places": []}
+    """``(feeds, realtime, edges, places)`` of the published index, its
+    partitions joined; JSON columns decoded. Every file is read once and
+    checked against the snapshot's digest and row count, and only the
+    layout's own partition and table names are opened."""
+    tables = {"feeds": [], "realtime": [], "edges": [], "places": []}
     for partition, listed in (snapshot.get("partitions") or {}).items():
-        for table in listed:
+        if not PARTITION_NAME.fullmatch(partition):
+            raise StatsError(f"{partition!r}: not a partition of the index")
+        allowed = PARTITION_LAYOUT.get(partition, set(tables))
+        for table, entry in listed.items():
+            if table not in allowed:
+                raise StatsError(f"{partition}/{table}: not a table of the index")
             path = cache_dir / "index" / partition / f"{table}.parquet"
-            tables[table].extend(pq.read_table(path).to_pylist())
-    for feed in tables["feeds"]:
-        for key in ("atlas", "mdb", "gbfs", "country_shares"):
+            data = path.read_bytes()
+            if hashlib.sha256(data).hexdigest() != (entry or {}).get("sha256"):
+                raise StatsError(f"{path}: does not match the snapshot's digest")
+            rows = pq.read_table(io.BytesIO(data)).to_pylist()
+            if len(rows) != (entry or {}).get("rows"):
+                raise StatsError(
+                    f"{path}: {len(rows)} rows, the snapshot lists {entry}"
+                )
+            tables[table].extend(rows)
+    for feed in tables["feeds"] + tables["realtime"]:
+        for key in ("atlas", "mdb", "gbfs", "country_shares", "urls"):
             if isinstance(feed.get(key), str):
                 feed[key] = json.loads(feed[key])
-    return tables["feeds"], tables["edges"], tables["places"]
+    return tables["feeds"], tables["realtime"], tables["edges"], tables["places"]
+
+
+def realtime_section(realtime, feeds):
+    """The GTFS-RT companions: how many, linked to a static feed of the index
+    or not, by source and by the entity types their endpoints carry, and
+    the static feeds with at least one companion."""
+    static = {feed["feed_id"] for feed in feeds}
+    linked = sum(1 for r in realtime if r.get("static_feed_id") in static)
+    return {
+        "feeds": len(realtime),
+        "linked": linked,
+        "unlinked": len(realtime) - linked,
+        "by_source": dict(collections.Counter(r["source"] for r in realtime)),
+        "by_entity_type": dict(
+            collections.Counter(
+                t for r in realtime for t in r.get("entity_types") or ()
+            )
+        ),
+        "by_link_method": dict(
+            collections.Counter(r.get("static_link_method") or "none" for r in realtime)
+        ),
+        "static_feeds_with_realtime": sum(
+            1 for feed in feeds if feed.get("realtime_feed_ids")
+        ),
+    }
 
 
 def _crawl_log(cache_dir):
@@ -875,6 +1003,11 @@ PLACE_SCHEMA = pa.schema(
         ("feeds_by_category", pa.string()),
         ("departures_per_day", pa.float64()),
         ("has_primary", pa.bool_()),
+        # The place's validity (schema 9): dated feeds and the best window.
+        ("feeds_dated", pa.int64()),
+        ("best_start", pa.string()),
+        ("best_end", pa.string()),
+        ("best_feeds", pa.int64()),
         ("snapshot_id", pa.string()),
     ]
 )
@@ -897,6 +1030,17 @@ DEFINITIONS = {
         "recorded reason, and outcomes by the row's catalogue status."
     ),
     "licensing": "Licence declarations and the redistribution judgement per feed.",
+    "validity": (
+        "Feed validity against the build date: dated feeds, the ones valid "
+        "on it, expired or not started, the valid ones ending within 30 and "
+        "90 days (cumulative), span quantiles, and the places whose best "
+        "window (most valid feeds) contains the build date."
+    ),
+    "realtime": (
+        "The GTFS-RT companions shipped beside the GTFS feeds: linked to a "
+        "static feed of the index or not, by source, endpoint entity type "
+        "and link method, and the static feeds that have one."
+    ),
     "scale": (
         "Stops per crawled feed and places per feed (count, median, 95th "
         "percentile, maximum), and countries served per feed."
@@ -930,7 +1074,9 @@ REPORT_SECTIONS = (
     "identity",
     "availability",
     "licensing",
+    "realtime",
     "scale",
+    "validity",
     "country_agreement",
     "declared_municipality",
     "duplicate_coverage",
@@ -966,6 +1112,10 @@ def place_rows(places, edges, snapshot_id=None):
             if per_feed.get(e["feed_id"]) is None:
                 per_feed[e["feed_id"]] = value
         reported = [d for d in per_feed.values() if d is not None]
+        validity = place.get("validity")
+        if isinstance(validity, str):
+            validity = json.loads(validity)
+        best = (validity or {}).get("best") or {}
         rows.append(
             {
                 "place_id": place["place_id"],
@@ -977,6 +1127,10 @@ def place_rows(places, edges, snapshot_id=None):
                 ),
                 "departures_per_day": sum(reported) if reported else None,
                 "has_primary": bool(categories.get("primary")),
+                "feeds_dated": (validity or {}).get("feeds_dated", 0),
+                "best_start": best.get("start"),
+                "best_end": best.get("end"),
+                "best_feeds": best.get("feeds"),
                 "snapshot_id": snapshot_id,
             }
         )
@@ -1071,7 +1225,10 @@ def _cell(value):
         return f"{value:.3f}".rstrip("0").rstrip(".")
     if isinstance(value, (list, tuple)):
         return ", ".join(str(v) for v in value)
-    return "" if value is None else str(value)
+    # A pipe or a line break in a value (an archive label, a URL) would
+    # break the table: escaped and folded to one line.
+    text = "" if value is None else str(value)
+    return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
 def _table(rows, columns):
