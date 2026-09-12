@@ -296,3 +296,38 @@ def test_country_selection_matches_code_and_curated_name_and_rejects_others():
     assert sc._unrecognized_countries({"ÑL"}) == ["ÑL"]  # non-ASCII, not a code
     # a non-ASCII char must not case-fold into a code ("ß".upper() == "SS")
     assert sc._unrecognized_countries({"ß"}) == ["ß"]
+
+
+def test_include_pulls_a_named_atlas_feed_and_a_foreign_mdb_row(tmp_path):
+    # An Atlas feed carries no country, and an MDB row can be filed under the
+    # wrong one: --include reaches both; an id matching nothing is refused.
+    archive = tmp_path / "atlas.tar.gz"
+    _archive(
+        archive,
+        [
+            ("r/feeds/ovapi.dmfr.json", _dmfr("f-u-nl", "https://gtfs.ovapi.nl/g.zip")),
+            ("r/feeds/other.dmfr.json", _dmfr("f-x", "https://x.example/gtfs.zip")),
+        ],
+    )
+    kept = sc._select_atlas(archive, set(), set(), includes={"f-u-nl"})
+    assert [f["id"] for _, p in kept for f in p["feeds"]] == ["f-u-nl"]
+    mdb = tmp_path / "feeds_v2.csv"
+    mdb.write_text(
+        "id,location.country_code,urls.direct_download\n"
+        "mdb-1,NL,https://a/x.zip\nmdb-1090,FI,https://b/y.zip\nmdb-3,DE,https://c/z.zip\n"
+    )
+    _, rows = sc._select_csv(
+        mdb, sc.MDB_COUNTRY, (sc.MDB_COUNTRY, sc.MDB_DOWNLOAD), {"NL"}, {"mdb-1090"}
+    )
+    assert sorted(r["id"] for r in rows) == ["mdb-1", "mdb-1090"]
+    sc._check_includes({"f-u-nl", "mdb-1090"}, rows, kept)
+    with pytest.raises(SystemExit, match=r"--include \['f-nope'\] matches no"):
+        sc._check_includes({"f-nope"}, rows, kept)
+
+
+def test_an_included_row_survives_the_cap_and_the_subdivision_filter():
+    pulled = [{"id": "mdb-9", sc.MDB_COUNTRY: "FI"}]
+    narrowed = [{"id": "mdb-1", sc.MDB_COUNTRY: "NL"}]
+    assert sc._with_included(narrowed, pulled) == narrowed + pulled
+    # Already present after narrowing: not duplicated.
+    assert sc._with_included(narrowed + pulled, pulled) == narrowed + pulled
