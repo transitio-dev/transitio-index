@@ -18,7 +18,9 @@ otherwise non-global literal address, never ``localhost``-like names.
 Redirects are followed manually so each hop pays the token bucket and appears
 in the counters. Requests ask for ``identity`` encoding and refuse encoded
 answers, because ranges and Content-Length only mean anything over the raw
-bytes. Range reads and resumes carry ``If-Range``, and a ``Content-Range``
+bytes; the one exception is a whole download from a host that answers 406 to
+identity, which is retried with gzip and decoded as it streams, never resumed
+by range. Range reads and resumes carry ``If-Range``, and a ``Content-Range``
 answer must match what was asked, so a feed republished mid-crawl degrades to a
 whole download instead of mixing versions.
 
@@ -34,6 +36,7 @@ import os
 import threading
 import time
 import urllib.parse
+import zlib
 
 import httpx
 import idna
@@ -195,11 +198,17 @@ def _content_range(response):
     )
 
 
-def _refuse_encoding(response, url):
-    """Refuse a content-encoded answer: offsets and lengths mean raw bytes."""
+def _refuse_encoding(response, url, *, gzip_ok=False):
+    """Refuse a content-encoded answer: offsets and lengths mean raw bytes.
+
+    With ``gzip_ok`` a gzip answer passes — the one encoding a download asks
+    for when a host refuses identity; nothing that reads ranges ever does.
+    """
     encoding = response.headers.get("Content-Encoding", "").lower()
-    if encoding not in ("", "identity"):
+    accepted = ("", "identity", "gzip") if gzip_ok else ("", "identity")
+    if encoding not in accepted:
         raise FetchError(f"{url}: content-encoding {encoding!r} is not accepted")
+    return encoding == "gzip"
 
 
 class Fetcher:
@@ -457,9 +466,11 @@ class Fetcher:
         as it arrives, bounded by ``max_bytes``, checked against the declared
         Content-Length — and replaced into place only when complete. A
         connection dropping mid-body is resumed with a range request from the
-        bytes already written, pinned by ``If-Range`` to the representation the
-        first bytes came from; a refused or unpinnable resume restarts from
-        zero. Returns ``status``, ``sha256``, ``bytes`` and the response
+        bytes already written (what the failed attempt appended, and its
+        digest, are discarded first), pinned by ``If-Range`` to the
+        representation the first bytes came from; a refused or unpinnable
+        resume restarts from zero, as does an encoded body. Returns
+        ``status``, ``sha256``, ``bytes`` and the response
         validators (kept from the responses that supplied them, so a resumed
         download still records the validators for the next crawl's
         conditional request).
@@ -474,6 +485,10 @@ class Fetcher:
         digest = hashlib.sha256()
         written = 0
         validators = {}
+        # A host that answers 406 to identity encoding gets one more chance
+        # with gzip; its body is decoded as it streams and never resumed by
+        # range (offsets into the encoded body mean nothing to the file).
+        encoded = False
         try:
             with os.fdopen(handle, "wb") as opened_file:
                 handle = None
@@ -481,9 +496,10 @@ class Fetcher:
                     resume_pin = validators.get("etag") or validators.get(
                         "last_modified"
                     )
-                    if written and not resume_pin:
-                        # Nothing to pin the resume to: bytes from a possibly
-                        # different representation must not be mixed in.
+                    if written and (encoded or not resume_pin):
+                        # Nothing to pin the resume to, or an encoded body:
+                        # bytes from a possibly different representation must
+                        # not be mixed in.
                         opened_file.seek(0)
                         opened_file.truncate()
                         digest = hashlib.sha256()
@@ -493,13 +509,32 @@ class Fetcher:
                     if written:
                         headers["Range"] = f"bytes={written}-"
                         headers["If-Range"] = resume_pin
+                    if encoded:
+                        headers["Accept-Encoding"] = "gzip"
+                    # The attempt hashes into its own copy and appends past
+                    # ``written``: a failure drops both, so the next attempt
+                    # continues from bytes that were fully accounted for.
+                    attempt_digest = digest.copy()
                     try:
                         outcome = self._stream_once(
-                            url, headers, opened_file, digest, written, max_bytes
+                            url,
+                            headers,
+                            opened_file,
+                            attempt_digest,
+                            written,
+                            max_bytes,
+                            gzip_ok=encoded,
                         )
                     except (httpx.HTTPError, FetchError) as error:
+                        opened_file.seek(written)
+                        opened_file.truncate()
                         if attempt == DOWNLOAD_ATTEMPTS:
                             raise FetchError(f"GET {url}: {error}")
+                        continue
+                    if outcome["status"] == "not_acceptable":
+                        if encoded or attempt == DOWNLOAD_ATTEMPTS:
+                            raise FetchError(f"GET {url}: HTTP 406")
+                        encoded = True
                         continue
                     if outcome["status"] == "not_modified":
                         return {"status": "not_modified"}
@@ -526,6 +561,7 @@ class Fetcher:
                         validators = {}
                         continue
                     written = outcome["written"]
+                    digest = attempt_digest
                     for key, value in outcome["validators"].items():
                         # A later 206 that omits a validator must not erase the
                         # one the representation was pinned by.
@@ -552,12 +588,19 @@ class Fetcher:
                 os.close(handle)
             store.unlink(directory, partial)
 
-    def _stream_once(self, url, headers, opened_file, digest, written, max_bytes):
+    def _stream_once(
+        self, url, headers, opened_file, digest, written, max_bytes, *, gzip_ok=False
+    ):
         """One streaming attempt; returns what happened rather than raising.
 
         Network errors propagate (the caller retries); protocol answers are
-        returned so the caller can distinguish 304, a refused resume, and a
-        short body.
+        returned so the caller can distinguish 304, a refused resume, 406 to
+        the encoding asked for, and a short body. With ``gzip_ok`` a gzip
+        answer is decoded as it streams: the file, the digest and the
+        ``max_bytes`` ceiling are over the decoded bytes, ``bytes_fetched``
+        over the encoded bytes read from the wire, and the declared
+        Content-Length (the encoded size) does not judge completeness: the
+        gzip trailer does, and a body cut before it is an error.
         """
         expected = None
         final, response = self._hops("GET", url, headers, stream=True)
@@ -570,13 +613,15 @@ class Fetcher:
                 self._note(host, failed=False)
             if response.status_code == 304:
                 return {"status": "not_modified"}
+            if response.status_code == 406:
+                return {"status": "not_acceptable"}
             if written and response.status_code != 206:
                 return {"status": "restart"}
             if response.status_code not in (200, 206):
                 raise FetchError(f"HTTP {response.status_code}")
             if response.status_code == 206 and not written:
                 raise FetchError("206 answer to a request without a range")
-            _refuse_encoding(response, url)
+            gzipped = _refuse_encoding(response, url, gzip_ok=gzip_ok)
             total = None
             if written:
                 claimed = _content_range(response)
@@ -586,23 +631,61 @@ class Fetcher:
                     return {"status": "restart"}
                 total = claimed[2]
             declared = response.headers.get("Content-Length")
-            if declared and declared.isdigit():
+            if declared and declared.isdigit() and not gzipped:
                 expected = written + int(declared)
             if total is not None:
                 # A resumed segment is complete only when the whole declared
                 # representation is: a short segment must trigger another
                 # resume, never publish a truncated file.
                 expected = total
+
+            def take(chunk):
+                nonlocal written
+                written += len(chunk)
+                if written > max_bytes:
+                    raise FetchError(f"download exceeds the {max_bytes}-byte ceiling")
+                digest.update(chunk)
+                opened_file.write(chunk)
+
             try:
-                for chunk in response.iter_bytes(1024 * 1024):
-                    written += len(chunk)
-                    self.bytes_fetched += len(chunk)
-                    if written > max_bytes:
-                        raise FetchError(
-                            f"download exceeds the {max_bytes}-byte ceiling"
-                        )
-                    digest.update(chunk)
-                    opened_file.write(chunk)
+                if gzipped:
+                    # The raw wire bytes, decoded here rather than by the
+                    # client so the end-of-stream marker can be demanded: a
+                    # body cut before its trailer decodes cleanly but is not
+                    # complete.
+                    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    try:
+                        for raw in response.iter_raw(1024 * 1024):
+                            while raw:
+                                if decoder.eof:
+                                    # gzip allows concatenated members; the
+                                    # bytes after one member's trailer start
+                                    # the next.
+                                    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                                # Bounded output: a small chunk can inflate a
+                                # thousandfold, so one call yields at most a
+                                # megabyte, and never more than the ceiling
+                                # allows plus the byte that proves it crossed.
+                                allowance = min(max_bytes - written + 1, 1024 * 1024)
+                                take(decoder.decompress(raw, allowance))
+                                raw = (
+                                    decoder.unused_data
+                                    if decoder.eof
+                                    else decoder.unconsumed_tail
+                                )
+                        take(decoder.flush())
+                        if not decoder.eof:
+                            raise FetchError("gzip body ended before its trailer")
+                    finally:
+                        # Every wire byte read, whether it reached the
+                        # chunker's output or the connection dropped first.
+                        self.bytes_fetched += response.num_bytes_downloaded
+                else:
+                    for chunk in response.iter_bytes(1024 * 1024):
+                        self.bytes_fetched += len(chunk)
+                        take(chunk)
+            except zlib.error as error:
+                raise FetchError(f"gzip body could not be decoded: {error}")
             except httpx.TransportError:
                 # Counted against the host; the caller's retry sees it unchanged.
                 self._note(host, failed=True)
