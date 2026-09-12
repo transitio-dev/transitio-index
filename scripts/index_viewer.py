@@ -222,6 +222,8 @@ FEED_TABLE_COLUMNS = (
     "home_country",
     "scope",
     "partition",
+    "service_start",
+    "service_end",
 )
 # The descriptive columns a feed record carries when the build has them.
 FEED_RECORD_COLUMNS = (
@@ -243,6 +245,8 @@ FEED_RECORD_COLUMNS = (
     "declared_countries",
     "realtime_feed_ids",
     "partition",
+    "service_start",
+    "service_end",
 )
 
 
@@ -416,6 +420,13 @@ class Build:
         # normalized (non-finite → None); nothing parses it again per request,
         # and malformed JSON makes the build unavailable rather than a 500.
         self.service = [_loads(v) for v in self.places["service"].to_numpy()]
+        # Schema 9: the validity of each place's feeds, parsed once like the
+        # service; None before it.
+        self.validity = (
+            [_loads(v) for v in self.places["validity"].to_numpy()]
+            if "validity" in self.places.columns
+            else None
+        )
         self.edge_service = (
             [_loads(v) for v in self.edges["service"].to_numpy()]
             if "service" in self.edges.columns
@@ -903,6 +914,8 @@ def place_record(build, place_id):
     if "names" in props:  # an Arrow map: a dict even when empty
         props["names"] = _as_map(place["names"])
     props["service"] = build.service[row]
+    if build.validity is not None:
+        props["validity"] = build.validity[row]
     props["served"] = bool(build.served[row])
     props["feed_count"] = int(build.feed_count[row])
     props["bbox"] = [_cell(v) for v in build.bounds[row]]

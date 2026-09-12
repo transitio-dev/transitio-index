@@ -774,7 +774,7 @@ def test_feeds_have_a_table_a_record_with_a_hull_and_edges_both_ways(
 # ---- schema 7: a partitioned build ----
 
 
-def _feed7(feed_id, name, home, scope, spec="gtfs"):
+def _feed7(feed_id, name, home, scope, spec="gtfs", start=None, end=None):
     return {
         "feed_id": feed_id,
         "name": name,
@@ -783,6 +783,8 @@ def _feed7(feed_id, name, home, scope, spec="gtfs"):
         "home_country": home,
         "scope": scope,
         "declared_countries": ["FI"],
+        "service_start": start,
+        "service_end": end,
     }
 
 
@@ -1247,3 +1249,43 @@ def test_a_schema_8_build_carries_its_realtime_companions(tmp_path):
     broken = {k: v for k, v in REALTIME_ROWS["FI"][0].items() if k != "urls"}
     write_partitioned_build(tmp_path / "no-urls", realtime={"FI": [broken]})
     assert iv.load_build("x", tmp_path / "no-urls") is None
+
+
+def test_a_schema_9_build_carries_the_feed_dates_and_place_validity(tmp_path):
+    validity = {
+        "feeds_dated": 1,
+        "feeds_undated": 1,
+        "start": "2026-09-01",
+        "end": "2026-09-14",
+        "windows": [{"start": "2026-09-01", "end": "2026-09-14", "feeds": 1}],
+        "best": {"start": "2026-09-01", "end": "2026-09-14", "feeds": 1},
+    }
+    places = [
+        dict(p, validity=json.dumps(validity) if p["place_id"] == "hel" else None)
+        for p in PLACES
+    ]
+    feeds = [
+        _feed7("f1", "HSL", "FI", "domestic", start="2026-09-01", end="2026-09-14"),
+        _feed7("f2", "Ferry", None, "international"),
+    ]
+    edges = {"FI": PARTITIONED_EDGES["FI"][:1], "links": PARTITIONED_EDGES["links"]}
+    write_partitioned_build(tmp_path, places=places, feeds=feeds, edges=edges)
+    build = iv.load_build("b", tmp_path)
+    # The dates ride on feed rows and records; the place record carries its
+    # parsed validity, None where the build has none for the place.
+    rows = {r["feed_id"]: r for r in iv.feeds_table(build)["rows"]}
+    assert (rows["f1"]["service_start"], rows["f1"]["service_end"]) == (
+        "2026-09-01",
+        "2026-09-14",
+    )
+    assert rows["f2"]["service_start"] is None
+    record = json.loads(iv.feed_record(build, "f1"))["properties"]
+    assert record["service_end"] == "2026-09-14"
+    hel = json.loads(iv.place_record(build, "hel"))["properties"]
+    assert hel["validity"] == validity
+    assert json.loads(iv.place_record(build, "esp"))["properties"]["validity"] is None
+    # Before schema 9 a place record has no validity at all.
+    write_partitioned_build(tmp_path / "eight")
+    eight = iv.load_build("e", tmp_path / "eight")
+    assert eight.validity is None
+    assert "validity" not in json.loads(iv.place_record(eight, "hel"))["properties"]

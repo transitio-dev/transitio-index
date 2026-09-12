@@ -261,6 +261,7 @@ export function detailsHtml(record, field = "tier") {
     .join(" › ");
   const specs = specLine(p.feeds_by_spec);
   const reach = specLine(p.reached_from);
+  const validity = validityHtml(p.validity);
   const served = p.served
     ? `served by ${p.feed_count} feed${p.feed_count === 1 ? "" : "s"}${specs ? ` (${specs})` : ""}` +
       (reach ? ` · reached from ${reach}` : "")
@@ -297,7 +298,28 @@ export function detailsHtml(record, field = "tier") {
     (feeds
       ? `<table class="feeds"><thead><tr><th>Feed</th><th>Class</th><th>Rel.</th><th>Conf.</th><th>Method</th></tr></thead><tbody>${feeds}</tbody></table>`
       : "") +
-    (ids ? `<ul class="ids">${ids}</ul>` : "")
+    (ids ? `<ul class="ids">${ids}</ul>` : "") +
+    validity
+  );
+}
+
+// A place's feed validity (schema 9): how many feeds are dated, the best
+// window (most valid feeds, the longest, the earliest) and every window.
+export function validityHtml(validity) {
+  if (!validity || typeof validity !== "object") return "";
+  const dated = validity.feeds_dated ?? 0;
+  const undated = validity.feeds_undated ?? 0;
+  const summary = `${escapeHtml(dated)} dated feed${dated === 1 ? "" : "s"}${undated ? `, ${escapeHtml(undated)} undated` : ""}`;
+  if (!dated) return `<p class="validity">${summary}</p>`;
+  const best = validity.best
+    ? ` · best ${escapeHtml(validity.best.start)} to ${escapeHtml(validity.best.end)} (${escapeHtml(validity.best.feeds)} feed${validity.best.feeds === 1 ? "" : "s"})`
+    : "";
+  const windows = (validity.windows || [])
+    .map((w) => `<li>${escapeHtml(w.start)} to ${escapeHtml(w.end)}: ${escapeHtml(w.feeds)}</li>`)
+    .join("");
+  return (
+    `<p class="validity">${summary} · valid ${escapeHtml(validity.start)} to ${escapeHtml(validity.end)}${best}</p>` +
+    (windows ? `<ul class="windows">${windows}</ul>` : "")
   );
 }
 
@@ -427,6 +449,8 @@ export const FEED_COLUMNS = [
   ["crawl_status", "Crawl"],
   ["places_served", "Places"],
   ["realtime", "RT"],
+  ["service_start", "Valid from"],
+  ["service_end", "Valid to"],
 ];
 
 // The feed table's columns end with the edge counts per class of ``field``.
@@ -475,6 +499,7 @@ export function feedDetailsHtml(record) {
     `<p>${escapeHtml(p.places_served)} place${p.places_served === 1 ? "" : "s"} served${tiers ? ` (${tiers})` : ""}` +
     `${p.stop_count == null ? "" : ` · ${formatStat(p.stop_count)} stops`}` +
     `${record.geometry ? "" : " · no coverage hull"}</p>` +
+    `${p.service_start ? `<p>valid ${escapeHtml(p.service_start)} to ${escapeHtml(p.service_end ?? DASH)}</p>` : ""}` +
     `${p.crawl_status ? `<p>crawl: ${escapeHtml(p.crawl_status)}${p.last_crawled ? ` (${escapeHtml(String(p.last_crawled).slice(0, 10))})` : ""}</p>` : ""}` +
     realtimeHtml(p.realtime)
   );
