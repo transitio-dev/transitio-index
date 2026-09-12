@@ -166,7 +166,7 @@ AREAS = [
 ]
 
 
-def _publish_names(cache, places):
+def _publish_names(cache, places, **manifest):
     directory = store.open_subdir(cache, "gazetteer")
     try:
         with store.exclusive_writer(directory):
@@ -174,7 +174,7 @@ def _publish_names(cache, places):
                 cache / "gazetteer",
                 "names.json",
                 {"places_seed.jsonl": store.jsonl_chunks(places)},
-                {"source": "names", "overture_release": "2026-08-19.0"},
+                {"source": "names", "overture_release": "2026-08-19.0", **manifest},
                 held=directory,
             )
     finally:
@@ -714,3 +714,12 @@ def test_a_crawled_qid_for_a_place_known_by_its_division_joins_it(tmp_path):
         places["Q40840"]["place_id"] == "tp_2"
         and "Manse" in places["Q40840"]["aliases"]
     )
+
+
+def test_seed_geometry_at_another_tolerance_is_refused(tmp_path):
+    # Discovered places would be simplified at the current tolerance beside
+    # seeded ones at the old: the geometry stage must run again first.
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES, simplify_tolerance_deg=0.001)
+    with pytest.raises(overture.GazetteerError, match="re-run the geometry"):
+        _expand(tmp_path, cache)
