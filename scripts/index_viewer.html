@@ -51,6 +51,19 @@
 <body>
 <header>
   <label>Build <select id="build"></select></label>
+  <label>Level <select id="level">
+    <option value="">every kind</option>
+    <option value="city">city</option>
+    <option value="regional">regional</option>
+    <option value="national">national</option>
+    <option value="international">international</option>
+  </select></label>
+  <label>Spec <select id="spec">
+    <option value="all">GTFS and GBFS</option>
+    <option value="gtfs">GTFS</option>
+    <option value="gtfs-rt">GTFS-RT</option>
+    <option value="gbfs">GBFS</option>
+  </select></label>
   <span id="stats"></span>
   <span id="hint" hidden></span>
   <span id="legend" class="legend"></span>

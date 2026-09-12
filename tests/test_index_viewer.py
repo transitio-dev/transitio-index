@@ -324,6 +324,7 @@ def test_slices_are_capped_by_count_then_bytes(tmp_path):
         "parent_id": "fi",
         "country_code": "FI",
         "service": '{"feeds": 1}',
+        "tier": None,  # unserved: no class (``category`` on schema 7)
         "feed_count": 0,
         "served": False,
     }
@@ -581,12 +582,14 @@ def test_the_places_table_is_sorted_paged_and_geometry_free(tmp_path):
         "country_code",
         "served",
         "feed_count",
+        "tier",
         "stops",
         "routes",
         "departures_per_day",
     }
     busiest = iv.places_table(build, everything, sort="feed_count", order="desc")
     assert busiest["rows"][0]["place_id"] == "hel" and busiest["rows"][0]["served"]
+    assert busiest["rows"][0]["tier"] == "local"  # the highest class per place
     assert busiest["rows"][0]["parent_name"] == "Uusimaa"
     assert busiest["rows"][0]["stops"] is None  # the fixture's service has none
     paged = iv.places_table(build, everything, limit=2, offset=2)
@@ -764,4 +767,396 @@ def test_feeds_have_a_table_a_record_with_a_hull_and_edges_both_ways(
         cut_edges["total"] == 3
         and cut_edges["truncated"]
         and len(cut_edges["rows"]) == 1
+    )
+
+
+# ---- schema 7: a partitioned build ----
+
+
+def _feed7(feed_id, name, home, scope, spec="gtfs"):
+    return {
+        "feed_id": feed_id,
+        "name": name,
+        "spec": spec,
+        "coverage": None,
+        "home_country": home,
+        "scope": scope,
+        "declared_countries": ["FI"],
+    }
+
+
+def _edge7(place_id, feed_id, tier, category, relevance, cross, partition=None):
+    row = {
+        "place_id": place_id,
+        "feed_id": feed_id,
+        "tier": tier,
+        "relevance_category": category,
+        "relevance": relevance,
+        "cross_border": cross,
+    }
+    if partition is not None:
+        row["feed_partition"] = partition
+    return row
+
+
+PARTITIONED_FEEDS = [
+    _feed7("f1", "HSL", "FI", "domestic"),
+    _feed7("f2", "Ferry", None, "international"),
+    _feed7("f3", "Bikes", "FI", "domestic", spec="gbfs"),
+]
+PARTITIONED_EDGES = {
+    "FI": [
+        _edge7("hel", "f1", "local", "primary", 0.9, False),
+        _edge7("hel", "f3", "local", "primary", 0.2, False),
+    ],
+    "links": [
+        _edge7(
+            "hel", "f2", "international", "international", 0.3, True, "international"
+        )
+    ],
+}
+
+
+def write_partitioned_build(
+    path,
+    places=PLACES,
+    feeds=PARTITIONED_FEEDS,
+    edges=PARTITIONED_EDGES,
+    notice=b"NOTICE\n",
+):
+    """A schema-7 build: FI places and domestic edges, feeds by home country
+    (``international`` without one), the cross-border edges under ``links``,
+    every table listed with its rows and digest; ``notice=None`` publishes
+    it unlicensed."""
+    path.mkdir(parents=True, exist_ok=True)
+    tables = {"FI/places.parquet": pa.Table.from_pylist(places)}
+    for feed in feeds:
+        partition = feed["home_country"] or "international"
+        key = f"{partition}/feeds.parquet"
+        tables.setdefault(key, []).append(feed)
+    for partition, rows in edges.items():
+        tables[f"{partition}/edges.parquet"] = pa.Table.from_pylist(rows)
+    listing = {}
+    for name, table in tables.items():
+        if isinstance(table, list):
+            table = pa.Table.from_pylist(table)
+        partition, _, file = name.partition("/")
+        (path / partition).mkdir(exist_ok=True)
+        sink = io.BytesIO()
+        pq.write_table(table, sink)
+        (path / name).write_bytes(sink.getvalue())
+        listing.setdefault(partition, {})[file[: -len(".parquet")]] = {
+            "rows": len(table),
+            "sha256": _sha(sink.getvalue()),
+        }
+    snapshot = {
+        "schema_version": 7,
+        "built_at": "2026-09-12T00:00:00+00:00",
+        "counts": {"places": len(places)},
+        "partitions": listing,
+        "licensed": notice is not None,
+        "notice_sha256": None if notice is None else _sha(notice),
+    }
+    if notice is not None:
+        (path / "NOTICE").write_bytes(notice)
+    (path / "snapshot.json").write_text(json.dumps(snapshot))
+    return snapshot
+
+
+def _rewrite_snapshot(path, change):
+    snapshot = json.loads((path / "snapshot.json").read_text())
+    change(snapshot)
+    (path / "snapshot.json").write_text(json.dumps(snapshot))
+
+
+def _tamper_partition(path):
+    (path / "FI" / "edges.parquet").write_bytes(b"not the bytes the snapshot hashed")
+
+
+def _wrong_rows(path):
+    _rewrite_snapshot(path, lambda s: s["partitions"]["FI"]["edges"].update(rows=9))
+
+
+def _bad_partition_name(path):
+    def change(s):
+        s["partitions"]["../x"] = s["partitions"].pop("international")
+
+    _rewrite_snapshot(path, change)
+
+
+def _links_holding_places(path):
+    # The file exists and verifies: only the layout check can refuse it.
+    (path / "links" / "places.parquet").write_bytes(
+        (path / "FI" / "places.parquet").read_bytes()
+    )
+
+    def change(s):
+        s["partitions"]["links"]["places"] = s["partitions"]["FI"]["places"]
+
+    _rewrite_snapshot(path, change)
+
+
+def _edges_without_relevance(path):
+    table = pq.read_table(path / "FI" / "edges.parquet").drop_columns(
+        ["relevance_category", "relevance", "cross_border"]
+    )
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    (path / "FI" / "edges.parquet").write_bytes(sink.getvalue())
+    _rewrite_snapshot(
+        path,
+        lambda s: s["partitions"]["FI"]["edges"].update(sha256=_sha(sink.getvalue())),
+    )
+
+
+def _symlinked_partition(path):
+    real = (path / "FI").rename(path / "FI-real")
+    if not _symlink(real, path / "FI"):
+        pytest.skip("this platform cannot create symlinks")
+
+
+def _notice_listed_but_gone(path):
+    (path / "NOTICE").unlink()
+
+
+def _licensed_without_notice(path):
+    _rewrite_snapshot(path, lambda s: s.update(notice_sha256=None))
+
+
+@pytest.mark.parametrize(
+    ("tamper", "loads"),
+    [
+        (None, True),
+        (_tamper_partition, False),
+        (_wrong_rows, False),
+        (_bad_partition_name, False),
+        (_links_holding_places, False),
+        (_edges_without_relevance, False),
+        (_symlinked_partition, False),
+        (_notice_listed_but_gone, False),
+        (_licensed_without_notice, False),
+    ],
+    ids=[
+        "intact",
+        "tampered-partition",
+        "wrong-row-count",
+        "bad-partition-name",
+        "tables-outside-the-layout",
+        "schema-7-columns-missing",
+        "symlinked-partition",
+        "notice-missing",
+        "licensed-without-notice",
+    ],
+)
+def test_a_partitioned_build_loads_only_when_every_partition_verifies(
+    tmp_path, tamper, loads
+):
+    write_partitioned_build(tmp_path)
+    if tamper:
+        tamper(tmp_path)
+    build = iv.load_build("b", tmp_path)
+    assert (build is not None) is loads
+    if tamper is _symlinked_partition:
+        # The listing agrees with the loader: a linked partition is not complete.
+        assert iv.describe("b", tmp_path)["complete"] is False
+    if loads:
+        # The frames the viewer reads: every feed with its partition, the
+        # domestic edges and the links joined, feed_partition on the links.
+        assert list(build.feeds["partition"]) == ["FI", "FI", "international"]
+        assert len(build.edges) == 3
+        assert sorted(build.edges["feed_partition"].fillna("-")) == [
+            "-",
+            "-",
+            "international",
+        ]
+        assert list(build.edges["relevance_category"]).count("primary") == 2
+        assert build.served.sum() == 1
+        assert build.feed_count[list(build.places["place_id"]).index("hel")] == 3
+        assert set(build.digests) == {
+            "FI/places.parquet",
+            "FI/feeds.parquet",
+            "FI/edges.parquet",
+            "international/feeds.parquet",
+            "links/edges.parquet",
+            "NOTICE",
+        }
+
+
+def test_an_unlicensed_partitioned_build_has_no_notice_to_verify(tmp_path):
+    write_partitioned_build(tmp_path, notice=None)
+    build = iv.load_build("b", tmp_path)
+    assert build is not None and "NOTICE" not in build.digests
+    # A NOTICE listed as null but present is not read; one listed and missing is.
+    row = iv.describe("b", tmp_path)
+    assert row["complete"] is True and row["schema_version"] == 7
+    assert row["partitions"] == {
+        "FI": {"places": 6, "feeds": 2, "edges": 2},
+        "international": {"feeds": 1},
+        "links": {"edges": 1},
+    }
+
+
+def test_the_cache_and_the_api_serve_a_partitioned_build(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    write_partitioned_build(cache / "index")
+    builds = iv.BuildCache(cache)
+    first = builds.get(iv.LATEST)
+    assert builds.get(iv.LATEST) is first
+    # A republish that changes one partition's digest reloads the build.
+    write_partitioned_build(
+        cache / "index",
+        feeds=PARTITIONED_FEEDS[:1],
+        edges={"FI": PARTITIONED_EDGES["FI"][:1]},
+    )
+    second = builds.get(iv.LATEST)
+    assert second is not first and second.feed_count.max() == 1
+    client = TestClient(iv.create_app(cache))
+    listing = client.get("/api/builds").json()
+    assert listing[0]["complete"] is True and listing[0]["schema_version"] == 7
+    summary = client.get(f"/api/builds/{iv.LATEST}/summary").json()
+    assert summary["schema_version"] == 7 and set(summary["partitions"]) == {"FI"}
+    assert client.get(f"/api/builds/{iv.LATEST}/places").status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("spec", "level", "feed_count", "category"),
+    [
+        ("all", None, 3, "primary"),
+        ("gbfs", None, 1, "primary"),
+        ("gtfs", "city", 1, "primary"),
+        ("gtfs", "international", 1, "international"),
+        ("gtfs", "national", 0, None),
+        ("gbfs", "international", 0, None),
+    ],
+)
+def test_a_view_keeps_the_edges_of_one_spec_at_one_level(
+    tmp_path, spec, level, feed_count, category
+):
+    # A domestic edge in the international category is not a border crossing.
+    domestic = _edge7("hel", "f1", "national", "international", 0.1, False)
+    edges = dict(PARTITIONED_EDGES, FI=PARTITIONED_EDGES["FI"] + [domestic])
+    write_partitioned_build(tmp_path, edges=edges)
+    build = iv.load_build("b", tmp_path)
+    view = build.view(spec, level)
+    assert build.view(spec, level) is view  # derived once per combination
+    hel = list(build.places["place_id"]).index("hel")
+    assert view.feed_count[hel] == feed_count
+    assert bool(view.served[hel]) is (feed_count > 0)
+    assert view.category[hel] == category  # the highest class among kept edges
+    assert view.served.sum() == (1 if feed_count else 0)
+    mask = np.ones(len(build.places), dtype=bool)
+    rows = iv.places_table(build, mask, view=view)["rows"]
+    row = next(r for r in rows if r["place_id"] == "hel")
+    assert row["category"] == category and row["feed_count"] == feed_count
+
+
+def test_the_api_filters_places_by_level_and_spec(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    write_partitioned_build(cache / "index")
+    client = TestClient(iv.create_app(cache))
+    url = f"/api/builds/{iv.LATEST}"
+    # A level names its kinds and the classes that count; a spec its feeds.
+    params = {"level": "city", "spec": "gbfs"}
+    rows = client.get(f"{url}/places/table", params=params).json()["rows"]
+    assert {r["kind"] for r in rows} == {"city"} and len(rows) == 3
+    hel = next(r for r in rows if r["place_id"] == "hel")
+    assert hel["served"] and hel["feed_count"] == 1 and hel["category"] == "primary"
+    params = {"level": "city", "served": "true", "sort": "category"}
+    rows = client.get(f"{url}/places/table", params=params).json()["rows"]
+    assert [r["place_id"] for r in rows] == ["hel"]
+    params = {"level": "city", "spec": "gtfs", "parent_id": "uus"}
+    features = client.get(f"{url}/places", params=params).json()["features"]
+    props = {f["id"]: f["properties"] for f in features}
+    assert props["hel"]["category"] == "primary" and props["hel"]["feed_count"] == 1
+    assert props["esp"]["category"] is None and not props["esp"]["served"]
+    # A feed's slice classes each place by that feed's own edges the view keeps.
+    params = {"feed_id": "f3", "parent_id": "uus", "spec": "gbfs"}
+    features = client.get(f"{url}/places", params=params).json()["features"]
+    assert [(f["id"], f["properties"]["category"]) for f in features] == [
+        ("hel", "primary")
+    ]
+    params["feed_id"] = "f1"  # a gtfs feed under the gbfs spec serves nothing
+    assert client.get(f"{url}/places", params=params).json()["features"] == []
+    national = client.get(f"{url}/places", params={"level": "national"}).json()
+    assert [f["id"] for f in national["features"]] == ["fi"]
+    assert national["features"][0]["properties"]["feed_count"] == 0
+    assert client.get(f"{url}/summary").json()["category_field"] == "category"
+    for bad in ({"spec": "bikes"}, {"level": "galactic"}):
+        assert client.get(f"{url}/places/table", params=bad).status_code == 400
+
+
+def test_the_feed_side_api_filters_by_spec_level_and_country(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    write_partitioned_build(cache / "index")
+    write_build(cache / "builds" / "flat" / "index")  # schema 6, beside it
+    client = TestClient(iv.create_app(cache))
+    url = f"/api/builds/{iv.LATEST}"
+
+    def feed_ids(**params):
+        return [
+            r["feed_id"]
+            for r in client.get(f"{url}/feeds", params=params).json()["rows"]
+        ]
+
+    rows = client.get(f"{url}/feeds").json()["rows"]
+    assert [r["feed_id"] for r in rows] == ["f1", "f3", "f2"]  # partition order
+    f1 = rows[0]
+    assert (f1["home_country"], f1["scope"], f1["partition"]) == (
+        "FI",
+        "domestic",
+        "FI",
+    )
+    assert f1["places_served"] == 1 and f1["tier_local"] == 1
+    assert f1["category_primary"] == 1 and f1["category_international"] == 0
+    # A spec keeps its feeds, a level the feeds with an edge it counts, a
+    # country the feeds of that partition.
+    assert feed_ids(spec="gbfs") == ["f3"]
+    assert feed_ids(level="international") == ["f2"]
+    assert feed_ids(country="international") == ["f2"]
+    assert feed_ids(level="city", spec="gtfs") == ["f1"]
+    assert feed_ids(level="international", country="FI") == []
+    assert client.get(f"{url}/feeds", params={"spec": "bikes"}).status_code == 400
+    # Edges, the place record and the feed record carry the relevance fields.
+    edges = client.get(f"{url}/edges", params={"place_id": "hel"}).json()["rows"]
+    link = next(e for e in edges if e["feed_id"] == "f2")
+    assert link["relevance_category"] == "international" and link["relevance"] == 0.3
+    assert link["spec"] == "gtfs" and link["feed_name"] == "Ferry"
+    assert link["cross_border"] is True and link["feed_partition"] == "international"
+    params = {"place_id": "hel", "spec": "gtfs", "level": "city"}
+    kept = client.get(f"{url}/edges", params=params).json()
+    assert kept["total"] == 1 and kept["rows"][0]["feed_id"] == "f1"
+    record = client.get(f"{url}/places/hel").json()["properties"]
+    assert record["feeds_by_spec"] == {"gtfs": 2, "gbfs": 1}
+    assert record["reached_from"] == {"international": 1}  # over the border
+    assert {e["feed_id"]: e["partition"] for e in record["edges"]}[
+        "f2"
+    ] == "international"
+    assert {e["feed_id"]: e["relevance_category"] for e in record["edges"]} == {
+        "f1": "primary",
+        "f2": "international",
+        "f3": "primary",
+    }
+    feed = client.get(f"{url}/feeds/f1").json()["properties"]
+    assert feed["categories"]["primary"] == 1
+    assert feed["places"][0]["relevance_category"] == "primary"
+    summary = client.get(f"{url}/summary").json()
+    assert summary["edges_by_category"] == {"primary": 2, "international": 1}
+    assert summary["feeds_by_spec"] == {"gtfs": 2, "gbfs": 1}
+    # Schema 6: tiers stand in for categories, and there is no spec to count.
+    flat = client.get("/api/builds/flat/summary").json()
+    assert flat["category_field"] == "tier" and flat["edges_by_category"] == {
+        "local": 1
+    }
+    assert flat["feeds_by_spec"] == {}
+    assert (
+        "category_primary" not in client.get("/api/builds/flat/feeds").json()["rows"][0]
     )
