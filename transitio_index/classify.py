@@ -93,8 +93,10 @@ SPAN_MAX_STOPS = 2048
 PATTERN_SAMPLE = 8
 # The decision table's version: bumped whenever a rule, a range or the way a
 # signal feeds a rule changes, so two snapshots' tiers can be told apart from
-# their manifests alone. 1 is the table as shipped in schemas 6–9.
-RULES_VERSION = 1
+# their manifests alone. 1 was the table shipped in schemas 6–9; 2 decides
+# extended types by family, covers basic types 5–7, 11 and 12, and marks air,
+# taxi and miscellaneous services unclassifiable (rule 10).
+RULES_VERSION = 2
 
 EARTH_RADIUS_KM = 6371.0088
 
@@ -155,6 +157,25 @@ def _decide(tier, confidence, rule, pairs=()):
 
 
 _UNKNOWN = {"tier": "unknown", "tier_confidence": 0.0, "rule": 9, "margin": False}
+# Out of scope by design, not a missing signal: air, taxi and miscellaneous
+# services. Table structure, versioned by RULES_VERSION.
+_UNCLASSIFIABLE = {
+    "tier": "unknown",
+    "tier_confidence": 0.0,
+    "rule": 10,
+    "margin": False,
+}
+UNCLASSIFIABLE_RANGES = ((1100, 1199), (1500, 1599), (1600, 1799))
+# Basic types local by nature: tram, subway, cable tram, aerial lift,
+# funicular, trolleybus, monorail.
+_LOCAL_BASIC_TYPES = (0, 1, 5, 6, 7, 11, 12)
+# Extended types by hundred: railway and suburban railway; coach; urban
+# railway, metro, underground, bus, trolleybus, tram, aerial lift and
+# funicular; water transport and ferry.
+_RAIL_FAMILIES = (1, 3)
+_COACH_FAMILIES = (2,)
+_LOCAL_FAMILIES = (4, 5, 6, 7, 8, 9, 13, 14)
+_WATER_FAMILIES = (10, 12)
 
 
 def classify_route(route_type, countries, span_km, median_km):
@@ -163,31 +184,33 @@ def classify_route(route_type, countries, span_km, median_km):
 
     A rule whose signal is missing (``None``) is skipped rather than decided;
     rules 6–8 are guarded on both bus signals being known, so an unmeasured
-    bus route can never be swallowed as ``national``.
+    bus route can never be swallowed as ``national``. Extended route types
+    decide by family (the hundreds); a sub-type never changes the decision.
+    Air, taxi and miscellaneous services are out of scope by design (rule 10),
+    unlike a type the table does not know (rule 9).
     """
     if countries is not None and len(countries) >= 2:
         return _decide("international", 0.95, 1)
     if route_type is not None and route_type >= 100:
-        if 100 <= route_type <= 117:
+        family = route_type // 100
+        if family in _RAIL_FAMILIES:
             if span_km is None:
                 return dict(_UNKNOWN)
             tier = "regional" if span_km <= RAIL_SPAN_KM else "national"
             return _decide(tier, 0.95, 2, [(span_km, RAIL_SPAN_KM)])
-        if 200 <= route_type <= 209:
+        if family in _COACH_FAMILIES:
             return _decide("national", 0.95, 2)
-        if (
-            400 <= route_type <= 405
-            or 700 <= route_type <= 716
-            or 800 <= route_type <= 999
-        ):
+        if family in _LOCAL_FAMILIES:
             return _decide("local", 0.95, 2)
-        if route_type == 1000:
+        if family in _WATER_FAMILIES:
             if span_km is None:
                 return dict(_UNKNOWN)
             tier = "local" if span_km <= WATER_SPAN_KM else "regional"
             return _decide(tier, 0.95, 2, [(span_km, WATER_SPAN_KM)])
+        if any(low <= route_type <= high for low, high in UNCLASSIFIABLE_RANGES):
+            return dict(_UNCLASSIFIABLE)
         return dict(_UNKNOWN)
-    if route_type in (0, 1):
+    if route_type in _LOCAL_BASIC_TYPES:
         return _decide("local", 0.90, 3)
     if route_type == 2 and span_km is not None:
         tier = "regional" if span_km <= RAIL_SPAN_KM else "national"
@@ -787,6 +810,7 @@ def _tier_edges(
                 "median_interstop_km": statistics.median(medians) if medians else None,
                 "spread_km": max(spans) if spans else None,
                 "serving_routes": len(items),
+                "rules": sorted({item["decision"]["rule"] for item in items}),
                 "route_min_stops": route_min_stops,
                 "review_cutoff": REVIEW_CUTOFF,
                 "near_threshold": near,

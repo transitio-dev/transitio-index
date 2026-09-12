@@ -18,8 +18,18 @@ from transitio_index import classify, coverage, crawl, publish, store  # noqa: E
         (204, None, None, None, "national", 0.95, 2),
         (715, None, None, None, "local", 0.95, 2),
         (1000, {"AA"}, 20.0, None, "local", 0.95, 2),
-        (1100, {"AA"}, 20.0, None, "unknown", 0.0, 9),  # unlisted extended
+        (300, {"AA"}, 100.0, None, "regional", 0.95, 2),  # suburban railway
+        (300, {"AA"}, 400.0, None, "national", 0.95, 2),
+        (500, None, None, None, "local", 0.95, 2),  # metro service
+        (1200, {"AA"}, 20.0, None, "local", 0.95, 2),  # ferry, as water
+        (1200, {"AA"}, 80.0, None, "regional", 0.95, 2),
+        (1301, None, None, None, "local", 0.95, 2),  # telecabin sub-type
+        (1100, {"AA"}, 20.0, None, "unknown", 0.0, 10),  # air: out of scope
+        (1501, {"AA"}, 20.0, 1.0, "unknown", 0.0, 10),  # taxi: out of scope
+        (1800, {"AA"}, 20.0, 1.0, "unknown", 0.0, 9),  # not a GTFS type
         (1, None, None, None, "local", 0.90, 3),
+        (5, None, None, None, "local", 0.90, 3),  # cable tram
+        (11, None, None, None, "local", 0.90, 3),  # trolleybus
         (2, {"AA"}, 100.0, None, "regional", 0.75, 4),
         (4, {"AA"}, 80.0, None, "regional", 0.75, 5),
         (3, {"AA"}, 30.0, 1.0, "local", 0.85, 6),
