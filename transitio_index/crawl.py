@@ -11,7 +11,8 @@ Feeds large enough to pay for it (past the size threshold, on a server that
 honours ranges and offers a strong validator) are read member-by-member through
 :mod:`transitio_index.ziprange`; everything else — and any range oddity — downloads
 whole and extracts. Members are written to disk one at a time, never
-accumulated, so several large members cannot compound in memory. Re-runs are
+accumulated, so several large members cannot compound in memory; a member too
+large for the ranged reader's buffer is fetched by the whole download instead. Re-runs are
 cheap: a feed whose validators match the stored state — and whose cached
 members verify against their recorded digests — is skipped, except when
 ``cache/recrawl_requests.jsonl`` names it, which bypasses the skip so a
@@ -78,9 +79,11 @@ LOG_FILE = "crawl_log.jsonl"
 STATE_FILE = "state.json"
 ARCHIVE_FILE = "feed.zip"
 
-# Ceiling on one extracted member from a whole-download archive; mirrors the
-# ziprange member ceiling so both paths agree.
-MAX_MEMBER_BYTES = ziprange.MAX_MEMBER_BYTES
+# The ranged path buffers a member in memory, so it takes one only up to the
+# store's artifact ceiling and hands larger ones to the whole download, which
+# streams each member to disk; that path's ceiling bounds disk alone, and a
+# national aggregate's stop_times.txt runs to several GiB.
+DOWNLOAD_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 
 
 def _feed_url(feed):
@@ -545,7 +548,9 @@ def _write_ranged(fetcher, url, probe, feed_dir, decide):
         entry = directory.get(name)
         if entry is None:
             return
-        data = ziprange.read_member(read, entry)
+        data = ziprange.read_member(
+            read, entry, max_member_bytes=store.MAX_ARTIFACT_BYTES
+        )
         store.write_bytes(feed_dir, name, data)
         digests[name] = hashlib.sha256(data).hexdigest()
 
@@ -577,7 +582,7 @@ def _extract_members(feed_dir, decide):
                 info = archive.getinfo(name)
             except KeyError:
                 return
-            if info.file_size > MAX_MEMBER_BYTES:
+            if info.file_size > DOWNLOAD_MEMBER_BYTES:
                 raise fetch.FetchError(
                     f"{name}: {info.file_size} bytes is over the member ceiling"
                 )
