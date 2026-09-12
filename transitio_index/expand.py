@@ -607,6 +607,7 @@ def expand(
                 "mode": mode,
                 "places": len(places_by_id),
                 "overture_release": release,
+                "simplify_tolerance_deg": geometry.SIMPLIFY_TOLERANCE_DEG,
                 "reported": len(report),
                 **counts,
                 "retrieved_at": datetime.datetime.now(

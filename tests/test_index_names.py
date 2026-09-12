@@ -63,6 +63,8 @@ def _run(tmp_path, overrides_dir=None, strict=False):
         strict=strict,
     )
     places, _ = store.read_jsonl(cache / "gazetteer", "names.json", "places_seed.jsonl")
+    # The tolerance travels from the geometry generation to the names one.
+    assert "simplify_tolerance_deg" in manifest
     return manifest, {p["place_id"]: p for p in places}
 
 

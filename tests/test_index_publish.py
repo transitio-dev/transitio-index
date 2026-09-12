@@ -19,6 +19,7 @@ import shapely  # noqa: E402
 
 from transitio_index import publish  # noqa: E402
 from transitio_index import classify  # noqa: E402
+from transitio_index import geometry  # noqa: E402
 from transitio_index import overrides  # noqa: E402
 
 # Import the read layer directly too, so an old installed transitio shadowing
@@ -269,6 +270,7 @@ def _edges_index(
             "source": "expand",
             "places_overrides_sha256": None,
             "overture_release": release,
+            "simplify_tolerance_deg": geometry.SIMPLIFY_TOLERANCE_DEG,
             "stale_place_overrides": stale[0],
         },
     )
@@ -1615,6 +1617,7 @@ def test_a_published_index_carries_its_realtime_table(tmp_path):
     assert manifest["classifier"] == classify.classifier_settings()
     assert manifest["margin_share"] == 0.0
     assert set(manifest["stop_artefacts"]) == set(classify._stop_artefacts({}))
+    assert manifest["simplify_tolerance_deg"] == geometry.SIMPLIFY_TOLERANCE_DEG
     # Declared coverage gives f-a no home: it and its companion are international.
     listed = manifest["partitions"]["international"]
     assert listed["realtime"]["rows"] == 1 and listed["feeds"]["rows"] == 1

@@ -7,7 +7,14 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
-from transitio_index import boundaries, crawl, expand, overture, store  # noqa: E402
+from transitio_index import (  # noqa: E402
+    boundaries,
+    crawl,
+    expand,
+    geometry,
+    overture,
+    store,
+)
 
 # A source the geometry allowlist accepts, and one it does not.
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
@@ -248,6 +255,7 @@ def test_no_crawl_artifacts_pass_the_seed_through(tmp_path):
     _publish_names(cache, SEED_PLACES)
     manifest, places, report = _expand(tmp_path, cache)
     assert manifest["mode"] == "declared"
+    assert manifest["simplify_tolerance_deg"] == geometry.SIMPLIFY_TOLERANCE_DEG
     assert manifest["places_added"] == 0
     assert set(places) == {"Q33"}
     assert report == []

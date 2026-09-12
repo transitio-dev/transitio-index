@@ -411,7 +411,7 @@ def test_the_boundary_memo_grows_by_appended_parts(tmp_path, monkeypatch):
 
     monkeypatch.setattr(boundaries, "PART_BYTES", 1)  # every row its own part
     cache = tmp_path / "cache"
-    memo = cache / "boundary_lookup" / "test-release"
+    memo = cache / "boundary_lookup" / boundaries.memo_name("test-release")
     divisions = fx.write_dataset(tmp_path / "d.parquet", bt.DIVISIONS)
     areas = fx.write_area_dataset(
         tmp_path / "a.parquet",

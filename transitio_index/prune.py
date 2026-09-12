@@ -154,6 +154,7 @@ def prune(cache_dir):
             "source": "prune",
             "sources": manifest.get("sources"),
             "overture_release": expanded.get("overture_release"),
+            "simplify_tolerance_deg": expanded.get("simplify_tolerance_deg"),
             # The exact generations pruned against: publish refuses these
             # places once either has moved on.
             "curate_generation": manifest.get("generation"),

@@ -124,6 +124,8 @@ def _run(tmp_path, overrides_dir=None, derived=()):
     manifest = geometry.attach_geometry(
         cache, dataset=dataset, overrides_dir=overrides_dir
     )
+    # Every geometry generation says which tolerance shaped its boundaries.
+    assert manifest["simplify_tolerance_deg"] == geometry.SIMPLIFY_TOLERANCE_DEG
     places, _ = store.read_jsonl(
         cache / "gazetteer", "geometry.json", "places_seed.jsonl"
     )

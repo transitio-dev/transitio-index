@@ -8,7 +8,8 @@ groups carry ``bbox`` statistics, so a spatial query reads the file footers and
 only the row groups whose boxes intersect the query — the COG access pattern —
 and the divisions theme supplies the matching subtype/hierarchy metadata.
 
-What a query touches is memoized under ``cache/boundary_lookup/<release>/`` as
+What a query touches is memoized under
+``cache/boundary_lookup/<release>-t<tolerance>/`` as
 GeoParquet parts of the division polygons (simplified to the shipping
 tolerance) plus their metadata, keyed by the release, so repeated queries
 within and across builds read locally and both consumers see the same
@@ -129,6 +130,14 @@ def _read_memo(directory, name):
     return records, damaged
 
 
+def memo_name(release, tolerance=None):
+    """The memo directory for ``release`` at the simplification ``tolerance``
+    (the shipping tolerance by default): a memo holds polygons simplified at
+    one tolerance, so another tolerance is another memo, never a stale read."""
+    tolerance = geometry.SIMPLIFY_TOLERANCE_DEG if tolerance is None else tolerance
+    return f"{release}-t{tolerance!r}"
+
+
 def _part_name(part):
     return part == DIVISIONS_FILE or bool(PART_PATTERN.fullmatch(part))
 
@@ -224,7 +233,7 @@ class BoundaryLookup:
         self._reopen_division = reopen_division
         root = store.open_subdir(cache_dir, "boundary_lookup")
         try:
-            self._dir = store.open_subdir(root.path, release)
+            self._dir = store.open_subdir(root.path, memo_name(release))
         finally:
             root.close()
         self._records = {}
