@@ -174,7 +174,12 @@ def _publish_names(cache, places, **manifest):
                 cache / "gazetteer",
                 "names.json",
                 {"places_seed.jsonl": store.jsonl_chunks(places)},
-                {"source": "names", "overture_release": "2026-08-19.0", **manifest},
+                {
+                    "source": "names",
+                    "overture_release": "2026-08-19.0",
+                    "simplify_tolerance_deg": geometry.SIMPLIFY_TOLERANCE_DEG,
+                    **manifest,
+                },
                 held=directory,
             )
     finally:
@@ -716,10 +721,12 @@ def test_a_crawled_qid_for_a_place_known_by_its_division_joins_it(tmp_path):
     )
 
 
-def test_seed_geometry_at_another_tolerance_is_refused(tmp_path):
+@pytest.mark.parametrize("recorded", [0.001, None], ids=["other", "unrecorded"])
+def test_seed_geometry_at_another_tolerance_is_refused(tmp_path, recorded):
     # Discovered places would be simplified at the current tolerance beside
-    # seeded ones at the old: the geometry stage must run again first.
+    # seeded ones at another, or at one nobody recorded: the geometry stage
+    # must run again first.
     cache = tmp_path / "cache"
-    _publish_names(cache, SEED_PLACES, simplify_tolerance_deg=0.001)
+    _publish_names(cache, SEED_PLACES, simplify_tolerance_deg=recorded)
     with pytest.raises(overture.GazetteerError, match="re-run the geometry"):
         _expand(tmp_path, cache)

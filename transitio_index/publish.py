@@ -1500,7 +1500,8 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             manifest["overture_release"] = overture_release
             # The tolerance the shipped boundaries were simplified at, from
             # whichever places generation ships; null when that generation
-            # predates the record.
+            # predates the record (expand refuses to build on such a seed, so
+            # a null here is a legacy cache re-published as it was).
             manifest["simplify_tolerance_deg"] = (places_manifest or {}).get(
                 "simplify_tolerance_deg"
             )

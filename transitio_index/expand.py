@@ -528,9 +528,10 @@ def expand(
             )
             release = names_manifest.get("overture_release")
             recorded = names_manifest.get("simplify_tolerance_deg")
-            if recorded is not None and recorded != geometry.SIMPLIFY_TOLERANCE_DEG:
-                # The seeded boundaries were simplified at another tolerance:
-                # discovered places must not ship beside them at this one.
+            if recorded != geometry.SIMPLIFY_TOLERANCE_DEG:
+                # The seeded boundaries were simplified at another tolerance,
+                # or at one nobody recorded: discovered places must not ship
+                # beside them at this one.
                 raise overture.GazetteerError(
                     f"the seed geometry was simplified at {recorded}°, not "
                     f"{geometry.SIMPLIFY_TOLERANCE_DEG}°; re-run the geometry "
