@@ -765,3 +765,254 @@ def test_feeds_have_a_table_a_record_with_a_hull_and_edges_both_ways(
         and cut_edges["truncated"]
         and len(cut_edges["rows"]) == 1
     )
+
+
+# ---- schema 7: a partitioned build ----
+
+
+def _feed7(feed_id, name, home, scope, spec="gtfs"):
+    return {
+        "feed_id": feed_id,
+        "name": name,
+        "spec": spec,
+        "coverage": None,
+        "home_country": home,
+        "scope": scope,
+        "declared_countries": ["FI"],
+    }
+
+
+def _edge7(place_id, feed_id, tier, category, relevance, cross, partition=None):
+    row = {
+        "place_id": place_id,
+        "feed_id": feed_id,
+        "tier": tier,
+        "relevance_category": category,
+        "relevance": relevance,
+        "cross_border": cross,
+    }
+    if partition is not None:
+        row["feed_partition"] = partition
+    return row
+
+
+PARTITIONED_FEEDS = [
+    _feed7("f1", "HSL", "FI", "domestic"),
+    _feed7("f2", "Ferry", None, "international"),
+    _feed7("f3", "Bikes", "FI", "domestic", spec="gbfs"),
+]
+PARTITIONED_EDGES = {
+    "FI": [
+        _edge7("hel", "f1", "local", "primary", 0.9, False),
+        _edge7("hel", "f3", "local", "primary", 0.2, False),
+    ],
+    "links": [
+        _edge7(
+            "hel", "f2", "international", "international", 0.3, True, "international"
+        )
+    ],
+}
+
+
+def write_partitioned_build(
+    path,
+    places=PLACES,
+    feeds=PARTITIONED_FEEDS,
+    edges=PARTITIONED_EDGES,
+    notice=b"NOTICE\n",
+):
+    """A schema-7 build: FI places and domestic edges, feeds by home country
+    (``international`` without one), the cross-border edges under ``links``,
+    every table listed with its rows and digest; ``notice=None`` publishes
+    it unlicensed."""
+    path.mkdir(parents=True, exist_ok=True)
+    tables = {"FI/places.parquet": pa.Table.from_pylist(places)}
+    for feed in feeds:
+        partition = feed["home_country"] or "international"
+        key = f"{partition}/feeds.parquet"
+        tables.setdefault(key, []).append(feed)
+    for partition, rows in edges.items():
+        tables[f"{partition}/edges.parquet"] = pa.Table.from_pylist(rows)
+    listing = {}
+    for name, table in tables.items():
+        if isinstance(table, list):
+            table = pa.Table.from_pylist(table)
+        partition, _, file = name.partition("/")
+        (path / partition).mkdir(exist_ok=True)
+        sink = io.BytesIO()
+        pq.write_table(table, sink)
+        (path / name).write_bytes(sink.getvalue())
+        listing.setdefault(partition, {})[file[: -len(".parquet")]] = {
+            "rows": len(table),
+            "sha256": _sha(sink.getvalue()),
+        }
+    snapshot = {
+        "schema_version": 7,
+        "built_at": "2026-09-12T00:00:00+00:00",
+        "counts": {"places": len(places)},
+        "partitions": listing,
+        "licensed": notice is not None,
+        "notice_sha256": None if notice is None else _sha(notice),
+    }
+    if notice is not None:
+        (path / "NOTICE").write_bytes(notice)
+    (path / "snapshot.json").write_text(json.dumps(snapshot))
+    return snapshot
+
+
+def _rewrite_snapshot(path, change):
+    snapshot = json.loads((path / "snapshot.json").read_text())
+    change(snapshot)
+    (path / "snapshot.json").write_text(json.dumps(snapshot))
+
+
+def _tamper_partition(path):
+    (path / "FI" / "edges.parquet").write_bytes(b"not the bytes the snapshot hashed")
+
+
+def _wrong_rows(path):
+    _rewrite_snapshot(path, lambda s: s["partitions"]["FI"]["edges"].update(rows=9))
+
+
+def _bad_partition_name(path):
+    def change(s):
+        s["partitions"]["../x"] = s["partitions"].pop("international")
+
+    _rewrite_snapshot(path, change)
+
+
+def _links_holding_places(path):
+    # The file exists and verifies: only the layout check can refuse it.
+    (path / "links" / "places.parquet").write_bytes(
+        (path / "FI" / "places.parquet").read_bytes()
+    )
+
+    def change(s):
+        s["partitions"]["links"]["places"] = s["partitions"]["FI"]["places"]
+
+    _rewrite_snapshot(path, change)
+
+
+def _edges_without_relevance(path):
+    table = pq.read_table(path / "FI" / "edges.parquet").drop_columns(
+        ["relevance_category", "relevance", "cross_border"]
+    )
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    (path / "FI" / "edges.parquet").write_bytes(sink.getvalue())
+    _rewrite_snapshot(
+        path,
+        lambda s: s["partitions"]["FI"]["edges"].update(sha256=_sha(sink.getvalue())),
+    )
+
+
+def _symlinked_partition(path):
+    real = (path / "FI").rename(path / "FI-real")
+    if not _symlink(real, path / "FI"):
+        pytest.skip("this platform cannot create symlinks")
+
+
+def _notice_listed_but_gone(path):
+    (path / "NOTICE").unlink()
+
+
+def _licensed_without_notice(path):
+    _rewrite_snapshot(path, lambda s: s.update(notice_sha256=None))
+
+
+@pytest.mark.parametrize(
+    ("tamper", "loads"),
+    [
+        (None, True),
+        (_tamper_partition, False),
+        (_wrong_rows, False),
+        (_bad_partition_name, False),
+        (_links_holding_places, False),
+        (_edges_without_relevance, False),
+        (_symlinked_partition, False),
+        (_notice_listed_but_gone, False),
+        (_licensed_without_notice, False),
+    ],
+    ids=[
+        "intact",
+        "tampered-partition",
+        "wrong-row-count",
+        "bad-partition-name",
+        "tables-outside-the-layout",
+        "schema-7-columns-missing",
+        "symlinked-partition",
+        "notice-missing",
+        "licensed-without-notice",
+    ],
+)
+def test_a_partitioned_build_loads_only_when_every_partition_verifies(
+    tmp_path, tamper, loads
+):
+    write_partitioned_build(tmp_path)
+    if tamper:
+        tamper(tmp_path)
+    build = iv.load_build("b", tmp_path)
+    assert (build is not None) is loads
+    if tamper is _symlinked_partition:
+        # The listing agrees with the loader: a linked partition is not complete.
+        assert iv.describe("b", tmp_path)["complete"] is False
+    if loads:
+        # The frames the viewer reads: every feed with its partition, the
+        # domestic edges and the links joined, feed_partition on the links.
+        assert list(build.feeds["partition"]) == ["FI", "FI", "international"]
+        assert len(build.edges) == 3
+        assert sorted(build.edges["feed_partition"].fillna("-")) == [
+            "-",
+            "-",
+            "international",
+        ]
+        assert list(build.edges["relevance_category"]).count("primary") == 2
+        assert build.served.sum() == 1
+        assert build.feed_count[list(build.places["place_id"]).index("hel")] == 3
+        assert set(build.digests) == {
+            "FI/places.parquet",
+            "FI/feeds.parquet",
+            "FI/edges.parquet",
+            "international/feeds.parquet",
+            "links/edges.parquet",
+            "NOTICE",
+        }
+
+
+def test_an_unlicensed_partitioned_build_has_no_notice_to_verify(tmp_path):
+    write_partitioned_build(tmp_path, notice=None)
+    build = iv.load_build("b", tmp_path)
+    assert build is not None and "NOTICE" not in build.digests
+    # A NOTICE listed as null but present is not read; one listed and missing is.
+    row = iv.describe("b", tmp_path)
+    assert row["complete"] is True and row["schema_version"] == 7
+    assert row["partitions"] == {
+        "FI": {"places": 6, "feeds": 2, "edges": 2},
+        "international": {"feeds": 1},
+        "links": {"edges": 1},
+    }
+
+
+def test_the_cache_and_the_api_serve_a_partitioned_build(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    write_partitioned_build(cache / "index")
+    builds = iv.BuildCache(cache)
+    first = builds.get(iv.LATEST)
+    assert builds.get(iv.LATEST) is first
+    # A republish that changes one partition's digest reloads the build.
+    write_partitioned_build(
+        cache / "index",
+        feeds=PARTITIONED_FEEDS[:1],
+        edges={"FI": PARTITIONED_EDGES["FI"][:1]},
+    )
+    second = builds.get(iv.LATEST)
+    assert second is not first and second.feed_count.max() == 1
+    client = TestClient(iv.create_app(cache))
+    listing = client.get("/api/builds").json()
+    assert listing[0]["complete"] is True and listing[0]["schema_version"] == 7
+    summary = client.get(f"/api/builds/{iv.LATEST}/summary").json()
+    assert summary["schema_version"] == 7 and set(summary["partitions"]) == {"FI"}
+    assert client.get(f"/api/builds/{iv.LATEST}/places").status_code == 200

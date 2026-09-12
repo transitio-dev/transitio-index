@@ -3,18 +3,24 @@
 """Inspect a built index in the browser: the viewer's read-only data layer.
 
 A maintainer tool, not part of the package. A build is a directory holding
-the published index — ``places.parquet``, ``edges.parquet``, ``feeds.parquet``,
-``snapshot.json`` and ``NOTICE``, what the ``publish`` stage writes. Builds
-are discovered under a cache: the latest at ``cache/index`` and the country
+the published index, what the ``publish`` stage writes: before schema 7 the
+flat ``places.parquet``, ``edges.parquet``, ``feeds.parquet``, ``NOTICE`` and
+``snapshot.json``; from schema 7 a directory of partitions — one per country
+code with its feeds, places and domestic edges, ``international/feeds.parquet``
+and ``links/edges.parquet`` (the cross-border edges, with ``feed_partition``)
+— listed in ``snapshot.json`` with each table's rows and digest. Builds are
+discovered under a cache: the latest at ``cache/index`` and the country
 loop's under ``cache/builds/<name>/index``.
 
-A build is loaded as a *verified snapshot*. ``snapshot.json`` records a
-SHA-256 for each of the four files; each file is read into memory exactly
-once, hashed, and — for the parquet files — parsed from those same bytes, so
-a republish landing between two reads can never pair one generation's places
-with another's edges: a digest that does not match means the build is
-mid-publish, and it is reported unavailable rather than cached. Per-country
-builds are written once and never rewritten; only ``cache/index`` churns.
+A build is loaded as a *verified snapshot*. Each listed file is read into
+memory exactly once, hashed, and — for the parquet files — parsed from those
+same bytes, so a republish landing between two reads can never pair one
+generation's places with another's edges: a digest that does not match means
+the build is mid-publish, and it is reported unavailable rather than cached.
+A partitioned build's tables are joined into the three frames the viewer
+reads (feeds with their ``partition``, places, edges with ``feed_partition``
+on the links). Per-country builds are written once and never rewritten; only
+``cache/index`` churns.
 
 The bounded map slices and the web app that serves them build on this
 loader; ``python scripts/index_viewer.py --cache cache`` runs the app.
@@ -28,6 +34,7 @@ import io
 import json
 import math
 import os
+import re
 import stat
 import threading
 import time
@@ -47,6 +54,20 @@ DIGEST_KEYS = {
     "edges.parquet": "edges_sha256",
     "feeds.parquet": "feeds_sha256",
     "NOTICE": "notice_sha256",
+}
+# Schema 7: a partition is a country code, ``international`` (feeds without a
+# home country) or ``links`` (the cross-border edges); its tables are listed
+# under ``partitions`` in the snapshot with their rows and digest.
+PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
+PARTITION_TABLES = ("feeds", "places", "edges")
+# The tables a partition kind may carry; a country partition any of the three.
+PARTITION_LAYOUT = {"international": {"feeds"}, "links": {"edges"}}
+LINKS = "links"
+# What a schema-7 build carries on top of the flat columns: the classify
+# stage's country fields and the rank stage's relevance.
+SCHEMA_7_COLUMNS = {
+    "feeds.parquet": {"home_country", "scope", "declared_countries"},
+    "edges.parquet": {"relevance_category", "relevance", "cross_border"},
 }
 LATEST = "latest"  # the id of the build at cache/index
 CACHED_BUILDS = 4  # verified builds kept in memory
@@ -205,6 +226,94 @@ def snapshot_digests(snapshot):
     return digests
 
 
+def snapshot_files(snapshot):
+    """``{relative path: (digest, rows)}`` for every file a snapshot lists, or
+    None when it lists none or lists them badly.
+
+    Before schema 7 the four flat files, each with a digest and no row count.
+    From schema 7 every partition table (a partition name of the layout, a
+    table of the layout, a string digest and an integer row count) and the
+    ``NOTICE`` when the build is licensed (``notice_sha256`` a string; an
+    unlicensed build has none).
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    listing = snapshot.get("partitions")
+    if listing is None:
+        digests = snapshot_digests(snapshot)
+        return None if digests is None else {n: (d, None) for n, d in digests.items()}
+    if not isinstance(listing, dict) or not listing:
+        return None
+    files = {}
+    for partition, tables in listing.items():
+        if not isinstance(partition, str) or not PARTITION_NAME.fullmatch(partition):
+            return None
+        if not isinstance(tables, dict) or not tables:
+            return None
+        allowed = PARTITION_LAYOUT.get(partition, set(PARTITION_TABLES))
+        for table, entry in tables.items():
+            if table not in allowed or not isinstance(entry, dict):
+                return None
+            digest, rows = entry.get("sha256"), entry.get("rows")
+            if not isinstance(digest, str) or not digest:
+                return None
+            if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
+                return None
+            files[f"{partition}/{table}.parquet"] = (digest, rows)
+    notice = snapshot.get("notice_sha256")
+    if notice is None and snapshot.get("licensed"):
+        return None  # a licensed build ships its NOTICE
+    if notice is not None:
+        if not isinstance(notice, str) or not notice:
+            return None
+        files["NOTICE"] = (notice, None)
+    return files
+
+
+def _files_present(path, files):
+    """Every listed file is a regular file inside a plain partition directory."""
+    for name in files:
+        partition = name.rpartition("/")[0]
+        if partition and not _plain_directory(path / partition):
+            return False
+        if not _is_regular_file(path / name):
+            return False
+    return True
+
+
+def _join_partitions(tables):
+    """The three viewer frames of a partitioned build from its parquet
+    tables by path: feeds with their ``partition``, places, and the domestic
+    edges with the links (``feed_partition`` on the links, null elsewhere)."""
+    parts = {name: [] for name in PARTITION_TABLES}
+    for path, table in tables.items():
+        partition, _, file = path.partition("/")
+        kind = file[: -len(".parquet")]
+        if kind == "feeds":
+            column = pa.array([partition] * len(table), pa.string())
+            table = table.append_column("partition", column)
+        elif kind == "edges" and "feed_partition" not in table.column_names:
+            table = table.append_column(
+                "feed_partition", pa.nulls(len(table), pa.string())
+            )
+        parts[kind].append(table)
+    joined = {}
+    for kind, found in parts.items():
+        if not found:
+            return None  # a feeds-only build is not a build the viewer shows
+        joined[f"{kind}.parquet"] = pa.concat_tables(found, promote_options="default")
+    return joined
+
+
+def _plain_directory(path):
+    """A directory that is not a symlink; False if it cannot be inspected."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+
+
 class Build:
     """One verified build: its tables, its geometry and per-place summaries."""
 
@@ -216,7 +325,7 @@ class Build:
         # One id for the whole verified snapshot: every file's digest, so a
         # republish that changes only the edges still changes it.
         self.snapshot_id = hashlib.sha256(
-            "".join(digests[name] for name in INDEX_FILES).encode()
+            "".join(f"{name}:{digests[name]}" for name in sorted(digests)).encode()
         ).hexdigest()
         places = tables["places.parquet"].to_pandas()
         self.geoms = shapely.from_wkb(places["geometry"].to_numpy())
@@ -253,6 +362,18 @@ class Build:
         )
 
 
+def _has_columns(table, name, required):
+    """Every column ``required`` lists for ``name``, and no column twice.
+
+    Arrow allows a duplicated column; one would select a two-dimensional
+    geometry.
+    """
+    columns = table.column_names
+    if len(set(columns)) != len(columns):
+        return False
+    return required.get(name, set()) <= set(columns)
+
+
 def load_build(build_id, path, read_bytes=_read_file):
     """The verified build at ``path``, or None while it is mid-publish.
 
@@ -263,21 +384,33 @@ def load_build(build_id, path, read_bytes=_read_file):
     path = Path(path)
     try:
         snapshot = json.loads(read_bytes(path / "snapshot.json"))
-        digests = snapshot_digests(snapshot)
-        if digests is None:
+        files = snapshot_files(snapshot)
+        if files is None:
             return None
-        tables = {}
-        for name in INDEX_FILES:
-            data = read_bytes(path / name)
-            if hashlib.sha256(data).hexdigest() != digests[name]:
+        digests, tables = {}, {}
+        for name, (digest, rows) in files.items():
+            partition = name.rpartition("/")[0]
+            if partition and not _plain_directory(path / partition):
                 return None
+            data = read_bytes(path / name)
+            if hashlib.sha256(data).hexdigest() != digest:
+                return None
+            digests[name] = digest
             if name.endswith(".parquet"):
-                tables[name] = pq.read_table(io.BytesIO(data))
-        for name, required in REQUIRED_COLUMNS.items():
-            columns = tables[name].column_names
-            # Every required column, and no column twice (Arrow allows it; a
-            # duplicated column would select a two-dimensional geometry).
-            if len(set(columns)) != len(columns) or not required <= set(columns):
+                table = pq.read_table(io.BytesIO(data))
+                if rows is not None and len(table) != rows:
+                    return None
+                if "partitions" in snapshot and not _has_columns(
+                    table, name.rpartition("/")[2], SCHEMA_7_COLUMNS
+                ):
+                    return None
+                tables[name] = table
+        if "partitions" in snapshot:
+            tables = _join_partitions(tables)
+            if tables is None:
+                return None
+        for name in REQUIRED_COLUMNS:
+            if not _has_columns(tables[name], name, REQUIRED_COLUMNS):
                 return None
         return Build(build_id, path, snapshot, digests, tables)
     except _BUILD_ERRORS:
@@ -340,9 +473,18 @@ def describe(build_id, path, read_bytes=_read_file):
         return row
     row["built_at"] = snapshot.get("built_at")
     row["counts"] = snapshot.get("counts")
-    row["complete"] = snapshot_digests(snapshot) is not None and all(
-        _is_regular_file(Path(path) / name) for name in INDEX_FILES
-    )
+    row["schema_version"] = snapshot.get("schema_version")
+    files = snapshot_files(snapshot)
+    row["complete"] = files is not None and _files_present(Path(path), files)
+    if isinstance(snapshot.get("partitions"), dict):
+        row["partitions"] = {
+            name: {
+                table: entry.get("rows") if isinstance(entry, dict) else None
+                for table, entry in tables.items()
+            }
+            for name, tables in snapshot["partitions"].items()
+            if isinstance(tables, dict)
+        }
     return row
 
 
@@ -380,9 +522,8 @@ class BuildCache:
             self._builds.pop(build_id, None)  # gone: never serve the stale copy
             return None
         try:
-            current = snapshot_digests(
-                json.loads(self.read_bytes(path / "snapshot.json"))
-            )
+            listed = snapshot_files(json.loads(self.read_bytes(path / "snapshot.json")))
+            current = None if listed is None else {n: d for n, (d, _) in listed.items()}
         except _SNAPSHOT_ERRORS:
             current = None
         cached = self._builds.get(build_id)
