@@ -9,7 +9,7 @@ The snapshot the statistics describe and the catalogues it read.
 | metric | value |
 |---|---|
 | snapshot_id | <snapshot> |
-| stats_schema_version | 1 |
+| stats_schema_version | 2 |
 | schema_version | 8 |
 | overture_release |  |
 | sample | sample |
@@ -140,6 +140,17 @@ Licence declarations and the redistribution judgement per feed.
 | key | value |
 |---|---|
 | unknown | 3 |
+
+## Realtime
+
+The GTFS-RT companions shipped beside the GTFS feeds: linked to a static feed of the index or not, by source, endpoint entity type and link method, and the static feeds that have one.
+
+| metric | value |
+|---|---|
+| feeds | 0 |
+| linked | 0 |
+| unlinked | 0 |
+| static_feeds_with_realtime | 0 |
 
 ## Scale
 

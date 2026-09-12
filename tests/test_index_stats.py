@@ -210,6 +210,9 @@ def test_summary_sections_count_the_catalogue_defects():
     assert identity["mdb_rows_without_name"] == 3
     assert identity["gbfs_duplicate_system_ids"] == 1
     assert identity["rows_into_feeds"] == 5 and identity["gbfs_systems_kept"] == 1
+    # Aggregating archives has no systems artifact: the count is unknown.
+    assert stats.identity(rows, FEEDS)["gbfs_systems_kept"] is None
+    assert stats._cell("a|b\nc") == "a\\|b c"  # a value never breaks a table
     assert identity["rows_dropped_by_reason"] == {"not_transit": 2, "ambiguous_id": 1}
     assert identity["feeds_by_crosswalk_method"] == {"url_exact": 1, "none": 3}
 
@@ -293,6 +296,7 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
     assert summary["build"]["sample_sources"] == ["mdb", "atlas", "gbfs"]
     assert summary["identity"]["feeds"] == 4
     assert summary["identity"]["gbfs_systems_kept"] == 0  # no artifact: none
+    assert summary["realtime"]["feeds"] == 0 and manifest["realtime"] == 0
 
 
 def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
@@ -655,3 +659,79 @@ def fixture_report(tmp_path):
 
 def test_the_report_of_the_fixture_build_matches_the_golden_file(tmp_path):
     assert fixture_report(tmp_path) == GOLDEN_REPORT.read_text(encoding="utf-8")
+
+
+def test_the_realtime_companions_have_their_own_section(tmp_path):
+    from test_index_publish import _atlas_archive, _build_index
+
+    feeds = [
+        {"feed_id": "f-a", "realtime_feed_ids": ["f-rt-a"]},
+        {"feed_id": "f-b", "realtime_feed_ids": []},
+    ]
+    realtime = [
+        {
+            "feed_id": "f-rt-a",
+            "source": "atlas",
+            "static_feed_id": "f-a",
+            "static_link_method": "declared",
+            "entity_types": ["trip_updates", "alerts"],
+        },
+        {
+            "feed_id": "f-rt-x",
+            "source": "mdb",
+            "static_feed_id": "f-gone",  # dangling: unlinked
+            "static_link_method": "inferred",
+            "entity_types": [],
+        },
+    ]
+    assert stats.realtime_section(realtime, feeds) == {
+        "feeds": 2,
+        "linked": 1,
+        "unlinked": 1,
+        "by_source": {"atlas": 1, "mdb": 1},
+        "by_entity_type": {"trip_updates": 1, "alerts": 1},
+        "by_link_method": {"declared": 1, "inferred": 1},
+        "static_feeds_with_realtime": 1,
+    }
+    # Through the stage: the crosswalk infers the one static feed as the
+    # Atlas GTFS-RT feed's, both without a home country land in the
+    # international tables, which the stage reads and reports.
+    archive = _atlas_archive(
+        tmp_path,
+        [
+            {"id": "f-a", "spec": "gtfs", "urls": {"static_current": "https://a"}},
+            {"id": "f-rt", "spec": "gtfs-rt", "urls": {"realtime_alerts": "https://r"}},
+        ],
+    )
+    cache, published = _build_index(tmp_path, archive=archive)
+    assert published["counts"]["realtime_linked"] == 1
+    manifest = stats.stats(cache)
+    assert manifest["realtime"] == 1 and "realtime" in manifest["sections"]
+    generation, _ = store.resolve(cache / "stats", "stats.json")
+    with generation:
+        summary = json.loads(generation.read_bytes("summary.json"))
+        report = generation.read_bytes("report.md").decode()
+        feeds = pq.read_table(pa_source(generation.read_bytes("feeds.parquet")))
+    # The companion is a transit feed row too, never crawled.
+    (rt,) = [r for r in feeds.to_pylist() if r["spec"] == "gtfs-rt"]
+    assert rt["feed_id"] == "f-rt" and rt["crawl_outcome"] == "not_crawled"
+    assert manifest["feeds"] == 4 == feeds.num_rows
+    assert summary["realtime"]["linked"] == 1 == summary["realtime"]["feeds"]
+    assert summary["realtime"]["by_entity_type"] == {"alerts": 1}
+    assert summary["realtime"]["static_feeds_with_realtime"] == 1
+    assert "## Realtime" in report
+    # A table or partition the layout does not know is refused, never
+    # skipped, and a table that does not match the snapshot is refused too.
+    snapshot = json.loads((cache / "index" / "snapshot.json").read_text())
+    bad = json.loads(json.dumps(snapshot))
+    bad["partitions"]["international"]["vehicles"] = {"rows": 0, "sha256": "x"}
+    with pytest.raises(stats.StatsError, match="not a table of the index"):
+        stats._index_tables(cache, bad)
+    bad = json.loads(json.dumps(snapshot))
+    bad["partitions"]["../x"] = bad["partitions"].pop("international")
+    with pytest.raises(stats.StatsError, match="not a partition"):
+        stats._index_tables(cache, bad)
+    bad = json.loads(json.dumps(snapshot))
+    bad["partitions"]["international"]["realtime"]["sha256"] = "0" * 64
+    with pytest.raises(stats.StatsError, match="does not match"):
+        stats._index_tables(cache, bad)

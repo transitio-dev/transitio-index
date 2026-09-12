@@ -24,6 +24,7 @@ aggregate.
 import argparse
 import collections
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,9 +39,15 @@ KEYS = {
     "places": lambda row: row["place_id"],
 }
 # The summary fields every archive must share.
-COMPATIBILITY = ("stats_schema_version", "overture_release", "catalogue_dates")
-# The per-build sections repeated per archive rather than recomputed.
-PER_BUILD = ("duplicate_coverage", "distributions")
+COMPATIBILITY = (
+    "stats_schema_version",
+    "schema_version",
+    "overture_release",
+    "catalogue_dates",
+)
+# The per-build sections repeated per archive rather than recomputed (the
+# realtime companions have no archived row table of their own).
+PER_BUILD = ("duplicate_coverage", "distributions", "realtime")
 
 
 def read_archive(path):
@@ -178,6 +185,20 @@ def aggregate(archives):
     return summary, stats.render_report(summary)
 
 
+def _write(path, text):
+    """Write ``text`` at ``path`` through a fresh file replaced into place, so
+    a symlink planted there is replaced, never followed."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    os.replace(tmp, path)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="python scripts/aggregate_stats.py",
@@ -215,10 +236,8 @@ def main(argv=None):
     if out_dir in inputs:
         raise SystemExit(f"{args.out_dir}: the output directory is an input archive")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    (args.out_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
-    )
-    (args.out_dir / "report.md").write_text(report, encoding="utf-8")
+    _write(args.out_dir / "summary.json", json.dumps(summary, indent=2, sort_keys=True))
+    _write(args.out_dir / "report.md", report)
     print(f"archives: {len(archives)}", file=sys.stderr)
     print(f"wrote: {args.out_dir / 'summary.json'}")
     print(f"wrote: {args.out_dir / 'report.md'}")

@@ -15,6 +15,7 @@ summary records the build's snapshot id and source versions.
 """
 
 import collections
+import hashlib
 import contextlib
 import datetime
 import io
@@ -29,7 +30,11 @@ from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host
 
 STATS_POINTER = "stats.json"
 # The shape of the stats artifacts; the aggregation script refuses a mismatch.
-STATS_SCHEMA_VERSION = 1
+STATS_SCHEMA_VERSION = 2  # 2: the realtime section
+# A partition of the published index: a country code, international or links.
+PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
+# The tables a partition kind may carry; a country partition any of them.
+PARTITION_LAYOUT = {"international": {"feeds", "realtime"}, "links": {"edges"}}
 CATALOGUE_ARTIFACT = "catalogue.parquet"
 FEEDS_ARTIFACT = "feeds.parquet"
 PLACES_ARTIFACT = "places.parquet"
@@ -294,10 +299,11 @@ def declared_places(rows):
     }
 
 
-def identity(rows, feeds, systems=()):
+def identity(rows, feeds, systems=None):
     """The identity-and-duplication section: id namespaces, deprecated rows
     and their redirects, nameless rows, duplicated GBFS ids, and what the
-    crosswalk made of the rows (feeds, and the GBFS systems it kept apart)."""
+    crosswalk made of the rows: feeds, and the GBFS systems it kept apart
+    (``systems``, a per-build count; None when aggregating archives)."""
     mdb = [row for row in rows if row["source"] == "mdb"]
     deprecated = [row for row in mdb if row["status"] == "deprecated"]
     url_by_id = {row["source_id"]: row["download_url"] for row in mdb}
@@ -334,7 +340,7 @@ def identity(rows, feeds, systems=()):
             if n > 1
         ),
         "rows_into_feeds": sum(1 for r in rows if r["feed_id"]),
-        "gbfs_systems_kept": len(systems),
+        "gbfs_systems_kept": None if systems is None else len(systems),
         "rows_dropped_by_reason": dict(
             collections.Counter(r["drop_reason"] for r in rows if r["drop_reason"])
         ),
@@ -449,13 +455,15 @@ def stats(cache_dir):
                     "the crawl changed since the index was published; re-run "
                     "the pipeline in stage order"
                 )
-            published, edges, places = _index_tables(cache_dir, snapshot)
+            published, realtime, edges, places = _index_tables(cache_dir, snapshot)
             by_place = {place["place_id"]: place for place in places}
             statuses = {
                 r["source_id"]: r["status"] for r in rows if r["source"] == "mdb"
             }
+            # The companions are transit feeds too: one row each, never
+            # crawled, so the table matches the crosswalk's feeds.
             feed_table = feed_rows(
-                published,
+                published + [{**r, "spec": "gtfs-rt"} for r in realtime],
                 edges,
                 by_place,
                 _crawl_log(cache_dir),
@@ -464,6 +472,7 @@ def stats(cache_dir):
                 snapshot_id,
             )
         summary.update(feed_sections(feed_table))
+        summary["realtime"] = realtime_section(realtime, published)
         place_table = place_rows(places, edges, snapshot_id)
         summary["duplicate_coverage"] = duplicate_coverage(edges, rows)
         summary["distributions"] = distributions(edges, places)
@@ -478,6 +487,7 @@ def stats(cache_dir):
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         manifest["feeds"] = len(feed_table)
+        manifest["realtime"] = len(realtime)
         manifest["places"] = len(place_table)
         manifest["sections"] = sorted(summary)
         data = _parquet(rows)
@@ -826,18 +836,58 @@ def feed_sections(rows):
 
 
 def _index_tables(cache_dir, snapshot):
-    """``(feeds, edges, places)`` of the published index, its partitions
-    joined; JSON columns decoded."""
-    tables = {"feeds": [], "edges": [], "places": []}
+    """``(feeds, realtime, edges, places)`` of the published index, its
+    partitions joined; JSON columns decoded. Every file is read once and
+    checked against the snapshot's digest and row count, and only the
+    layout's own partition and table names are opened."""
+    tables = {"feeds": [], "realtime": [], "edges": [], "places": []}
     for partition, listed in (snapshot.get("partitions") or {}).items():
-        for table in listed:
+        if not PARTITION_NAME.fullmatch(partition):
+            raise StatsError(f"{partition!r}: not a partition of the index")
+        allowed = PARTITION_LAYOUT.get(partition, set(tables))
+        for table, entry in listed.items():
+            if table not in allowed:
+                raise StatsError(f"{partition}/{table}: not a table of the index")
             path = cache_dir / "index" / partition / f"{table}.parquet"
-            tables[table].extend(pq.read_table(path).to_pylist())
-    for feed in tables["feeds"]:
-        for key in ("atlas", "mdb", "gbfs", "country_shares"):
+            data = path.read_bytes()
+            if hashlib.sha256(data).hexdigest() != (entry or {}).get("sha256"):
+                raise StatsError(f"{path}: does not match the snapshot's digest")
+            rows = pq.read_table(io.BytesIO(data)).to_pylist()
+            if len(rows) != (entry or {}).get("rows"):
+                raise StatsError(
+                    f"{path}: {len(rows)} rows, the snapshot lists {entry}"
+                )
+            tables[table].extend(rows)
+    for feed in tables["feeds"] + tables["realtime"]:
+        for key in ("atlas", "mdb", "gbfs", "country_shares", "urls"):
             if isinstance(feed.get(key), str):
                 feed[key] = json.loads(feed[key])
-    return tables["feeds"], tables["edges"], tables["places"]
+    return tables["feeds"], tables["realtime"], tables["edges"], tables["places"]
+
+
+def realtime_section(realtime, feeds):
+    """The GTFS-RT companions: how many, linked to a static feed of the index
+    or not, by source and by the entity types their endpoints carry, and
+    the static feeds with at least one companion."""
+    static = {feed["feed_id"] for feed in feeds}
+    linked = sum(1 for r in realtime if r.get("static_feed_id") in static)
+    return {
+        "feeds": len(realtime),
+        "linked": linked,
+        "unlinked": len(realtime) - linked,
+        "by_source": dict(collections.Counter(r["source"] for r in realtime)),
+        "by_entity_type": dict(
+            collections.Counter(
+                t for r in realtime for t in r.get("entity_types") or ()
+            )
+        ),
+        "by_link_method": dict(
+            collections.Counter(r.get("static_link_method") or "none" for r in realtime)
+        ),
+        "static_feeds_with_realtime": sum(
+            1 for feed in feeds if feed.get("realtime_feed_ids")
+        ),
+    }
 
 
 def _crawl_log(cache_dir):
@@ -910,6 +960,11 @@ DEFINITIONS = {
         "recorded reason, and outcomes by the row's catalogue status."
     ),
     "licensing": "Licence declarations and the redistribution judgement per feed.",
+    "realtime": (
+        "The GTFS-RT companions shipped beside the GTFS feeds: linked to a "
+        "static feed of the index or not, by source, endpoint entity type "
+        "and link method, and the static feeds that have one."
+    ),
     "scale": (
         "Stops per crawled feed and places per feed (count, median, 95th "
         "percentile, maximum), and countries served per feed."
@@ -943,6 +998,7 @@ REPORT_SECTIONS = (
     "identity",
     "availability",
     "licensing",
+    "realtime",
     "scale",
     "country_agreement",
     "declared_municipality",
@@ -1084,7 +1140,10 @@ def _cell(value):
         return f"{value:.3f}".rstrip("0").rstrip(".")
     if isinstance(value, (list, tuple)):
         return ", ".join(str(v) for v in value)
-    return "" if value is None else str(value)
+    # A pipe or a line break in a value (an archive label, a URL) would
+    # break the table: escaped and folded to one line.
+    text = "" if value is None else str(value)
+    return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
 def _table(rows, columns):

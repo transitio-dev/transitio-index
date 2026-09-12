@@ -456,3 +456,39 @@ def test_the_reader_fixture_packs_the_way_the_publisher_does(tmp_path):
     fixture_manifest = json.loads(_fixture_pack(directory)["manifest.json"])
     assert manifest["members"] == fixture_manifest["members"]
     assert manifest["archive"]["sha256"] == fixture_manifest["archive"]["sha256"]
+
+
+def test_pack_ships_a_listed_realtime_table(tmp_path):
+    index_dir = _index(tmp_path)
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    part = next(p for p, t in sorted(snapshot["partitions"].items()) if "feeds" in t)
+    # A realtime table listed beside the feeds is a member like any table.
+    companion = {
+        "feed_id": "f-rt",
+        "id_minted": False,
+        "source": "atlas",
+        "spec": "gtfs-rt",
+        "crosswalk_method": "none",
+        "crosswalk_confidence": 0.0,
+        "static_feed_id": "f-a",
+        "atlas": {"urls": {"realtime_trip_updates": "https://rt"}},
+    }
+    data = publish._parquet_bytes(
+        [companion],
+        snapshot["snapshot_id"],
+        publish._realtime_row,
+        publish._REALTIME_SCHEMA,
+    )
+    (index_dir / part / "realtime.parquet").write_bytes(data)
+    snapshot["partitions"][part]["realtime"] = {
+        "rows": 1,
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+    # Packed under the lineage check: the table derives from the feeds leaf
+    # the snapshot already records, so nothing more is required of it.
+    assets, manifest = publisher.pack(index_dir, cache_dir=tmp_path / "cache")
+    assert f"{part}/realtime.parquet" in manifest["members"]
+    archive = assets[contract.archive_name(manifest["snapshot_id"])]
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+        assert tar.extractfile(f"{part}/realtime.parquet").read() == data

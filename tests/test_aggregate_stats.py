@@ -101,12 +101,14 @@ def _archive(tmp_path, label, tables, **build):
         "build": {
             "snapshot_id": snapshot,
             "stats_schema_version": stats.STATS_SCHEMA_VERSION,
+            "schema_version": 8,
             "overture_release": "2026-08-19.0",
             "catalogue_dates": {"mdb": "2026-08-28"},
             **build,
         },
         "distributions": {"tiers_by_kind": {"city": {"local": len(tables["feeds"])}}},
         "duplicate_coverage": {"pairs": 0},
+        "realtime": {"feeds": 0},
     }
     (directory / "summary.json").write_text(json.dumps(summary))
     return tmp_path / label
@@ -167,6 +169,7 @@ def test_archives_are_merged_on_their_keys_and_the_summary_recomputed(tmp_path):
         ("place", "overlapping: places"),
         ("catalogue", "differs between"),
         ("release", "overture_release"),
+        ("schema", "schema_version"),
     ],
 )
 def test_overlaps_and_incompatible_archives_are_refused(tmp_path, change, message):
@@ -190,12 +193,35 @@ def test_overlaps_and_incompatible_archives_are_refused(tmp_path, change, messag
         other["places"].append(_place("hel", "b"))
     elif change == "catalogue":
         other["catalogue"].append(_catalogue("mdb-1", "b", "f-1", country="EE"))
-    else:
+    elif change == "release":
         build["overture_release"] = "2026-09-01.0"
+    else:  # an index of another schema describes another feed population
+        build["schema_version"] = 7
     first = _archive(tmp_path, "one", base)
     second = _archive(tmp_path, "two", other, **build)
     with pytest.raises(SystemExit, match=message):
         agg.main([str(first), str(second), "--out-dir", str(tmp_path / "out")])
+
+
+def test_outputs_replace_a_planted_symlink_instead_of_following_it(tmp_path):
+    archive = _archive(
+        tmp_path,
+        "one",
+        {
+            "catalogue": [_catalogue("mdb-1", "a", "f-1")],
+            "feeds": [_feed("f-1", "a")],
+            "places": [_place("hel", "a")],
+        },
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("untouched")
+    (out / "report.md").symlink_to(elsewhere)
+    assert agg.main([str(archive), "--out-dir", str(out)]) == 0
+    assert elsewhere.read_text() == "untouched"
+    assert not (out / "report.md").is_symlink()
+    assert (out / "report.md").read_text().startswith("# Build statistics")
 
 
 def test_mixed_snapshots_and_duplicate_labels_are_refused(tmp_path):
