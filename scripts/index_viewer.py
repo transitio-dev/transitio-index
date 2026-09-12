@@ -66,7 +66,7 @@ LINKS = "links"
 # What a schema-7 build carries on top of the flat columns: the classify
 # stage's country fields and the rank stage's relevance.
 SCHEMA_7_COLUMNS = {
-    "feeds.parquet": {"home_country", "scope", "declared_countries"},
+    "feeds.parquet": {"spec", "home_country", "scope", "declared_countries"},
     "edges.parquet": {"relevance_category", "relevance", "cross_border"},
 }
 LATEST = "latest"  # the id of the build at cache/index
@@ -164,7 +164,14 @@ EDGE_COLUMNS = (
     "cross_border",
     "feed_partition",
 )
-EDGE_FEED_COLUMNS = ("name", "spec", "source", "crawl_status", "stop_count")
+EDGE_FEED_COLUMNS = (
+    "name",
+    "spec",
+    "source",
+    "crawl_status",
+    "stop_count",
+    "partition",
+)
 # An edge's class: the rank stage's relevance category (schema 7) or, before
 # it, the classify stage's tier; each in rank order, highest first.
 TIERS = ("local", "regional", "national", "international", "unknown")
@@ -435,12 +442,24 @@ class View:
         self.served = ids.isin(set(kept["place_id"])).to_numpy()
         per_place = kept.groupby("place_id")["feed_id"].nunique()
         self.feed_count = ids.map(per_place).fillna(0).astype(int).to_numpy()
-        names = build.class_names
-        rank = build.classes[keep].map({name: i for i, name in enumerate(names)})
-        best = ids.map(rank.groupby(kept["place_id"].to_numpy()).min())
-        lookup = np.array(names + (None,), dtype=object)
-        self.category = lookup[best.fillna(len(names)).astype(int).to_numpy()]
+        top = ids.map(best_class(build, keep)).astype(object)
+        self.category = top.where(top.notna(), None).to_numpy()
         self.feed_table = _feed_table(build, keep)
+
+
+def best_class(build, mask):
+    """The highest class per served place over the edges ``mask`` keeps.
+
+    A Series indexed by place_id; a place with edges of no known class is
+    None.
+    """
+    names = build.class_names
+    rank = build.classes[mask].map({name: i for i, name in enumerate(names)})
+    best = rank.groupby(build.edges.loc[mask, "place_id"].to_numpy()).min()
+    lookup = np.array(names + (None,), dtype=object)
+    return pd.Series(
+        lookup[best.fillna(len(names)).astype(int).to_numpy()], index=best.index
+    )
 
 
 def _has_columns(table, name, required):
@@ -834,8 +853,9 @@ def place_record(build, place_id):
 
     The properties carry the row's descriptive columns present in this build,
     its parsed ``service``, ``served`` and ``feed_count``, its ``bbox``, the
-    ``ancestors`` root first, a ``children`` summary and its ``edges`` joined
-    with the feed table.
+    ``ancestors`` root first, a ``children`` summary, its ``edges`` joined
+    with the feed table, the distinct feeds by spec and, on schema 7, the
+    feeds reaching it over a border by partition (``reached_from``).
     """
     if place_id not in build._row_of.index:
         return None
@@ -886,6 +906,12 @@ def place_record(build, place_id):
         if "spec" in distinct.columns
         else {}
     )
+    if "cross_border" in distinct.columns:
+        # The feeds reaching the place over a border, by the partition
+        # holding each (the links carry it; a domestic edge has none).
+        foreign = distinct[distinct["cross_border"].fillna(False).astype(bool)]
+        by_partition = foreign["feed_partition"].dropna().value_counts()
+        props["reached_from"] = {k: int(v) for k, v in by_partition.items()}
     geometry = shapely.to_geojson(build.geoms[row])
     body = '{"type":"Feature","id":%s,"geometry":%s,"properties":%s}' % (
         json.dumps(place_id),
@@ -1065,8 +1091,9 @@ def edges_of(build, place_id=None, feed_id=None, view=None):
         columns={"name": "place_name"}
     )
     rows = rows.merge(places, on="place_id", how="left")
-    if "name" in build.feeds.columns:
-        feeds = build.feeds[["feed_id", "name"]].rename(columns={"name": "feed_name"})
+    columns = [c for c in ("feed_id", "name", "spec") if c in build.feeds.columns]
+    if len(columns) > 1:
+        feeds = build.feeds[columns].rename(columns={"name": "feed_name"})
         rows = rows.merge(feeds, on="feed_id", how="left")
     return {"total": total, "truncated": total > EDGES_LIMIT, "rows": _json_ready(rows)}
 
@@ -1113,7 +1140,7 @@ def places_geojson(
     geometry = shapely.to_geojson(geoms)
     props = build.places.iloc[index][list(PROPERTY_COLUMNS)]
     props[build.class_column] = view.category[index]
-    for key, by_place in (extra or {}).items():  # e.g. a feed's tier per place
+    for key, by_place in (extra or {}).items():  # e.g. a feed's class per place
         props[key] = props["place_id"].map(by_place)
     props = props.astype(object).where(props.notna(), None)
     features = []
@@ -1266,14 +1293,9 @@ def create_app(cache, size=CACHED_BUILDS):
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
         extra = None
-        if feed_id is not None:  # the tier at which this feed serves each place
-            edges = build.edges[view.edge_mask]
-            mine = edges.loc[
-                (edges["feed_id"] == feed_id).to_numpy(), ["place_id", "tier"]
-            ]
-            extra = {
-                "tier": mine.drop_duplicates("place_id").set_index("place_id")["tier"]
-            }
+        if feed_id is not None:  # this feed's own highest class at each place
+            mine = view.edge_mask & (build.edges["feed_id"] == feed_id).to_numpy()
+            extra = {build.class_column: best_class(build, mine)}
         body, overflow = places_geojson(
             build,
             mask,

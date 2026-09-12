@@ -1075,6 +1075,14 @@ def test_the_api_filters_places_by_level_and_spec(tmp_path):
     props = {f["id"]: f["properties"] for f in features}
     assert props["hel"]["category"] == "primary" and props["hel"]["feed_count"] == 1
     assert props["esp"]["category"] is None and not props["esp"]["served"]
+    # A feed's slice classes each place by that feed's own edges the view keeps.
+    params = {"feed_id": "f3", "parent_id": "uus", "spec": "gbfs"}
+    features = client.get(f"{url}/places", params=params).json()["features"]
+    assert [(f["id"], f["properties"]["category"]) for f in features] == [
+        ("hel", "primary")
+    ]
+    params["feed_id"] = "f1"  # a gtfs feed under the gbfs spec serves nothing
+    assert client.get(f"{url}/places", params=params).json()["features"] == []
     national = client.get(f"{url}/places", params={"level": "national"}).json()
     assert [f["id"] for f in national["features"]] == ["fi"]
     assert national["features"][0]["properties"]["feed_count"] == 0
@@ -1121,12 +1129,17 @@ def test_the_feed_side_api_filters_by_spec_level_and_country(tmp_path):
     edges = client.get(f"{url}/edges", params={"place_id": "hel"}).json()["rows"]
     link = next(e for e in edges if e["feed_id"] == "f2")
     assert link["relevance_category"] == "international" and link["relevance"] == 0.3
+    assert link["spec"] == "gtfs" and link["feed_name"] == "Ferry"
     assert link["cross_border"] is True and link["feed_partition"] == "international"
     params = {"place_id": "hel", "spec": "gtfs", "level": "city"}
     kept = client.get(f"{url}/edges", params=params).json()
     assert kept["total"] == 1 and kept["rows"][0]["feed_id"] == "f1"
     record = client.get(f"{url}/places/hel").json()["properties"]
     assert record["feeds_by_spec"] == {"gtfs": 2, "gbfs": 1}
+    assert record["reached_from"] == {"international": 1}  # over the border
+    assert {e["feed_id"]: e["partition"] for e in record["edges"]}[
+        "f2"
+    ] == "international"
     assert {e["feed_id"]: e["relevance_category"] for e in record["edges"]} == {
         "f1": "primary",
         "f2": "international",

@@ -253,8 +253,10 @@ export function detailsHtml(record, field = "tier") {
     )
     .join(" › ");
   const specs = specLine(p.feeds_by_spec);
+  const reach = specLine(p.reached_from);
   const served = p.served
-    ? `served by ${p.feed_count} feed${p.feed_count === 1 ? "" : "s"}${specs ? ` (${specs})` : ""}`
+    ? `served by ${p.feed_count} feed${p.feed_count === 1 ? "" : "s"}${specs ? ` (${specs})` : ""}` +
+      (reach ? ` · reached from ${reach}` : "")
     : "not served";
   const stats = Object.entries(p.service || {})
     .map(([key, value]) => `<li>${escapeHtml(key)}: ${escapeHtml(formatStat(value))}</li>`)
@@ -348,18 +350,36 @@ export function classColors(field = "tier") {
 }
 
 // The colour expression for a class the slice carries: the place's own class
-// under the level and spec, or the tier of the selected feed's outline.
+// under the level and spec, or the selected feed's class at the place.
 export function classColorExpression(field = "tier") {
   return ["match", ["get", field], ...Object.entries(classColors(field)).flat(), CLASS_COLORS[4]];
 }
 
-// A served place in its class colour, an unserved one in its kind colour.
-export function fillColorExpression(field = "tier") {
-  return ["case", ["to-boolean", ["get", "served"]], classColorExpression(field), KIND_MATCH];
+// The international level: every served country has the one class, so the
+// fill grades by how many feeds reach it from elsewhere instead.
+export const REACH_STOPS = [
+  [1, "#fecaca"],
+  [5, "#f87171"],
+  [20, "#b91c1c"],
+];
+
+export function reachColorExpression() {
+  return ["interpolate", ["linear"], ["get", "feed_count"], ...REACH_STOPS.flat()];
 }
 
-export function legendHtml(field = "tier") {
-  return Object.entries(classColors(field))
+// A served place in its class colour (at the international level, graded by
+// reach), an unserved one in its kind colour.
+export function fillColorExpression(field = "tier", level = "") {
+  const served = level === "international" ? reachColorExpression() : classColorExpression(field);
+  return ["case", ["to-boolean", ["get", "served"]], served, KIND_MATCH];
+}
+
+export function legendHtml(field = "tier", level = "") {
+  const entries =
+    level === "international"
+      ? REACH_STOPS.map(([n, color], i) => [`${n}${i === REACH_STOPS.length - 1 ? "+" : ""} feeds from elsewhere`, color])
+      : Object.entries(classColors(field));
+  return entries
     .map(([name, color]) => `<span class="swatch" style="background:${color}"></span>${name}`)
     .join(" ");
 }
@@ -395,6 +415,7 @@ export const FEED_COLUMNS = [
   ["source", "Source"],
   ["home_country", "Home"],
   ["scope", "Scope"],
+  ["partition", "Partition"],
   ["stop_count", "Stops"],
   ["crawl_status", "Crawl"],
   ["places_served", "Places"],
@@ -415,9 +436,15 @@ export function feedRowHtml(row, columns = FEED_COLUMNS) {
 
 // One edge row seen from a place (the feed side) or from a feed (the place side).
 export function edgeRowHtml(row, side, field = "tier") {
-  const other = side === "place" ? (row.feed_name ?? row.feed_id) : `${row.place_name ?? row.place_id} (${row.kind ?? DASH})`;
+  const other =
+    side === "place"
+      ? `${row.feed_name ?? row.feed_id}${row.spec ? ` (${row.spec})` : ""}`
+      : `${row.place_name ?? row.place_id} (${row.kind ?? DASH})`;
   const confidence = row.tier_confidence == null ? DASH : row.tier_confidence.toFixed(2);
-  const flags = [row.cross_border ? "cross-border" : null, row.needs_review ? "review" : null].filter(Boolean);
+  const flags = [
+    row.cross_border ? `cross-border${row.feed_partition ? ` from ${escapeHtml(row.feed_partition)}` : ""}` : null,
+    row.needs_review ? "review" : null,
+  ].filter(Boolean);
   return (
     `<tr><td>${escapeHtml(other)}</td><td>${escapeHtml(edgeClass(row, field))}</td>` +
     `<td>${row.relevance == null ? DASH : row.relevance.toFixed(2)}</td>` +
@@ -672,8 +699,7 @@ async function main() {
     snapshot = summary.snapshot_id;
     stats.textContent = summaryLabel(summary);
     classField = summary.category_field ?? "tier";
-    legend.innerHTML = legendHtml(classField);
-    map.setPaintProperty("places-fill", "fill-color", fillColorExpression(classField));
+    paintClasses();
     tableKind.innerHTML = kindOptionsHtml((summary.counts || {}).places_by_kind);
     loadTable().catch(console.error);
     loadTree().catch(console.error);
@@ -1154,11 +1180,19 @@ async function main() {
   });
   legend.innerHTML = legendHtml();
 
+  // The fill and the legend follow the build's class field and the level.
+  const paintClasses = () => {
+    legend.innerHTML = legendHtml(classField, view.level);
+    map.setPaintProperty("places-fill", "fill-color", fillColorExpression(classField, view.level));
+    map.setPaintProperty("served-line", "line-color", classColorExpression(classField));
+  };
+
   // A new level or spec: every view of the build follows — the map slice and
   // the served outline, the tables, and the edges of what is selected.
   const changeView = () => {
     view = { level: levelSelect.value, spec: specSelect.value };
     if (!current) return;
+    paintClasses();
     // While a build fit is in flight its own moveend requests the viewport
     // slice, and reads the view then.
     if (!fitting) refresh(current, generation, false).catch(console.error);

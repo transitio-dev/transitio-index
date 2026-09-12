@@ -27,6 +27,7 @@ import {
   paddedBounds,
   placesUrl,
   popupHtml,
+  reachColorExpression,
   revealPath,
   rowHtml,
   sliceParams,
@@ -206,8 +207,9 @@ test("the details render the chain, feeds and external ids, escaped", () => {
   assert.match(html, /<li>stops: 649<\/li><li>departures_per_day: 41936.0<\/li>/);
   assert.match(html, /<td>HSL<\/td><td>local<\/td><td>—<\/td><td>0.85<\/td><td>crawl<\/td>/);
   // On schema 7 the class is the relevance category, with relevance and the border flag.
-  const ranked = { properties: { ...record.properties, edges: [{ ...record.properties.edges[0], relevance_category: "international", relevance: 0.3, cross_border: true }] } };
+  const ranked = { properties: { ...record.properties, reached_from: { international: 1 }, edges: [{ ...record.properties.edges[0], relevance_category: "international", relevance: 0.3, cross_border: true }] } };
   assert.match(detailsHtml(ranked, "category"), /<td>HSL<\/td><td>international<\/td><td>0.30<\/td><td>0.85<\/td><td>crawl · cross-border<\/td>/);
+  assert.match(detailsHtml(ranked, "category"), /served by 1 feed \(1 gtfs\) · reached from 1 international</);
   assert.match(html, /href="https:\/\/www.wikidata.org\/wiki\/Q1757"/);
   assert.doesNotMatch(html, /OSM relation/);
   assert.doesNotMatch(html, /children/);
@@ -275,7 +277,7 @@ test("feed rows sort by number or text with nulls last, and filter by name or id
 test("feed and edge rows render names, dashes and the review flag", () => {
   const feed = { feed_id: "f<1", name: null, spec: "gtfs", source: null, home_country: "FI", scope: "domestic", stop_count: 12, crawl_status: "ok", places_served: 3, tier_local: 2, tier_regional: 0, tier_national: 1, tier_international: 0, tier_unknown: 0 };
   const html = feedRowHtml(feed, feedColumns("tier"));
-  assert.match(html, /^<tr data-id="f&lt;1"><td>f&lt;1<\/td><td>gtfs<\/td><td>—<\/td><td>FI<\/td><td>domestic<\/td><td>12<\/td><td>ok<\/td><td>3<\/td><td>2<\/td><td>0<\/td><td>1<\/td>/);
+  assert.match(html, /^<tr data-id="f&lt;1"><td>f&lt;1<\/td><td>gtfs<\/td><td>—<\/td><td>FI<\/td><td>domestic<\/td><td>—<\/td><td>12<\/td><td>ok<\/td><td>3<\/td><td>2<\/td><td>0<\/td><td>1<\/td>/);
   // The count columns follow the field: categories on schema 7, tiers before.
   assert.deepEqual(feedColumns("category").slice(-5).map(([column]) => column), ["category_primary", "category_secondary", "category_tertiary", "category_international", "category_unknown"]);
   assert.match(feedRowHtml({ ...feed, category_primary: 4 }, feedColumns("category")), /<td>3<\/td><td>4<\/td><td>—<\/td>/);
@@ -283,12 +285,12 @@ test("feed and edge rows render names, dashes and the review flag", () => {
   const hostileFeed = { feed_id: "<f>", name: "<n>", spec: "<s>", source: "<o>", stop_count: 1, crawl_status: "<c>", places_served: 0, tier_local: 0, tier_regional: 0, tier_national: 0, tier_international: 0, tier_unknown: 0 };
   const hostileHtml = feedRowHtml(hostileFeed);
   assert.doesNotMatch(hostileHtml, /<f>|<n>|<s>|<o>|<c>/);
-  assert.match(hostileHtml, /^<tr data-id="&lt;f&gt;"><td>&lt;n&gt;<\/td><td>&lt;s&gt;<\/td><td>&lt;o&gt;<\/td><td>—<\/td><td>—<\/td><td>1<\/td><td>&lt;c&gt;<\/td>/);
+  assert.match(hostileHtml, /^<tr data-id="&lt;f&gt;"><td>&lt;n&gt;<\/td><td>&lt;s&gt;<\/td><td>&lt;o&gt;<\/td><td>—<\/td><td>—<\/td><td>—<\/td><td>1<\/td><td>&lt;c&gt;<\/td>/);
   const edge = { place_id: "hel", place_name: "Helsinki", kind: "city", feed_id: "f1", feed_name: "HSL", tier: "local", tier_confidence: 0.85, method: "crawl", needs_review: true };
   assert.equal(edgeRowHtml(edge, "place"), "<tr><td>HSL</td><td>local</td><td>—</td><td>0.85</td><td>crawl</td><td>review</td></tr>");
   assert.match(edgeRowHtml({ ...edge, needs_review: false, tier_confidence: null }, "feed"), /^<tr><td>Helsinki \(city\)<\/td><td>local<\/td><td>—<\/td><td>—<\/td><td>crawl<\/td><td><\/td>/);
-  const link = { ...edge, relevance_category: "international", relevance: 0.3, cross_border: true };
-  assert.match(edgeRowHtml(link, "place", "category"), /<td>international<\/td><td>0.30<\/td><td>0.85<\/td><td>crawl<\/td><td>cross-border · review<\/td>/);
+  const link = { ...edge, spec: "gbfs", relevance_category: "international", relevance: 0.3, cross_border: true, feed_partition: "<SE>" };
+  assert.match(edgeRowHtml(link, "place", "category"), /<td>HSL \(gbfs\)<\/td><td>international<\/td><td>0.30<\/td><td>0.85<\/td><td>crawl<\/td><td>cross-border from &lt;SE&gt; · review<\/td>/);
   const hostileEdge = { place_id: "p", place_name: "<b>P", kind: "<i>", feed_id: "f", feed_name: "<u>F", tier: "<t>", tier_confidence: null, method: "<m>", needs_review: false };
   for (const side of ["place", "feed"]) {
     const html = edgeRowHtml(hostileEdge, side);
@@ -318,6 +320,10 @@ test("a feed's details, served-places slice and legend follow its tiers", () => 
   assert.deepEqual(classColorExpression("category").slice(0, 4), ["match", ["get", "category"], "primary", "#16a34a"]);
   const fill = fillColorExpression("category");
   assert.deepEqual([fill[0], fill[2][1], fill[3][1]], ["case", ["get", "category"], ["get", "kind"]]);
+  // The international level grades served countries by the feeds reaching them.
+  assert.deepEqual(fillColorExpression("category", "international")[2], reachColorExpression());
+  assert.deepEqual(reachColorExpression().slice(0, 4), ["interpolate", ["linear"], ["get", "feed_count"], 1]);
+  assert.match(legendHtml("category", "international"), /1 feeds from elsewhere .*20\+ feeds from elsewhere$/);
   // Categories replace tiers in a ranked feed's details, with its home and scope.
   const rankedFeed = { geometry: null, properties: { ...record.properties, home_country: "FI", scope: "domestic", categories: { primary: 1, secondary: 0 } } };
   assert.match(feedDetailsHtml(rankedFeed), /1 place served \(1 primary\)/);
