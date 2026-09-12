@@ -1,12 +1,16 @@
 """Publish stage: the feeds, places and membership edges as a shippable index.
 
-Writes ``<cache>/index/`` — ``feeds.parquet`` (one row per feed),
-``places.parquet`` (one row per place, a GeoParquet with the simplified
-boundary), ``edges.parquet`` (one membership row per place/feed/tier) and
-``snapshot.json`` (the manifest: a deterministic snapshot id, the schema
-version, the source versions, the counts, and each Parquet's SHA-256). The
-feeds come from the latest edge stage when one exists (curated, classified or
-coverage edges, with the feeds stamped ``coverage_source`` and ``crawlable``),
+Writes ``<cache>/index/`` as a directory of partitions (schema 7): under each
+country code ``feeds.parquet`` (one row per feed whose home country it is),
+``places.parquet`` (one row per place there, a GeoParquet with the simplified
+boundary) and ``edges.parquet`` (the domestic membership rows, one per
+place/feed/tier); ``international/feeds.parquet`` for the feeds without a
+home country; ``links/edges.parquet`` for every cross-border edge, with
+``feed_partition``; and ``snapshot.json`` (the manifest: a deterministic
+snapshot id, the schema version, the source versions, the counts, and every
+partition table's row count and SHA-256). The feeds come from the latest edge
+stage when one exists (ranked, curated, classified or coverage edges, with
+the feeds stamped ``coverage_source`` and ``crawlable``),
 else from the resolved feeds, else from the crosswalk; the places from the
 pruned generation for a curated build, else the expanded generation, else the
 names one. Places and edges are optional: an index built before those stages
@@ -25,6 +29,7 @@ import datetime
 import hashlib
 import io
 import json
+import stat
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -33,12 +38,26 @@ from transitio_index import overture
 from transitio_index import registry as _registry
 from transitio_index import store
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+# The reader release that first reads this schema; the installed reader's own
+# floor table wins once it knows the version.
+MIN_READER_VERSION = "0.12.0"
+# The edge generations that carry curation (curate, and rank on top of it).
+FINAL_SOURCES = ("curate", "rank")
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
 SNAPSHOT_FILE = "snapshot.json"
 NOTICE_FILE = "NOTICE"
+# The index is a directory of partitions (schema_version 7): one per country
+# code holding the feeds whose home country it is, its places and their
+# domestic edges; ``international`` holding the feeds without a home country;
+# ``links`` holding every edge whose feed has no home country or whose place
+# lies outside the feed's home country, with ``feed_partition`` naming the
+# partition that holds the feed.
+INTERNATIONAL_PARTITION = "international"
+LINKS_PARTITION = "links"
+TABLE_FILES = {"feeds": FEEDS_FILE, "places": PLACES_FILE, "edges": EDGES_FILE}
 
 
 class PublishError(RuntimeError):
@@ -78,6 +97,13 @@ _SCHEMA = pa.schema(
         # Whether the feed's licence permits redistributing derived data;
         # null when unknown. Set by the license stage.
         ("redistribution_allowed", pa.bool_()),
+        # The feed's home country from its stops, its stop shares per country
+        # (a JSON object), its scope and the catalogues' claimed countries
+        # (schema_version 7). Set by the classify stage.
+        ("home_country", pa.string()),
+        ("country_shares", pa.string()),
+        ("scope", pa.string()),
+        ("declared_countries", pa.list_(pa.string())),
         ("snapshot", pa.string()),
     ]
 )
@@ -117,6 +143,10 @@ def _row(record, snapshot_id):
         "crawl_status": record.get("crawl_status"),
         "files": record.get("files") or [],
         "redistribution_allowed": record.get("redistribution_allowed"),
+        "home_country": record.get("home_country"),
+        "country_shares": _json_block(record.get("country_shares")),
+        "scope": record.get("scope"),
+        "declared_countries": record.get("declared_countries") or [],
         "snapshot": snapshot_id,
     }
 
@@ -421,6 +451,12 @@ _EDGES_SCHEMA = pa.schema(
         ("selector_state", pa.string()),
         ("selector", pa.string()),
         ("needs_review", pa.bool_()),
+        # The rank stage's relevance (schema_version 7): the category the
+        # tier maps to, the score within it and whether the place lies
+        # outside the feed's home country.
+        ("relevance_category", pa.string()),
+        ("relevance", pa.float64()),
+        ("cross_border", pa.bool_()),
         ("snapshot", pa.string()),
     ]
 )
@@ -444,17 +480,118 @@ def _edge_row(record, snapshot_id):
         "selector_state": record["selector_state"],
         "selector": _json_block(record.get("selector")),
         "needs_review": record["needs_review"],
+        "relevance_category": record.get("relevance_category"),
+        "relevance": record.get("relevance"),
+        "cross_border": record.get("cross_border"),
         "snapshot": snapshot_id,
     }
 
 
-def _edges_parquet_bytes(edges, snapshot_id):
-    table = pa.Table.from_pylist(
-        [_edge_row(record, snapshot_id) for record in edges], schema=_EDGES_SCHEMA
-    )
+_LINKS_SCHEMA = _EDGES_SCHEMA.append(pa.field("feed_partition", pa.string()))
+
+
+def _edges_parquet_bytes(edges, snapshot_id, links=False):
+    rows = [_edge_row(record, snapshot_id) for record in edges]
+    if links:
+        for row, record in zip(rows, edges):
+            row["feed_partition"] = record["feed_partition"]
+    table = pa.Table.from_pylist(rows, schema=_LINKS_SCHEMA if links else _EDGES_SCHEMA)
     sink = io.BytesIO()
     pq.write_table(table, sink)
     return sink.getvalue()
+
+
+def partition(records, places, edges):
+    """Route the feeds, places and edges into partitions, as ``{partition:
+    {table: rows}}`` sorted by partition name.
+
+    A feed goes under its ``home_country``, else ``international``; a place
+    under its ``country_code`` — a place without one is an integrity error,
+    as a missing licence is; an edge under the feed's home country when the
+    place lies there, else into ``links`` with ``feed_partition``. Nothing is
+    dropped: the partitions and the links together are the flat tables.
+    """
+    home = {record["feed_id"]: record.get("home_country") for record in records}
+    parts = collections.defaultdict(dict)
+    for record in records:
+        name = home[record["feed_id"]] or INTERNATIONAL_PARTITION
+        parts[name].setdefault("feeds", []).append(record)
+    country = {}
+    for place in places or ():
+        code = place.get("country_code")
+        if not code:
+            raise PublishError(
+                f"place {place['place_id']} has no country_code; every place "
+                "belongs to one country partition"
+            )
+        country[place["place_id"]] = code
+        parts[code].setdefault("places", []).append(place)
+    for edge in edges or ():
+        if edge["feed_id"] not in home:
+            raise PublishError(f"edge of a feed the index lacks: {edge['feed_id']}")
+        place_country = country.get(edge["place_id"])
+        if place_country is None:
+            raise PublishError(f"edge to a place the index lacks: {edge['place_id']}")
+        feed_home = home[edge["feed_id"]]
+        if feed_home is None or feed_home != place_country:
+            linked = {**edge, "feed_partition": feed_home or INTERNATIONAL_PARTITION}
+            parts[LINKS_PARTITION].setdefault("edges", []).append(linked)
+        else:
+            parts[feed_home].setdefault("edges", []).append(edge)
+    return dict(sorted(parts.items()))
+
+
+def _partition_tables(partitions, snapshot_id, service, identities):
+    """``({(partition, table): parquet bytes}, manifest listing)`` for every
+    partition table; the listing carries each file's row count and digest."""
+    files, listing = {}, {}
+    for name, tables in partitions.items():
+        listing[name] = {}
+        for table, rows in tables.items():
+            if table == "feeds":
+                data = _parquet_bytes(rows, snapshot_id)
+            elif table == "places":
+                data = _places_parquet_bytes(
+                    rows, snapshot_id, service, identities=identities
+                )
+            else:
+                data = _edges_parquet_bytes(
+                    rows, snapshot_id, links=name == LINKS_PARTITION
+                )
+            files[(name, table)] = data
+            listing[name][table] = {
+                "rows": len(rows),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+    return files, listing
+
+
+def _write_partitions(directory, files, listing):
+    """Write every partition table under ``directory`` after dropping the
+    tables and partitions this build lacks — and the flat tables of the
+    layout before schema 7 — so nothing lingers from an earlier build."""
+    for name in sorted(directory.listdir()):
+        if name.startswith("."):
+            continue
+        if stat.S_ISDIR(directory.stat(name).st_mode):
+            wanted = {TABLE_FILES[table] for table in listing.get(name, ())}
+            child = directory.subdirectory(name)
+            try:
+                for entry in child.listdir():
+                    if entry not in wanted:
+                        child.unlink(entry)
+            finally:
+                child.close()
+            if name not in listing:
+                directory.rmdir(name)
+        elif name in TABLE_FILES.values():
+            directory.unlink(name)
+    for (name, table), data in files.items():
+        child = directory.child(name)
+        try:
+            store.write_bytes(child, TABLE_FILES[table], data)
+        finally:
+            child.close()
 
 
 def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
@@ -470,7 +607,7 @@ def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
     The release is taken from the same generation's own manifest, so the
     places cannot be labelled with a different pointer read separately.
     """
-    curated = edge_manifest is not None and edge_manifest.get("source") == "curate"
+    curated = edge_manifest is not None and edge_manifest.get("source") in FINAL_SOURCES
     pruned = cache_dir / "prune" / "places_pruned.json"
     if pruned.is_symlink() or pruned.exists():
         try:
@@ -552,6 +689,7 @@ def _read_places(cache_dir, edge_manifest=None, overrides_dir=None):
 RAW_POINTERS = ("atlas.json", "mdb.json", "gbfs.json")
 # The edge pointer each edge stage publishes.
 EDGE_POINTERS = {
+    "rank": ("rank", "edges_ranked.json"),
     "curate": ("curate", "edges_final.json"),
     "classify": ("classify", "edges.json"),
     "coverage": ("coverage", "coverage.json"),
@@ -598,6 +736,8 @@ def _generations(cache_dir, edges, resolved, places):
         leaves["edges"] = leaves["feeds"] = f"{subdir}/{pointer}"
         found["classify/edges.json"] = edges.get("classify_generation")
         found["coverage/coverage.json"] = edges.get("coverage_generation")
+        if edges.get("source") == "rank":
+            found["curate/edges_final.json"] = edges.get("curate_generation")
         if edges.get("source") == "classify":
             found["classify/edges.json"] = edges.get("generation")
         if edges.get("source") == "coverage":
@@ -775,6 +915,7 @@ STAGE_LOCKS = (
     "coverage",
     "classify",
     "curate",
+    "rank",
     "prune",
 )
 
@@ -850,7 +991,7 @@ def read_inputs(cache_dir, overrides_dir):
                 "the edges were derived from a different places generation "
                 "than the one being published; re-run the pipeline in stage order"
             )
-        if coverage.get("source") not in ("classify", "curate"):
+        if coverage.get("source") not in ("classify", *FINAL_SOURCES):
             # Candidate edges carry no tiers; shipping them would publish
             # every edge as unknown with the tier gate silently off.
             raise PublishError(
@@ -1050,7 +1191,10 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             # The NOTICE ships too: a corrected attribution is a new snapshot.
             digests.append(hashlib.sha256(licensed).hexdigest())
         snapshot_id = _snapshot_id(sources, overture_release, digests)
-        feeds_data = _parquet_bytes(records, snapshot_id)
+        partitions = partition(records, places, edges)
+        files, listing = _partition_tables(
+            partitions, snapshot_id, _service_by_place(edges), identities
+        )
         counts = _counts(records)
         manifest = {
             "schema_version": SCHEMA_VERSION,
@@ -1058,13 +1202,17 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             # build's version are recorded so a reproduction can say whether
             # it is exact, and a reader below the schema's floor refuses it.
             "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
-            "min_reader_version": MIN_READER_VERSIONS[SCHEMA_VERSION],
+            "min_reader_version": MIN_READER_VERSIONS.get(
+                SCHEMA_VERSION, MIN_READER_VERSION
+            ),
             "built_with": built_with,
             "snapshot_id": snapshot_id,
             "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "sources": sources,
             "counts": counts,
-            "feeds_sha256": hashlib.sha256(feeds_data).hexdigest(),
+            # Every partition's tables with their row counts and digests: the
+            # reader checks each file against these.
+            "partitions": listing,
             # The stage generations this index was built from, by pointer,
             # the leaf that produced each table, and the override files
             # applied, so a release can check they are all still current.
@@ -1086,22 +1234,14 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             ),
         }
 
-        places_data = None
         if places is not None:
-            places_data = _places_parquet_bytes(
-                places, snapshot_id, _service_by_place(edges), identities=identities
-            )
-            manifest["places_sha256"] = hashlib.sha256(places_data).hexdigest()
             manifest["overture_release"] = overture_release
             counts["places"] = len(places)
             counts["places_by_kind"] = dict(
                 collections.Counter(p["kind"] for p in places)
             )
 
-        edges_data = None
         if edges is not None:
-            edges_data = _edges_parquet_bytes(edges, snapshot_id)
-            manifest["edges_sha256"] = hashlib.sha256(edges_data).hexdigest()
             manifest["coverage_mode"] = coverage.get("mode")
             manifest["overrides_sha256"] = override_digest
             if coverage.get("unknown_share") is not None:
@@ -1124,7 +1264,7 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             "stale_feed_overrides": (coverage or {}).get("stale_feed_overrides"),
             "stale_edge_overrides": (
                 coverage.get("stale_overrides")
-                if coverage is not None and coverage.get("source") == "curate"
+                if coverage is not None and coverage.get("source") in FINAL_SOURCES
                 else 0
             ),
         }
@@ -1165,18 +1305,13 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
                             f"{what} changed during publication; re-run the "
                             f"{rerun} stage"
                         )
-                store.write_bytes(directory, FEEDS_FILE, feeds_data)
-                # A table this build lacks must not linger from an earlier one,
-                # nor a NOTICE from a licensed build under an unlicensed one.
-                for name, data in (
-                    (PLACES_FILE, places_data),
-                    (EDGES_FILE, edges_data),
-                    (NOTICE_FILE, licensed),
-                ):
-                    if data is not None:
-                        store.write_bytes(directory, name, data)
-                    else:
-                        store.unlink(directory, name)
+                _write_partitions(directory, files, listing)
+                # A NOTICE from a licensed build must not linger under an
+                # unlicensed one.
+                if licensed is not None:
+                    store.write_bytes(directory, NOTICE_FILE, licensed)
+                else:
+                    store.unlink(directory, NOTICE_FILE)
                 store.write_file(
                     directory,
                     SNAPSHOT_FILE,
