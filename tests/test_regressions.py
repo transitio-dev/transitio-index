@@ -23,6 +23,7 @@ from transitio_index import (  # noqa: E402
     overture,
     registry,
     seed,
+    store,
 )
 
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
@@ -844,3 +845,58 @@ def test_every_gtfs_route_type_decides_a_tier_or_is_out_of_scope_by_design():
         else:
             assert decision["tier"] != "unknown", route_type
             assert decision["rule"] != 10, route_type
+
+
+@pytest.mark.parametrize(
+    ("routes", "status"),
+    [
+        (b"route_id,route_type\nbus,3\n", "no_service"),
+        (b"route_id,route_type\n", "no_routes"),
+    ],
+    ids=["routes-without-trips", "no-routes"],
+)
+def test_a_complete_crawl_without_a_schedule_keeps_its_edges_and_home(
+    tmp_path, routes, status
+):
+    """Five Finnish ELY-centre feeds ship stops and routes with header-only
+    trips and stop_times; complete mode dropped every candidate as unserved
+    and left no country evidence, so Finnish feeds landed in international/.
+    Such a feed keeps explicit unknown edges and counts its located stops."""
+    from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
+
+    cache = tmp_path / "cache"
+    feeds = [
+        {
+            "feed_id": "f-shell",
+            "spec": "gtfs",
+            "coverage_source": "crawl",
+            "aliases": [],
+        }
+    ]
+    _write_crawl(
+        cache,
+        "f-shell",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
+            "routes.txt": routes,
+            "trips.txt": b"trip_id,route_id\n",
+            "stop_times.txt": b"trip_id,stop_id,stop_sequence\n",
+        },
+        "complete",
+    )
+    _coverage(cache, feeds, [_candidate("Q-city", "f-shell", 2)])
+    manifest = classify.classify(cache, lookup=LOOKUP)
+    edges, _ = store.read_jsonl(
+        cache / "classify", "edges.json", classify.EDGES_ARTIFACT
+    )
+    (edge,) = edges
+    assert edge["tier"] == "unknown" and edge["needs_review"] is True
+    assert edge["evidence"]["unknown_reason"] == status
+    records, _ = store.read_jsonl(
+        cache / "classify", "edges.json", classify.FEEDS_ARTIFACT
+    )
+    (feed,) = records
+    assert feed["country_stops"] == {"AA": 2} and feed["country_basis"] == "located"
+    assert feed["scope"] == "domestic" and feed["home_country"] == "AA"
+    assert manifest["feeds_by_status"] == {status: 1}
+    assert manifest["edges_dropped_no_serving_route"] == 0
