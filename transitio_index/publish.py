@@ -1243,6 +1243,13 @@ def read_inputs(cache_dir, overrides_dir):
             raise PublishError(
                 "the edges are unclassified; run the classify stage before publishing"
             )
+        if coverage.get("classifier") is None:
+            # Classified before the settings were recorded: the snapshot
+            # could not say which thresholds decided its tiers.
+            raise PublishError(
+                "the edges carry no classifier settings; re-run the classify "
+                "stage before publishing"
+            )
     return {
         "records": records,
         "edges": edges,
@@ -1505,6 +1512,14 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
                 # the companions' inherited edges too).
                 unknown = sum(1 for e in edges if e["tier"] == "unknown")
                 manifest["unknown_share"] = unknown / len(edges)
+            # The thresholds the tiers were decided by, and how many of the
+            # shipped edges were decided within MARGIN of one of them.
+            manifest["classifier"] = coverage.get("classifier")
+            if edges is not None:
+                from transitio_index import classify
+
+                flagged = classify.near_threshold_count(edges)
+                manifest["margin_share"] = flagged / len(edges) if edges else 0.0
             if golden_report is not None:
                 manifest["golden_entries"] = golden_report["entries"]
             counts["edges"] = len(edges)

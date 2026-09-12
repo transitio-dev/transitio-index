@@ -210,6 +210,7 @@ def rank(cache_dir):
             "expanded_generation",
             "overrides_sha256",
             "stale_overrides",
+            "classifier",
         )
         by_tier = collections.Counter(e["tier"] for e in ranked)
         manifest = {
@@ -223,6 +224,7 @@ def rank(cache_dir):
             "edges_by_tier": dict(by_tier),
             "unknown_share": (by_tier["unknown"] / len(ranked)) if ranked else 0.0,
             "needs_review": sum(1 for e in ranked if e["needs_review"]),
+            "edges_near_threshold": classify.near_threshold_count(ranked),
             **report,
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }

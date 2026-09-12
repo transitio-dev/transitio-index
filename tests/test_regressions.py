@@ -16,6 +16,7 @@ import overture_fixture as fx  # noqa: E402
 import test_index_boundaries as bt  # noqa: E402
 from transitio_index import (  # noqa: E402
     boundaries,
+    classify,
     coverage,
     fetch,
     geometry,
@@ -801,3 +802,45 @@ def test_stats_keys_gbfs_systems_sharing_id_and_country_by_ordinal():
     assert [r["source_id"] for r in rows] == ["seville/ES#1", "seville/ES#2"]
     assert {r["drop_reason"] for r in rows} == {"ambiguous_id"}
     assert stats.identity(rows, [])["gbfs_duplicate_system_ids"] == 1
+
+
+# The GTFS route types: the basic set and the extended set (families by
+# hundred, sub-types as enumerated by the extended route types reference).
+GTFS_BASIC_ROUTE_TYPES = (0, 1, 2, 3, 4, 5, 6, 7, 11, 12)
+GTFS_EXTENDED_ROUTE_TYPES = (
+    *range(100, 118),
+    *range(200, 210),
+    300,
+    *range(400, 406),
+    500,
+    600,
+    *range(700, 717),
+    800,
+    *range(900, 907),
+    *range(1000, 1022),
+    *range(1100, 1115),
+    1200,
+    *range(1300, 1308),
+    1400,
+    *range(1500, 1508),
+    *range(1600, 1605),
+    *range(1700, 1703),
+)
+
+
+def test_every_gtfs_route_type_decides_a_tier_or_is_out_of_scope_by_design():
+    """A route type the decision table did not list fell through to
+    ``unknown`` silently: funiculars, trolleybuses, ferries and monorails
+    did, in 271 edges over ten archived builds. Every enumerated type now
+    decides a tier given full signals, or is unclassifiable by design (rule
+    10) and lies in the table's out-of-scope ranges."""
+    for route_type in (*GTFS_BASIC_ROUTE_TYPES, *GTFS_EXTENDED_ROUTE_TYPES):
+        decision = classify.classify_route(route_type, {"AA"}, 10.0, 1.0)
+        out_of_scope = any(
+            low <= route_type <= high for low, high in classify.UNCLASSIFIABLE_RANGES
+        )
+        if out_of_scope:
+            assert (decision["tier"], decision["rule"]) == ("unknown", 10), route_type
+        else:
+            assert decision["tier"] != "unknown", route_type
+            assert decision["rule"] != 10, route_type

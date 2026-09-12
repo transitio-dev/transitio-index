@@ -719,6 +719,7 @@ def curate(cache_dir, *, overrides_dir=None, strict=False, registry=None):
             "feeds_overrides_sha256": classified.get("feeds_overrides_sha256"),
             "stale_feed_overrides": classified.get("stale_feed_overrides"),
             "expanded_generation": classified.get("expanded_generation"),
+            "classifier": classified.get("classifier"),
             # The digest of the very bytes the entries were parsed from:
             # publish refuses these edges once the file has been edited.
             "overrides_sha256": digest,
@@ -734,6 +735,7 @@ def curate(cache_dir, *, overrides_dir=None, strict=False, registry=None):
             "edges_by_tier": dict(by_tier),
             "unknown_share": (by_tier["unknown"] / len(final)) if final else 0.0,
             "needs_review": sum(1 for e in final if e["needs_review"]),
+            "edges_near_threshold": classify.near_threshold_count(final),
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         return store.publish(

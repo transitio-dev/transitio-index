@@ -1612,6 +1612,8 @@ def test_a_published_index_carries_its_realtime_table(tmp_path):
     assert manifest["counts"]["realtime"] == 1 == manifest["counts"]["realtime_linked"]
     assert manifest["counts"]["edges"] == 1
     assert manifest["unknown_share"] == 1.0  # over the one edge that ships
+    assert manifest["classifier"] == classify.classifier_settings()
+    assert manifest["margin_share"] == 0.0
     # Declared coverage gives f-a no home: it and its companion are international.
     listed = manifest["partitions"]["international"]
     assert listed["realtime"]["rows"] == 1 and listed["feeds"]["rows"] == 1
@@ -1786,3 +1788,80 @@ def test_a_published_index_carries_the_feed_dates_and_place_validity(
         "windows": [{"start": "2026-09-01", "end": "2026-09-14", "feeds": 1}],
         "best": {"start": "2026-09-01", "end": "2026-09-14", "feeds": 1},
     }
+
+
+def test_margin_share_is_measured_over_the_edges_that_ship(tmp_path, monkeypatch):
+    import test_index_classify as classify_tests
+    from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
+
+    # Through classify: a bus decided within MARGIN of a threshold, a tram far
+    # from every threshold, and a companion whose declared edge publish drops
+    # before counting. The coverage names this suite's sources.
+    monkeypatch.setattr(classify_tests, "SOURCES", SOURCES)
+    cache = tmp_path / "cache"
+    feeds = [
+        _covered_feed("f-near", coverage_source="crawl"),
+        _covered_feed("f-far", coverage_source="crawl"),
+        _realtime_feed("f-rt", "f-near"),
+    ]
+    _write_crawl(
+        cache,
+        "f-near",
+        {
+            "stops.txt": (
+                b"stop_id,stop_lat,stop_lon\n"
+                b"n1,1.0,10.0\nn2,1.0126,10.0\nn3,1.0252,10.0\n"
+            ),
+            "routes.txt": b"route_id,route_type\nbus,3\n",
+            "trips.txt": b"trip_id,route_id\nt,bus\n",
+            "stop_times.txt": (
+                b"trip_id,stop_id,stop_sequence\nt,n1,1\nt,n2,2\nt,n3,3\n"
+            ),
+        },
+        "complete",
+    )
+    _write_crawl(
+        cache,
+        "f-far",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": b"trip_id,route_id\nt,tram\n",
+            "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt,s1,1\nt,s2,2\n",
+        },
+        "complete",
+    )
+    places = [
+        dict(p, country_code=p.get("country_code") or "AA")
+        for p in classify_tests.PLACES
+    ]
+    _coverage(
+        cache,
+        feeds,
+        [
+            _candidate("Q-city", "f-near"),
+            _candidate("Q-city", "f-far", 2),
+            _candidate("Q-other", "f-rt"),
+        ],
+        places=places,
+    )
+    classified = classify.classify(cache, lookup=LOOKUP)
+    assert classified["edges_near_threshold"] == 1
+    manifest = publish.publish(cache)
+    assert manifest["counts"]["edges"] == 2  # the companion's edge does not ship
+    assert manifest["margin_share"] == 0.5
+    assert manifest["classifier"]["rules_version"] == classify.RULES_VERSION
+
+
+def test_publish_refuses_edges_classified_without_settings(tmp_path, monkeypatch):
+    cache, _ = _edges_index(tmp_path, [_edge("Q1757", "f-a")])
+    feeds, edges, manifest = classify.read_edges(cache)
+    stale = {key: value for key, value in manifest.items() if key != "classifier"}
+    monkeypatch.setattr(classify, "read_edges", lambda *a, **k: (feeds, edges, stale))
+    with pytest.raises(publish.PublishError, match="classifier settings"):
+        publish.publish(cache)
+
+
+def test_a_classified_snapshot_without_edges_records_a_zero_margin_share(tmp_path):
+    _, manifest = _edges_index(tmp_path, [])
+    assert manifest["counts"]["edges"] == 0 and manifest["margin_share"] == 0.0

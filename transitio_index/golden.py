@@ -3,16 +3,16 @@
 The golden file (``golden/feeds.jsonl``, committed) is ground truth written by
 a person, never captured from a build: each entry names a real feed and what
 the index must say about it — the places its membership must include (and may
-be required to exactly equal or to exclude), and, recorded for the classifier
-to be asserted once it exists, its expected tier set and review state. The
-check compares a build's coverage artifacts against those expectations and
-reports every violation; regeneration must fail loudly on any.
+be required to exactly equal or to exclude), and its expected tier set and
+review state. The check compares a build's coverage artifacts against those
+expectations and reports every violation; regeneration must fail loudly on
+any.
 
 Membership uses include/exclude contracts rather than only exact sets because
 a national feed's full membership is open-ended while its anchor places are
 not; a small city feed can pin ``exact`` instead. Tier and review-state
-assertions stay off until the classifier lands — the entries already record
-them so the switch is a flag, not a schema change.
+assertions are on whenever the edges come from a classify, curate or rank
+generation; against candidate edges only membership is checked.
 """
 
 import json

@@ -92,6 +92,10 @@ def test_set_tiers_redefines_the_pair_and_stamps_it(tmp_path):
     assert local["selector"] == {"route_id": ["tram"]}
     assert manifest["edges_added"] == 1 and manifest["edges_removed"] == 1
     assert manifest["source"] == "curate"
+    # The classifier's settings ride along for publish; nothing sits near a
+    # threshold in this fixture.
+    assert manifest["classifier"] == classify.classifier_settings()
+    assert manifest["edges_near_threshold"] == 0
     # The other places of the feed are untouched.
     assert a[("Q-other", "national")]["method"] == "crawl"
 

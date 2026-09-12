@@ -12,6 +12,7 @@ The snapshot the statistics describe and the catalogues it read.
 | stats_schema_version | 3 |
 | schema_version | 9 |
 | overture_release |  |
+| classifier |  |
 | sample | sample |
 
 ### sources
