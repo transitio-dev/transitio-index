@@ -1081,3 +1081,69 @@ def test_the_api_filters_places_by_level_and_spec(tmp_path):
     assert client.get(f"{url}/summary").json()["category_field"] == "category"
     for bad in ({"spec": "bikes"}, {"level": "galactic"}):
         assert client.get(f"{url}/places/table", params=bad).status_code == 400
+
+
+def test_the_feed_side_api_filters_by_spec_level_and_country(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    write_partitioned_build(cache / "index")
+    write_build(cache / "builds" / "flat" / "index")  # schema 6, beside it
+    client = TestClient(iv.create_app(cache))
+    url = f"/api/builds/{iv.LATEST}"
+
+    def feed_ids(**params):
+        return [
+            r["feed_id"]
+            for r in client.get(f"{url}/feeds", params=params).json()["rows"]
+        ]
+
+    rows = client.get(f"{url}/feeds").json()["rows"]
+    assert [r["feed_id"] for r in rows] == ["f1", "f3", "f2"]  # partition order
+    f1 = rows[0]
+    assert (f1["home_country"], f1["scope"], f1["partition"]) == (
+        "FI",
+        "domestic",
+        "FI",
+    )
+    assert f1["places_served"] == 1 and f1["tier_local"] == 1
+    assert f1["category_primary"] == 1 and f1["category_international"] == 0
+    # A spec keeps its feeds, a level the feeds with an edge it counts, a
+    # country the feeds of that partition.
+    assert feed_ids(spec="gbfs") == ["f3"]
+    assert feed_ids(level="international") == ["f2"]
+    assert feed_ids(country="international") == ["f2"]
+    assert feed_ids(level="city", spec="gtfs") == ["f1"]
+    assert feed_ids(level="international", country="FI") == []
+    assert client.get(f"{url}/feeds", params={"spec": "bikes"}).status_code == 400
+    # Edges, the place record and the feed record carry the relevance fields.
+    edges = client.get(f"{url}/edges", params={"place_id": "hel"}).json()["rows"]
+    link = next(e for e in edges if e["feed_id"] == "f2")
+    assert link["relevance_category"] == "international" and link["relevance"] == 0.3
+    assert link["cross_border"] is True and link["feed_partition"] == "international"
+    params = {"place_id": "hel", "spec": "gtfs", "level": "city"}
+    kept = client.get(f"{url}/edges", params=params).json()
+    assert kept["total"] == 1 and kept["rows"][0]["feed_id"] == "f1"
+    record = client.get(f"{url}/places/hel").json()["properties"]
+    assert record["feeds_by_spec"] == {"gtfs": 2, "gbfs": 1}
+    assert {e["feed_id"]: e["relevance_category"] for e in record["edges"]} == {
+        "f1": "primary",
+        "f2": "international",
+        "f3": "primary",
+    }
+    feed = client.get(f"{url}/feeds/f1").json()["properties"]
+    assert feed["categories"]["primary"] == 1
+    assert feed["places"][0]["relevance_category"] == "primary"
+    summary = client.get(f"{url}/summary").json()
+    assert summary["edges_by_category"] == {"primary": 2, "international": 1}
+    assert summary["feeds_by_spec"] == {"gtfs": 2, "gbfs": 1}
+    # Schema 6: tiers stand in for categories, and there is no spec to count.
+    flat = client.get("/api/builds/flat/summary").json()
+    assert flat["category_field"] == "tier" and flat["edges_by_category"] == {
+        "local": 1
+    }
+    assert flat["feeds_by_spec"] == {}
+    assert (
+        "category_primary" not in client.get("/api/builds/flat/feeds").json()["rows"][0]
+    )
