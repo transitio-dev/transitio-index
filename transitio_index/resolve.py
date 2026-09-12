@@ -5,7 +5,9 @@ Applies the ``set_identity`` and ``mark_uncrawlable`` operations from
 ``feeds_resolved.jsonl``. These two are settled before any crawl because identity
 is the crawl cache key and an uncrawlable feed must never be fetched at all; the
 crawl half itself is a later stage, and ``set_coverage`` is left for the coverage
-stage. It fetches nothing. An override references a feed by its ``feed_id`` or any
+stage. A GTFS feed whose download URL needs a key (the catalogue's
+``requires_auth``) is uncrawlable from the start, so the crawl never spends a
+request to learn the 401. It fetches nothing. An override references a feed by its ``feed_id`` or any
 of its aliases — the crosswalk keeps superseded ids in ``aliases`` for exactly
 this — so a correction filed against a pre-crosswalk id still lands.
 """
@@ -13,7 +15,7 @@ this — so a correction filed against a pre-crosswalk id still lands.
 import collections
 import datetime
 
-from transitio_index import overrides, store
+from transitio_index import crawl, overrides, store
 
 RESOLVE_POINTER = "feeds_resolved.json"
 RESOLVE_ARTIFACT = "feeds_resolved.jsonl"
@@ -68,6 +70,20 @@ def _apply(feed, entry):
         )
 
 
+AUTH_REASON = "requires authentication"
+
+
+def _requires_auth(feed):
+    """Whether the catalogue record supplying the crawl URL is key-gated."""
+    atlas = feed.get("atlas") or {}
+    url = crawl.feed_url(feed)
+    from_atlas = url is not None and url == (atlas.get("urls") or {}).get(
+        "static_current"
+    )
+    supplier = atlas if from_atlas else (feed.get("mdb") or {})
+    return bool(supplier.get("requires_auth"))
+
+
 def resolve(cache_dir, *, overrides_dir=None):
     """Resolve feed identity and crawlability; publish the ``feeds_resolved`` gen.
 
@@ -89,7 +105,10 @@ def resolve(cache_dir, *, overrides_dir=None):
             for feed in feeds:
                 # Only static GTFS is crawled in v1; GTFS-RT and GBFS are
                 # indexed but never fetched.
-                feed.setdefault("crawlable", feed.get("spec") == "gtfs")
+                if "crawlable" not in feed:
+                    gated = feed.get("spec") == "gtfs" and _requires_auth(feed)
+                    feed["crawlable"] = feed.get("spec") == "gtfs" and not gated
+                    feed["uncrawlable_reason"] = AUTH_REASON if gated else None
                 feed.setdefault("uncrawlable_reason", None)
                 refs = _matching_refs(feed_overrides, feed)
                 if len(refs) > 1:
@@ -119,6 +138,15 @@ def resolve(cache_dir, *, overrides_dir=None):
                 "feeds": len(feeds),
                 "overridden_feeds": len(matched),
                 "uncrawlable": sum(1 for feed in feeds if not feed["crawlable"]),
+                # Refused GTFS feeds whose URL is key-gated, whatever reason an
+                # override gave.
+                "requires_auth": sum(
+                    1
+                    for feed in feeds
+                    if not feed["crawlable"]
+                    and feed.get("spec") == "gtfs"
+                    and _requires_auth(feed)
+                ),
                 "unmatched_overrides": sorted(set(feed_overrides) - matched),
                 # The exact feeds.yaml applied, and its identity and
                 # crawlability operations alone: coverage must see the same
