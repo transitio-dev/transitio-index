@@ -10,7 +10,11 @@ root-file manifest, time).
 Feeds large enough to pay for it (past the size threshold, on a server that
 honours ranges and offers a strong validator) are read member-by-member through
 :mod:`transitio_index.ziprange`; everything else — and any range oddity — downloads
-whole and extracts. Members are written to disk one at a time, never
+whole and extracts. A URL fragment names where the files live inside the
+archive — ``#inner.zip`` a nested archive, ``#folder`` a folder — and an
+archive whose files all sit under one folder is read from that folder; both
+are how GitHub source archives and zips of zips reach the catalogues.
+Members are written to disk one at a time, never
 accumulated, so several large members cannot compound in memory; a member too
 large for the ranged reader's buffer is fetched by the whole download instead. Re-runs are
 cheap: a feed whose validators match the stored state — and whose cached
@@ -44,6 +48,7 @@ import math
 import os
 import re
 import tempfile
+import urllib.parse
 import zipfile
 import zlib
 
@@ -501,10 +506,44 @@ def _prune_members(feed_dir, kept):
             store.unlink(feed_dir, name)
 
 
+def _fragment(url):
+    """Where the URL fragment says the files live: ``("archive", path)`` for a
+    nested zip, ``("folder", path)`` otherwise; None without a usable fragment."""
+    raw = urllib.parse.unquote(urllib.parse.urlsplit(url).fragment) if url else ""
+    path = raw.rstrip("/")
+    if not path or raw.startswith("/") or ".." in path.split("/"):
+        return None
+    return ("archive" if path.lower().endswith(".zip") else "folder"), path
+
+
+def _archive_root(names, folder=None):
+    """The prefix the GTFS members live under: the fragment's folder when the
+    archive has it, else ``""`` when a member is at the root, else the single
+    top-level folder holding one; ``""`` otherwise."""
+    names = list(names)
+    if folder is not None:
+        prefix = folder + "/"
+        if any(name.startswith(prefix) for name in names):
+            return prefix
+    if any(name in MEMBERS for name in names):
+        return ""
+    firsts = {name.split("/", 1)[0] for name in names if name}
+    if len(firsts) == 1:
+        prefix = firsts.pop() + "/"
+        if any(name[len(prefix) :] in MEMBERS for name in names):
+            return prefix
+    return ""
+
+
+def _under(names, root):
+    """The names beneath ``root`` with the prefix stripped."""
+    return [name[len(root) :] for name in names if name.startswith(root)]
+
+
 def _root_files(names):
     """The archive's distinct root-level file names, sorted: a member with a
-    ``/`` is in a subfolder (which the crawl never reads) or a directory marker,
-    so only root entries count, deduplicated. Restricted to printable ASCII —
+    ``/`` is in a subfolder or a directory marker, so only root entries count,
+    deduplicated (callers strip the effective root first). Restricted to printable ASCII —
     every GTFS spec file qualifies, while a control-character or non-ASCII entry
     (which the range and download paths could decode differently, or which could
     spoof a capability name) is dropped: the manifest is a best-effort
@@ -532,20 +571,22 @@ def _manifest_list(value):
     return None
 
 
-def _write_ranged(fetcher, url, probe, feed_dir, decide):
+def _write_ranged(fetcher, url, probe, feed_dir, decide, fragment=None):
     """Write members via range reads, one at a time; return their digests and
     the archive's file manifest.
 
     The cheap members land first; ``decide`` then rules on the complete
     ``stop_times.txt`` read from what is on disk. The manifest is the central
     directory the range reads already parse, so it costs no extra fetch.
+    ``fragment`` is a folder fragment when the URL carries one.
     """
     read = fetcher.range_reader(url, validator=_range_validator(probe))
     directory = ziprange.central_directory(read, probe["size"])
+    root = _archive_root(directory, fragment[1] if fragment else None)
     digests = {}
 
     def write(name):
-        entry = directory.get(name)
+        entry = directory.get(root + name)
         if entry is None:
             return
         data = ziprange.read_member(
@@ -559,55 +600,93 @@ def _write_ranged(fetcher, url, probe, feed_dir, decide):
     skipped, reason = decide(feed_dir, digests)
     if not skipped:
         write(STOP_TIMES)
-    return digests, _root_files(directory), skipped, reason
+    return digests, _root_files(_under(directory, root)), skipped, reason
 
 
-def _extract_members(feed_dir, decide):
+def _write_member(feed_dir, archive, info):
+    """Stream one archive member to a temporary under ``feed_dir``, capped by
+    its declared size; return ``(temporary name, sha256)``. The caller owns
+    the temporary."""
+    if info.file_size > DOWNLOAD_MEMBER_BYTES:
+        raise fetch.FetchError(
+            f"{info.filename}: {info.file_size} bytes is over the member ceiling"
+        )
+    handle, partial = store.create_temporary(feed_dir)
+    try:
+        digest = hashlib.sha256()
+        got = 0
+        with os.fdopen(handle, "wb") as opened_file:
+            handle = None
+            with archive.open(info) as opened:
+                while True:
+                    chunk = opened.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    if got > info.file_size:
+                        raise fetch.FetchError(f"{info.filename}: longer than declared")
+                    digest.update(chunk)
+                    opened_file.write(chunk)
+    except BaseException:
+        if handle is not None:
+            os.close(handle)
+        store.unlink(feed_dir, partial)
+        raise
+    return partial, digest.hexdigest()
+
+
+def _open_archive(stack, feed_dir, name):
+    """A ``ZipFile`` over ``name`` in ``feed_dir``, opened without following a
+    symlink and read through that same descriptor."""
+    opened = stack.enter_context(
+        os.fdopen(store.open_nofollow(feed_dir.path / name), "rb")
+    )
+    return zipfile.ZipFile(opened)
+
+
+def _extract_members(feed_dir, decide, fragment=None):
     """Extract the members from the downloaded archive, streamed and bounded.
 
     ``zipfile`` handles what ziprange deliberately refuses (ZIP64, data
     descriptors); each member is capped and streamed straight to its file, so
-    members never accumulate in memory. The cheap members land first; ``decide``
-    then rules on extracting ``stop_times.txt``. Returns the digests and the
-    archive file manifest, which comes from the same ``zipfile`` reader that
-    extracts the members, so the two never disagree about what the archive
-    holds.
+    members never accumulate in memory. An archive fragment names a nested zip,
+    extracted first and read in the outer one's place. The cheap members land
+    first; ``decide`` then rules on extracting ``stop_times.txt``. Returns the
+    digests and the archive file manifest, which comes from the same
+    ``zipfile`` reader that extracts the members, so the two never disagree
+    about what the archive holds.
     """
     digests = {}
-    with zipfile.ZipFile(feed_dir.path / ARCHIVE_FILE) as archive:
-        files = _root_files(archive.namelist())
+    inner = None
+    with contextlib.ExitStack() as stack:
+        archive = stack.enter_context(_open_archive(stack, feed_dir, ARCHIVE_FILE))
+        if fragment and fragment[0] == "archive":
+            try:
+                info = archive.getinfo(fragment[1])
+            except KeyError:
+                raise fetch.FetchError(
+                    f"inner archive {fragment[1]!r} not in the archive"
+                )
+            inner, _ = _write_member(feed_dir, archive, info)
+            stack.callback(store.unlink, feed_dir, inner)
+            archive = stack.enter_context(_open_archive(stack, feed_dir, inner))
+        names = archive.namelist()
+        root = _archive_root(
+            names, fragment[1] if fragment and fragment[0] == "folder" else None
+        )
+        files = _root_files(_under(names, root))
 
         def extract(name):
             try:
-                info = archive.getinfo(name)
+                info = archive.getinfo(root + name)
             except KeyError:
                 return
-            if info.file_size > DOWNLOAD_MEMBER_BYTES:
-                raise fetch.FetchError(
-                    f"{name}: {info.file_size} bytes is over the member ceiling"
-                )
-            handle, partial = store.create_temporary(feed_dir)
+            partial, digest = _write_member(feed_dir, archive, info)
             try:
-                digest = hashlib.sha256()
-                got = 0
-                with os.fdopen(handle, "wb") as opened_file:
-                    handle = None
-                    with archive.open(info) as opened:
-                        while True:
-                            chunk = opened.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            got += len(chunk)
-                            if got > info.file_size:
-                                raise fetch.FetchError(f"{name}: longer than declared")
-                            digest.update(chunk)
-                            opened_file.write(chunk)
                 feed_dir.replace(partial, name)
-                digests[name] = digest.hexdigest()
             finally:
-                if handle is not None:
-                    os.close(handle)
                 store.unlink(feed_dir, partial)
+            digests[name] = digest
 
         for name in CHEAP_MEMBERS:
             extract(name)
@@ -686,10 +765,14 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
 
         digests = None
         files = []
+        fragment = _fragment(url)
+        nested = fragment is not None and fragment[0] == "archive"
         # Range reads span several requests, so they are only taken when a
-        # strong validator can pin them all to one representation.
+        # strong validator can pin them all to one representation; a nested
+        # archive has to be downloaded whole to reach the inner one.
         ranged = (
-            probe is not None
+            not nested
+            and probe is not None
             and probe.get("size")
             and probe["size"] >= range_threshold
             and probe.get("accept_ranges")
@@ -698,7 +781,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
         if ranged:
             try:
                 digests, files, skipped, skip_reason = _write_ranged(
-                    fetcher, url, probe, feed_dir, decide
+                    fetcher, url, probe, feed_dir, decide, fragment
                 )
                 record["method"] = "range"
                 record["bytes_saved"] = probe["size"] - (
@@ -711,6 +794,8 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
             except (fetch.FetchError, ziprange.RangeReadError) as error:
                 fallback_reason = str(error)
                 digests = None
+        elif nested:
+            fallback_reason = "nested archive"
         elif probe is not None:
             if not probe.get("size") or probe["size"] < range_threshold:
                 fallback_reason = "below the range threshold"
@@ -747,7 +832,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 return record
             try:
                 digests, files, skipped, skip_reason = _extract_members(
-                    feed_dir, decide
+                    feed_dir, decide, fragment
                 )
             finally:
                 # Never leave the archive behind, extraction failures included.
