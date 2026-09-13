@@ -331,3 +331,147 @@ def test_an_included_row_survives_the_cap_and_the_subdivision_filter():
     assert sc._with_included(narrowed, pulled) == narrowed + pulled
     # Already present after narrowing: not duplicated.
     assert sc._with_included(narrowed + pulled, pulled) == narrowed + pulled
+
+
+def _feed(feed_id, url, spec="gtfs"):
+    urls = {"static_current": url} if url is not None else {}
+    return {"id": feed_id, "spec": spec, "urls": urls}
+
+
+def _payload(*feeds):
+    return {"feeds": list(feeds)}
+
+
+def test_atlas_unmatched_selects_the_complement(tmp_path):
+    exact_url = "https://ex.example/gtfs.zip"
+    h1 = "https://h.example/1.zip"
+    h2 = "https://h.example/2.zip"
+    archive = tmp_path / "atlas.tar.gz"
+    _archive(
+        archive,
+        [
+            (
+                "r/feeds/a.dmfr.json",
+                _payload(
+                    _feed("f-exact", exact_url),
+                    _feed("f-host1", h1),
+                    _feed("f-host2", h2),
+                    _feed("f-lonely", "https://lonely.example/g.zip"),
+                    _feed("f-rt", "https://rt.example/x.pb", spec="gtfs-rt"),
+                    _feed("f-nourl", None),
+                ),
+            )
+        ],
+    )
+    # h.example: 2 feeds, one (f-host1) exact-matches an MDB URL -> 1/2 = 0.5,
+    # clears HOST_MATCH_SHARE, so the whole host is reachable.
+    url_to_countries = {exact_url: {"AA"}, h1: {"AA"}}
+    kept = sc._select_atlas_unmatched(archive, url_to_countries)
+    assert [feed["id"] for _, _, feed in kept] == ["f-lonely"]
+
+
+def test_atlas_unmatched_host_threshold_is_per_country(tmp_path):
+    u1 = "https://p.example/1.zip"
+    u2 = "https://p.example/2.zip"
+    u3 = "https://p.example/3.zip"
+    archive = tmp_path / "atlas.tar.gz"
+    _archive(
+        archive,
+        [
+            (
+                "r/feeds/p.dmfr.json",
+                _payload(_feed("f-c1", u1), _feed("f-c2", u2), _feed("f-c3", u3)),
+            )
+        ],
+    )
+    # p.example has 3 feeds; two exact-match, but each to a DIFFERENT country, so
+    # no single country reaches the 0.5*3 threshold. Pooled it would (2/3); the
+    # per-country rule must not, so the unmatched f-c3 stays kept.
+    url_to_countries = {u1: {"C1"}, u2: {"C2"}}
+    kept = sc._select_atlas_unmatched(archive, url_to_countries)
+    assert [feed["id"] for _, _, feed in kept] == ["f-c3"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--country", "FI"],
+        ["--include", "f-x"],
+        ["--exclude", "mdb-1"],
+        ["--subdivision", "Uusimaa"],
+    ],
+)
+def test_atlas_unmatched_rejects_conflicting_flags(extra, monkeypatch):
+    monkeypatch.setattr(sc, "_download", lambda *a, **k: pytest.fail("downloaded"))
+    with pytest.raises(SystemExit):
+        sc.main(["--atlas-unmatched", *extra])
+
+
+def test_atlas_unmatched_cut_writes_empty_csvs_and_batches(
+    tmp_path, monkeypatch, capsys
+):
+    matched = "https://m.example/gtfs.zip"
+    atlas_path = tmp_path / "atlas.tar.gz"
+    _archive(
+        atlas_path,
+        [
+            (
+                "r/feeds/a.dmfr.json",
+                _payload(
+                    _feed("f-m", matched),
+                    _feed("f-1", "https://a.example/1.zip"),
+                    _feed("f-2", "https://b.example/2.zip"),
+                    _feed("f-3", "https://c.example/3.zip"),
+                ),
+            )
+        ],
+    )
+    mdb_path = tmp_path / "feeds_v2.csv"
+    mdb_path.write_text(
+        "id,data_type,location.country_code,urls.direct_download\n"
+        f"mdb-1,gtfs,AA,{matched}\n",
+        encoding="utf-8",
+    )
+    gbfs_path = tmp_path / "systems.csv"
+    gbfs_path.write_text("System ID,Country Code\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sc, "_download", lambda work, commit: (atlas_path, mdb_path, gbfs_path)
+    )
+
+    out = tmp_path / "out"
+    sc.main(["--atlas-unmatched", "--out-dir", str(out), "--batch-size", "2"])
+
+    run_dir = next(out.iterdir())
+    batches = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    assert len(batches) == 2  # three unmatched feeds, two per batch
+    seen = []
+    for batch in batches:
+        mdb_lines = (batch / "mdb_sample.csv").read_text().splitlines()
+        assert mdb_lines == [
+            "id,data_type,location.country_code,urls.direct_download"
+        ]  # header only
+        assert (batch / "gbfs_sample.csv").read_text().splitlines() == [
+            "System ID,Country Code"
+        ]  # GBFS header only too
+        with tarfile.open(batch / "atlas_sample.tar.gz") as tar:
+            for member in tar.getmembers():
+                payload = json.loads(tar.extractfile(member).read())
+                seen += [f["id"] for f in payload["feeds"]]
+    assert sorted(seen) == ["f-1", "f-2", "f-3"]  # the matched feed is excluded
+    out = capsys.readouterr().out
+    assert "--allow-empty-mdb" in out and "--no-golden" in out
+
+
+def test_mdb_url_countries_maps_only_gtfs_and_canonical_codes(tmp_path):
+    src = tmp_path / "feeds.csv"
+    src.write_text(
+        "id,data_type,location.country_code,urls.direct_download\n"
+        "mdb-1,gtfs,FI,https://a.example/g.zip\n"
+        "mdb-2,gtfs,FINLAND,https://a.example/g.zip\n"  # full name folds to FI
+        "mdb-3,gtfs-rt,SE,https://rt.example/x.pb\n"  # realtime is ignored
+        "mdb-4,gtfs,NOTACODE,https://b.example/g.zip\n",  # unselectable country
+        encoding="utf-8",
+    )
+    mapped = sc._mdb_url_countries(src)
+    assert len(mapped) == 1  # only the one selectable GTFS URL
+    assert list(mapped.values()) == [{"FI"}]  # FINLAND -> FI; the bogus one dropped

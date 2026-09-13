@@ -385,6 +385,35 @@ def _build_index(
     return cache, manifest
 
 
+def test_an_atlas_only_sample_builds_and_publishes(tmp_path):
+    # The --atlas-unmatched sampler emits zero MDB/GBFS rows; that empty-source
+    # build (mdb.ingest allow_empty) must still ingest, crosswalk and publish,
+    # with the Atlas feed reaching the index.
+    cache = tmp_path / "cache"
+    archive = _atlas_archive(
+        tmp_path,
+        [
+            {
+                "id": "f-only",
+                "spec": "gtfs",
+                "name": "Only",
+                "urls": {"static_current": "https://only.example/g.zip"},
+            }
+        ],
+    )
+    atlas.ingest(cache, archive=archive, commit="a" * 40)
+    mdb.ingest(
+        cache,
+        csv_path=_write(tmp_path / "m.csv", _csv(MDB_COLUMNS, [])),
+        allow_empty=True,
+    )
+    gbfs.ingest(cache, csv_path=_write(tmp_path / "s.csv", _csv(GBFS_COLUMNS, [])))
+    crosswalk.crosswalk(cache)
+    publish.publish(cache)
+    index = transitio_index.read_index(cache / "index")
+    assert "f-only" in set(index.feeds["feed_id"])
+
+
 def test_publish_round_trips_through_the_reader(tmp_path):
     cache, manifest = _build_index(tmp_path)
     index = transitio_index.read_index(cache / "index")

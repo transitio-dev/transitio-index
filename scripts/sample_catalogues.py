@@ -494,7 +494,9 @@ def _missing(rows, field, countries):
     return _unmatched(rows, field, countries, _match_values)
 
 
-def _build_command(atlas_out, mdb_out, gbfs_out, commit):
+def _build_command(
+    atlas_out, mdb_out, gbfs_out, commit, allow_empty_mdb=False, no_golden=False
+):
     """The build command for the sample: every stage, pinned to ``commit``.
 
     ``--downstream`` runs ingest through publish (the gazetteer mints and saves
@@ -518,10 +520,21 @@ def _build_command(atlas_out, mdb_out, gbfs_out, commit):
             "--gbfs-csv",
             str(gbfs_out),
         ]
+        + (["--allow-empty-mdb"] if allow_empty_mdb else [])
+        + (["--no-golden"] if no_golden else [])
     )
 
 
-def _emit(out_dir, mdb_fields, gbfs_fields, sample, countries, commit):
+def _emit(
+    out_dir,
+    mdb_fields,
+    gbfs_fields,
+    sample,
+    countries,
+    commit,
+    allow_empty_mdb=False,
+    no_golden=False,
+):
     """Write one sample set (``(mdb_rows, gbfs_rows, atlas_files)``) to
     ``out_dir`` and print its counts and build command."""
     mdb_rows, gbfs_rows, atlas_files = sample
@@ -547,7 +560,144 @@ def _emit(out_dir, mdb_fields, gbfs_fields, sample, countries, commit):
         f"-> {gbfs_out}"
     )
     print(f"atlas dmfr files: {len(atlas_files)} -> {atlas_out}")
-    print(f"run: {_build_command(atlas_out, mdb_out, gbfs_out, commit)}")
+    print(
+        f"run: {_build_command(atlas_out, mdb_out, gbfs_out, commit, allow_empty_mdb, no_golden)}"
+    )
+
+
+def _mdb_url_countries(mdb_src):
+    """``{cleaned MDB download URL: set of country codes that declare it}`` over
+    every GTFS row — the evidence for whether some ``--country`` cut could pull
+    an Atlas feed on that URL. Only GTFS rows count (a realtime endpoint is never
+    a static feed a country cut keeps), and the country is canonicalised to its
+    code so a code and its curated full name are the one country a cut selects."""
+    out = collections.defaultdict(set)
+    with open(mdb_src, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for column in ("data_type", MDB_COUNTRY, MDB_DOWNLOAD):
+            if column not in (reader.fieldnames or []):
+                raise SystemExit(f"{mdb_src}: missing column {column!r}")
+        for row in reader:
+            if (row.get("data_type") or "").strip().lower() != "gtfs":
+                continue
+            url = _clean_url(row.get(MDB_DOWNLOAD))
+            token = (row.get(MDB_COUNTRY) or "").strip()
+            if url is None or not token:
+                continue
+            code = _country_code(token.upper())
+            # Only a country a --country cut could select counts toward
+            # reachability; a value that is neither an ISO code nor a curated
+            # name names no selectable cut, so it makes nothing reachable.
+            if _is_iso_code(code):
+                out[url].add(code)
+    return out
+
+
+def _select_atlas_unmatched(archive, url_to_countries):
+    """Flat ``[(source_file, payload, feed)]`` for every Atlas GTFS feed that no
+    country cut would pull: not exact-matched by an MDB URL, and not on a host a
+    single country reaches. Reachability is the union of the per-country cuts, so
+    a host is reachable only when one country's exact matches on it clear
+    ``HOST_MATCH_SHARE`` — a pooled count across countries never decides it.
+    Non-GTFS specs and feeds with no static URL are skipped.
+    """
+    urls = set(url_to_countries)
+    host_total = collections.Counter()
+    exact_by_country = collections.defaultdict(collections.Counter)
+    files = []
+    for source_file, payload in atlas.iter_dmfr(archive):
+        feeds = []
+        for feed in payload.get("feeds") or []:
+            url = _feed_url(feed)
+            host = _host(url) if url is not None else None
+            if host is not None:
+                host_total[host] += 1
+                for country in url_to_countries.get(url, ()):
+                    exact_by_country[host][country] += 1
+            feeds.append((feed, url, host))
+        files.append((source_file, payload, feeds))
+    matched_hosts = {
+        host
+        for host, total in host_total.items()
+        if total
+        and not _is_shared(host)
+        and max(exact_by_country[host].values(), default=0) >= HOST_MATCH_SHARE * total
+    }
+    kept = []
+    for source_file, payload, feeds in files:
+        for feed, url, host in feeds:
+            if (feed.get("spec") or "").lower() != "gtfs" or url is None:
+                continue
+            if url in urls or host in matched_hosts:
+                continue
+            kept.append((source_file, payload, feed))
+    return kept
+
+
+def _group_atlas(flat):
+    """Regroup ``[(source_file, payload, feed)]`` into the ``[(source_file,
+    payload)]`` shape :func:`_write_atlas` expects — one DMFR file per source,
+    its other keys preserved, feeds trimmed to the kept ones, order kept."""
+    grouped = {}
+    for source_file, payload, feed in flat:
+        if source_file not in grouped:
+            grouped[source_file] = (payload, [])
+        grouped[source_file][1].append(feed)
+    return [
+        (name, {**payload, "feeds": feeds})
+        for name, (payload, feeds) in grouped.items()
+    ]
+
+
+def _run_atlas_unmatched(args):
+    """Cut the Atlas feeds no country cut reaches, in one set or --batch-size
+    sets, each with header-only MDB/GBFS CSVs and an Atlas-only tarball."""
+    with tempfile.TemporaryDirectory(prefix="sample-catalogues-") as tmp:
+        atlas_full, mdb_full, gbfs_full = _download(Path(tmp), args.commit)
+        mdb_fields, _ = _select_csv(
+            mdb_full, MDB_COUNTRY, (MDB_ID, MDB_COUNTRY, MDB_DOWNLOAD), set()
+        )
+        gbfs_fields, _ = _select_csv(
+            gbfs_full, GBFS_COUNTRY, (GBFS_ID, GBFS_COUNTRY), set()
+        )
+        flat = _select_atlas_unmatched(atlas_full, _mdb_url_countries(mdb_full))
+        if args.limit is not None:
+            flat = flat[: args.limit]
+        if not flat:
+            raise SystemExit("no unmatched Atlas GTFS feeds to sample")
+        batches = [flat] if args.batch_size is None else _chunks(flat, args.batch_size)
+        planned = [_group_atlas(chunk) for chunk in batches]
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=args.out_dir))
+        print(f"atlas feeds: {len(flat)} (unmatched by any country cut)")
+        if args.batch_size is None:
+            _emit(
+                run_dir,
+                mdb_fields,
+                gbfs_fields,
+                ([], [], planned[0]),
+                set(),
+                args.commit,
+                allow_empty_mdb=True,
+                no_golden=True,
+            )
+        else:
+            print(f"batches: {len(planned)} (up to {args.batch_size} atlas feeds each)")
+            for index, files in enumerate(planned):
+                batch_dir = run_dir / f"batch-{index:03d}"
+                batch_dir.mkdir()
+                print(f"[batch {index}]")
+                _emit(
+                    batch_dir,
+                    mdb_fields,
+                    gbfs_fields,
+                    ([], [], files),
+                    set(),
+                    args.commit,
+                    allow_empty_mdb=True,
+                    no_golden=True,
+                )
+    return 0
 
 
 def main(argv=None):
@@ -623,11 +773,31 @@ def main(argv=None):
         "feeds), each a self-contained set built on its own — process a large "
         "country in memory-safe pieces rather than all at once",
     )
+    parser.add_argument(
+        "--atlas-unmatched",
+        action="store_true",
+        help="ignore --country and cut every Atlas GTFS feed that no country cut "
+        "could pull (its URL is on no MDB row's host); the build gives each a home "
+        "country from its crawled stops. Combine with --batch-size to split it.",
+    )
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
     if args.batch_size is not None and args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.atlas_unmatched:
+        conflicts = {
+            "--country": args.countries,
+            "--subdivision": args.subdivisions,
+            "--include": args.includes,
+            "--exclude": args.excludes,
+        }
+        named = sorted(name for name, value in conflicts.items() if value)
+        if named:
+            parser.error(
+                f"--atlas-unmatched cannot be combined with {', '.join(named)}"
+            )
+        return _run_atlas_unmatched(args)
     raw = [c.strip() for c in (args.countries or DEFAULT_COUNTRIES)]
     # Requests may be ISO codes or full names; a token that is neither an ASCII
     # alpha-2 code nor a curated full name is refused before any download,
