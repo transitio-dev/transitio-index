@@ -23,6 +23,8 @@ import functools
 import json
 import hashlib
 
+import shapely
+
 from transitio_index import eurostat, geometry, overrides, overture, seed, store
 from transitio_index.progress import progress
 
@@ -410,6 +412,32 @@ def _fao_version(inputs_manifest):
     )
 
 
+def _published_footprints(metros, by_id, areas):
+    """The land footprint of every city already in a published metro, so a FAO
+    city-region whose core falls inside one can be told apart from a new core."""
+    footprints = []
+    for metro in metros.values():
+        for city_id in metro.get("member_ids", []):
+            city = by_id.get(city_id)
+            overture_id = city.get("overture_id") if city else None
+            footprint = (
+                eurostat._footprint(areas.get(overture_id)) if overture_id else None
+            )
+            if footprint is not None:
+                footprints.append(footprint)
+    return footprints
+
+
+def _over_published_metro(footprint, published):
+    """Whether a FAO city-region's ``footprint`` sits over a metro already
+    published: its representative point falls inside a published metro member's
+    footprint held in the ``published`` STRtree."""
+    if footprint is None:
+        return False
+    point = footprint.representative_point()
+    return bool(len(published.query(point, predicate="covered_by")))
+
+
 def _apply_fao(
     place_overrides,
     places,
@@ -453,6 +481,9 @@ def _apply_fao(
     names = {}
     if ucdb.DERIVED in geometry.DERIVED_SOURCE_ALLOWLIST:
         names, _ = ucdb.load_names(cache_dir, expected=ucdb_pins)
+    # A FAO city-region whose core sits inside a metro already published this
+    # run (Eurostat or US) duplicates it; those are dropped, not minted again.
+    duplicates = shapely.STRtree(_published_footprints(metros, by_id, areas))
     published = 0
     memberships = 0
     for region_id in sorted(grouped):
@@ -474,6 +505,23 @@ def _apply_fao(
                     "metro_id": f"fao_city_region:{region_id}",
                     "code": region_id,
                     "reason": "a derived input is not allowlisted",
+                }
+            )
+            continue
+        footprint = eurostat._footprint(
+            [
+                {"geom": patches[p]["geom"]}
+                for p in regions[region_id]["patches"]
+                if p in patches
+            ]
+        )
+        if _over_published_metro(footprint, duplicates):
+            report.append(
+                {
+                    "branch": "fao",
+                    "metro_id": f"fao_city_region:{region_id}",
+                    "code": region_id,
+                    "reason": "duplicate of a published metro",
                 }
             )
             continue
