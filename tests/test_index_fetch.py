@@ -577,6 +577,8 @@ def test_a_host_that_keeps_failing_to_connect_is_not_asked_again():
 
     def handler(request):  # the dead host answers b.zip only, and hangs otherwise
         calls.append(request.url.host)
+        if request.url.host == "front.example":  # every feed redirects to one hop
+            return httpx.Response(302, headers={"Location": "https://dead.example/x"})
         if request.url.host == "dead.example" and request.url.path != "/b.zip":
             raise httpx.ConnectTimeout("hang", request=request)
         if request.url.host == "stall.example":  # answers, then stalls mid-body
@@ -589,20 +591,28 @@ def test_a_host_that_keeps_failing_to_connect_is_not_asked_again():
     with pytest.raises(fetch.FetchError, match="hang"):
         fetcher.head("https://dead.example/a.zip")
     fetcher.head("https://dead.example/b.zip")  # answers: the count resets
-    for _ in range(2):
+    for _ in range(2):  # one URL retried counts once, however many workers
         with pytest.raises(fetch.FetchError, match="hang"):
             fetcher.head("https://dead.example/c.zip")
-    with pytest.raises(fetch.FetchError, match="unreachable this run.*not tried"):
+    with pytest.raises(fetch.FetchError, match="hang"):  # a second URL: two in a row
         fetcher.head("https://dead.example/d.zip")
-    assert calls.count("dead.example") == 4  # d.zip never reached the transport
+    with pytest.raises(fetch.FetchError, match="unreachable this run.*not tried"):
+        fetcher.head("https://dead.example/e.zip")
+    assert calls.count("dead.example") == 5  # e.zip never reached the transport
+    fetcher = _fetcher(httpx.MockTransport(handler), host_failures=2)
+    for path in ("a.zip", "b.zip"):  # distinct feeds behind one failing hop URL
+        with pytest.raises(fetch.FetchError, match="hang"):
+            fetcher.head(f"https://front.example/{path}")
+    with pytest.raises(fetch.FetchError, match="not tried"):
+        fetcher.head("https://front.example/c.zip")
     fetcher.head("https://alive.example/e.zip")  # another host is unaffected
     # A failure while streaming the body counts like a failure to connect.
-    for _ in range(2):
+    for path in ("f.zip", "f.zip", "g.zip"):
         with pytest.raises(fetch.FetchError, match="stalled"):
-            fetcher.read_range("https://stall.example/f.zip", 0, 4)
+            fetcher.read_range(f"https://stall.example/{path}", 0, 4)
     with pytest.raises(fetch.FetchError, match="not tried"):
-        fetcher.read_range("https://stall.example/g.zip", 0, 4)
-    assert calls.count("stall.example") == 2
+        fetcher.read_range("https://stall.example/h.zip", 0, 4)
+    assert calls.count("stall.example") == 3
 
 
 def test_requests_are_throttled_by_host():
@@ -826,3 +836,18 @@ def test_concatenated_gzip_members_decode_as_one_body(tmp_path):
         directory.close()
     assert result["sha256"] == hashlib.sha256(BODY).hexdigest()
     assert (tmp_path / "crawl" / "feed.zip").read_bytes() == BODY
+
+
+def test_a_download_keeps_its_first_transport_error_beside_the_refusal(tmp_path):
+    # With the host tripped after one failure, the retries are refused up
+    # front; the record still says why the first attempt failed.
+    def handler(request):
+        raise httpx.ConnectTimeout("hang", request=request)
+
+    directory = store.open_subdir(tmp_path, "crawl")
+    try:
+        with _fetcher(httpx.MockTransport(handler), host_failures=1) as fetcher:
+            with pytest.raises(fetch.FetchError, match="hang.*last attempt.*not tried"):
+                fetcher.download("https://dead.example/a.zip", directory, "feed.zip")
+    finally:
+        directory.close()

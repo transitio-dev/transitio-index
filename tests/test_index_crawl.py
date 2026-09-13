@@ -514,12 +514,89 @@ def test_an_encrypted_archive_fails_the_feed_not_the_run(tmp_path):
 
 def test_an_oversized_member_fails_without_leaving_the_archive(tmp_path, monkeypatch):
     cache = tmp_path / "cache"
-    monkeypatch.setattr(crawl, "MAX_MEMBER_BYTES", 10)
+    monkeypatch.setattr(crawl, "DOWNLOAD_MEMBER_BYTES", 10)
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
     _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(), None)}))
     assert log["f-a"]["method"] == "failed"
     assert "ceiling" in log["f-a"]["fallback_reason"]
     assert not (_feed_dir(cache, "f-a") / "feed.zip").exists()
+
+
+def test_a_member_over_the_ranged_buffer_downloads_whole(tmp_path, monkeypatch):
+    # The ranged reader buffers a member in memory, so one over the store's
+    # artifact ceiling is left to the whole download, which streams it.
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(store, "MAX_ARTIFACT_BYTES", 2000)  # stop_times alone is over
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    _, log = _crawl(
+        cache, _server({"/a.zip": (_zip_bytes(), '"v1"')}), range_threshold=1
+    )
+    assert log["f-a"]["method"] == "download"
+    assert "stop_times.txt" in log["f-a"]["fallback_reason"]
+    assert "ceiling" in log["f-a"]["fallback_reason"]
+    assert log["f-a"]["stop_times"] == "complete"
+
+
+def test_members_under_one_folder_are_read_from_it(tmp_path):
+    # GitHub source archives and some publishers put the files under a folder;
+    # a fragment names the folder when the archive has several.
+    cache = tmp_path / "cache"
+    under = {f"gtfs/{name}": data for name, data in FULL_MEMBERS.items()}
+    two = {f"a/{name}": data for name, data in FULL_MEMBERS.items()}
+    two["b/readme.txt"] = b"x"
+    server = _server(
+        {
+            "/ranged.zip": (_zip_bytes(under), '"v1"'),
+            "/whole.zip": (_zip_bytes(under), None),
+            "/two.zip": (_zip_bytes(two), None),
+        }
+    )
+    _publish_resolved(
+        cache,
+        [
+            _feed("f-rg", "https://feeds.example/ranged.zip"),
+            _feed("f-dl", "https://feeds.example/whole.zip"),
+            _feed("f-frag", "https://feeds.example/two.zip#a"),
+            _feed("f-enc", "https://feeds.example/two.zip#%61%2F"),  # "a/", decoded
+        ],
+    )
+    _, log = _crawl(cache, server, range_threshold=1)
+    assert log["f-rg"]["method"] == "range"
+    assert log["f-dl"]["method"] == "download"
+    assert log["f-frag"]["method"] == "download"
+    for feed_id in ("f-rg", "f-dl", "f-frag", "f-enc"):
+        assert log[feed_id]["members"] == sorted(FULL_MEMBERS), feed_id
+        assert log[feed_id]["files"] == sorted(FULL_MEMBERS), feed_id
+        assert (_feed_dir(cache, feed_id) / "stops.txt").read_bytes() == STOPS
+
+
+def test_an_archive_fragment_names_the_inner_zip(tmp_path):
+    cache = tmp_path / "cache"
+    outer = _zip_bytes(
+        {
+            "7/google_transit.zip": _zip_bytes(),
+            "8/other.zip": _zip_bytes({"agency.txt": AGENCY}),
+        }
+    )
+    server = _server({"/gtfs.zip": (outer, '"v1"')})
+    _publish_resolved(
+        cache,
+        [
+            _feed("f-in", "https://feeds.example/gtfs.zip#7/google_transit.zip"),
+            _feed("f-miss", "https://feeds.example/gtfs.zip#9/none.zip"),
+            _feed("f-slash", "https://feeds.example/gtfs.zip#/7/google_transit.zip"),
+        ],
+    )
+    _, log = _crawl(cache, server, range_threshold=1)
+    assert log["f-in"]["method"] == "download"  # never ranged: the inner zip is inside
+    assert log["f-in"]["fallback_reason"] == "nested archive"
+    assert log["f-in"]["members"] == sorted(FULL_MEMBERS)
+    left = {p.name for p in _feed_dir(cache, "f-in").iterdir()}
+    assert left == set(FULL_MEMBERS) | {"state.json"}  # no inner zip or temporary
+    assert log["f-miss"]["method"] == "failed"
+    assert "9/none.zip" in log["f-miss"]["fallback_reason"]
+    # A fragment with a leading slash is ignored: the outer root has no members.
+    assert log["f-slash"]["method"] == "range" and log["f-slash"]["members"] == []
 
 
 def test_a_member_dropped_upstream_is_pruned_locally(tmp_path):

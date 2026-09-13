@@ -25,6 +25,8 @@ that test and contributes only its exact matches). Each DMFR file keeps only
 its matching feeds. That Atlas↔MDB overlap is kept when it exists; a country
 served by a single national feed with no Atlas match yields an MDB-only sample.
 A catalogue row whose declared country is wrong is dropped with ``--exclude``;
+a record a country cut cannot reach — an Atlas feed, which carries no country,
+or an MDB row filed under another country — is pulled in with ``--include``;
 a kept MDB row whose bounding box lies outside every requested country is
 flagged so the operator can decide. Downloads and matching reuse the build's
 own modules, so the cut sees the catalogues exactly as the build would.
@@ -108,6 +110,16 @@ COUNTRY_BOXES = {
     "HK": (112.8, 21.1, 115.4, 23.6),
     "CN": (72.5, 17.2, 136.1, 54.6),
     "FR": (-6.1, 40.3, 10.6, 52.1),
+    "PL": (13.5, 48.5, 24.7, 55.4),
+    "SE": (10.5, 54.6, 24.7, 69.6),
+    "DK": (7.5, 54.0, 15.8, 58.3),
+    "IT": (5.9, 35.0, 19.2, 47.6),
+    "GR": (18.9, 33.9, 29.2, 42.3),
+    "AR": (-74.1, -56.0, -52.6, -20.8),
+    "TH": (96.8, 5.1, 106.2, 21.1),
+    "EG": (23.9, 21.5, 37.4, 32.7),
+    "PH": (115.8, 3.4, 127.6, 21.9),
+    "BE": (1.9, 48.9, 7.0, 52.1),
 }
 
 # An Atlas host is matched as a whole only when at least this share of its
@@ -330,8 +342,9 @@ def _download(work, commit):
     return base / "atlas.tar.gz", base / "feeds_v2.csv", base / "systems.csv"
 
 
-def _select_csv(src, country_field, required, countries):
-    """``(fieldnames, rows)`` for rows whose country is in ``countries``.
+def _select_csv(src, country_field, required, countries, include_ids=frozenset()):
+    """``(fieldnames, rows)`` for rows whose country is in ``countries``, plus
+    the rows whose ``id`` is in ``include_ids`` whatever their country.
 
     A missing required column is upstream schema drift, not an empty result, so
     it stops the cut rather than silently matching nothing.
@@ -346,8 +359,27 @@ def _select_csv(src, country_field, required, countries):
             row
             for row in reader
             if (row.get(country_field) or "").strip().upper() in countries
+            or (row.get(MDB_ID) or "").strip() in include_ids
         ]
     return fieldnames, kept
+
+
+def _with_included(rows, pulled):
+    """``rows`` plus the ``pulled`` (explicitly included) rows the subdivision
+    filter or the per-country cap removed, each once, in input order."""
+    present = {(row.get(MDB_ID) or "").strip() for row in rows}
+    extra = [row for row in pulled if (row.get(MDB_ID) or "").strip() not in present]
+    return rows + extra
+
+
+def _check_includes(includes, mdb_rows, atlas_files):
+    """Refuse an ``--include`` that named no MDB row and no Atlas feed: a typo
+    or a stale id would otherwise pass as a silently thinner sample."""
+    found = {(row.get(MDB_ID) or "").strip() for row in mdb_rows}
+    found |= {feed.get("id") for _, payload in atlas_files for feed in payload["feeds"]}
+    missing = sorted(includes - found)
+    if missing:
+        raise SystemExit(f"--include {missing} matches no MDB id or Atlas feed id")
 
 
 def _mdb_targets(rows):
@@ -370,7 +402,7 @@ def _feed_url(feed):
     return _clean_url((feed.get("urls") or {}).get(ATLAS_STATIC_URL))
 
 
-def _select_atlas(archive, urls, hosts):
+def _select_atlas(archive, urls, hosts, includes=frozenset()):
     """``(member name, payload)`` for the DMFR files with a matching feed, each
     trimmed to its matching feeds.
 
@@ -378,7 +410,10 @@ def _select_atlas(archive, urls, hosts):
     kept MDB feed when at least ``HOST_MATCH_SHARE`` of that host's Atlas feeds
     match by exact URL: a platform host serving many agencies would otherwise
     pull every agency into the sample. Host totals and exact matches are
-    gathered over the whole archive in one pass before any feed is kept.
+    gathered over the whole archive in one pass before any feed is kept. A feed
+    whose Onestop id is in ``includes`` is kept whatever its URL: Atlas records
+    carry no country, so a national feed with no MDB twin is otherwise
+    unreachable from a country cut.
     """
     files = []
     host_total, host_exact = collections.Counter(), collections.Counter()
@@ -401,7 +436,9 @@ def _select_atlas(archive, urls, hosts):
     kept = []
     for source_file, payload, feeds in files:
         matching = [
-            feed for feed, exact, host in feeds if exact or host in matched_hosts
+            feed
+            for feed, exact, host in feeds
+            if exact or host in matched_hosts or feed.get("id") in includes
         ]
         if matching:
             kept.append((source_file, {**payload, "feeds": matching}))
@@ -457,7 +494,9 @@ def _missing(rows, field, countries):
     return _unmatched(rows, field, countries, _match_values)
 
 
-def _build_command(atlas_out, mdb_out, gbfs_out, commit):
+def _build_command(
+    atlas_out, mdb_out, gbfs_out, commit, allow_empty_mdb=False, no_golden=False
+):
     """The build command for the sample: every stage, pinned to ``commit``.
 
     ``--downstream`` runs ingest through publish (the gazetteer mints and saves
@@ -481,10 +520,21 @@ def _build_command(atlas_out, mdb_out, gbfs_out, commit):
             "--gbfs-csv",
             str(gbfs_out),
         ]
+        + (["--allow-empty-mdb"] if allow_empty_mdb else [])
+        + (["--no-golden"] if no_golden else [])
     )
 
 
-def _emit(out_dir, mdb_fields, gbfs_fields, sample, countries, commit):
+def _emit(
+    out_dir,
+    mdb_fields,
+    gbfs_fields,
+    sample,
+    countries,
+    commit,
+    allow_empty_mdb=False,
+    no_golden=False,
+):
     """Write one sample set (``(mdb_rows, gbfs_rows, atlas_files)``) to
     ``out_dir`` and print its counts and build command."""
     mdb_rows, gbfs_rows, atlas_files = sample
@@ -510,7 +560,145 @@ def _emit(out_dir, mdb_fields, gbfs_fields, sample, countries, commit):
         f"-> {gbfs_out}"
     )
     print(f"atlas dmfr files: {len(atlas_files)} -> {atlas_out}")
-    print(f"run: {_build_command(atlas_out, mdb_out, gbfs_out, commit)}")
+    command = _build_command(
+        atlas_out, mdb_out, gbfs_out, commit, allow_empty_mdb, no_golden
+    )
+    print(f"run: {command}")
+
+
+def _mdb_url_countries(mdb_src):
+    """``{cleaned MDB download URL: set of country codes that declare it}`` over
+    every GTFS row — the evidence for whether some ``--country`` cut could pull
+    an Atlas feed on that URL. Only GTFS rows count (a realtime endpoint is never
+    a static feed a country cut keeps), and the country is canonicalised to its
+    code so a code and its curated full name are the one country a cut selects."""
+    out = collections.defaultdict(set)
+    with open(mdb_src, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for column in ("data_type", MDB_COUNTRY, MDB_DOWNLOAD):
+            if column not in (reader.fieldnames or []):
+                raise SystemExit(f"{mdb_src}: missing column {column!r}")
+        for row in reader:
+            if (row.get("data_type") or "").strip().lower() != "gtfs":
+                continue
+            url = _clean_url(row.get(MDB_DOWNLOAD))
+            token = (row.get(MDB_COUNTRY) or "").strip()
+            if url is None or not token:
+                continue
+            code = _country_code(token.upper())
+            # Only a country a --country cut could select counts toward
+            # reachability; a value that is neither an ISO code nor a curated
+            # name names no selectable cut, so it makes nothing reachable.
+            if _is_iso_code(code):
+                out[url].add(code)
+    return out
+
+
+def _select_atlas_unmatched(archive, url_to_countries):
+    """Flat ``[(source_file, payload, feed)]`` for every Atlas GTFS feed that no
+    country cut would pull: not exact-matched by an MDB URL, and not on a host a
+    single country reaches. Reachability is the union of the per-country cuts, so
+    a host is reachable only when one country's exact matches on it clear
+    ``HOST_MATCH_SHARE`` — a pooled count across countries never decides it.
+    Non-GTFS specs and feeds with no static URL are skipped.
+    """
+    urls = set(url_to_countries)
+    host_total = collections.Counter()
+    exact_by_country = collections.defaultdict(collections.Counter)
+    files = []
+    for source_file, payload in atlas.iter_dmfr(archive):
+        feeds = []
+        for feed in payload.get("feeds") or []:
+            url = _feed_url(feed)
+            host = _host(url) if url is not None else None
+            if host is not None:
+                host_total[host] += 1
+                for country in url_to_countries.get(url, ()):
+                    exact_by_country[host][country] += 1
+            feeds.append((feed, url, host))
+        files.append((source_file, payload, feeds))
+    matched_hosts = {
+        host
+        for host, total in host_total.items()
+        if total
+        and not _is_shared(host)
+        and max(exact_by_country[host].values(), default=0) >= HOST_MATCH_SHARE * total
+    }
+    kept = []
+    for source_file, payload, feeds in files:
+        for feed, url, host in feeds:
+            if (feed.get("spec") or "").lower() != "gtfs" or url is None:
+                continue
+            if url in urls or host in matched_hosts:
+                continue
+            kept.append((source_file, payload, feed))
+    return kept
+
+
+def _group_atlas(flat):
+    """Regroup ``[(source_file, payload, feed)]`` into the ``[(source_file,
+    payload)]`` shape :func:`_write_atlas` expects — one DMFR file per source,
+    its other keys preserved, feeds trimmed to the kept ones, order kept."""
+    grouped = {}
+    for source_file, payload, feed in flat:
+        if source_file not in grouped:
+            grouped[source_file] = (payload, [])
+        grouped[source_file][1].append(feed)
+    return [
+        (name, {**payload, "feeds": feeds})
+        for name, (payload, feeds) in grouped.items()
+    ]
+
+
+def _run_atlas_unmatched(args):
+    """Cut the Atlas feeds no country cut reaches, in one set or --batch-size
+    sets, each with header-only MDB/GBFS CSVs and an Atlas-only tarball."""
+    with tempfile.TemporaryDirectory(prefix="sample-catalogues-") as tmp:
+        atlas_full, mdb_full, gbfs_full = _download(Path(tmp), args.commit)
+        mdb_fields, _ = _select_csv(
+            mdb_full, MDB_COUNTRY, (MDB_ID, MDB_COUNTRY, MDB_DOWNLOAD), set()
+        )
+        gbfs_fields, _ = _select_csv(
+            gbfs_full, GBFS_COUNTRY, (GBFS_ID, GBFS_COUNTRY), set()
+        )
+        flat = _select_atlas_unmatched(atlas_full, _mdb_url_countries(mdb_full))
+        if args.limit is not None:
+            flat = flat[: args.limit]
+        if not flat:
+            raise SystemExit("no unmatched Atlas GTFS feeds to sample")
+        batches = [flat] if args.batch_size is None else _chunks(flat, args.batch_size)
+        planned = [_group_atlas(chunk) for chunk in batches]
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=args.out_dir))
+        print(f"atlas feeds: {len(flat)} (unmatched by any country cut)")
+        if args.batch_size is None:
+            _emit(
+                run_dir,
+                mdb_fields,
+                gbfs_fields,
+                ([], [], planned[0]),
+                set(),
+                args.commit,
+                allow_empty_mdb=True,
+                no_golden=True,
+            )
+        else:
+            print(f"batches: {len(planned)} (up to {args.batch_size} atlas feeds each)")
+            for index, files in enumerate(planned):
+                batch_dir = run_dir / f"batch-{index:03d}"
+                batch_dir.mkdir()
+                print(f"[batch {index}]")
+                _emit(
+                    batch_dir,
+                    mdb_fields,
+                    gbfs_fields,
+                    ([], [], files),
+                    set(),
+                    args.commit,
+                    allow_empty_mdb=True,
+                    no_golden=True,
+                )
+    return 0
 
 
 def main(argv=None):
@@ -568,6 +756,16 @@ def main(argv=None):
         "row is refused",
     )
     parser.add_argument(
+        "--include",
+        dest="includes",
+        action="append",
+        metavar="ID",
+        help="pull this record into the cut whatever its country — an MDB id "
+        "filed under another country, or an Atlas Onestop id (f-u-nl), which "
+        "carries no country at all; repeatable; an id matching no record is "
+        "refused; with --batch-size the Atlas record joins the first batch",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=None,
@@ -576,11 +774,31 @@ def main(argv=None):
         "feeds), each a self-contained set built on its own — process a large "
         "country in memory-safe pieces rather than all at once",
     )
+    parser.add_argument(
+        "--atlas-unmatched",
+        action="store_true",
+        help="ignore --country and cut every Atlas GTFS feed that no country cut "
+        "could pull (its URL is on no MDB row's host); the build gives each a home "
+        "country from its crawled stops. Combine with --batch-size to split it.",
+    )
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
     if args.batch_size is not None and args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.atlas_unmatched:
+        conflicts = {
+            "--country": args.countries,
+            "--subdivision": args.subdivisions,
+            "--include": args.includes,
+            "--exclude": args.excludes,
+        }
+        named = sorted(name for name, value in conflicts.items() if value)
+        if named:
+            parser.error(
+                f"--atlas-unmatched cannot be combined with {', '.join(named)}"
+            )
+        return _run_atlas_unmatched(args)
     raw = [c.strip() for c in (args.countries or DEFAULT_COUNTRIES)]
     # Requests may be ISO codes or full names; a token that is neither an ASCII
     # alpha-2 code nor a curated full name is refused before any download,
@@ -603,6 +821,9 @@ def main(argv=None):
     excluded = {e.strip() for e in args.excludes or ()}
     if "" in excluded:
         parser.error("--exclude must name a catalogue id")
+    included = {i.strip() for i in args.includes or ()}
+    if "" in included:
+        parser.error("--include must name a catalogue or Atlas id")
 
     # Fetch and validate everything before publishing any output, so a schema
     # drift or an unsupported country fails loudly instead of leaving a
@@ -613,15 +834,18 @@ def main(argv=None):
             (MDB_SUBDIVISION,) if subdivisions else ()
         )
         mdb_fields, mdb_rows = _select_csv(
-            mdb_full, MDB_COUNTRY, required, match_values
+            mdb_full, MDB_COUNTRY, required, match_values, include_ids=included
         )
         gbfs_fields, gbfs_rows = _select_csv(
             gbfs_full, GBFS_COUNTRY, (GBFS_ID, GBFS_COUNTRY), match_values
         )
         mdb_rows, gbfs_rows = _drop_excluded(mdb_rows, gbfs_rows, excluded)
+        pulled = [r for r in mdb_rows if (r.get(MDB_ID) or "").strip() in included]
         mdb_rows, gbfs_rows = _narrow(
             mdb_rows, gbfs_rows, countries, subdivisions, args.limit
         )
+        # An explicit include is neither capped nor filtered away.
+        mdb_rows = _with_included(mdb_rows, pulled)
         _warn_foreign_boxes(mdb_rows, countries)
         # Plan the sets while the downloaded catalogues still exist: one set, or
         # consecutive MDB slices, each with a proportional GBFS share and the
@@ -632,17 +856,24 @@ def main(argv=None):
                 (
                     mdb_rows,
                     gbfs_rows,
-                    _select_atlas(atlas_full, urls, hosts),
+                    _select_atlas(atlas_full, urls, hosts, includes=included),
                 )
             ]
         else:
             mdb_batches = _chunks(mdb_rows, args.batch_size)
             gbfs_batches = _even_split(gbfs_rows, len(mdb_batches))
             planned = []
-            for mdb_chunk, gbfs_chunk in zip(mdb_batches, gbfs_batches):
+            for index, (mdb_chunk, gbfs_chunk) in enumerate(
+                zip(mdb_batches, gbfs_batches)
+            ):
                 urls, hosts = _mdb_targets(mdb_chunk)
-                atlas_chunk = _select_atlas(atlas_full, urls, hosts)
+                atlas_chunk = _select_atlas(
+                    atlas_full, urls, hosts, includes=included if index == 0 else ()
+                )
                 planned.append((mdb_chunk, gbfs_chunk, atlas_chunk))
+        _check_includes(
+            included, mdb_rows, [f for _, _, files in planned for f in files]
+        )
 
     # A fresh per-run directory: concurrent runs never collide, and a set is
     # only advertised once every file is written.

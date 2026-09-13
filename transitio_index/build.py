@@ -89,7 +89,13 @@ def run_ingest(arguments):
             )
         )
     if "mdb" in arguments.sources:
-        summaries.append(mdb.ingest(arguments.cache_dir, csv_path=arguments.mdb_csv))
+        summaries.append(
+            mdb.ingest(
+                arguments.cache_dir,
+                csv_path=arguments.mdb_csv,
+                allow_empty=arguments.allow_empty_mdb,
+            )
+        )
     if "gbfs" in arguments.sources:
         summaries.append(gbfs.ingest(arguments.cache_dir, csv_path=arguments.gbfs_csv))
     return summaries
@@ -375,6 +381,12 @@ def parse_args(argv=None):
         "--mdb-csv",
         type=pathlib.Path,
         help="ingest this local feeds_v2.csv instead of downloading it",
+    )
+    parser.add_argument(
+        "--allow-empty-mdb",
+        action="store_true",
+        help="accept a header-only feeds_v2.csv (zero MDB feeds) — for an "
+        "Atlas-only sample; a normal build's MDB source must not be empty",
     )
     parser.add_argument(
         "--gbfs-csv",

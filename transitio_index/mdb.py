@@ -188,8 +188,19 @@ def parse_rows(rows, source_file):
     }
 
 
-def ingest(cache_dir, *, csv_path=None, label=DEFAULT_LABEL, expected_sha256=None):
-    """Run the MDB ingest, publishing a ``mdb.json`` generation."""
+def ingest(
+    cache_dir,
+    *,
+    csv_path=None,
+    label=DEFAULT_LABEL,
+    expected_sha256=None,
+    allow_empty=False,
+):
+    """Run the MDB ingest, publishing a ``mdb.json`` generation.
+
+    ``allow_empty`` permits a header-only CSV (zero feeds): the default refuses
+    it as a broken export, but an Atlas-only sample legitimately has no MDB rows.
+    """
     return csv_source.ingest_csv(
         cache_dir,
         source="mdb",
@@ -201,4 +212,5 @@ def ingest(cache_dir, *, csv_path=None, label=DEFAULT_LABEL, expected_sha256=Non
         required_headers=REQUIRED_HEADERS,
         csv_path=csv_path,
         expected_sha256=expected_sha256,
+        allow_empty=allow_empty,
     )
