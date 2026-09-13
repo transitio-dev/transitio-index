@@ -560,9 +560,10 @@ def _emit(
         f"-> {gbfs_out}"
     )
     print(f"atlas dmfr files: {len(atlas_files)} -> {atlas_out}")
-    print(
-        f"run: {_build_command(atlas_out, mdb_out, gbfs_out, commit, allow_empty_mdb, no_golden)}"
+    command = _build_command(
+        atlas_out, mdb_out, gbfs_out, commit, allow_empty_mdb, no_golden
     )
+    print(f"run: {command}")
 
 
 def _mdb_url_countries(mdb_src):
