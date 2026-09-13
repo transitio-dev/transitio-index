@@ -813,7 +813,9 @@ def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
     metro = places["Q1754965"]
     assert metro["name"] == "Chicagoland" and metro["members_curated"]
     assert metro["member_ids"] == [places["Q1297"]["place_id"]]
-    assert sum(1 for p in places.values() if p.get("statistical_area_id") == "16980") == 1
+    assert (
+        sum(1 for p in places.values() if p.get("statistical_area_id") == "16980") == 1
+    )
     saved = registry.load(path)
     assert saved.resolve("Q1754965") == saved.resolve("cbsa:16980") == metro["place_id"]
     # A rebuild keys the curated metro by its own id and still joins on the
@@ -826,7 +828,9 @@ def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
             registry=again,
         )
         assert again.minted == 0
-    assert sum(1 for p in places.values() if p.get("statistical_area_id") == "16980") == 1
+    assert (
+        sum(1 for p in places.values() if p.get("statistical_area_id") == "16980") == 1
+    )
     assert places["Q1754965"]["statistical_area_id"] == "16980"
 
 
@@ -878,7 +882,9 @@ def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, co
                 _run(tmp_path, metro_map, registry=reg)
             return
         _, places = _run(tmp_path, metro_map, registry=reg)
-    assert sum(1 for p in places.values() if p.get("statistical_area_id") == "16980") == 1
+    assert (
+        sum(1 for p in places.values() if p.get("statistical_area_id") == "16980") == 1
+    )
     metro = places["Q1754965"]
     assert metro["place_id"] == "tp_1" and "discovered_qids" not in metro
     assert sorted(metro["member_ids"]) == sorted(
@@ -919,7 +925,15 @@ def _ucdb_inputs(tmp_path):
             [(50, 1, shapely.box(-89.0, 41.0, -86.0, 43.0))]
         ),
         ucdb.UCDB_FILE: ffx.ucdb_zip(
-            [(1, "Chicago", "Chicago", "United States", shapely.box(-88.5, 41.2, -87.0, 42.5))],
+            [
+                (
+                    1,
+                    "Chicago",
+                    "Chicago",
+                    "United States",
+                    shapely.box(-88.5, 41.2, -87.0, 42.5),
+                )
+            ],
             ucdb.UCDB_MEMBER,
             ucdb.UCDB_LAYER,
         ),

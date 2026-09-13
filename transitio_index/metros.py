@@ -1,22 +1,20 @@
 """Attach metropolitan-area membership to the seeded places.
 
-Three branches. Two are gated on a city's country. US cities: Wikidata links a
-city to the metropolitan statistical area it belongs to (P8138, class
-``US_MSA_CLASS``), keyed by the metro's CBSA code (P882), and each such metro
-is emitted as a ``metro`` place. Cities of the countries Eurostat's pinned
-composition covers: the NUTS-3 region containing the city's Overture land
-areas gives its metropolitan region; that membership is derived offline and
-recorded for every such city in ``metro_assignments.jsonl``, but a Eurostat
-metro is published only through a curated ``set_statistical_area`` crosswalk
-naming its QID, and only while every derived input is allowlisted — otherwise
-it is reported with the Wikidata candidates a curator can pick from. Every
-member city carries its metros in ``metro_ids`` — a city can belong to more
-than one. The third branch, gated on the FAO derived inputs, publishes a
-curated FAO city-region: the metro a metadata-only ``add_place`` seeded takes
-the members this stage derives from the pinned FAO inputs once a
-``set_statistical_area`` of the ``fao_city_region`` scheme confirms them.
-This stage adds membership only; the geometry stage draws a metro from its
-members' shipped polygons.
+Three branches. US cities: Wikidata links a city to the metropolitan
+statistical area it belongs to (P8138, class ``US_MSA_CLASS``), keyed by the
+metro's CBSA code (P882), and each such metro is emitted as a ``metro`` place.
+Cities of the countries Eurostat's pinned composition covers: the NUTS-3
+region containing the city's Overture land areas gives its metropolitan
+region, and every region with member cities is published as a ``metro`` keyed
+by its Eurostat metro code; a curator ``set_statistical_area`` crosswalk may
+instead merge it onto a chosen QID. Cities elsewhere: the FAO city-region a
+city's Overture land area falls in is published as a ``metro`` keyed by its
+region id and named from its GHS-UCDB centre. The Eurostat and FAO branches
+publish only while their derived inputs are allowlisted, and never cover a
+city another branch already placed. Every member city carries its metros in
+``metro_ids`` — a city can belong to more than one. This stage adds
+membership only; the geometry stage draws a metro from its members' shipped
+polygons.
 """
 
 import collections
@@ -585,9 +583,7 @@ def _attach_eurostat(
             reason = "derived inputs not allowlisted"
         else:
             key = entry["place"] if entry is not None else f"eurostat_metro:{code}"
-            _publish_eurostat(
-                by_id, metros, key, code, composition[code], city_ids
-            )
+            _publish_eurostat(by_id, metros, key, code, composition[code], city_ids)
             published.add(code)
             if entry is not None:
                 crosswalked += 1
@@ -688,19 +684,19 @@ def attach_metros(
 ):
     """Add metro places and memberships to the seed places.
 
-    Runs the US and the Eurostat branches and republishes the places with
+    Runs the US, Eurostat and FAO branches and republishes the places with
     metro rows appended and ``metro_ids`` / ``member_ids`` filled, beside the
     report (``metro_report.jsonl``) and the Eurostat assignments
     (``metro_assignments.jsonl``). ``dataset`` is the Overture
-    ``division_area`` dataset the Eurostat branch reads city land areas from
+    ``division_area`` dataset the branches read city land areas from
     (the pinned release by default) and ``pins`` the Eurostat inputs' digests
     (the module's pins by default). One writer lock spans the seed read, the
     live queries and the publish, so a concurrent gazetteer run cannot shift
     the seed under it. With a ``registry`` session every metro row gets its
-    registry id and ``wikidata_id``. ``fao_files`` and ``fao_pins`` name the FAO
-    inputs a curated FAO city-region is derived from (the module's pins by
-    default; prepared only when an override asks for one). Returns the
-    generation manifest.
+    registry id and ``wikidata_id``. ``fao_files``, ``fao_pins`` and
+    ``ucdb_pins`` name the FAO and UCDB inputs the FAO branch derives and names
+    city-regions from (the modules' pins by default). ``derive_fao`` runs the
+    FAO branch (on by default). Returns the generation manifest.
     """
     if wikidata is None:
         wikidata = overture.WikidataClient()
