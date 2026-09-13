@@ -7,9 +7,10 @@ is the crawl cache key and an uncrawlable feed must never be fetched at all; the
 crawl half itself is a later stage, and ``set_coverage`` is left for the coverage
 stage. A GTFS feed whose download URL needs a key (the catalogue's
 ``requires_auth``) is uncrawlable from the start, so the crawl never spends a
-request to learn the 401. It fetches nothing. An override references a feed by its ``feed_id`` or any
-of its aliases — the crosswalk keeps superseded ids in ``aliases`` for exactly
-this — so a correction filed against a pre-crosswalk id still lands.
+request to learn the 401. It fetches nothing. An override references a feed by
+its ``feed_id`` or any of its aliases — the crosswalk keeps superseded ids in
+``aliases`` for exactly this — so a correction filed against a pre-crosswalk id
+still lands.
 """
 
 import collections
