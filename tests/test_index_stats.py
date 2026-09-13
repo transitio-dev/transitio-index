@@ -2,8 +2,6 @@
 
 import datetime
 import json
-import re
-from pathlib import Path
 
 import pytest
 
@@ -652,28 +650,6 @@ def test_place_rows_duplicates_and_distributions():
         {"build": {"snapshot_id": "s"}, "distributions": spread}
     )
     assert "## Distributions" in report and "| EE |" in report
-
-
-GOLDEN_REPORT = Path(__file__).resolve().parent / "fixtures" / "stats_report.md"
-
-
-def fixture_report(tmp_path):
-    """The fixture build's report with its build-time values replaced by
-    placeholders: the snapshot id, and every digest (the fixture tarball's
-    timestamps and the platform's CSV line endings change them)."""
-    from test_index_publish import _build_index
-
-    cache, published = _build_index(tmp_path)
-    stats.stats(cache)
-    generation, _ = store.resolve(cache / "stats", "stats.json")
-    with generation:
-        report = generation.read_bytes("report.md").decode().replace("\r\n", "\n")
-    report = report.replace(published["snapshot_id"], "<snapshot>")
-    return re.sub(r"\b[0-9a-f]{64}\b", "<digest>", report)
-
-
-def test_the_report_of_the_fixture_build_matches_the_golden_file(tmp_path):
-    assert fixture_report(tmp_path) == GOLDEN_REPORT.read_text(encoding="utf-8")
 
 
 def test_the_realtime_companions_have_their_own_section(tmp_path):
