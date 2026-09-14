@@ -182,6 +182,8 @@ AREAS = [
     fx.area("us-chi", shapely.to_wkb(shapely.box(-87.9, 41.6, -87.5, 42.0)), [OSM]),
 ]
 MEMBERS = ["Q1757", "Q7"]
+# FAO region 50's single patch, holding Chicago's land area.
+CHICAGO_PATCH = shapely.box(-89.0, 41.0, -86.0, 43.0)
 
 
 def _crosswalk(digest=None, place="Q673425", code="FI001MC"):
@@ -958,7 +960,7 @@ def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, co
     )
 
 
-def _fao_inputs(tmp_path, patch=shapely.box(-89.0, 41.0, -86.0, 43.0)):
+def _fao_inputs(tmp_path, patch=CHICAGO_PATCH):
     """One FAO region, 50, whose single ``patch`` holds Chicago's land area."""
     import hashlib
 
