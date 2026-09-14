@@ -241,6 +241,141 @@ def dropped_qids(generation):
     }
 
 
+def _join_metro(metro, city):
+    """Join ``city`` to ``metro`` reciprocally, unless the metro's members are
+    curated."""
+    if metro.get("members_curated"):
+        return
+    metro.setdefault("member_ids", [])
+    if city["place_id"] not in metro["member_ids"]:
+        metro["member_ids"].append(city["place_id"])
+        metro["member_ids"].sort()
+    city.setdefault("metro_ids", [])
+    if metro["place_id"] not in city["metro_ids"]:
+        city["metro_ids"].append(metro["place_id"])
+
+
+def _metro_member_footprints(places_by_id):
+    """The shipped boundary of every city already in a metro, for the FAO
+    duplicate check."""
+    geoms = []
+    for place in places_by_id.values():
+        if (
+            place.get("kind") == "city"
+            and place.get("metro_ids")
+            and place.get("geometry")
+        ):
+            try:
+                geoms.append(shapely.from_wkb(bytes.fromhex(place["geometry"])))
+            except Exception:  # noqa: B902 - a malformed boundary is skipped
+                continue
+    return geoms
+
+
+def _load_derived(load, keys):
+    """Run ``load`` when every key in ``keys`` is allowlisted and the inputs
+    are prepared; ``None`` otherwise (a declared-only build prepared none)."""
+    if not all(k in geometry.DERIVED_SOURCE_ALLOWLIST for k in keys):
+        return None
+    try:
+        return load()
+    except store.StoreError:
+        return None
+
+
+def _attach_derived_metros(cache_dir, places_by_id, new_cities, areas, registry):
+    """Eurostat and FAO metro membership for the discovered cities, mirroring
+    the metros stage: each new city is assigned to its Eurostat metropolitan
+    region, or failing that its FAO city-region; the metro is found among the
+    published places by its statistical code or minted, and the city joined. A
+    FAO city-region whose core sits inside a metro already present is skipped.
+    Each branch publishes only while its derived inputs are allowlisted.
+    Returns the metro place keys minted here."""
+    from transitio_index import eurostat, fao, ucdb
+
+    city_rows = [places_by_id[qid] for qid in new_cities]
+    if not city_rows:
+        return []
+    added = []
+
+    assignments = []
+    euro = _load_derived(
+        lambda: eurostat.load_inputs(cache_dir), metros.EUROSTAT_DERIVED
+    )
+    if euro is not None:
+        composition, nuts_boundaries, _ = euro
+        assignments = eurostat.assign(city_rows, areas, composition, nuts_boundaries)
+        for row in assignments:
+            if row["status"] != "assigned":
+                continue
+            code = row["metro_code"]
+            city = places_by_id[row["city_id"]]
+            metro = metros._by_code(places_by_id, code, "metropolitan region")
+            if metro is None:
+                key = f"eurostat_metro:{code}"
+                metro = metros._eurostat_place(key, code, composition[code])
+                places_by_id[key] = metro
+                added.append(key)
+            _join_metro(metro, city)
+
+    fao_inputs = _load_derived(lambda: fao.load_inputs(cache_dir), metros.FAO_DERIVED)
+    if fao_inputs is not None:
+        regions, patches, _ = fao_inputs
+        names = {}
+        if ucdb.DERIVED in geometry.DERIVED_SOURCE_ALLOWLIST:
+            try:
+                names, _ = ucdb.load_names(cache_dir)
+            except store.StoreError:
+                names = {}
+        grouped, _, countries, _, _ = fao.place_cities(
+            city_rows, areas, regions, patches, assignments, []
+        )
+        published = shapely.STRtree(_metro_member_footprints(places_by_id))
+        for region_id in sorted(grouped):
+            footprint = eurostat._footprint(
+                [
+                    {"geom": patches[p]["geom"]}
+                    for p in regions[region_id]["patches"]
+                    if p in patches
+                ]
+            )
+            if metros._over_published_metro(footprint, published):
+                continue
+            shared = countries.get(region_id, set())
+            country = (
+                next(iter(shared)) if len(shared) == 1 and None not in shared else None
+            )
+            named = names.get(region_id)
+            name = named["name"] if named else None
+            metro = metros._by_code(places_by_id, region_id, metros.FAO_SUBTYPE)
+            if metro is None:
+                key = f"fao_city_region:{region_id}"
+                metro = metros._fao_place(key, region_id, name, country)
+                places_by_id[key] = metro
+                added.append(key)
+            for city_id in sorted(grouped[region_id]):
+                _join_metro(metro, places_by_id[city_id])
+
+    # A metro minted here is drawn from its members' shipped polygons, like the
+    # geometry stage does for seeded metros; without it a geometry-less metro
+    # would be dropped by the licence stage's rehoming.
+    for key in added:
+        metro = places_by_id[key]
+        geoms = [
+            shapely.from_wkb(bytes.fromhex(places_by_id[m]["geometry"]))
+            for m in metro.get("member_ids") or []
+            if places_by_id.get(m) and places_by_id[m].get("geometry")
+        ]
+        if not geoms:
+            continue
+        merged = geoms[0] if len(geoms) == 1 else shapely.unary_union(geoms)
+        simplified = geometry._simplify(merged)
+        if geometry._valid_polygon(simplified):
+            metro["geometry"] = shapely.to_wkb(simplified).hex()
+            metro["geometry_source"] = "member_union"
+    return added
+
+
 def _discover(
     cache_dir,
     places_by_id,
@@ -402,10 +537,23 @@ def _discover(
     new_metros, metro_pairs = _attach_metros(
         places_by_id, new_cities, wikidata, report, registry
     )
+    # The Eurostat and FAO branches attach only US metros above; give the
+    # discovered cities their metropolitan region and city-region too.
+    derived_metros = _attach_derived_metros(
+        cache_dir, places_by_id, new_cities, areas, registry
+    )
+    new_metros = new_metros + derived_metros
     if registry is not None:
-        # A seeded metro a discovered CBSA pair names is enriched too.
+        from transitio_index import eurostat as _eurostat
+        from transitio_index import fao as _fao
+
+        # A seeded metro a discovered CBSA pair names is enriched too; the
+        # Eurostat and FAO metros minted here are identified by their code.
         identified += metros._identify_metros(
-            {qid: places_by_id[qid] for qid in metro_pairs}, registry, None
+            {qid: places_by_id[qid] for qid in metro_pairs + derived_metros},
+            registry,
+            _eurostat.PINS,
+            _fao.PINS,
         )
         # A seeded row a discovery joined through its division publishes
         # the QID the registry now keys it by, and is enriched under it.
