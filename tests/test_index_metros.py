@@ -182,6 +182,8 @@ AREAS = [
     fx.area("us-chi", shapely.to_wkb(shapely.box(-87.9, 41.6, -87.5, 42.0)), [OSM]),
 ]
 MEMBERS = ["Q1757", "Q7"]
+# FAO region 50's single patch, holding Chicago's land area.
+CHICAGO_PATCH = shapely.box(-89.0, 41.0, -86.0, 43.0)
 
 
 def _crosswalk(digest=None, place="Q673425", code="FI001MC"):
@@ -222,14 +224,14 @@ def _publish(cache, subdir, pointer, artifact, records):
         directory.close()
 
 
-def _inputs(tmp_path, cache):
+def _inputs(tmp_path, cache, composition=COMPOSITION, boundaries=BOUNDARIES):
     """Publish the Eurostat fixture inputs for ``cache``; return their pins."""
     files = {
         eurostat.COMPOSITION_FILE: tmp_path / "composition.xlsx",
         eurostat.BOUNDARIES_FILE: tmp_path / "boundaries.parquet",
     }
-    files[eurostat.COMPOSITION_FILE].write_bytes(efx.workbook(COMPOSITION))
-    files[eurostat.BOUNDARIES_FILE].write_bytes(efx.parquet(BOUNDARIES))
+    files[eurostat.COMPOSITION_FILE].write_bytes(efx.workbook(composition))
+    files[eurostat.BOUNDARIES_FILE].write_bytes(efx.parquet(boundaries))
     pins = {
         name: hashlib.sha256(path.read_bytes()).hexdigest()
         for name, path in files.items()
@@ -358,6 +360,11 @@ def test_a_metro_place_and_its_memberships_are_attached(tmp_path):
     # the fixture's Finnish cities (Helsinki and Espoo).
     assert manifest["metros"] == 2
     assert manifest["cities_with_metro"] == 4
+    # The snapshot the branch read, for the expand stage to derive from too.
+    assert set(manifest["derived_inputs"]["eurostat"]) == {
+        eurostat.COMPOSITION_FILE,
+        eurostat.BOUNDARIES_FILE,
+    }
 
 
 def test_a_city_with_no_metro_keeps_an_empty_list(tmp_path):
@@ -515,7 +522,11 @@ def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
     assert metro["member_ids"] == ["Q1297"]
     assert "Q1754965" not in places["Q28515"]["metro_ids"]
     wikidata = fx.StubWikidata(metros={"Q28515": [CHICAGO_METRO]})
-    assert expand._attach_metros(places, ["Q28515"], wikidata, []) == ([], ["Q1754965"])
+    codes = metros._code_index(places.values())
+    assert expand._attach_metros(places, codes, ["Q28515"], wikidata, []) == (
+        [],
+        ["Q1754965"],
+    )
     assert metro["member_ids"] == ["Q1297"]
     assert manifest["places"] == len(places)
     # places.yaml edited between the seed and metros stages: refused.
@@ -539,7 +550,9 @@ def test_a_metro_qid_already_seeded_as_a_city_fails_the_build(tmp_path):
         for qid in ("Q28515", "Q1297")
     }
     with pytest.raises(overture.GazetteerError, match="already seeded"):
-        expand._attach_metros(places, ["Q28515"], fx.StubWikidata(metros=collided), [])
+        expand._attach_metros(
+            places, {}, ["Q28515"], fx.StubWikidata(metros=collided), []
+        )
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -660,6 +673,25 @@ def test_the_derived_gate_closes_the_eurostat_branch(tmp_path, monkeypatch, miss
     assert manifest["stale_overrides"] == 1
 
 
+def test_an_unavailable_eurostat_input_degrades_to_no_eu_metros(tmp_path, monkeypatch):
+    def unavailable(cache_dir, *, expected=eurostat.PINS):
+        raise eurostat.EurostatError("composition.xlsx: unavailable")
+
+    monkeypatch.setattr(eurostat, "load_inputs", unavailable)
+    manifest, places = _run(tmp_path, {"Q1297": [CHICAGO_METRO]})
+    # The US branch still publishes Chicago; the Eurostat branch, its input
+    # unavailable, degrades to no metros rather than aborting the stage, and
+    # the run records no Eurostat snapshot for the expand stage to derive from.
+    assert places["Q1754965"]["kind"] == "metro"
+    assert manifest["metros"] == 1
+    assert manifest["eurostat"] == {
+        "status": "inputs unavailable",
+        "metros_published": 0,
+    }
+    assert manifest["derived_inputs"] == {"eurostat": None, "fao": None, "ucdb": None}
+    assert manifest["derived_inventory"] == []
+
+
 @pytest.mark.parametrize(
     ("entries", "metro_map", "error", "message"),
     [
@@ -731,9 +763,9 @@ def test_the_derived_credits_reach_the_inventory_and_notice(tmp_path):
         cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
     )
     derived = [row for row in rows if row["use"] == "derived"]
-    assert [row["dataset"] for row in derived] == [
+    assert sorted(row["dataset"] for row in derived) == sorted(
         d for d, _ in metros.EUROSTAT_DERIVED
-    ]
+    )
     assert all(row["credit"] and row["url"] and row["allowed"] for row in derived)
     generation, _ = store.resolve(cache / "gazetteer", "geometry.json")
     with generation:
@@ -779,7 +811,7 @@ def test_wikidata_is_asked_for_qids_only(tmp_path):
         {"place_id": "Q1297", "kind": "city", "country_code": "US", "metro_ids": []},
     ]
     stub = Recording()
-    metros._attach_us(places, {p["place_id"]: p for p in places}, {}, [], stub)
+    metros._attach_us(places, {p["place_id"]: p for p in places}, {}, {}, [], stub)
     metros._candidates(stub, {"C1": ["tp_9", "Q1297"]})
     assert stub.asked == [["Q1297"], ["Q1297"]]
 
@@ -837,21 +869,57 @@ def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
 def test_a_code_matches_only_within_its_scheme():
     rows = {
         "tp_1": {
+            "place_id": "tp_1",
             "kind": "metro",
             "statistical_area_id": "16980",
             "source_subtype": "metropolitan region",
         },
         "tp_2": {
+            "place_id": "tp_2",
             "kind": "metro",
             "statistical_area_id": "16980",
             "source_subtype": "metropolitan statistical area",
         },
     }
-    assert (
-        metros._by_code(rows, "16980", "metropolitan statistical area") is rows["tp_2"]
-    )
-    assert metros._by_code(rows, "16980", "metropolitan region") is rows["tp_1"]
-    assert metros._by_code(rows, "99999", "metropolitan region") is None
+    codes = metros._code_index(rows.values())
+    assert codes[("metropolitan statistical area", "16980")] is rows["tp_2"]
+    assert codes[("metropolitan region", "16980")] is rows["tp_1"]
+    assert ("metropolitan region", "99999") not in codes
+    # One code names one place: a second row carrying it fails the build.
+    twin = {**rows["tp_2"], "place_id": "tp_3"}
+    with pytest.raises(overture.GazetteerError, match="both carry"):
+        metros._code_index([*rows.values(), twin])
+
+
+@pytest.mark.parametrize(
+    ("countries", "expected"),
+    [(["FI", "FI", "SE"], "FI"), (["FI", "SE"], None), ([None, None], None)],
+    ids=["majority", "tie", "no country"],
+)
+def test_a_metro_is_partitioned_by_a_majority_of_its_members(countries, expected):
+    by_id = {
+        f"Q{i}": {"place_id": f"Q{i}", "kind": "city", "country_code": country}
+        for i, country in enumerate(countries)
+    }
+    assert metros._majority_country(sorted(by_id), by_id) == expected
+
+
+def test_a_metro_without_a_majority_country_is_left_unpublished():
+    by_id = {
+        "Q1": {"place_id": "Q1", "country_code": "FI", "metro_ids": ["tie"]},
+        "Q2": {"place_id": "Q2", "country_code": "SE", "metro_ids": ["tie"]},
+    }
+    tied = {"place_id": "tie", "country_code": "FI", "member_ids": ["Q1", "Q2"]}
+    # A crosswalked placeholder has no member yet: its source's country stands.
+    placeholder = {"place_id": "empty", "country_code": "FI", "member_ids": []}
+    rows = {"tie": tied, "empty": placeholder}
+    report = []
+    assert metros.partition(rows, by_id, {}, report) == {"tie"}
+    assert list(rows) == ["empty"] and placeholder["country_code"] == "FI"
+    assert all(by_id[q]["metro_ids"] == [] for q in ("Q1", "Q2"))
+    assert report == [
+        {"kind": "metro", "metro_id": "tie", "reason": "no majority country"}
+    ]
 
 
 @pytest.mark.parametrize("alias_first", [False, True])
@@ -892,17 +960,15 @@ def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, co
     )
 
 
-def _fao_inputs(tmp_path):
-    """One FAO region, 50, whose single patch holds Chicago's land area."""
+def _fao_inputs(tmp_path, patch=CHICAGO_PATCH):
+    """One FAO region, 50, whose single ``patch`` holds Chicago's land area."""
     import hashlib
 
     import fao_fixture as ffx
     from transitio_index import fao
 
     payloads = {
-        fao.PATCHES_FILE: ffx.patches_zip(
-            [(7, (50, 0, 0, 0), shapely.box(-89.0, 41.0, -86.0, 43.0))]
-        ),
+        fao.PATCHES_FILE: ffx.patches_zip([(7, (50, 0, 0, 0), patch)]),
         fao.REGIONS_FILE: ffx.regions_csv([("50", "USA", 1, ["7"], "S")]),
     }
     files = {}
@@ -964,13 +1030,19 @@ def test_a_fao_metro_auto_publishes_under_the_derived_gate(
     if missing is not None:
         allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {missing}
         monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
+    from transitio_index import ucdb
+
     manifest, places = _fao_run(tmp_path)
-    fao_rows = [r for r in manifest["derived_inventory"] if r.get("branch") == "fao"]
-    assert [r["dataset"] for r in fao_rows] == [geometry.FAO_DERIVED[0]]
-    datasets = [r["dataset"] for r in manifest["derived_inventory"]]
-    assert datasets.count("Overture Maps divisions") == 1
+    # One inventory row per source the branches read: Overture once, though
+    # the Eurostat and FAO branches both place cities by it, and the UCDB the
+    # FAO metros are named from.
+    inventory = {r["dataset"]: r for r in manifest["derived_inventory"]}
+    assert len(inventory) == len(manifest["derived_inventory"]) == 5
+    fao_rows = [inventory[geometry.FAO_DERIVED[0]], inventory[ucdb.DERIVED[0]]]
     report = _artefact(tmp_path, "metro_report.jsonl")
     if missing is None:
+        # Helsinki and Espoo assigned by Eurostat, Chicago placed by FAO.
+        assert inventory["Overture Maps divisions"]["memberships"] == 3
         # Chicago's land area lies in region 50's patch, so the region
         # auto-publishes keyed by its FAO id and named from its UCDB centre;
         # the members are derived, never curated.
@@ -1023,6 +1095,21 @@ def test_a_registry_backed_fao_metro_carries_its_region_not_a_cbsa(tmp_path):
     with registry.session(path) as again:
         _fao_run(tmp_path / "again", registry=again)
         assert again.minted == 0
+
+
+def test_a_fao_region_over_a_published_metro_is_a_duplicate():
+    # A FAO city-region whose core (its footprint's representative point) falls
+    # inside a metro already published is a duplicate; one whose core lies
+    # elsewhere is not.
+    member = shapely.box(24.4, 60.1, 24.6, 60.3)
+    published = shapely.STRtree([member])
+    over = shapely.unary_union(
+        [shapely.box(24.35, 60.05, 24.65, 60.35), shapely.box(26.05, 60.4, 26.15, 60.5)]
+    )
+    elsewhere = shapely.box(25.0, 64.0, 25.5, 64.5)
+    assert metros._over_published_metro(over, published) is True
+    assert metros._over_published_metro(elsewhere, published) is False
+    assert metros._over_published_metro(None, published) is False
 
 
 def test_the_fao_derived_version_covers_both_inputs():

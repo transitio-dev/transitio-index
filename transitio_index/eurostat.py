@@ -250,6 +250,13 @@ def _footprint(rows):
     return None if merged.is_empty else merged
 
 
+def place_footprint(areas, place):
+    """A place's land footprint from ``areas`` (``geometry.read_areas`` output
+    keyed by Overture id), or None without a usable one."""
+    overture_id = place.get("overture_id")
+    return _footprint(areas.get(overture_id)) if overture_id else None
+
+
 def _pick(candidates, footprint, boundaries, by_nuts3):
     """``(nuts_id, ambiguous)`` among the regions covering a footprint's
     representative point. One candidate, or several implying one metro,
@@ -293,8 +300,7 @@ def assign(places, areas, metros, boundaries):
     for place in places:
         if place.get("kind") != "city" or place.get("country_code") not in covered:
             continue
-        overture_id = place.get("overture_id")
-        footprint = _footprint(areas.get(overture_id)) if overture_id else None
+        footprint = place_footprint(areas, place)
         if footprint is None:
             status, nuts_id = "unplaceable", None
         else:

@@ -884,6 +884,9 @@ def attach_geometry(
                 "source": "geometry",
                 "sources": metros_manifest.get("sources"),
                 "seed_generation": metros_manifest.get("seed_generation"),
+                # Carried forward so the expand stage derives metros from the
+                # same pinned inputs as the metros stage, not the module pins.
+                "derived_inputs": metros_manifest.get("derived_inputs"),
                 "overture_release": overture.OVERTURE_RELEASE,
                 "simplify_tolerance_deg": SIMPLIFY_TOLERANCE_DEG,
                 "with_geometry": with_geometry,
