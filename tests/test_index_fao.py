@@ -58,12 +58,12 @@ PLACES = [
     _city("Q_A", "FI", "a"),  # eligible, patch 1
     _city("Q_B", "FI", "b"),  # eligible, patch 2: same tier-2 region as A
     _city("Q_C", "FI", "c", metro_ids=["Q_M"]),  # already in a metro: context
-    _city("Q_D", "SE", "d"),  # an official assignment exists: context
-    _city("Q_E", "SE", "e"),  # linked to a US MSA in the report: context
+    _city("Q_D", "SE", "d"),  # a published official metro covers it: context
+    _city("Q_E", "SE", "e"),  # eligible, patch 3: no metro covers it
     _city("Q_F", "FI", "f"),  # outside every patch
     _city("Q_G", "FI", None),  # no land area: unplaceable
     _city("Q_H", "SE", "h"),  # eligible, patch 3
-    _city("Q_I", "SE", "i"),  # an ambiguous official assignment: context
+    _city("Q_I", "SE", "i"),  # eligible, patch 3: its official assignment ambiguous
     _city("Q_J", "SE", "j"),  # explicitly unassigned officially: eligible
     _city(
         "Q_K", "FI", None, metro_ids=["Q_M"]
@@ -100,18 +100,10 @@ ASSIGNMENTS = [
         "city_id": "Q_D",
         "status": "assigned",
         "metro_code": "SE001M",
-        "published": False,
+        "published": True,
     },
     {"city_id": "Q_I", "status": "ambiguous", "metro_code": None, "published": False},
     {"city_id": "Q_J", "status": "unassigned", "metro_code": None, "published": False},
-]
-METRO_REPORT = [
-    {
-        "branch": "us",
-        "city_id": "Q_E",
-        "metro_id": "Q_MSA",
-        "reason": "US MSA without a CBSA code",
-    }
 ]
 
 
@@ -157,7 +149,7 @@ def _ucdb_inputs(tmp_path):
     )
 
 
-def _metros_generation(cache, places, assignments=(), report=()):
+def _metros_generation(cache, places, assignments=(), **manifest):
     directory = store.open_subdir(cache, "gazetteer")
     try:
         with store.exclusive_writer(directory):
@@ -167,13 +159,29 @@ def _metros_generation(cache, places, assignments=(), report=()):
                 {
                     "places_seed.jsonl": store.jsonl_chunks(places),
                     "metro_assignments.jsonl": store.jsonl_chunks(list(assignments)),
-                    "metro_report.jsonl": store.jsonl_chunks(list(report)),
                 },
-                {"source": "metros"},
+                {"source": "metros", **manifest},
                 held=directory,
             )
     finally:
         directory.close()
+
+
+def test_a_run_whose_fao_branch_was_disabled_gets_an_empty_report(tmp_path):
+    cache = tmp_path / "cache"
+    files, expected = _inputs(tmp_path)
+    fao.prepare_inputs(cache, files=files, expected=expected)
+    ucdb_files, ucdb_expected = _ucdb_inputs(tmp_path)
+    ucdb.prepare_inputs(cache, files=ucdb_files, expected=ucdb_expected)
+    # The metros stage recorded no FAO snapshot (its inputs were unavailable):
+    # the report follows that record over the caller's pins, and stays empty.
+    disabled = {"eurostat": None, "fao": None, "ucdb": None}
+    _metros_generation(cache, PLACES, derived_inputs=disabled)
+    areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
+    manifest = fao.suggest_metros(
+        cache, dataset=areas, pins=expected, ucdb_pins=ucdb_expected
+    )
+    assert (manifest["entries"], manifest["names"]["digests"]) == (0, None)
 
 
 def test_inputs_are_converted_once_and_loaded_under_the_contract(tmp_path):
@@ -315,7 +323,7 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
     fao.prepare_inputs(cache, files=files, expected=expected)
     ucdb_files, ucdb_expected = _ucdb_inputs(tmp_path)
     ucdb.prepare_inputs(cache, files=ucdb_files, expected=ucdb_expected)
-    _metros_generation(cache, PLACES, ASSIGNMENTS, METRO_REPORT)
+    _metros_generation(cache, PLACES, ASSIGNMENTS)
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
     manifest = fao.suggest_metros(
         cache, dataset=areas, pins=expected, ucdb_pins=ucdb_expected
@@ -383,10 +391,10 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
             "name": None,
             "name_ambiguous": False,
             "name_candidates": [],
-            "cities": ["Q_H", "Q_J", "Q_O"],
-            "cities_wikidata": [None] * len(["Q_H", "Q_J", "Q_O"]),
-            "context": ["Q_D", "Q_E", "Q_I"],
-            "evidence_hash": digest(["Q_H", "Q_J", "Q_O"]),
+            "cities": ["Q_E", "Q_H", "Q_I", "Q_J", "Q_O"],
+            "cities_wikidata": [None] * 5,
+            "context": ["Q_D"],
+            "evidence_hash": digest(["Q_E", "Q_H", "Q_I", "Q_J", "Q_O"]),
             "override": [
                 {
                     "place": "fao_city_region:30",
@@ -395,7 +403,7 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
                 {
                     "place": "fao_city_region:30",
                     "set_statistical_area": {"scheme": "fao_city_region", "code": "30"},
-                    "evidence_hash": digest(["Q_H", "Q_J", "Q_O"]),
+                    "evidence_hash": digest(["Q_E", "Q_H", "Q_I", "Q_J", "Q_O"]),
                 },
             ],
         },
@@ -406,7 +414,7 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
         {"city_id": "Q_K", "eligible": False, "reason": "no usable land area"},
         {"city_id": "Q_N", "eligible": True, "reason": "on a boundary between regions"},
     ]
-    assert manifest["entries"] == 2 and manifest["eligible_cities"] == 6
+    assert manifest["entries"] == 2 and manifest["eligible_cities"] == 8
     assert manifest["tiers"] == {1: 1, 2: 1}
     assert manifest["unplaced"] == 3 and manifest["doi"] == fao.DOI
     assert manifest["named_entries"] == 1 and manifest["names"] == names

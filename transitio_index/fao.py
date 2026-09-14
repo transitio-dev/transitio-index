@@ -311,23 +311,15 @@ def _patch_of(footprint, containment, geoms, region_by_patch):
     return eurostat._pick(hits, footprint, geoms, region_by_patch)
 
 
-def place_cities(places, areas, regions, patches, assignments, metro_report):
+def place_cities(places, areas, regions, patches, assignments):
     """Every city placed in its FAO region by its representative point:
     ``(grouped, context, countries, unplaced, qid_of)`` — the eligible cities
-    per region (no metro, no known official assignment), the cities already
-    in a metro there, the gazetteer countries per region, the cities that
-    could not be placed with the reason, and each city's QID. The one
-    derivation the suggestion report and a curated FAO metro both use."""
-    known = {
-        row["city_id"]
-        for row in assignments
-        if row.get("status") in ("assigned", "ambiguous")
-    }
-    known |= {
-        row["city_id"]
-        for row in metro_report
-        if row.get("branch") == "us" and row.get("city_id")
-    }
+    per region (no metro covers them: none joined, no published Eurostat
+    assignment), the cities a metro already covers there, the gazetteer
+    countries per region, the cities that could not be placed with the
+    reason, and each city's QID. The one derivation the suggestion report
+    and the published FAO metros both use."""
+    known = {row["city_id"] for row in assignments if row.get("published")}
     geoms = {pid: p["geom"] for pid, p in patches.items()}
     region_by_patch = {pid: region_of(p) for pid, p in patches.items()}
     containment = eurostat.Containment(geoms)
@@ -342,8 +334,7 @@ def place_cities(places, areas, regions, patches, assignments, metro_report):
         city = place["place_id"]
         qid_of[city] = place.get("wikidata_id")
         eligible = not place.get("metro_ids") and city not in known
-        overture_id = place.get("overture_id")
-        footprint = eurostat._footprint(areas.get(overture_id)) if overture_id else None
+        footprint = eurostat.place_footprint(areas, place)
         if footprint is None:
             unplaced.append(
                 {"city_id": city, "eligible": eligible, "reason": "no usable land area"}
@@ -369,11 +360,9 @@ def place_cities(places, areas, regions, patches, assignments, metro_report):
     return grouped, context, countries, unplaced, qid_of
 
 
-def suggest(
-    places, areas, regions, patches, assignments, metro_report, provenance, names=None
-):
+def suggest(places, areas, regions, patches, assignments, provenance, names=None):
     """``(entries, unplaced)``: one report entry per city-region holding an
-    eligible city — a city with no metro and no known official assignment —
+    eligible city — a city no metro covers —
     with the cities already in a metro there as context; and every city, eligible
     or not, that could not be placed (no usable land area, or a footprint on a
     boundary between regions) with the reason. ``provenance`` (DOI, cutoff,
@@ -384,7 +373,7 @@ def suggest(
     ``add_place`` prefilled with the name — a region without one keeps the
     placeholder."""
     grouped, context, countries, unplaced, qid_of = place_cities(
-        places, areas, regions, patches, assignments, metro_report
+        places, areas, regions, patches, assignments
     )
     entries = []
     for region_id, cities in progress(sorted(grouped.items()), "fao"):
@@ -440,14 +429,21 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
     its centre's GHS-UCDB match. ``dataset`` is the Overture ``division_area``
     dataset (the pinned release by default), ``pins`` the FAO inputs' digests
     and ``ucdb_pins`` the UCDB inputs'. Returns the generation manifest."""
-    from transitio_index import ucdb  # builds on this module, so imported here
+    # Both build on this module, so imported here.
+    from transitio_index import metros, ucdb
 
     pins = dict(pins or PINS)
     ucdb_pins = dict(ucdb_pins or ucdb.PINS)
-    # All under the raw store's own lock, before the gazetteer lock below.
-    prepare_inputs(cache_dir, expected=pins)
-    convert_patches(cache_dir, expected=pins)
-    ucdb.prepare_inputs(cache_dir, expected=ucdb_pins)
+    # All under the raw store's own lock, before the gazetteer lock below. An
+    # input that cannot be fetched or verified was unavailable to the metros
+    # stage too, whose manifest then leaves this report empty below.
+    metros._available(
+        lambda: (
+            prepare_inputs(cache_dir, expected=pins),
+            convert_patches(cache_dir, expected=pins),
+            ucdb.prepare_inputs(cache_dir, expected=ucdb_pins),
+        )
+    )
 
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
@@ -464,22 +460,32 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
                 "metro_assignments.jsonl",
                 generations=run,
             )
-            metro_report, _ = store.read_jsonl(
-                cache_dir / "gazetteer",
-                "metros.json",
-                "metro_report.jsonl",
-                generations=run,
-            )
-            regions, patches, inputs_manifest = load_inputs(cache_dir, expected=pins)
-            wanted = {
-                p["overture_id"]
-                for p in places
-                if p.get("kind") == "city" and p.get("overture_id")
-            }
-            areas = geometry.place_areas(cache_dir, dataset, places, wanted)
-            # Names are a derived use of the UCDB: attached only while its
-            # allowlist entry stands; the report goes out unnamed otherwise.
-            names, names_manifest = ucdb.load_names(cache_dir, expected=ucdb_pins)
+            # The report follows the snapshot the metros stage records having
+            # published metros from: the same FAO inputs, names only when it
+            # read the UCDB, and no report at all for a FAO branch it disabled
+            # (its inputs unavailable) — never a stage aborting on the same
+            # inputs. A generation recording none reads the caller's pins.
+            derived = metros_manifest.get("derived_inputs")
+            if derived is not None:
+                pins, ucdb_pins = derived.get("fao"), derived.get("ucdb")
+            inputs_manifest = names_manifest = names = {}
+            if pins is not None:
+                regions, patches, inputs_manifest = load_inputs(
+                    cache_dir, expected=pins
+                )
+                wanted = {
+                    p["overture_id"]
+                    for p in places
+                    if p.get("kind") == "city" and p.get("overture_id")
+                }
+                areas = geometry.place_areas(cache_dir, dataset, places, wanted)
+                if ucdb_pins is not None:
+                    # Names are a derived use of the UCDB: attached only while
+                    # its allowlist entry stands; the report goes out unnamed
+                    # otherwise.
+                    names, names_manifest = ucdb.load_names(
+                        cache_dir, expected=ucdb_pins
+                    )
             allowed = ucdb.DERIVED in geometry.DERIVED_SOURCE_ALLOWLIST
             provenance = {
                 "doi": DOI,
@@ -497,16 +503,17 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
                     "allowed": allowed,
                 },
             }
-            entries, unplaced = suggest(
-                places,
-                areas,
-                regions,
-                patches,
-                assignments,
-                metro_report,
-                provenance,
-                names if allowed else {},
-            )
+            entries, unplaced = [], []
+            if pins is not None:
+                entries, unplaced = suggest(
+                    places,
+                    areas,
+                    regions,
+                    patches,
+                    assignments,
+                    provenance,
+                    names if allowed else {},
+                )
             manifest = {
                 "source": "fao",
                 "doi": DOI,

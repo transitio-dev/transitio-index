@@ -110,6 +110,7 @@ def merge_names(
                 "sources": geometry_manifest.get("sources"),
                 "seed_generation": geometry_manifest.get("seed_generation"),
                 "geometry_generation": geometry_manifest.get("generation"),
+                "derived_inputs": geometry_manifest.get("derived_inputs"),
                 "wikidata_api": overture.WIKIDATA_API,
                 # Carried forward so the publish stage reads the pinned release
                 # from the same generation as the places, not a separate pointer.
