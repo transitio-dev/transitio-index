@@ -412,6 +412,17 @@ def _fao_version(inputs_manifest):
     )
 
 
+def _majority_country(city_ids, by_id):
+    """The country most of ``city_ids`` are in — the metro's one country
+    partition — or None when none of them carry a country."""
+    counts = collections.Counter(
+        by_id[c].get("country_code")
+        for c in city_ids
+        if by_id.get(c) and by_id[c].get("country_code")
+    )
+    return counts.most_common(1)[0][0] if counts else None
+
+
 def _published_footprints(metros, by_id, areas):
     """The land footprint of every city already in a published metro, so a FAO
     city-region whose core falls inside one can be told apart from a new core."""
@@ -471,7 +482,7 @@ def _apply_fao(
         p["overture_id"] for p in places if p["kind"] == "city" and p.get("overture_id")
     }
     areas = geometry.place_areas(cache_dir, dataset, places, wanted)
-    grouped, _, countries, _, _ = fao.place_cities(
+    grouped, _, _, _, _ = fao.place_cities(
         places, areas, regions, patches, assignments, report
     )
     allowed = all(key in geometry.DERIVED_SOURCE_ALLOWLIST for key in FAO_DERIVED)
@@ -490,12 +501,12 @@ def _apply_fao(
         derived = sorted(grouped[region_id])
         if not derived:
             continue
-        # The region's country is its cities' one shared country; a
-        # cross-border or indeterminate region carries none.
-        shared = countries.get(region_id, set())
-        country = (
-            next(iter(shared)) if len(shared) == 1 and None not in shared else None
-        )
+        # A metro belongs to one country partition, so a cross-border region
+        # takes the country most of its cities are in; a region whose cities
+        # carry no country at all is skipped rather than published countryless.
+        country = _majority_country(derived, by_id)
+        if country is None:
+            continue
         named = names.get(region_id)
         name = named["name"] if named else None
         if not allowed:

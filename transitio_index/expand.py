@@ -327,7 +327,7 @@ def _attach_derived_metros(cache_dir, places_by_id, new_cities, areas, registry)
                 names, _ = ucdb.load_names(cache_dir)
             except store.StoreError:
                 names = {}
-        grouped, _, countries, _, _ = fao.place_cities(
+        grouped, _, _, _, _ = fao.place_cities(
             city_rows, areas, regions, patches, assignments, []
         )
         published = shapely.STRtree(_metro_member_footprints(places_by_id))
@@ -341,10 +341,12 @@ def _attach_derived_metros(cache_dir, places_by_id, new_cities, areas, registry)
             )
             if metros._over_published_metro(footprint, published):
                 continue
-            shared = countries.get(region_id, set())
-            country = (
-                next(iter(shared)) if len(shared) == 1 and None not in shared else None
-            )
+            # A metro belongs to one country partition: a cross-border region
+            # takes the country most of its cities are in, and one with no
+            # country at all is skipped rather than published countryless.
+            country = metros._majority_country(grouped[region_id], places_by_id)
+            if country is None:
+                continue
             named = names.get(region_id)
             name = named["name"] if named else None
             metro = metros._by_code(places_by_id, region_id, metros.FAO_SUBTYPE)
