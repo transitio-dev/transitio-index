@@ -52,11 +52,16 @@ export function paddedBounds(bounds, factor = 0.5) {
   };
 }
 
-export function sliceParams(zoom, bounds, view = INITIAL_VIEW) {
+// ``coarse``: a build with more countries and regions than a slice may hold
+// (the catalogue) shows countries alone below the viewport zoom, whatever
+// the level; regions join with the viewport bbox from there, as cities do
+// from the city zoom (the city level is bounded at any zoom).
+export function sliceParams(zoom, bounds, view = INITIAL_VIEW, coarse = false) {
   const params = { zoom, ...viewParams(view) };
   // The city level shows cities at any zoom, and a slice with cities is bounded.
   if (zoom >= VIEWPORT_ZOOM || view.level === "city") params.bbox = bboxParam(paddedBounds(bounds));
   if (zoom >= CITY_ZOOM && !view.level) params.kind = "all";
+  else if (coarse && zoom < VIEWPORT_ZOOM && view.level !== "city") params.kind = "country";
   return params;
 }
 
@@ -64,17 +69,26 @@ export function sliceParams(zoom, bounds, view = INITIAL_VIEW) {
 // it: no bbox, and never finer than the coarsest zoom band, so a large build
 // stays under the byte cap whatever the current zoom. No level: the fit spans
 // the build, whatever the selectors say; the spec still colours it.
-export function overviewParams(zoom, view = INITIAL_VIEW) {
-  return { zoom: Math.min(zoom, VIEWPORT_ZOOM - 1), ...viewParams({ ...view, level: "" }) };
+export function overviewParams(zoom, view = INITIAL_VIEW, coarse = false) {
+  const params = { zoom: Math.min(zoom, VIEWPORT_ZOOM - 1), ...viewParams({ ...view, level: "" }) };
+  if (coarse) params.kind = "country";
+  return params;
+}
+
+export const SLICE_CAP = 3000; // the server's feature cap on one slice
+
+export function isCoarse(summary) {
+  const byKind = (summary.counts || {}).places_by_kind || {};
+  return (byKind.country || 0) + (byKind.region || 0) > SLICE_CAP;
 }
 
 export function buildLabel(row) {
   if (!row.complete) return `${row.id} (incomplete)`;
   const date = (row.built_at || "").slice(0, 10);
   const places = row.counts && row.counts.places;
-  return [row.id, date, places === undefined ? null : `${places} places`]
-    .filter(Boolean)
-    .join(" · ");
+  const count =
+    row.sources !== undefined ? `${row.sources} builds` : places === undefined ? null : `${places} places`;
+  return [row.id, date, count].filter(Boolean).join(" · ");
 }
 
 export function summaryLabel(summary) {
@@ -603,6 +617,7 @@ async function main() {
   const specSelect = document.getElementById("spec");
   let view = { ...INITIAL_VIEW }; // the level and spec every request carries
   let classField = "tier"; // the build's class field, from its summary
+  let coarse = false; // the build's countries and regions overflow a slice
   let selectedId = null; // the selected place, marked in the tree
   let selectedRecord = null; // `{ record, mine }`: revealed once the tree has loaded
   let pendingScroll = null; // the tree item to scroll to when the Tree tab is next shown
@@ -657,7 +672,9 @@ async function main() {
   // fits the map to it; the fit's moveend then requests the viewport slice.
   async function refresh(build, gen, fit) {
     const mine = ++sequence;
-    const params = fit ? overviewParams(map.getZoom(), view) : sliceParams(map.getZoom(), boundsOf(), view);
+    const params = fit
+      ? overviewParams(map.getZoom(), view, coarse)
+      : sliceParams(map.getZoom(), boundsOf(), view, coarse);
     let slice;
     try {
       slice = await fetchSlice(placesUrl(build, params));
@@ -752,6 +769,7 @@ async function main() {
     snapshot = summary.snapshot_id;
     stats.textContent = summaryLabel(summary);
     classField = summary.category_field ?? "tier";
+    coarse = isCoarse(summary);
     specSelect.parentElement.hidden = !specSelectable(summary);
     if (specSelect.parentElement.hidden && view.spec !== "all") {
       specSelect.value = "all";

@@ -21,6 +21,7 @@ import {
   kindRank,
   legendHtml,
   buildLabel,
+  isCoarse,
   collectionBounds,
   overflowText,
   overviewParams,
@@ -74,12 +75,22 @@ test("the overview has no bbox; from zoom 7 the slice follows the padded viewpor
   // A build change loads the overview: never a bbox, never finer than zoom 6.
   assert.deepEqual(overviewParams(12.4), { zoom: 6 });
   assert.deepEqual(overviewParams(3), { zoom: 3 });
+  // A coarse build (the catalogue) shows countries alone below the viewport zoom.
+  assert.equal(isCoarse({ counts: { places_by_kind: { country: 116, region: 24000 } } }), true);
+  assert.equal(isCoarse({ counts: { places_by_kind: { country: 1, region: 1563 } } }), false);
+  assert.deepEqual(overviewParams(3, INITIAL_VIEW, true), { zoom: 3, kind: "country" });
+  assert.deepEqual(sliceParams(5, bounds, INITIAL_VIEW, true), { zoom: 5, kind: "country" });
+  assert.equal(sliceParams(7, bounds, INITIAL_VIEW, true).kind, undefined);
+  assert.equal(sliceParams(5, bounds, { level: "regional", spec: "all" }, true).kind, "country");
+  assert.equal(sliceParams(5, bounds, { level: "city", spec: "all" }, true).kind, undefined);
 });
 
 test("labels name a build by id, date and count, and mark an incomplete one", () => {
   const row = { id: "es-full", complete: true, built_at: "2026-09-11T00:00:00+00:00", counts: { places: 11875 } };
   assert.equal(buildLabel(row), "es-full · 2026-09-11 · 11875 places");
   assert.equal(buildLabel({ id: "half", complete: false }), "half (incomplete)");
+  const catalogue = { id: "catalogue", complete: true, built_at: "2026-09-15T05:45:01+00:00", sources: 104 };
+  assert.equal(buildLabel(catalogue), "catalogue · 2026-09-15 · 104 builds");
   assert.equal(
     summaryLabel({ counts: { places: 6, feeds: 1, edges: 1 }, served_places: 1 }),
     "6 places · 1 feeds · 1 edges · 1 served",
