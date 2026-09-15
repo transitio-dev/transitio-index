@@ -767,6 +767,58 @@ def test_search_orders_every_rank_and_serves_the_route(tmp_path, monkeypatch):
         )
 
 
+def test_a_place_record_names_its_metros_and_members(tmp_path, monkeypatch):
+    metro = _place(
+        "hma",
+        "metro",
+        "Helsinki metropolitan area",
+        None,
+        BOX(24, 60, 26, 61),
+        source_subtype="metropolitan region",
+        statistical_area_id="FI001MC",
+        member_ids=["hel", "esp", "ghost"],  # a member the build does not hold
+    )
+    # Helsinki names its metro; Espoo is known as a member from the metro alone.
+    places = [
+        dict(p, metro_ids=["hma"] if p["place_id"] == "hel" else []) for p in PLACES
+    ]
+    build = iv.load_build("b", write_build(tmp_path, places + [metro]) and tmp_path)
+    hma = {
+        "place_id": "hma",
+        "name": "Helsinki metropolitan area",
+        "source_subtype": "metropolitan region",
+        "statistical_area_id": "FI001MC",
+    }
+    city = json.loads(iv.place_record(build, "hel"))["properties"]
+    assert city["metros"] == [hma]
+    assert city["members"] == {"count": 0, "served": 0, "rows": []}
+    assert json.loads(iv.place_record(build, "esp"))["properties"]["metros"] == [hma]
+    area = json.loads(iv.place_record(build, "hma"))["properties"]
+    assert area["metros"] == [] and area["members"] == {
+        "count": 3,  # the ghost counts; it has no row
+        "served": 1,
+        "rows": [
+            {
+                "place_id": "hel",
+                "name": "Helsinki",
+                "kind": "city",
+                "served": True,
+                "feed_count": 1,
+            },
+            {
+                "place_id": "esp",
+                "name": "Espoo",
+                "kind": "city",
+                "served": False,
+                "feed_count": 0,
+            },
+        ],
+    }
+    monkeypatch.setattr(iv, "MEMBERS_LIMIT", 1)
+    cut = json.loads(iv.place_record(build, "hma"))["properties"]["members"]
+    assert cut["count"] == 3 and len(cut["rows"]) == 1
+
+
 def test_a_place_record_carries_ancestors_children_and_feeds(tmp_path):
     build = iv.load_build("b", write_build(tmp_path) and tmp_path)
     feature = json.loads(iv.place_record(build, "hel"))

@@ -148,7 +148,8 @@ TABLE_LIMIT = 200  # rows per page of the places table, at most
 TREE_LIMIT = 2000  # nodes per tree level, at most
 SEARCH_LIMIT = 50  # search rows returned by default ...
 SEARCH_MAX = 200  # ... and at most
-# What a search row carries.
+MEMBERS_LIMIT = 2000  # a metro record lists at most this many members
+# What a search row and a record's metro and member rows carry.
 SEARCH_COLUMNS = (
     "place_id",
     "name",
@@ -159,6 +160,8 @@ SEARCH_COLUMNS = (
     "country_code",
     "build_id",
 )
+METRO_COLUMNS = ("place_id", "name", "source_subtype", "statistical_area_id")
+MEMBER_COLUMNS = ("place_id", "name", "kind", "served", "feed_count")
 KIND_RANK = {"country": 0, "region": 1, "city": 2}  # the tree's order
 SERVICE_STATS = ("stops", "routes", "departures_per_day")
 # The places table's columns; ``build_id`` in the catalogue only.
@@ -480,6 +483,7 @@ class Build:
         self._row_of = pd.Series(
             np.arange(len(self.places)), index=self.places["place_id"].to_numpy()
         )
+        self.metros_of = _metros_of(self.places)
         # The ``service`` JSON of places and edges, parsed once here and
         # normalized (non-finite → None); nothing parses it again per request,
         # and malformed JSON makes the build unavailable rather than a 500.
@@ -1353,6 +1357,44 @@ def search_places(build, q, limit=SEARCH_LIMIT, view=None):
     return {"total": int(hits.size), "rows": rows}
 
 
+def _metros_of(places):
+    """``{member place_id: [metro place_ids]}`` from the metros' member lists;
+    a member's own ``metro_ids`` is empty in the published index."""
+    if "member_ids" not in places.columns:
+        return {}
+    members = places[["place_id", "member_ids"]].explode("member_ids").dropna()
+    return members.groupby("member_ids")["place_id"].agg(list).to_dict()
+
+
+def _rows_of(build, ids):
+    """The row positions of the places ``ids`` names, those the build holds."""
+    present = [i for i in _list(ids) if i in build._row_of.index]
+    return build._row_of[present].to_numpy() if present else np.array([], dtype=int)
+
+
+def _metro_rows(build, place_id, ids):
+    """The metros a place belongs to — those listing it as a member, and
+    ``ids`` — as ``METRO_COLUMNS`` records."""
+    ids = dict.fromkeys([*build.metros_of.get(place_id, ()), *_list(ids)])
+    places = build.places.iloc[_rows_of(build, list(ids))]
+    return _json_ready(places[[c for c in METRO_COLUMNS if c in places.columns]])
+
+
+def _member_rows(build, ids):
+    """``{"count", "served", "rows"}``: how many members ``ids`` names, and
+    of those the build holds, how many are served and their rows, the most
+    served first, at most ``MEMBERS_LIMIT`` of them."""
+    rows = build.table.iloc[_rows_of(build, ids)][list(MEMBER_COLUMNS)]
+    rows = rows.sort_values(
+        ["feed_count", "name"], ascending=[False, True], kind="stable"
+    )
+    return {
+        "count": len(_list(ids)),
+        "served": int(rows["served"].sum()),
+        "rows": _json_ready(rows.iloc[:MEMBERS_LIMIT]),
+    }
+
+
 def _cell(value):
     """One pandas cell as a JSON value (Arrow maps arrive as lists of pairs)."""
     if isinstance(value, np.ndarray):
@@ -1402,9 +1444,11 @@ def place_record(build, place_id):
 
     The properties carry the row's descriptive columns present in this build,
     its parsed ``service``, ``served`` and ``feed_count``, its ``bbox``, the
-    ``ancestors`` root first, a ``children`` summary, its ``edges`` joined
-    with the feed table, the distinct feeds by spec and, on schema 7, the
-    feeds reaching it over a border by partition (``reached_from``).
+    ``ancestors`` root first, a ``children`` summary, its ``metros`` and
+    ``members`` (the metro rows it belongs to; the member rows it holds), its
+    ``edges`` joined with the feed table, the distinct feeds by spec and, on
+    schema 7, the feeds reaching it over a border by partition
+    (``reached_from``).
     """
     if place_id not in build._row_of.index:
         return None
@@ -1421,6 +1465,8 @@ def place_record(build, place_id):
     props["feed_count"] = int(build.feed_count[row])
     props["bbox"] = [_cell(v) for v in build.bounds[row]]
     props["ancestors"] = _ancestors(build, place["parent_id"])
+    props["metros"] = _metro_rows(build, place_id, place.get("metro_ids"))
+    props["members"] = _member_rows(build, place.get("member_ids"))
     children = (places["parent_id"] == place_id).to_numpy()
     props["children"] = {
         "count": int(children.sum()),
