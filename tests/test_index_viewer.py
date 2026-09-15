@@ -30,7 +30,7 @@ _spec.loader.exec_module(iv)
 BOX = shapely.box
 
 
-def _place(place_id, kind, name, parent_id, geom, country="FI"):
+def _place(place_id, kind, name, parent_id, geom, country="FI", **extra):
     return {
         "place_id": place_id,
         "kind": kind,
@@ -39,7 +39,21 @@ def _place(place_id, kind, name, parent_id, geom, country="FI"):
         "country_code": country,
         "service": json.dumps({"feeds": 1}),
         "geometry": shapely.to_wkb(geom),
+        **extra,
     }
+
+
+def _places_table(places):
+    """The places as Arrow: every key any row has (``from_pylist`` reads the
+    first row's), ``names`` typed as the map the publisher writes."""
+    keys = [k for k in dict.fromkeys(k for p in places for k in p) if k != "names"]
+    table = pa.Table.from_pylist([{k: p.get(k) for k in keys} for p in places])
+    if any("names" in p for p in places):
+        names = [list((p.get("names") or {}).items()) for p in places]
+        table = table.append_column(
+            "names", pa.array(names, pa.map_(pa.string(), pa.string()))
+        )
+    return table
 
 
 # A country, two regions and three cities; only Helsinki is served, by feed f1.
@@ -47,7 +61,15 @@ PLACES = [
     _place("fi", "country", "Finland", None, BOX(19, 59, 32, 71)),
     _place("uus", "region", "Uusimaa", "fi", BOX(23, 59.8, 26.5, 60.9)),
     _place("lap", "region", "Lapland", "fi", BOX(20, 66, 30, 70)),
-    _place("hel", "city", "Helsinki", "uus", BOX(24.8, 60.1, 25.3, 60.35)),
+    _place(
+        "hel",
+        "city",
+        "Helsinki",
+        "uus",
+        BOX(24.8, 60.1, 25.3, 60.35),
+        names={"sv": "Helsingfors"},
+        aliases=["Hki"],
+    ),
     _place("esp", "city", "Espoo", "uus", BOX(24.4, 60.1, 24.9, 60.3)),
     _place("rov", "city", "Rovaniemi", "lap", BOX(25.5, 66.4, 26.0, 66.6)),
 ]
@@ -67,7 +89,7 @@ def write_build(path, places=PLACES, edges=EDGES, feeds=FEEDS, notice=b"NOTICE\n
         "counts": {"places": len(places)},
     }
     tables = {
-        "places.parquet": pa.Table.from_pylist(places),
+        "places.parquet": _places_table(places),
         "edges.parquet": pa.Table.from_pylist(edges),
         "feeds.parquet": pa.Table.from_pylist(feeds),
     }
@@ -606,6 +628,145 @@ def test_the_places_table_is_sorted_paged_and_geometry_free(tmp_path):
         iv.places_table(build, everything, sort="geometry")
 
 
+@pytest.mark.parametrize(
+    ("q", "limit", "total", "ids", "matched"),
+    [
+        ("Helsinki", 50, 1, ["hel"], None),
+        ("helsingfors", 50, 1, ["hel"], "Helsingfors"),
+        ("HKI", 50, 1, ["hel"], "Hki"),
+        ("sink", 50, 1, ["hel"], None),
+        ("la", 50, 2, ["lap", "fi"], None),
+        ("land", 50, 2, ["fi", "lap"], None),
+        ("la", 1, 2, ["lap"], None),
+        ("zz", 50, 0, [], None),
+        (" h ", 50, None, ValueError, None),
+    ],
+    ids=[
+        "name",
+        "other-language-name",
+        "alias",
+        "substring",
+        "word-prefix-before-substring",
+        "name-order-within-a-rank",
+        "limit",
+        "no-match",
+        "too-short",
+    ],
+)
+def test_search_ranks_names_then_aliases_then_prefixes(
+    tmp_path, q, limit, total, ids, matched
+):
+    build = iv.load_build("b", write_build(tmp_path) and tmp_path)
+    if ids is ValueError:
+        with pytest.raises(ValueError, match="two characters"):
+            iv.search_places(build, q, limit)
+        return
+    reply = iv.search_places(build, q, limit)
+    assert reply["total"] == total
+    assert [row["place_id"] for row in reply["rows"]] == ids
+    chains = {"hel": ["Finland", "Uusimaa"], "lap": ["Finland"], "fi": []}
+    for row in reply["rows"]:
+        assert row["chain"] == chains[row["place_id"]]
+    if ids:
+        first = reply["rows"][0]
+        assert first["matched"] == matched
+        assert (first["served"], first["feed_count"], first["tier"]) == (
+            (True, 1, "local") if ids[0] == "hel" else (False, 0, None)
+        )
+
+
+def test_search_orders_every_rank_and_serves_the_route(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    box = BOX(-0.2, 50.8, 0, 50.9)
+    places = [
+        _place("alb", "city", "Albrighton", None, box),  # a substring
+        _place("bbe", "city", "Brighton Beach", None, box),  # a word starts with it
+        _place("bhi", "city", "Brighton Hill", None, box),
+        _place("bri", "city", "Brighton", None, box),  # the name
+        _place("hov", "city", "Hove", None, box, aliases=["Brighton"]),  # an alias
+        _place(
+            "nbr",
+            "city",
+            "New\r\nBrighton",
+            None,
+            box,
+            names={"cy": "Brighton\rNewydd"},
+        ),
+        _place("vol", "city", "ΒΟΛΟΣ", None, box),  # a final sigma
+    ]
+    edges = [
+        {"place_id": "nbr", "feed_id": "f1", "tier": "local"},
+        {"place_id": "nbr", "feed_id": "f2", "tier": "local"},
+        {"place_id": "bbe", "feed_id": "f1", "tier": "local"},
+    ]
+    feeds = [{"feed_id": f, "name": f, "coverage": None} for f in ("f1", "f2")]
+    cache = tmp_path / "cache"
+    write_build(cache / "index", places=places, edges=edges, feeds=feeds)
+    build = iv.load_build("b", cache / "index")
+    # Rank, then served before unserved, then more feeds, then the name; a
+    # newline inside a value or the query never joins two values.
+    rows = iv.search_places(build, "  brighton\n ")["rows"]
+    assert [r["place_id"] for r in rows] == ["bri", "hov", "nbr", "bbe", "bhi", "alb"]
+    assert [r["matched"] for r in rows] == [None, "Brighton", None, None, None, None]
+    assert [r["place_id"] for r in iv.search_places(build, "newydd")["rows"]] == ["nbr"]
+    assert [
+        r["place_id"] for r in iv.search_places(build, "brighton newydd")["rows"]
+    ] == ["nbr"]
+    assert iv.search_places(build, "hove brighton")["total"] == 0  # two values, not one
+    # A value with a newline in it ranks as the text matched it: the name
+    # exactly, a word of it, or an alias (returned as stored).
+    exact = iv.search_places(build, "new brighton")["rows"]
+    assert [(r["place_id"], r["matched"]) for r in exact] == [("nbr", None)]
+    prefix = iv.search_places(build, "bright")["rows"]
+    assert [r["place_id"] for r in prefix] == ["nbr", "bbe", "bri", "bhi", "alb", "hov"]
+    assert [r["matched"] for r in prefix] == [None, None, None, None, None, "Brighton"]
+    assert iv.search_places(build, "newydd")["rows"][0]["matched"] == "Brighton\rNewydd"
+    volos = iv.search_places(build, "ΒΟΛΟΣ")["rows"]
+    assert [(r["place_id"], r["matched"]) for r in volos] == [("vol", None)]
+    client = TestClient(iv.create_app(cache))
+    reply = client.get(
+        f"/api/builds/{iv.LATEST}/search", params={"q": "Brighton", "limit": 2}
+    )
+    assert reply.status_code == 200 and reply.headers["X-Snapshot"] == build.snapshot_id
+    assert reply.json()["total"] == 6 and [
+        r["place_id"] for r in reply.json()["rows"]
+    ] == ["bri", "hov"]
+    assert set(reply.json()["rows"][0]) == {
+        "place_id",
+        "name",
+        "kind",
+        "parent_id",
+        "country_code",
+        "chain",
+        "served",
+        "feed_count",
+        "tier",
+        "matched",
+    }
+    at_level = client.get(
+        f"/api/builds/{iv.LATEST}/search", params={"q": "Brighton", "level": "national"}
+    )
+    assert [r["served"] for r in at_level.json()["rows"]].count(
+        True
+    ) == 0  # local edges do not count
+    monkeypatch.setattr(iv, "SEARCH_MAX", 3)
+    capped = client.get(
+        f"/api/builds/{iv.LATEST}/search", params={"q": "Brighton", "limit": 500}
+    )
+    assert len(capped.json()["rows"]) == 3
+    for params in (
+        {"q": "b"},
+        {"q": "Brighton", "limit": 0},
+        {"q": "Brighton", "level": "x"},
+    ):
+        assert (
+            client.get(f"/api/builds/{iv.LATEST}/search", params=params).status_code
+            == 400
+        )
+
+
 def test_a_place_record_carries_ancestors_children_and_feeds(tmp_path):
     build = iv.load_build("b", write_build(tmp_path) and tmp_path)
     feature = json.loads(iv.place_record(build, "hel"))
@@ -867,7 +1028,10 @@ def write_partitioned_build(
     listing = {}
     for name, table in tables.items():
         if isinstance(table, list):
-            table = pa.Table.from_pylist(table)
+            rows = table
+            table = (
+                _places_table(rows) if "places" in name else pa.Table.from_pylist(rows)
+            )
         partition, _, file = name.partition("/")
         (path / partition).mkdir(exist_ok=True)
         sink = io.BytesIO()

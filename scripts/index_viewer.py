@@ -45,6 +45,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import shapely
 import shapely.errors
@@ -145,6 +146,19 @@ PROPERTY_COLUMNS = ("place_id", "name", "kind", "parent_id", "country_code", "se
 _HERE = Path(__file__).resolve().parent  # the page and its module live here
 TABLE_LIMIT = 200  # rows per page of the places table, at most
 TREE_LIMIT = 2000  # nodes per tree level, at most
+SEARCH_LIMIT = 50  # search rows returned by default ...
+SEARCH_MAX = 200  # ... and at most
+# What a search row carries.
+SEARCH_COLUMNS = (
+    "place_id",
+    "name",
+    "kind",
+    "source_subtype",
+    "statistical_area_id",
+    "parent_id",
+    "country_code",
+    "build_id",
+)
 KIND_RANK = {"country": 0, "region": 1, "city": 2}  # the tree's order
 SERVICE_STATS = ("stops", "routes", "departures_per_day")
 # The places table's columns; ``build_id`` in the catalogue only.
@@ -396,6 +410,43 @@ def _plain_directory(path):
     return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
 
 
+def _one_line(values):
+    """String values with any line break (LF, CRLF or CR) made a space: one
+    value is one line."""
+    values = pc.fill_null(values.cast(pa.string()), "")
+    return pc.replace_substring_regex(values, pattern=r"\r\n|\r|\n", replacement=" ")
+
+
+def _flat(values):
+    """String values as the search text holds them: one line, lower-cased
+    by Arrow — the one case mapping the text, the query and the ranks share."""
+    return pc.utf8_lower(_one_line(values))
+
+
+def _lines(offsets, values):
+    """The rows of a list column joined with newlines, from the ``offsets``
+    into ``values`` the array exposes; a null value joins as nothing."""
+    values = pa.ListArray.from_arrays(offsets, _one_line(values))
+    return pc.binary_join(values, "\n")
+
+
+def _search_text(places):
+    """What a query matches, one string per place: the name, the aliases and
+    the names in other languages, one per line, lower-cased. Arrow list
+    operations throughout; a build without aliases or names has the name."""
+    parts = [_one_line(places["name"].combine_chunks())]
+    if "aliases" in places.column_names:
+        aliases = places["aliases"].combine_chunks()
+        if pa.types.is_list(aliases.type):
+            parts.append(_lines(aliases.offsets, aliases.values))
+    if "names" in places.column_names:
+        names = places["names"].combine_chunks()
+        if pa.types.is_map(names.type):
+            parts.append(_lines(names.offsets, names.items))
+    joined = pc.binary_join_element_wise(*parts, "\n", null_handling="skip")
+    return pc.utf8_lower(joined)  # the values are one line each already
+
+
 class Build:
     """One verified build: its tables, its geometry and per-place summaries."""
 
@@ -406,6 +457,7 @@ class Build:
         self.digests = digests
         self.snapshot_id = _snapshot_digest(snapshot)
         places = tables["places.parquet"].to_pandas()
+        self.search_text = _search_text(tables["places.parquet"])
         self.geoms = shapely.from_wkb(places["geometry"].to_numpy())
         self.bounds = shapely.bounds(self.geoms)
         # Positional frames: a parquet written with a pandas index would
@@ -1085,9 +1137,11 @@ def filter_places(
     None for every kind. With ``bounded`` (the default, for map slices) a
     slice that can include cities must be bounded by ``parent_id`` or
     ``bbox`` (``ValueError`` otherwise); the geometry-free table passes
-    ``bounded=False``. ``feed_id`` keeps the places that feed serves, through the
-    edges. ``served`` and ``feed_id`` read the ``view`` (the build's default
-    when omitted). Every test is a vectorized mask over the build's arrays.
+    ``bounded=False``. ``q`` matches the search text (name, aliases and names
+    in other languages, any case). ``feed_id`` keeps the places that feed
+    serves, through the edges. ``served`` and ``feed_id`` read the ``view``
+    (the build's default when omitted). Every test is a vectorized mask over
+    the build's arrays.
     """
     places = build.places
     view = view or build.view()
@@ -1111,7 +1165,8 @@ def filter_places(
     if served is not None:
         mask &= view.served if served else ~view.served
     if q:
-        mask &= places["name"].str.contains(q, case=False, na=False, regex=False)
+        hits = pc.match_substring(build.search_text, q, ignore_case=True)
+        mask &= pc.fill_null(hits, False).to_numpy(zero_copy_only=False)
     if feed_id is not None:
         edges = build.edges[view.edge_mask]
         serving = set(edges.loc[edges["feed_id"] == feed_id, "place_id"])
@@ -1206,6 +1261,98 @@ def places_table(build, mask, sort="name", order="asc", offset=0, limit=50, view
     }
 
 
+def _ancestors(build, parent):
+    """The chain above a place, root first, as ``{place_id, name, kind}``."""
+    ancestors = []
+    for _ in range(8):  # a bounded walk: a cycle in the data cannot loop
+        if not isinstance(parent, str) or parent not in build._row_of.index:
+            break
+        ancestor = build.places.iloc[int(build._row_of[parent])]
+        ancestors.append(
+            {"place_id": parent, "name": ancestor["name"], "kind": ancestor["kind"]}
+        )
+        parent = ancestor["parent_id"]
+    return ancestors[::-1]
+
+
+def _list(value):
+    """An Arrow list cell as a list; a null cell is empty."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value if isinstance(value, list) else []
+
+
+def _matched(place, needle):
+    """The alias or other-language name of ``place`` containing ``needle``
+    when its name does not, else None; the value as stored."""
+    names = _as_map(place.get("names")) or {}
+    candidates = [*_list(place.get("aliases")), *names.values()]
+    candidates = [c for c in candidates if isinstance(c, str)]
+    flat = _flat(pa.array([place["name"], *candidates], pa.string())).to_pylist()
+    if needle in flat[0]:
+        return None
+    for candidate, line in zip(candidates, flat[1:]):
+        if needle in line:
+            return candidate
+    return None
+
+
+def search_places(build, q, limit=SEARCH_LIMIT, view=None):
+    """``{"total", "rows"}``: the places ``q`` matches, the best ``limit`` first.
+
+    Ranked: the name equals ``q`` (any case); an alias or a name in another
+    language does; a word of the name starts with ``q``; ``q`` is a substring
+    of any of them. Within a rank served places first, then more feeds, then
+    the name. A row carries the place's ``chain`` (its ancestors' names, root
+    first), the view's served flag, feed count and class, and ``matched``:
+    the alias or other name that matched when the name itself does not
+    contain ``q``.
+    """
+    q = " ".join(q.split())  # one space between words, none around, no newline
+    if len(q) < 2:
+        raise ValueError("q needs at least two characters")
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    view = view or build.view()
+    hits = np.flatnonzero(filter_places(build, None, q=q, bounded=False, view=view))
+    if not hits.size:
+        return {"total": 0, "rows": []}
+    needle = _flat(pa.array([q]))[0].as_py()
+    pattern = re.escape(needle)
+    text = build.search_text.take(pa.array(hits))
+    # The name as the text holds it (its first line), so that a name with a
+    # newline in it ranks as the text matched it.
+    names = pd.Series(pc.list_element(pc.split_pattern(text, "\n", max_splits=1), 0))
+    exact_line = pc.fill_null(pc.match_substring_regex(text, f"(?m)^{pattern}$"), False)
+    rank = np.select(
+        [
+            (names == needle).to_numpy(),
+            exact_line.to_numpy(zero_copy_only=False),
+            names.str.contains(rf"\b{pattern}", regex=True, na=False).to_numpy(),
+        ],
+        [0, 1, 2],
+        default=3,
+    )
+    order = pd.DataFrame(
+        {
+            "rank": rank,
+            "unserved": ~view.served[hits],
+            "feeds": -view.feed_count[hits],
+            "name": names.to_numpy(),
+        }
+    ).sort_values(["rank", "unserved", "feeds", "name"], kind="stable")
+    top = hits[order.index[: min(limit, SEARCH_MAX)]]
+    places = build.places.iloc[top]
+    rows = _json_ready(places[[c for c in SEARCH_COLUMNS if c in places.columns]])
+    for row, (_, place), position in zip(rows, places.iterrows(), top):
+        row["chain"] = [a["name"] for a in _ancestors(build, place["parent_id"])]
+        row["served"] = bool(view.served[position])
+        row["feed_count"] = int(view.feed_count[position])
+        row[build.class_column] = view.category[position]
+        row["matched"] = _matched(place, needle)
+    return {"total": int(hits.size), "rows": rows}
+
+
 def _cell(value):
     """One pandas cell as a JSON value (Arrow maps arrive as lists of pairs)."""
     if isinstance(value, np.ndarray):
@@ -1273,17 +1420,7 @@ def place_record(build, place_id):
     props["served"] = bool(build.served[row])
     props["feed_count"] = int(build.feed_count[row])
     props["bbox"] = [_cell(v) for v in build.bounds[row]]
-    ancestors = []
-    parent = place["parent_id"]
-    for _ in range(8):  # a bounded walk: a cycle in the data cannot loop
-        if not isinstance(parent, str) or parent not in build._row_of.index:
-            break
-        ancestor = places.iloc[int(build._row_of[parent])]
-        ancestors.append(
-            {"place_id": parent, "name": ancestor["name"], "kind": ancestor["kind"]}
-        )
-        parent = ancestor["parent_id"]
-    props["ancestors"] = ancestors[::-1]
+    props["ancestors"] = _ancestors(build, place["parent_id"])
     children = (places["parent_id"] == place_id).to_numpy()
     props["children"] = {
         "count": int(children.sum()),
@@ -1776,6 +1913,22 @@ def create_app(cache, size=CACHED_BUILDS):
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
         return JSONResponse(page, headers={"X-Snapshot": build.snapshot_id})
+
+    @app.get("/api/builds/{build_id}/search")
+    def search(
+        build_id: str,
+        q: str = "",
+        limit: int = SEARCH_LIMIT,
+        spec: str | None = None,
+        level: str | None = None,
+    ):
+        build = opened(build_id)
+        view = viewed(build, spec, level)
+        try:
+            reply = search_places(build, q, limit, view)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return JSONResponse(reply, headers={"X-Snapshot": build.snapshot_id})
 
     @app.get("/api/builds/{build_id}/places/{place_id}")
     def place(build_id: str, place_id: str):
