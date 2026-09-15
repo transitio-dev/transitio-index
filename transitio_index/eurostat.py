@@ -229,12 +229,23 @@ class Containment:
 
     def __init__(self, boundaries):
         self._ids = sorted(boundaries)
+        self._geoms = boundaries
         self._tree = STRtree([boundaries[nuts_id] for nuts_id in self._ids])
 
     def regions_at(self, point):
         """The NUTS-3 ids covering the point, sorted; several on a boundary."""
         found = self._tree.query(point, predicate="covered_by")
         return sorted(self._ids[index] for index in found)
+
+    def regions_over(self, footprint):
+        """The NUTS-3 ids whose region overlaps the footprint with some area,
+        sorted; a region only touched at its edge does not count."""
+        found = self._tree.query(footprint, predicate="intersects")
+        return sorted(
+            nuts_id
+            for nuts_id in (self._ids[index] for index in found)
+            if footprint.intersection(self._geoms[nuts_id]).area > 0
+        )
 
 
 def _footprint(rows):
@@ -258,11 +269,12 @@ def place_footprint(areas, place):
 
 
 def _pick(candidates, footprint, boundaries, by_nuts3):
-    """``(nuts_id, ambiguous)`` among the regions covering a footprint's
-    representative point. One candidate, or several implying one metro,
-    settle it; otherwise the region holding the larger share of the
-    footprint wins, and a tie (or a footprint without area) is ambiguous —
-    a boundary point may not choose between metros on its own."""
+    """``(nuts_id, ambiguous)`` among the candidate regions: those covering a
+    footprint's representative point or, when none does, those its land
+    overlaps. One candidate, or several implying one metro, settle it;
+    otherwise the region holding the larger share of the footprint wins,
+    and a tie (or a footprint without area) is ambiguous — a boundary point
+    may not choose between metros on its own."""
     if len(candidates) <= 1:
         return (candidates[0] if candidates else None), False
     if len({by_nuts3.get(nuts_id) for nuts_id in candidates}) == 1:
@@ -285,11 +297,15 @@ def assign(places, areas, metros, boundaries):
 
     ``status`` is ``"assigned"`` with the ``metro_code`` whose composition
     holds the city's NUTS-3 region, ``"unassigned"`` when that region is in
-    no metro (or the city lies outside every region), ``"ambiguous"`` when
-    the regions covering its representative point imply different metros
-    and hold equal shares of its footprint, and ``"unplaceable"`` when the
-    city has no usable land area. ``areas`` is ``geometry.read_areas``
-    output keyed by Overture id.
+    no metro (or the city's land overlaps no region), ``"ambiguous"`` when
+    the candidate regions imply different metros and hold equal shares of
+    its footprint, and ``"unplaceable"`` when the city has no usable land
+    area. The city's region is the one covering its footprint's
+    representative point; when that point lies in no region — a coastal
+    municipality whose Overture polygon runs out to sea, against the
+    coastline-clipped NUTS boundaries — the regions its land overlaps are
+    the candidates instead. ``areas`` is ``geometry.read_areas`` output
+    keyed by Overture id.
     """
     by_nuts3 = {
         nuts_id: code for code, metro in metros.items() for nuts_id in metro["nuts3"]
@@ -305,6 +321,8 @@ def assign(places, areas, metros, boundaries):
             status, nuts_id = "unplaceable", None
         else:
             candidates = containment.regions_at(footprint.representative_point())
+            if not candidates:
+                candidates = containment.regions_over(footprint)
             nuts_id, ambiguous = _pick(candidates, footprint, boundaries, by_nuts3)
             if ambiguous:
                 status = "ambiguous"
