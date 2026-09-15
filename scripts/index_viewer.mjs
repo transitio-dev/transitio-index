@@ -82,6 +82,75 @@ export function isCoarse(summary) {
   return (byKind.country || 0) + (byKind.region || 0) > SLICE_CAP;
 }
 
+export function searchUrl(build, q, view = INITIAL_VIEW) {
+  const query = new URLSearchParams({ q });
+  for (const [key, value] of Object.entries(viewParams(view))) {
+    if (value != null) query.set(key, String(value));
+  }
+  return `/api/builds/${encodeURIComponent(build)}/search?${query}`;
+}
+
+// What a place covers, from its kind and source subtype: a metro names its
+// source (the three the build writes) and its code; another kind its
+// subtype when that adds something.
+export const METRO_SOURCES = {
+  "metropolitan region": "Eurostat metropolitan region",
+  "city-region (FAO)": "FAO city-region",
+  "metropolitan statistical area": "US metropolitan statistical area",
+};
+
+export function coverageLabel(p) {
+  const subtype = p.source_subtype;
+  if (p.kind === "metro") {
+    const source = METRO_SOURCES[subtype] ?? subtype ?? "metropolitan area";
+    return p.statistical_area_id ? `${source} ${p.statistical_area_id}` : source;
+  }
+  return subtype && subtype !== p.kind ? `${p.kind} · ${subtype}` : p.kind;
+}
+
+export function kindBadge(kind) {
+  const color = KIND_COLORS[kind] ?? "#999";
+  return `<span class="badge" style="background:${color}">${escapeHtml(kind)}</span>`;
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+function hitHtml(row, field) {
+  const where = row.chain.slice(1).join(" › ");
+  const served = row.served
+    ? `served by ${plural(row.feed_count, "feed")}${row[field] ? ` · ${escapeHtml(row[field])}` : ""}`
+    : "unserved";
+  const matched = row.matched ? ` · as ${escapeHtml(row.matched)}` : "";
+  const build = row.build_id ? ` · ${escapeHtml(row.build_id)}` : "";
+  return (
+    `<button type="button" class="hit" data-id="${escapeHtml(row.place_id)}">` +
+    `${kindBadge(row.kind)}<strong>${escapeHtml(row.name)}</strong> ` +
+    `<span class="muted">${escapeHtml(coverageLabel(row))}</span>` +
+    `<br><small>${where ? `${escapeHtml(where)} · ` : ""}${served}${matched}${build}</small></button>`
+  );
+}
+
+// Search hits grouped by country — the chain's root, a country row itself —
+// so that a name shared across countries reads apart at a glance.
+export function searchResultsHtml(reply, q, field = "tier") {
+  if (!reply.rows.length) return `<p class="muted">Nothing matches “${escapeHtml(q)}”.</p>`;
+  const groups = new Map();
+  for (const row of reply.rows) {
+    const country = row.kind === "country" ? row.name : (row.chain[0] ?? row.country_code ?? "—");
+    if (!groups.has(country)) groups.set(country, []);
+    groups.get(country).push(row);
+  }
+  const sections = [...groups].map(([country, rows]) => {
+    const code = rows[0].country_code ? ` · ${escapeHtml(rows[0].country_code)}` : "";
+    return `<h4>${escapeHtml(country)}${code}</h4>${rows.map((row) => hitHtml(row, field)).join("")}`;
+  });
+  const more =
+    reply.total > reply.rows.length
+      ? `<p class="muted">${reply.rows.length} of ${reply.total} matches shown; type more to narrow.</p>`
+      : "";
+  return sections.join("") + more;
+}
+
 export function buildLabel(row) {
   if (!row.complete) return `${row.id} (incomplete)`;
   const date = (row.built_at || "").slice(0, 10);
@@ -582,9 +651,10 @@ async function fetchJson(url) {
   return response.json();
 }
 
-// A slice, with the snapshot digest the server stamped on it.
-async function fetchSlice(url) {
-  const response = await fetch(url);
+// A slice, with the snapshot digest the server stamped on it; ``signal``
+// aborts the request.
+async function fetchSlice(url, signal = undefined) {
+  const response = await fetch(url, signal ? { signal } : undefined);
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
   return { data: await response.json(), snapshot: response.headers.get("x-snapshot") };
 }
@@ -615,6 +685,8 @@ async function main() {
   const treeSection = document.getElementById("tree");
   const levelSelect = document.getElementById("level");
   const specSelect = document.getElementById("spec");
+  const searchInput = document.getElementById("search");
+  const searchResults = document.getElementById("search-results");
   let view = { ...INITIAL_VIEW }; // the level and spec every request carries
   let classField = "tier"; // the build's class field, from its summary
   let coarse = false; // the build's countries and regions overflow a slice
@@ -736,6 +808,9 @@ async function main() {
     // are dropped when they land.
     loadSelection = ++selectionSequence;
     tableSequence++;
+    closeSearch();
+    searchInput.value = "";
+    searchResults.innerHTML = "";
     recordCache.clear();
     dropPopup();
     details.innerHTML = PLACEHOLDER;
@@ -874,6 +949,77 @@ async function main() {
     map.getSource("ancestors").setData({ type: "FeatureCollection", features });
   }
 
+  // --- the search box: the whole build by name, alias or other-language name
+  // One query at a time: every keystroke, close, view change and build change
+  // outdates whatever is pending or in flight (the sequence), and a new
+  // request aborts the one in flight, so a stale reply never renders and a
+  // closed panel never reopens on its own.
+  let searchSequence = 0;
+  let searchTimer = null;
+  let searchAbort = null; // the controller of the request in flight
+  const outdateSearch = () => {
+    searchSequence++;
+    clearTimeout(searchTimer);
+    if (searchAbort) searchAbort.abort();
+  };
+  const closeSearch = () => {
+    outdateSearch();
+    searchResults.hidden = true;
+  };
+  async function runSearch() {
+    outdateSearch();
+    const q = searchInput.value.trim();
+    const mine = searchSequence;
+    if (q.length < 2 || !current) {
+      searchResults.hidden = true;
+      return;
+    }
+    const build = current;
+    const controller = new AbortController();
+    searchAbort = controller;
+    let reply;
+    try {
+      reply = await fetchSlice(searchUrl(build, q, view), controller.signal);
+    } catch (error) {
+      if (mine !== searchSequence || controller.signal.aborted) return;
+      searchResults.innerHTML = `<p class="muted">${escapeHtml(String(error))}</p>`;
+      searchResults.hidden = false;
+      return;
+    }
+    if (mine !== searchSequence) return;
+    if (reply.snapshot !== snapshot) {
+      startLoad(build); // ``latest`` was republished: one snapshot for all
+      return;
+    }
+    searchResults.innerHTML = searchResultsHtml(reply.data, q, classField);
+    searchResults.hidden = false;
+  }
+  const pickHit = (id) => {
+    closeSearch();
+    selectPlace(id, { zoom: true }).catch(console.error);
+  };
+  searchInput.addEventListener("input", () => {
+    outdateSearch();
+    searchTimer = setTimeout(() => runSearch().catch(console.error), 250);
+  });
+  searchInput.addEventListener("focus", () => {
+    if (searchResults.innerHTML && searchInput.value.trim().length >= 2) searchResults.hidden = false;
+  });
+  searchInput.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeSearch();
+    if (event.key === "Enter" && !searchResults.hidden) {
+      const first = searchResults.querySelector(".hit");
+      if (first) pickHit(first.dataset.id);
+    }
+  });
+  searchResults.addEventListener("click", (event) => {
+    const hit = event.target.closest(".hit");
+    if (hit) pickHit(hit.dataset.id);
+  });
+  document.addEventListener("click", (event) => {
+    if (!searchResults.hidden && !event.target.closest("#search-box")) closeSearch();
+  });
+
   // --- the Places tab: the whole build, paged and sorted by the server
   let table = { ...INITIAL_TABLE };
   let tableSequence = 0;
@@ -908,10 +1054,10 @@ async function main() {
     table = tableState(table, action);
     loadTable().catch(console.error);
   };
-  let searchTimer = null;
+  let tableTimer = null;
   tableSearch.addEventListener("input", () => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => dispatch({ type: "search", query: tableSearch.value.trim() }), 250);
+    clearTimeout(tableTimer);
+    tableTimer = setTimeout(() => dispatch({ type: "search", query: tableSearch.value.trim() }), 250);
   });
   tableKind.addEventListener("change", () => dispatch({ type: "filter", field: "kind", value: tableKind.value }));
   tableServed.addEventListener("change", () =>
@@ -1281,6 +1427,14 @@ async function main() {
     } else if (selectedRecord && selectedRecord.mine === selectionSequence) {
       const { record } = selectedRecord;
       loadEdges({ place_id: record.properties.place_id }, record.properties.name, selectionSequence).catch(console.error);
+    }
+    // Open results answer the old view: ask again; closed ones are dropped
+    // rather than shown again on focus.
+    if (!searchResults.hidden) {
+      runSearch().catch(console.error);
+    } else {
+      closeSearch();
+      searchResults.innerHTML = "";
     }
   };
   levelSelect.addEventListener("change", changeView);

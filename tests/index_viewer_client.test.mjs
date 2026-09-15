@@ -23,6 +23,9 @@ import {
   buildLabel,
   isCoarse,
   collectionBounds,
+  coverageLabel,
+  searchResultsHtml,
+  searchUrl,
   overflowText,
   overviewParams,
   paddedBounds,
@@ -83,6 +86,37 @@ test("the overview has no bbox; from zoom 7 the slice follows the padded viewpor
   assert.equal(sliceParams(7, bounds, INITIAL_VIEW, true).kind, undefined);
   assert.equal(sliceParams(5, bounds, { level: "regional", spec: "all" }, true).kind, "country");
   assert.equal(sliceParams(5, bounds, { level: "city", spec: "all" }, true).kind, undefined);
+});
+
+test("a coverage label names a metro's source and code, else the kind and subtype", () => {
+  const metro = { kind: "metro", source_subtype: "metropolitan region", statistical_area_id: "FI001MC" };
+  assert.equal(coverageLabel(metro), "Eurostat metropolitan region FI001MC");
+  assert.equal(coverageLabel({ kind: "metro", source_subtype: "city-region (FAO)", statistical_area_id: "1" }), "FAO city-region 1");
+  assert.equal(coverageLabel({ kind: "metro", source_subtype: "conurbation" }), "conurbation");
+  assert.equal(coverageLabel({ kind: "metro" }), "metropolitan area");
+  assert.equal(coverageLabel({ kind: "city", source_subtype: "locality" }), "city · locality");
+  assert.equal(coverageLabel({ kind: "country", source_subtype: "country" }), "country");
+  assert.equal(coverageLabel({ kind: "region" }), "region");
+});
+
+test("search results group by country, name what each hit covers and how it matched", () => {
+  const state = { place_id: "ga", name: "Georgia", kind: "region", source_subtype: "state", country_code: "US",
+    chain: ["United States"], served: true, feed_count: 12, tier: "regional", matched: null };
+  const country = { place_id: "ge", name: "Georgia", kind: "country", source_subtype: "country", country_code: "GE",
+    chain: [], served: false, feed_count: 0, tier: null, matched: null, build_id: "ge-0000000000000001" };
+  const alias = { place_id: "hel", name: "Helsinki", kind: "city", source_subtype: "locality", country_code: "FI",
+    chain: ["Finland", "Uusimaa"], served: true, feed_count: 3, tier: "local", matched: "Helsingfors" };
+  const html = searchResultsHtml({ total: 3, rows: [state, country, alias] }, "ge");
+  assert.match(html, /<h4>United States · US<\/h4>.*<h4>Georgia · GE<\/h4>.*<h4>Finland · FI<\/h4>/s);
+  assert.match(html, /data-id="ga".*Georgia<\/strong> <span class="muted">region · state<\/span><br><small>served by 12 feeds · regional/);
+  assert.match(html, /data-id="ge".*country<\/span><br><small>unserved · ge-0000000000000001/);
+  assert.match(html, /data-id="hel".*Uusimaa · served by 3 feeds · local · as Helsingfors/);
+  assert.doesNotMatch(html, /matches shown/);
+  const cut = searchResultsHtml({ total: 40, rows: [alias] }, "hel", "category");
+  assert.match(cut, /1 of 40 matches shown/);
+  assert.match(searchResultsHtml({ total: 0, rows: [] }, "<x>"), /Nothing matches “&lt;x&gt;”/);
+  assert.equal(searchUrl("fi", "hel sinki"), "/api/builds/fi/search?q=hel+sinki");
+  assert.equal(searchUrl("fi", "x", { level: "city", spec: "gtfs" }), "/api/builds/fi/search?q=x&level=city&spec=gtfs");
 });
 
 test("labels name a build by id, date and count, and mark an incomplete one", () => {
