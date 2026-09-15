@@ -99,17 +99,20 @@ export const METRO_SOURCES = {
   "metropolitan statistical area": "US metropolitan statistical area",
 };
 
+// A lookup by a value from the data: an own entry, never an inherited one.
+const named = (table, key) => (Object.hasOwn(table, key) ? table[key] : undefined);
+
 export function coverageLabel(p) {
   const subtype = p.source_subtype;
   if (p.kind === "metro") {
-    const source = METRO_SOURCES[subtype] ?? subtype ?? "metropolitan area";
+    const source = named(METRO_SOURCES, subtype) ?? subtype ?? "metropolitan area";
     return p.statistical_area_id ? `${source} ${p.statistical_area_id}` : source;
   }
   return subtype && subtype !== p.kind ? `${p.kind} · ${subtype}` : p.kind;
 }
 
 export function kindBadge(kind) {
-  const color = KIND_COLORS[kind] ?? "#999";
+  const color = named(KIND_COLORS, kind) ?? "#999";
   return `<span class="badge" style="background:${color}">${escapeHtml(kind)}</span>`;
 }
 
@@ -118,7 +121,7 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function hitHtml(row, field) {
   const where = row.chain.slice(1).join(" › ");
   const served = row.served
-    ? `served by ${plural(row.feed_count, "feed")}${row[field] ? ` · ${escapeHtml(row[field])}` : ""}`
+    ? `served by ${escapeHtml(plural(row.feed_count, "feed"))}${row[field] ? ` · ${escapeHtml(row[field])}` : ""}`
     : "unserved";
   const matched = row.matched ? ` · as ${escapeHtml(row.matched)}` : "";
   const build = row.build_id ? ` · ${escapeHtml(row.build_id)}` : "";
@@ -333,7 +336,57 @@ const specLine = (bySpec) =>
     .map(([spec, n]) => `${escapeHtml(n)} ${escapeHtml(spec)}`)
     .join(", ");
 
-export function detailsHtml(record, field = "tier") {
+// The coverage line: what the place is (a metro's source and code, another
+// kind's subtype), a metro's member count and boundary, a place's metros.
+export const GEOMETRY_SOURCES = { member_union: "union of members" };
+
+export function coverageLine(p) {
+  const parts = [`${kindBadge(p.kind)}${escapeHtml(coverageLabel(p))}`];
+  if (p.kind === "metro") {
+    const members = p.members || { count: 0, served: 0 };
+    const cities = members.count === 1 ? "member city" : "member cities";
+    parts.push(`${escapeHtml(members.count)} ${cities}, ${escapeHtml(members.served)} served`);
+    if (p.geometry_source) {
+      parts.push(`boundary: ${escapeHtml(named(GEOMETRY_SOURCES, p.geometry_source) ?? p.geometry_source)}`);
+    }
+  }
+  const metros = (p.metros || []).map(
+    (m) =>
+      `<button type="button" class="crumb" data-id="${escapeHtml(m.place_id)}">${escapeHtml(m.name)}</button>` +
+      ` (${escapeHtml(coverageLabel({ kind: "metro", source_subtype: m.source_subtype }))})`,
+  );
+  if (metros.length) parts.push(`member of ${metros.join(", ")}`);
+  return `<p class="coverage">${parts.join(" · ")}</p>`;
+}
+
+export function membersHtml(members) {
+  if (!members || !members.rows || !members.rows.length) return "";
+  const items = members.rows
+    .map(
+      (m) =>
+        `<li><button type="button" class="crumb" data-id="${escapeHtml(m.place_id)}">${escapeHtml(m.name)}</button> ` +
+        `<small class="muted">${m.served ? escapeHtml(plural(m.feed_count, "feed")) : "unserved"}</small></li>`,
+    )
+    .join("");
+  const cut =
+    members.count > members.rows.length ? `<li class="muted">${members.rows.length} of ${escapeHtml(members.count)} shown</li>` : "";
+  return `<details class="members"><summary>${escapeHtml(members.count)} members</summary><ul>${items}${cut}</ul></details>`;
+}
+
+// The tier checkboxes over a place's feeds; an edge without a tier is unknown.
+export const ALL_TIERS = ["local", "regional", "national", "international", "unknown"];
+const tierOf = (edge) => edge.tier ?? "unknown";
+
+export function tierFilterHtml(tiers) {
+  const boxes = ALL_TIERS.map(
+    (tier) => `<label><input type="checkbox" name="tier" value="${tier}"${tiers.has(tier) ? " checked" : ""}> ${tier}</label>`,
+  );
+  return `<p class="tiers">${boxes.join(" ")}</p>`;
+}
+
+// ``tiers``: the tiers whose feeds to list (every tier when null); ``sources``:
+// build id to built_at, for the source build line of a catalogue record.
+export function detailsHtml(record, field = "tier", { tiers = null, sources = {} } = {}) {
   const p = record.properties;
   const chain = crumbs(record)
     .map((c, i, all) =>
@@ -346,7 +399,7 @@ export function detailsHtml(record, field = "tier") {
   const reach = specLine(p.reached_from);
   const validity = validityHtml(p.validity);
   const served = p.served
-    ? `served by ${p.feed_count} feed${p.feed_count === 1 ? "" : "s"}${specs ? ` (${specs})` : ""}` +
+    ? `served by ${escapeHtml(plural(p.feed_count, "feed"))}${specs ? ` (${specs})` : ""}` +
       (reach ? ` · reached from ${reach}` : "")
     : "not served";
   const stats = Object.entries(p.service || {})
@@ -357,10 +410,14 @@ export function detailsHtml(record, field = "tier") {
         .map(([kind, n]) => `${escapeHtml(n)} ${escapeHtml(kind)}`)
         .join(", ")}), ${escapeHtml(p.children.served)} served</p>`
     : "";
-  const feeds = (p.edges || [])
+  const edges = p.edges || [];
+  const shown = tiers ? edges.filter((e) => tiers.has(tierOf(e))) : edges;
+  const category = field === "category";
+  const feeds = shown
     .map(
       (e) =>
-        `<tr><td>${escapeHtml(e.feed_name ?? e.feed_id)}</td><td>${escapeHtml(edgeClass(e, field))}</td>` +
+        `<tr><td>${escapeHtml(e.feed_name ?? e.feed_id)}</td><td>${escapeHtml(tierOf(e))}</td>` +
+        (category ? `<td>${escapeHtml(e.relevance_category ?? DASH)}</td>` : "") +
         `<td>${e.relevance == null ? DASH : e.relevance.toFixed(2)}</td>` +
         `<td>${e.tier_confidence == null ? DASH : e.tier_confidence.toFixed(2)}</td>` +
         `<td>${escapeHtml(e.method ?? DASH)}${e.cross_border ? " · cross-border" : ""}</td></tr>`,
@@ -373,16 +430,25 @@ export function detailsHtml(record, field = "tier") {
         : `<li>${label}: ${escapeHtml(p[key])}</li>`,
     )
     .join("");
+  const built = sources[p.build_id];
+  const source = p.build_id
+    ? `<p><small>from build ${escapeHtml(p.build_id)}${built ? `, built ${escapeHtml(String(built).slice(0, 10))}` : ""}</small></p>`
+    : "";
+  const count =
+    tiers && shown.length !== edges.length ? `<p class="muted">${shown.length} of ${edges.length} feeds</p>` : "";
+  const header = `<th>Feed</th><th>Tier</th>${category ? "<th>Category</th>" : ""}<th>Rel.</th><th>Conf.</th><th>Method</th>`;
   return (
     `<p class="chain">${chain}</p>` +
+    coverageLine(p) +
     `<p><small>${escapeHtml(p.kind)} · ${escapeHtml(p.place_id)}</small> · ${served}</p>` +
     (stats ? `<ul class="stats">${stats}</ul>` : "") +
     children +
-    (feeds
-      ? `<table class="feeds"><thead><tr><th>Feed</th><th>Class</th><th>Rel.</th><th>Conf.</th><th>Method</th></tr></thead><tbody>${feeds}</tbody></table>`
-      : "") +
+    membersHtml(p.members) +
+    (edges.length ? tierFilterHtml(tiers ?? new Set(ALL_TIERS)) + count : "") +
+    (feeds ? `<table class="feeds"><thead><tr>${header}</tr></thead><tbody>${feeds}</tbody></table>` : "") +
     (ids ? `<ul class="ids">${ids}</ul>` : "") +
-    validity
+    validity +
+    source
   );
 }
 
@@ -690,6 +756,9 @@ async function main() {
   let view = { ...INITIAL_VIEW }; // the level and spec every request carries
   let classField = "tier"; // the build's class field, from its summary
   let coarse = false; // the build's countries and regions overflow a slice
+  let sources = {}; // the catalogue's source builds by id, to their build date
+  let tiers = new Set(ALL_TIERS); // the tiers the details list feeds of
+  const renderDetails = (record) => detailsHtml(record, classField, { tiers, sources });
   let selectedId = null; // the selected place, marked in the tree
   let selectedRecord = null; // `{ record, mine }`: revealed once the tree has loaded
   let pendingScroll = null; // the tree item to scroll to when the Tree tab is next shown
@@ -845,6 +914,7 @@ async function main() {
     stats.textContent = summaryLabel(summary);
     classField = summary.category_field ?? "tier";
     coarse = isCoarse(summary);
+    sources = Object.fromEntries((summary.sources || []).map((s) => [s.id, s.built_at]));
     specSelect.parentElement.hidden = !specSelectable(summary);
     if (specSelect.parentElement.hidden && view.spec !== "all") {
       specSelect.value = "all";
@@ -927,9 +997,9 @@ async function main() {
     selectedId = record.properties.place_id;
     loadEdges({ place_id: id }, record.properties.name, mine).catch(console.error);
     selectedRecord = { record, mine }; // with the sequence it was accepted under
-    details.innerHTML = detailsHtml(record, classField);
+    details.innerHTML = renderDetails(record);
     revealInTree(record, mine).catch(console.error);
-    if (fromPopup && popup === fromPopup && popup.isOpen()) popup.setHTML(detailsHtml(record, classField));
+    if (fromPopup && popup === fromPopup && popup.isOpen()) popup.setHTML(renderDetails(record));
     showTab("details");
     map.getSource("selected").setData(record);
     map.getSource("ancestors").setData(EMPTY); // the old chain goes with the old selection
@@ -1073,9 +1143,26 @@ async function main() {
     const row = event.target.closest("tr[data-id]");
     if (row) selectPlace(row.dataset.id, { zoom: true }).catch(console.error);
   });
-  details.addEventListener("click", (event) => {
+  // The details render in the panel and, after a map click, in the popup
+  // too; both hold the same crumbs and tier checkboxes, so both are handled
+  // here and re-rendered together. The tier choice outlives the selection.
+  const detailsRoot = (target) => target.closest("#details, .maplibregl-popup-content");
+  const renderSelected = () => {
+    if (!selectedRecord) return;
+    const html = renderDetails(selectedRecord.record);
+    details.innerHTML = html;
+    if (popup && popup.isOpen()) popup.setHTML(html);
+  };
+  document.addEventListener("click", (event) => {
     const crumb = event.target.closest(".crumb");
-    if (crumb) selectPlace(crumb.dataset.id, { zoom: true }).catch(console.error);
+    if (crumb && detailsRoot(event.target)) selectPlace(crumb.dataset.id, { zoom: true }).catch(console.error);
+  });
+  document.addEventListener("change", (event) => {
+    const root = event.target.closest('input[name="tier"]') && detailsRoot(event.target);
+    if (!root) return;
+    const checked = root.querySelectorAll('input[name="tier"]:checked');
+    tiers = new Set([...checked].map((box) => box.value));
+    renderSelected();
   });
   for (const button of panel.querySelectorAll("nav button")) {
     button.addEventListener("click", () => showTab(button.dataset.tab));
