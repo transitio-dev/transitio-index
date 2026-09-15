@@ -1206,6 +1206,52 @@ def _run(builds, label, digit, **kwargs):
     return path.parent.name
 
 
+def test_the_catalogue_takes_each_label_s_newest_run_or_says_why_not(tmp_path):
+    cache = tmp_path / "cache"
+    builds = cache / "builds"
+    day = "2026-09-{:02d}T00:00:00+00:00".format
+    _run(builds, "fi", 1, built_at=day(13))
+    fi = _run(builds, "fi", 2, built_at=day(14))
+    de = _run(builds, "de", 3, built_at=day(15))
+    se = _run(builds, "se", 6, built_at=day(15))  # a tie: the lower id wins
+    _run(builds, "se", 7, built_at=day(15))
+    nl = _run(builds, "nl", 4, feeds=[], edges={})
+    gone = _run(builds, "gone", 5)
+    _notice_listed_but_gone(builds / gone / "index")
+    six = _run(builds, "six", 8)  # partitioned, yet claiming schema 6
+    _rewrite_snapshot(builds / six / "index", lambda s: s.update(schema_version=6))
+    _run(builds, "bad", 9, built_at=day(13))  # a run whose snapshot cannot be
+    bad = _run(builds, "bad", 10)  # read ranks first, so the label is skipped
+    (builds / bad / "index" / "snapshot.json").write_text("{")
+    _run(builds, "when", 11, built_at=day(13))  # so does one without a date
+    when = _run(builds, "when", 12, built_at="yesterday")
+    nodate = _run(builds, "nodate", 13)
+    _rewrite_snapshot(builds / nodate / "index", lambda s: s.pop("built_at"))
+    _run(builds, "raw", 14, built_at=day(13))  # a run without its index yet
+    (builds / "raw-000000000000000f").mkdir()
+    write_build(builds / "old" / "index")
+    write_build(cache / "index")
+    write_build(builds / iv.CATALOGUE / "index")  # a reserved id: not a build
+    sources, skipped = iv.catalogue_sources(cache)
+    assert [(b, s["built_at"][8:10]) for b, _, s in sources] == [
+        (de, "15"),
+        (fi, "14"),
+        (se, "15"),
+    ]
+    assert all(path == builds / b / "index" for b, path, _ in sources)
+    assert skipped == [
+        {"id": bad, "reason": "incomplete"},
+        {"id": gone, "reason": "incomplete"},
+        {"id": iv.LATEST, "reason": "not partitioned"},
+        {"id": nl, "reason": "no feeds"},
+        {"id": nodate, "reason": "undated"},
+        {"id": "old", "reason": "not partitioned"},
+        {"id": "raw-000000000000000f", "reason": "incomplete"},
+        {"id": six, "reason": "not partitioned"},
+        {"id": when, "reason": "undated"},
+    ]
+
+
 def test_the_catalogue_merges_feeds_edges_and_places_by_source(tmp_path):
     spill = json.dumps({"feeds": 2})  # the German build's own view of Finland
     a = _run(

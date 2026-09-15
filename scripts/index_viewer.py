@@ -589,8 +589,9 @@ def load_build(build_id, path, read_bytes=_read_file):
         return None
 
 
-def _is_build_dir(index, root):
-    """A real directory inside ``root`` holding a regular ``snapshot.json``.
+def _is_build_dir(index, root, listed=True):
+    """A real directory inside ``root`` holding a regular ``snapshot.json``
+    (any such directory, snapshot or not, when ``listed`` is False).
 
     Neither the directory nor the snapshot may be a symlink, and the directory
     must *resolve* under the resolved cache root, so a link anywhere in the
@@ -601,19 +602,25 @@ def _is_build_dir(index, root):
         return (
             index.is_dir()
             and not index.is_symlink()
-            and _is_regular_file(index / "snapshot.json")
+            and (not listed or _is_regular_file(index / "snapshot.json"))
             and index.resolve().is_relative_to(root)
         )
     except OSError:
         return False
 
 
-def discover(cache):
-    """``{build_id: index directory}`` for every build under ``cache``."""
+def discover(cache, listed=True):
+    """``{build_id: index directory}`` for every build under ``cache``.
+
+    With ``listed`` False the plain entries without a snapshot, or without
+    their index directory, yet are included too: the catalogue's
+    candidates, where a run being written must rank ahead of an older run
+    of its label.
+    """
     cache = Path(cache)
     root = cache.resolve()
     found = {}
-    if _is_build_dir(cache / "index", root):
+    if _is_build_dir(cache / "index", root, listed):
         found[LATEST] = cache / "index"
     builds = cache / "builds"
     try:
@@ -621,12 +628,15 @@ def discover(cache):
     except OSError:  # no builds/ directory, or it went away mid-scan
         entries = []
     for entry in entries:
-        # ``latest`` is reserved for cache/index, and a symlinked entry
-        # could redirect discovery outside the cache.
-        if entry.name == LATEST or entry.is_symlink():
+        # ``latest`` (cache/index) and ``catalogue`` are reserved ids, and a
+        # symlinked entry could redirect discovery outside the cache.
+        if entry.name in (LATEST, CATALOGUE) or entry.is_symlink():
             continue
-        if _is_build_dir(entry / "index", root):
-            found[entry.name] = entry / "index"
+        index = entry / "index"
+        if _is_build_dir(index, root, listed) or (
+            not listed and _is_build_dir(entry, root, False)
+        ):
+            found[entry.name] = index
     return found
 
 
@@ -663,6 +673,65 @@ def describe(build_id, path, read_bytes=_read_file):
 def label_of(build_id):
     """A build's label: an archived run's id without its snapshot suffix."""
     return LABEL_SUFFIX.sub("", build_id)
+
+
+_EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def _built_at(snapshot):
+    """A snapshot's build date as an aware datetime, None when unreadable."""
+    value = snapshot.get("built_at") if isinstance(snapshot, dict) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=datetime.timezone.utc)
+
+
+def catalogue_sources(cache, read_bytes=_read_file):
+    """``(sources, skipped)``: the newest build of every label under ``cache``.
+
+    ``sources`` lists ``(build_id, path, snapshot)`` by label; ``skipped``
+    the labels whose newest run cannot be a source, with the reason: not
+    complete, undated, not partitioned (before schema 7), or without a feeds
+    table. An older run of a skipped label is never consulted: it would show
+    stale data as current. Newest is by build date, ties to the lower id; a
+    run whose snapshot or date cannot be read — one still being written —
+    ranks first and is skipped.
+    """
+    runs = {}
+    for build_id, path in discover(cache, listed=False).items():
+        try:
+            snapshot = json.loads(read_bytes(path / "snapshot.json"))
+        except _SNAPSHOT_ERRORS:
+            snapshot = None
+        runs.setdefault(label_of(build_id), []).append(
+            (_built_at(snapshot), build_id, path, snapshot)
+        )
+    sources, skipped = [], []
+    for label in sorted(runs):
+        ranked = sorted(runs[label], key=lambda run: run[1])
+        ranked.sort(key=lambda run: (run[0] is None, run[0] or _EPOCH), reverse=True)
+        stamp, build_id, path, snapshot = ranked[0]
+        files = snapshot_files(snapshot)
+        if files is None or not _files_present(path, files):
+            reason = "incomplete"
+        elif stamp is None:
+            reason = "undated"
+        elif "partitions" not in snapshot or not (
+            isinstance(snapshot.get("schema_version"), int)
+            and snapshot["schema_version"] >= 7
+        ):
+            reason = "not partitioned"
+        elif not any(name.endswith("/feeds.parquet") for name in files):
+            reason = "no feeds"
+        else:
+            sources.append((build_id, path, snapshot))
+            continue
+        skipped.append({"id": build_id, "reason": reason})
+    return sources, skipped
 
 
 def _keys(table, columns, order):
