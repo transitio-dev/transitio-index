@@ -261,6 +261,8 @@ def test_every_assignment_status():
         _city("Q_SEA", "FI", "sea"),  # outside every region
         _city("Q_BRD", "FI", "brd"),  # astride a border inside one metro
         _city("Q_TIE", "FI", "tie"),  # astride a border between two metros
+        _city("Q_CST", "FI", "cst"),  # coastal: its point at sea, its land in a region
+        _city("Q_EDG", "FI", "edg"),  # at sea, touching a region at its edge only
         _city("Q_NOID", "FI", None),  # no overture id
         _city("Q_NOGEO", "FI", "nogeo"),  # only unreadable areas
         _city("Q_ATH", "GR", "ath"),  # gazetteer GR, Eurostat prefix EL
@@ -283,6 +285,8 @@ def test_every_assignment_status():
         "sea": [{"geom": shapely.box(0.0, 0.0, 1.0, 1.0), "sources": []}],
         "brd": [{"geom": shapely.box(24.9, 60.4, 25.1, 60.6), "sources": []}],
         "tie": [{"geom": shapely.box(24.2, 59.9, 24.4, 60.1), "sources": []}],
+        "cst": [{"geom": shapely.box(23.0, 60.4, 24.2, 60.6), "sources": []}],
+        "edg": [{"geom": shapely.box(23.0, 60.4, 24.0, 60.6), "sources": []}],
         "nogeo": [{"geom": None, "sources": []}],
         "ath": [{"geom": shapely.box(23.6, 37.9, 23.8, 38.1), "sources": []}],
         "lon": [{"geom": shapely.box(-0.2, 51.4, 0.1, 51.6), "sources": []}],
@@ -302,6 +306,18 @@ def test_every_assignment_status():
             "status": "assigned",
             "nuts_id": "FI1B1",
             "metro_code": "FI001MC",
+        },
+        {
+            "city_id": "Q_CST",
+            "status": "assigned",
+            "nuts_id": "FI1B1",
+            "metro_code": "FI001MC",
+        },
+        {
+            "city_id": "Q_EDG",
+            "status": "unassigned",
+            "nuts_id": None,
+            "metro_code": None,
         },
         {
             "city_id": "Q_ESP",
