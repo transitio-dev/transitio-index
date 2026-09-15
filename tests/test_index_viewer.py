@@ -845,13 +845,16 @@ def write_partitioned_build(
     edges=PARTITIONED_EDGES,
     notice=b"NOTICE\n",
     realtime=None,
+    built_at="2026-09-12T00:00:00+00:00",
 ):
-    """A schema-7 build: FI places and domestic edges, feeds by home country
-    (``international`` without one), the cross-border edges under ``links``,
-    every table listed with its rows and digest; ``notice=None`` publishes
-    it unlicensed."""
+    """A schema-7 build: places by country, feeds by home country
+    (``international`` without one), domestic edges by partition and the
+    cross-border edges under ``links``, every table listed with its rows and
+    digest; ``notice=None`` publishes it unlicensed."""
     path.mkdir(parents=True, exist_ok=True)
-    tables = {"FI/places.parquet": pa.Table.from_pylist(places)}
+    tables = {}
+    for place in places:
+        tables.setdefault(f"{place['country_code']}/places.parquet", []).append(place)
     for feed in feeds:
         partition = feed["home_country"] or "international"
         key = f"{partition}/feeds.parquet"
@@ -875,7 +878,7 @@ def write_partitioned_build(
         }
     snapshot = {
         "schema_version": 8 if realtime else 7,
-        "built_at": "2026-09-12T00:00:00+00:00",
+        "built_at": built_at,
         "counts": {"places": len(places)},
         "partitions": listing,
         "licensed": notice is not None,
@@ -1191,6 +1194,134 @@ def test_the_feed_side_api_filters_by_spec_level_and_country(tmp_path):
     assert (
         "category_primary" not in client.get("/api/builds/flat/feeds").json()["rows"][0]
     )
+
+
+# ---- the catalogue: every label's newest build, merged ----
+
+
+def _run(builds, label, digit, **kwargs):
+    """A partitioned build archived as ``<label>-<16 hex>`` under ``builds``."""
+    path = builds / f"{label}-{digit:016x}" / "index"
+    write_partitioned_build(path, **kwargs)
+    return path.parent.name
+
+
+def test_the_catalogue_merges_feeds_edges_and_places_by_source(tmp_path):
+    spill = json.dumps({"feeds": 2})  # the German build's own view of Finland
+    a = _run(
+        tmp_path,
+        "fi",
+        1,
+        feeds=[
+            _feed7("hsl", "HSL", "FI", "domestic"),
+            _feed7("tram", "Tram", "FI", "d"),
+            _feed7("nat", "Nat", "FI", "domestic"),
+        ],
+        edges={
+            "FI": [
+                _edge7("hel", "hsl", "local", "primary", 0.9, False),
+                _edge7("hel", "tram", "local", "primary", 0.5, False),
+                _edge7("esp", "tram", "local", "primary", 0.5, False),
+                _edge7("uus", "nat", "regional", "secondary", 0.5, False),
+            ]
+        },
+        realtime={
+            "FI": [
+                _rt("nat-rt", "nat", {"realtime_trip_updates": "https://a"}),
+                _rt("nat-rt2", "nat", {"realtime_alerts": "https://a2"}),
+                _rt("lost", None, {}, method="none"),
+            ]
+        },
+        built_at="2026-09-14T00:00:00+00:00",
+    )
+    b = _run(
+        tmp_path,
+        "de",
+        2,
+        places=[
+            _place("de", "country", "Germany", None, BOX(5, 47, 15, 55), country="DE"),
+            _place("ber", "city", "Berlin", "de", BOX(13, 52, 14, 53), country="DE"),
+            {**PLACES[0], "service": spill},
+            {**PLACES[2], "service": spill},  # unserved in both runs
+            {**PLACES[3], "service": spill},
+            {**PLACES[4], "service": spill},  # one edge in both runs
+        ],
+        feeds=[
+            _feed7("flix", "Flix", "DE", "domestic"),
+            _feed7("nat", "Nat 2", "FI", "d"),
+        ],
+        edges={
+            "DE": [_edge7("ber", "flix", "local", "primary", 0.9, False)],
+            "FI": [_edge7("fi", "nat", "national", "tertiary", 0.4, False)],
+            "links": [
+                _edge7(
+                    "hel", "flix", "international", "international", 0.3, True, "DE"
+                ),
+                _edge7(
+                    "esp", "flix", "international", "international", 0.3, True, "DE"
+                ),
+            ],
+        },
+        realtime={"FI": [_rt("nat-rt", "nat", {"realtime_trip_updates": "https://b"})]},
+        built_at="2026-09-15T00:00:00+00:00",
+    )
+    sources = []
+    for run in (a, b):
+        snapshot, _, tables = iv.load_tables(tmp_path / run / "index")
+        sources.append((run, snapshot, tables))
+    snapshot, tables = iv.merge_tables(
+        sources, skipped=[{"id": "nl", "reason": "no feeds"}]
+    )
+    build = iv.Build(iv.CATALOGUE, tmp_path, snapshot, {}, tables)
+    # A feed from the newest run carrying it, its edges from that run only.
+    feeds = build.feeds.set_index("feed_id")
+    assert feeds["build_id"].to_dict() == {"hsl": a, "tram": a, "flix": b, "nat": b}
+    assert feeds.loc["nat", "name"] == "Nat 2"
+    edges = build.edges[["place_id", "feed_id", "build_id"]]
+    assert set(map(tuple, edges.to_numpy())) == {
+        ("hel", "hsl", a),
+        ("hel", "tram", a),
+        ("esp", "tram", a),
+        ("ber", "flix", b),
+        ("fi", "nat", b),
+        ("hel", "flix", b),
+        ("esp", "flix", b),
+    }
+    # A place from the run serving it most (two edges beat one), the newest
+    # run on a tie (esp: one each) or when nothing serves it (lap); the row's
+    # service is that run's.
+    places = build.places.set_index("place_id")
+    ids = ["hel", "fi", "uus", "ber", "esp", "lap"]
+    assert places.loc[ids, "build_id"].to_list() == [a, b, a, b, b, b]
+    by_id = list(build.places["place_id"])
+    assert build.service[by_id.index("hel")] == {"feeds": 1}
+    assert build.service[by_id.index("lap")] == {"feeds": 2}
+    assert build.feed_count[by_id.index("hel")] == 3
+    # A companion of a won feed comes with that feed's run or not at all
+    # (nat-rt2 is the older run's); an unlinked one from the newest run.
+    assert build.realtime.set_index("feed_id")["build_id"].to_dict() == {
+        "nat-rt": b,
+        "lost": a,
+    }
+    assert build.realtime_urls[list(build.realtime["feed_id"]).index("nat-rt")] == {
+        "realtime_trip_updates": "https://b"
+    }
+    assert snapshot["counts"] == {
+        "places": 8,
+        "places_by_kind": {"city": 4, "region": 2, "country": 2},
+        "feeds": 4,
+        "edges": 7,
+        "edges_by_tier": {"local": 4, "international": 2, "national": 1},
+        "realtime": 2,
+    }
+    assert snapshot["built_at"][8:10] == "15" and snapshot["schema_version"] == 8
+    assert snapshot["licensed"] is True and snapshot["catalogue"] is True
+    assert [(s["label"], s["partitions"]) for s in snapshot["sources"]] == [
+        ("de", ["DE", "FI", "links"]),
+        ("fi", ["FI"]),
+    ]
+    assert snapshot["skipped"] == [{"id": "nl", "reason": "no feeds"}]
+    assert build.snapshot_id == iv._snapshot_digest(snapshot)
 
 
 def test_a_schema_8_build_carries_its_realtime_companions(tmp_path):
