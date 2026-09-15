@@ -1709,14 +1709,16 @@ def test_the_cache_and_the_api_serve_the_catalogue(tmp_path):
         {"id": junk, "reason": "does not verify"}
     ]
     # A repair that keeps the file's size and modification time is noticed
-    # too: the change time cannot be kept.
+    # too: the change time cannot be kept — except on Windows, whose change
+    # time is the creation time, so the repair there keeps its new mtime.
     edges_file.write_bytes(intact[:-1] + bytes([intact[-1] ^ 1]))
     _run(builds, "zz", 6)  # a new source: the next request reassembles
     sixth = cached.get(iv.CATALOGUE)
     assert [run["id"] for run in sixth.snapshot["skipped"]] == [broken, junk]
     tampered = os.stat(edges_file)
     edges_file.write_bytes(intact)
-    os.utime(edges_file, ns=(tampered.st_atime_ns, tampered.st_mtime_ns))
+    if os.name != "nt":
+        os.utime(edges_file, ns=(tampered.st_atime_ns, tampered.st_mtime_ns))
     seventh = cached.get(iv.CATALOGUE)
     assert seventh is not sixth and [r["id"] for r in seventh.snapshot["skipped"]] == [
         junk
