@@ -392,6 +392,7 @@ def test_the_api_serves_the_listing_summaries_and_bounded_slices(tmp_path, monke
     assert module.headers["content-type"].startswith("text/javascript")
     assert module.text.startswith("//")
     assert [row["id"] for row in client.get("/api/builds").json()] == [
+        iv.CATALOGUE,
         iv.LATEST,
         "fi-abc",
     ]
@@ -1048,7 +1049,7 @@ def test_the_cache_and_the_api_serve_a_partitioned_build(tmp_path):
     second = builds.get(iv.LATEST)
     assert second is not first and second.feed_count.max() == 1
     client = TestClient(iv.create_app(cache))
-    listing = client.get("/api/builds").json()
+    listing = client.get("/api/builds").json()[1:]  # after the catalogue's row
     assert listing[0]["complete"] is True and listing[0]["schema_version"] == 7
     summary = client.get(f"/api/builds/{iv.LATEST}/summary").json()
     assert summary["schema_version"] == 7 and set(summary["partitions"]) == {"FI"}
@@ -1368,6 +1369,148 @@ def test_the_catalogue_merges_feeds_edges_and_places_by_source(tmp_path):
     ]
     assert snapshot["skipped"] == [{"id": "nl", "reason": "no feeds"}]
     assert build.snapshot_id == iv._snapshot_digest(snapshot)
+
+
+def test_the_cache_and_the_api_serve_the_catalogue(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    builds = cache / "builds"
+    builds.mkdir(parents=True)
+    repairs = {}  # a file to restore the moment the cache has read it
+
+    def reading(path):
+        data = iv._read_file(path)
+        intact = repairs.pop(Path(path), None)
+        if intact is not None:
+            Path(path).write_bytes(intact)
+        return data
+
+    cached = iv.BuildCache(cache, read_bytes=reading)
+    assert cached.get(iv.CATALOGUE) is None  # nothing to merge yet
+    assert cached.summaries() == [
+        {
+            "id": iv.CATALOGUE,
+            "complete": False,
+            "built_at": None,
+            "sources": 0,
+            "skipped": [],
+        }
+    ]
+    fi = _run(builds, "fi", 1, built_at="2026-09-14T00:00:00+00:00")
+    de = _run(
+        builds,
+        "de",
+        2,
+        places=[
+            _place("de", "country", "Germany", None, BOX(5, 47, 15, 55), country="DE")
+        ],
+        feeds=[_feed7("flix", "Flix", "DE", "domestic")],
+        edges={
+            "links": [
+                _edge7("hel", "flix", "international", "international", 0.3, True, "DE")
+            ]
+        },
+        built_at="2026-09-15T00:00:00+00:00",
+    )
+    nl = _run(builds, "nl", 3, feeds=[], edges={})
+    first = cached.get(iv.CATALOGUE)
+    assert first is not None and cached.get(iv.CATALOGUE) is first
+    assert first.snapshot["skipped"] == [{"id": nl, "reason": "no feeds"}]
+    client = TestClient(iv.create_app(cache))
+    listing = client.get("/api/builds").json()
+    assert listing[0]["id"] == iv.CATALOGUE and listing[0]["complete"] is True
+    assert listing[0]["sources"] == 2 and listing[0]["built_at"][8:10] == "15"
+    assert listing[0]["counts"]["places"] == 7 and listing[0]["skipped"] == [
+        {"id": nl, "reason": "no feeds"}
+    ]
+    assert [row["id"] for row in listing[1:]] == [de, fi, nl]
+    summary = client.get(f"/api/builds/{iv.CATALOGUE}/summary")
+    assert (
+        summary.json()["catalogue"] is True and summary.json()["counts"]["places"] == 7
+    )
+    assert [s["label"] for s in summary.json()["sources"]] == ["de", "fi"]
+    # Every projection names the row's source build and the snapshot it is of.
+    table = client.get(f"/api/builds/{iv.CATALOGUE}/places/table", params={"q": "Hel"})
+    assert table.json()["rows"][0]["build_id"] == fi
+    assert table.headers["X-Snapshot"] == summary.json()["snapshot_id"]
+    record = client.get(f"/api/builds/{iv.CATALOGUE}/places/hel").json()["properties"]
+    assert record["build_id"] == fi and record["feed_count"] == 4
+    feeds = client.get(f"/api/builds/{iv.CATALOGUE}/feeds").json()["rows"]
+    assert {row["feed_id"]: row["build_id"] for row in feeds} == {
+        "f1": fi,
+        "f2": fi,
+        "f3": fi,
+        "flix": de,
+    }
+    feed = client.get(f"/api/builds/{iv.CATALOGUE}/feeds/flix").json()["properties"]
+    assert feed["build_id"] == de
+    # A new run reassembles the catalogue; one that does not verify is
+    # skipped, whether its digests mismatch or its tables are not a build's.
+    broken = _run(builds, "xx", 4)
+    edges_file = builds / broken / "index" / "FI" / "edges.parquet"
+    intact = edges_file.read_bytes()
+    edges_file.write_bytes(intact[:-1] + bytes([intact[-1] ^ 1]))  # same size
+    repairs[edges_file] = intact  # restored right after the failed read
+    junk = _run(
+        builds,
+        "yy",
+        5,
+        places=[{**PLACES[0], "geometry": b"not wkb"}],
+        feeds=[_feed7("j", "J", "FI", "domestic")],
+        edges={"FI": [_edge7("fi", "j", "national", "tertiary", 0.4, False)]},
+    )
+    second = cached.get(iv.CATALOGUE)
+    assert second is not first
+    assert second.snapshot["skipped"] == [
+        {"id": nl, "reason": "no feeds"},
+        {"id": broken, "reason": "does not verify"},
+        {"id": junk, "reason": "does not verify"},
+    ]
+    # The repair landed after the read that failed; it is noticed all the same.
+    third = cached.get(iv.CATALOGUE)
+    assert third is not second and cached.get(iv.CATALOGUE) is third
+    assert third.snapshot["skipped"] == [
+        {"id": nl, "reason": "no feeds"},
+        {"id": junk, "reason": "does not verify"},
+    ]
+    assert client.get("/api/builds").json()[0]["skipped"] == third.snapshot["skipped"]
+    # So are a source rewritten under its id, and a skipped run that goes away.
+    write_partitioned_build(
+        builds / fi / "index",
+        feeds=PARTITIONED_FEEDS[:1],
+        edges={"FI": PARTITIONED_EDGES["FI"][:1]},
+        built_at="2026-09-14T00:00:00+00:00",
+    )
+    fourth = cached.get(iv.CATALOGUE)
+    assert fourth is not third and fourth.snapshot["counts"]["feeds"] == 4
+    by_feed = dict(zip(fourth.feeds["feed_id"], fourth.feeds["build_id"]))
+    assert by_feed["f1"] == fi and by_feed["f2"] == broken  # f2 left the fi run
+    shutil.rmtree(builds / nl)
+    fifth = cached.get(iv.CATALOGUE)
+    assert fifth is not fourth and fifth.snapshot["skipped"] == [
+        {"id": junk, "reason": "does not verify"}
+    ]
+    # A repair that keeps the file's size and modification time is noticed
+    # too: the change time cannot be kept.
+    edges_file.write_bytes(intact[:-1] + bytes([intact[-1] ^ 1]))
+    _run(builds, "zz", 6)  # a new source: the next request reassembles
+    sixth = cached.get(iv.CATALOGUE)
+    assert [run["id"] for run in sixth.snapshot["skipped"]] == [broken, junk]
+    tampered = os.stat(edges_file)
+    edges_file.write_bytes(intact)
+    os.utime(edges_file, ns=(tampered.st_atime_ns, tampered.st_mtime_ns))
+    seventh = cached.get(iv.CATALOGUE)
+    assert seventh is not sixth and [r["id"] for r in seventh.snapshot["skipped"]] == [
+        junk
+    ]
+    later = client.get(f"/api/builds/{iv.CATALOGUE}/summary").json()
+    assert later["snapshot_id"] != summary.json()["snapshot_id"]
+    table = client.get(f"/api/builds/{iv.CATALOGUE}/places/table", params={"q": "Hel"})
+    assert table.headers["X-Snapshot"] == later["snapshot_id"]
+    # A source is loaded on the snapshot it was selected on, or not at all.
+    assert iv.load_tables(builds / fi / "index", expected={"other": True}) is None
 
 
 def test_a_schema_8_build_carries_its_realtime_companions(tmp_path):

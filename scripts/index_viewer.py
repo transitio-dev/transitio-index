@@ -147,6 +147,8 @@ TABLE_LIMIT = 200  # rows per page of the places table, at most
 TREE_LIMIT = 2000  # nodes per tree level, at most
 KIND_RANK = {"country": 0, "region": 1, "city": 2}  # the tree's order
 SERVICE_STATS = ("stops", "routes", "departures_per_day")
+# The places table's columns; ``build_id`` in the catalogue only.
+TABLE_COLUMNS = ("place_id", "name", "kind", "parent_id", "country_code", "build_id")
 TABLE_SORT_COLUMNS = (
     "place_id",
     "name",
@@ -176,6 +178,7 @@ RECORD_COLUMNS = (
     "curated",
     "metro_ids",
     "member_ids",
+    "build_id",
 )
 EDGE_COLUMNS = (
     "feed_id",
@@ -227,6 +230,7 @@ FEED_TABLE_COLUMNS = (
     "partition",
     "service_start",
     "service_end",
+    "build_id",
 )
 # The descriptive columns a feed record carries when the build has them.
 FEED_RECORD_COLUMNS = (
@@ -250,6 +254,7 @@ FEED_RECORD_COLUMNS = (
     "partition",
     "service_start",
     "service_end",
+    "build_id",
 )
 
 
@@ -529,17 +534,21 @@ def _has_columns(table, name, required):
     return required.get(name, set()) <= set(columns)
 
 
-def load_tables(path, read_bytes=_read_file):
+def load_tables(path, read_bytes=_read_file, expected=None):
     """``(snapshot, digests, tables)`` of the verified build at ``path``, or
     None while it is mid-publish.
 
     Every file is read once through ``read_bytes``; its digest is checked and a
     table is parsed from those same bytes, so a file swapped between two reads
-    surfaces as a digest mismatch, never as a mixed generation.
+    surfaces as a digest mismatch, never as a mixed generation. With
+    ``expected``, the snapshot read must equal it: a caller that chose the
+    build on a snapshot loads that generation or none.
     """
     path = Path(path)
     try:
         snapshot = json.loads(read_bytes(path / "snapshot.json"))
+        if expected is not None and snapshot != expected:
+            return None
         files = snapshot_files(snapshot)
         if files is None:
             return None
@@ -690,6 +699,32 @@ def _built_at(snapshot):
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=datetime.timezone.utc)
 
 
+def run_signature(path, snapshot):
+    """What repairing a run that did not verify changes while its snapshot
+    stays: the identity (inode, size, mode, modification and change times)
+    of every file the snapshot lists and of every partition directory."""
+    files = snapshot_files(snapshot) or ()
+    nodes = {*files, *(name.rpartition("/")[0] for name in files if "/" in name)}
+    signature = []
+    for name in sorted(nodes):
+        try:
+            info = os.lstat(Path(path) / name)
+        except OSError:
+            signature.append((name,))
+            continue
+        signature.append(
+            (
+                name,
+                info.st_ino,
+                info.st_size,
+                info.st_mode,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+        )
+    return tuple(signature)
+
+
 def catalogue_sources(cache, read_bytes=_read_file):
     """``(sources, skipped)``: the newest build of every label under ``cache``.
 
@@ -734,6 +769,28 @@ def catalogue_sources(cache, read_bytes=_read_file):
     return sources, skipped
 
 
+def catalogue_row(build, skipped):
+    """The catalogue's listing row from its assembled snapshot; incomplete,
+    with the runs skipped, when nothing could be assembled."""
+    if build is None:
+        return {
+            "id": CATALOGUE,
+            "complete": False,
+            "built_at": None,
+            "sources": 0,
+            "skipped": skipped,
+        }
+    snapshot = build.snapshot
+    return {
+        "id": CATALOGUE,
+        "complete": True,
+        "built_at": snapshot["built_at"],
+        "counts": snapshot["counts"],
+        "sources": len(snapshot["sources"]),
+        "skipped": snapshot["skipped"],
+    }
+
+
 def _keys(table, columns, order):
     """The key columns of a stacked table as a frame, with each row's
     position (``row``) and the rank of its source (``order``)."""
@@ -760,7 +817,7 @@ def merge_tables(sources, skipped=()):
     merged tables and lists the ``sources`` and the ``skipped`` runs.
     """
     ranked = sorted(sources, key=lambda source: source[0])
-    ranked.sort(key=lambda source: source[1].get("built_at") or "", reverse=True)
+    ranked.sort(key=lambda source: _built_at(source[1]) or _EPOCH, reverse=True)
     order = {build_id: rank for rank, (build_id, _, _) in enumerate(ranked)}
     stacked = {}
     for build_id, _, tables in ranked:
@@ -842,13 +899,63 @@ def merge_tables(sources, skipped=()):
     return snapshot, tables
 
 
+def _merged_build(cache, loaded, skipped):
+    if not loaded:
+        return None
+    try:
+        sources = [(build_id, s, t) for build_id, _, s, t, _ in loaded]
+        snapshot, tables = merge_tables(sources, skipped)
+        return Build(CATALOGUE, Path(cache), snapshot, {}, tables)
+    except _BUILD_ERRORS:
+        return None
+
+
+def assemble_catalogue(cache, sources, skipped, read_bytes=_read_file):
+    """``(build, skipped, unverified)``: the catalogue ``Build`` over
+    ``sources`` (None when none of them loads); every run skipped — the
+    selection's, plus a source that does not verify when read: a snapshot
+    rewritten since it was selected, a digest mismatch, or tables that are
+    not a build's (undecodable WKB, malformed service), found source by
+    source only when the merged build fails; and, for those unverified
+    runs, ``{build_id: (path, snapshot, signature)}``, the file signature a
+    repair changes, taken before the run was read so that a repair landing
+    right after the read is not missed."""
+    loaded, skipped, unverified = [], list(skipped), {}
+
+    def refuse(build_id, path, snapshot, signature):
+        skipped.append({"id": build_id, "reason": "does not verify"})
+        unverified[build_id] = (path, snapshot, signature)
+
+    for build_id, path, snapshot in sources:
+        signature = run_signature(path, snapshot)
+        verified = load_tables(path, read_bytes, expected=snapshot)
+        if verified is None:
+            refuse(build_id, path, snapshot, signature)
+        else:
+            loaded.append((build_id, path, verified[0], verified[2], signature))
+    build = _merged_build(cache, loaded, skipped)
+    if build is None and loaded:
+        sound = []
+        for source in loaded:
+            build_id, path, snapshot, tables, signature = source
+            try:
+                Build(build_id, Path(cache), snapshot, {}, tables)
+                sound.append(source)
+            except _BUILD_ERRORS:
+                refuse(build_id, path, snapshot, signature)
+        build = _merged_build(cache, sound, skipped)
+    return build, skipped, unverified
+
+
 class BuildCache:
     """Verified builds by id, reloaded exactly when a snapshot's digests change.
 
     ``get`` re-reads the small ``snapshot.json`` on every call and compares its
     digests with the cached build's: the churning ``cache/index`` is reloaded
-    when it changes, a per-country build is hashed once. The most recent
-    ``size`` builds are kept.
+    when it changes, a per-country build is hashed once. The catalogue is
+    assembled on its first request and again when the set of its sources or
+    any source's snapshot changes. The most recent ``size`` builds are kept,
+    the catalogue among them.
     """
 
     def __init__(self, cache, size=CACHED_BUILDS, read_bytes=_read_file):
@@ -856,19 +963,68 @@ class BuildCache:
         self.size = size
         self.read_bytes = read_bytes
         self._builds = collections.OrderedDict()
+        # What the last catalogue assembly saw: its key (the sources and the
+        # skipped runs; None once the catalogue is evicted), the runs it
+        # skipped, and the file signatures of those that did not verify.
+        self._catalogue_key = None
+        self._catalogue_skipped = []
+        self._catalogue_unverified = {}
         # The web app's handlers run in worker threads; a get is one
         # lookup-load-evict transaction, so it holds the lock throughout.
         self._lock = threading.Lock()
 
     def summaries(self):
-        return [
+        """The catalogue's row first (assembled now if need be), then every
+        discovered build's."""
+        rows = [
             describe(build_id, path, self.read_bytes)
             for build_id, path in discover(self.cache).items()
         ]
+        with self._lock:
+            catalogue = self._catalogue()
+            skipped = self._catalogue_skipped
+        return [catalogue_row(catalogue, skipped), *rows]
 
     def get(self, build_id):
         with self._lock:
+            if build_id == CATALOGUE:
+                return self._catalogue()
             return self._get(build_id)
+
+    def _keep(self, build_id, build):
+        self._builds[build_id] = build
+        self._builds.move_to_end(build_id)
+        while len(self._builds) > self.size:
+            evicted, _ = self._builds.popitem(last=False)
+            if evicted == CATALOGUE:
+                self._catalogue_key = None
+        return build
+
+    def _catalogue(self):
+        sources, skipped = catalogue_sources(self.cache, self.read_bytes)
+        key = [(build_id, _snapshot_digest(s)) for build_id, _, s in sources]
+        key += [(run["id"], run["reason"]) for run in skipped]
+        if self._catalogue_key == key and not self._repaired():
+            cached = self._builds.get(CATALOGUE)
+            if cached is not None:
+                self._builds.move_to_end(CATALOGUE)
+            return cached
+        build, skipped, unverified = assemble_catalogue(
+            self.cache, sources, skipped, self.read_bytes
+        )
+        self._catalogue_key, self._catalogue_skipped = key, skipped
+        self._catalogue_unverified = unverified
+        if build is None:
+            self._builds.pop(CATALOGUE, None)
+            return None
+        return self._keep(CATALOGUE, build)
+
+    def _repaired(self):
+        """A run that did not verify at the last assembly has changed since."""
+        return any(
+            run_signature(path, snapshot) != signature
+            for path, snapshot, signature in self._catalogue_unverified.values()
+        )
 
     def _get(self, build_id):
         path = discover(self.cache).get(build_id)
@@ -890,11 +1046,7 @@ class BuildCache:
         if build is None:
             self._builds.pop(build_id, None)
             return None
-        self._builds[build_id] = build
-        self._builds.move_to_end(build_id)
-        while len(self._builds) > self.size:
-            self._builds.popitem(last=False)
-        return build
+        return self._keep(build_id, build)
 
 
 def parse_kinds(value):
@@ -1007,7 +1159,7 @@ def _place_table(build, view):
     """The geometry-free table of a build's places under ``view``, one row each."""
     places = build.places
     names = pd.Series(places["name"].to_numpy(), index=places["place_id"].to_numpy())
-    table = places[["place_id", "name", "kind", "parent_id", "country_code"]].copy()
+    table = places[[c for c in TABLE_COLUMNS if c in places.columns]].copy()
     table["parent_name"] = places["parent_id"].map(names).to_numpy()
     table["served"] = view.served
     table["feed_count"] = view.feed_count
