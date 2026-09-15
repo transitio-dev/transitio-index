@@ -754,7 +754,10 @@ def _built_at(snapshot):
 def run_signature(path, snapshot):
     """What repairing a run that did not verify changes while its snapshot
     stays: the identity (inode, size, mode, modification and change times)
-    of every file the snapshot lists and of every partition directory."""
+    of every file the snapshot lists and of every partition directory. On
+    Windows the change time is the creation time, so a repair there that
+    keeps a file's size and modification time is not noticed until the
+    snapshot or another file changes."""
     files = snapshot_files(snapshot) or ()
     nodes = {*files, *(name.rpartition("/")[0] for name in files if "/" in name)}
     signature = []
