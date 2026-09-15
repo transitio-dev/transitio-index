@@ -45,6 +45,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import shapely
 import shapely.errors
@@ -92,6 +93,9 @@ REALTIME_COLUMNS = (
     "partition",
 )
 LATEST = "latest"  # the id of the build at cache/index
+CATALOGUE = "catalogue"  # the id of every label's newest build, merged
+# An archived run is ``<label>-<16 hex>``; any other build id is its own label.
+LABEL_SUFFIX = re.compile(r"-[0-9a-f]{16}$")
 CACHED_BUILDS = 4  # verified builds kept in memory
 # What a published index carries and the viewer reads; a verified set of
 # files that lacks any of these is not a build.
@@ -142,8 +146,26 @@ PROPERTY_COLUMNS = ("place_id", "name", "kind", "parent_id", "country_code", "se
 _HERE = Path(__file__).resolve().parent  # the page and its module live here
 TABLE_LIMIT = 200  # rows per page of the places table, at most
 TREE_LIMIT = 2000  # nodes per tree level, at most
+SEARCH_LIMIT = 50  # search rows returned by default ...
+SEARCH_MAX = 200  # ... and at most
+MEMBERS_LIMIT = 2000  # a metro record lists at most this many members
+# What a search row and a record's metro and member rows carry.
+SEARCH_COLUMNS = (
+    "place_id",
+    "name",
+    "kind",
+    "source_subtype",
+    "statistical_area_id",
+    "parent_id",
+    "country_code",
+    "build_id",
+)
+METRO_COLUMNS = ("place_id", "name", "source_subtype", "statistical_area_id")
+MEMBER_COLUMNS = ("place_id", "name", "kind", "served", "feed_count")
 KIND_RANK = {"country": 0, "region": 1, "city": 2}  # the tree's order
 SERVICE_STATS = ("stops", "routes", "departures_per_day")
+# The places table's columns; ``build_id`` in the catalogue only.
+TABLE_COLUMNS = ("place_id", "name", "kind", "parent_id", "country_code", "build_id")
 TABLE_SORT_COLUMNS = (
     "place_id",
     "name",
@@ -173,6 +195,7 @@ RECORD_COLUMNS = (
     "curated",
     "metro_ids",
     "member_ids",
+    "build_id",
 )
 EDGE_COLUMNS = (
     "feed_id",
@@ -224,6 +247,7 @@ FEED_TABLE_COLUMNS = (
     "partition",
     "service_start",
     "service_end",
+    "build_id",
 )
 # The descriptive columns a feed record carries when the build has them.
 FEED_RECORD_COLUMNS = (
@@ -247,6 +271,7 @@ FEED_RECORD_COLUMNS = (
     "partition",
     "service_start",
     "service_end",
+    "build_id",
 )
 
 
@@ -277,6 +302,14 @@ def _read_file(path):
         if not stat.S_ISREG(os.fstat(opened.fileno()).st_mode):
             raise OSError(f"{path}: not a regular file")
         return opened.read()
+
+
+def _snapshot_digest(snapshot):
+    """One id for a whole snapshot, metadata included: a republish that
+    changes only the edges, or only a count, changes it."""
+    return hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def snapshot_digests(snapshot):
@@ -380,6 +413,43 @@ def _plain_directory(path):
     return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
 
 
+def _one_line(values):
+    """String values with any line break (LF, CRLF or CR) made a space: one
+    value is one line."""
+    values = pc.fill_null(values.cast(pa.string()), "")
+    return pc.replace_substring_regex(values, pattern=r"\r\n|\r|\n", replacement=" ")
+
+
+def _flat(values):
+    """String values as the search text holds them: one line, lower-cased
+    by Arrow — the one case mapping the text, the query and the ranks share."""
+    return pc.utf8_lower(_one_line(values))
+
+
+def _lines(offsets, values):
+    """The rows of a list column joined with newlines, from the ``offsets``
+    into ``values`` the array exposes; a null value joins as nothing."""
+    values = pa.ListArray.from_arrays(offsets, _one_line(values))
+    return pc.binary_join(values, "\n")
+
+
+def _search_text(places):
+    """What a query matches, one string per place: the name, the aliases and
+    the names in other languages, one per line, lower-cased. Arrow list
+    operations throughout; a build without aliases or names has the name."""
+    parts = [_one_line(places["name"].combine_chunks())]
+    if "aliases" in places.column_names:
+        aliases = places["aliases"].combine_chunks()
+        if pa.types.is_list(aliases.type):
+            parts.append(_lines(aliases.offsets, aliases.values))
+    if "names" in places.column_names:
+        names = places["names"].combine_chunks()
+        if pa.types.is_map(names.type):
+            parts.append(_lines(names.offsets, names.items))
+    joined = pc.binary_join_element_wise(*parts, "\n", null_handling="skip")
+    return pc.utf8_lower(joined)  # the values are one line each already
+
+
 class Build:
     """One verified build: its tables, its geometry and per-place summaries."""
 
@@ -388,12 +458,9 @@ class Build:
         self.path = path
         self.snapshot = snapshot
         self.digests = digests
-        # One id for the whole verified snapshot, metadata included: a
-        # republish that changes only the edges, or only a count, changes it.
-        self.snapshot_id = hashlib.sha256(
-            json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        self.snapshot_id = _snapshot_digest(snapshot)
         places = tables["places.parquet"].to_pandas()
+        self.search_text = _search_text(tables["places.parquet"])
         self.geoms = shapely.from_wkb(places["geometry"].to_numpy())
         self.bounds = shapely.bounds(self.geoms)
         # Positional frames: a parquet written with a pandas index would
@@ -416,6 +483,7 @@ class Build:
         self._row_of = pd.Series(
             np.arange(len(self.places)), index=self.places["place_id"].to_numpy()
         )
+        self.metros_of = _metros_of(self.places)
         # The ``service`` JSON of places and edges, parsed once here and
         # normalized (non-finite → None); nothing parses it again per request,
         # and malformed JSON makes the build unavailable rather than a 500.
@@ -522,16 +590,21 @@ def _has_columns(table, name, required):
     return required.get(name, set()) <= set(columns)
 
 
-def load_build(build_id, path, read_bytes=_read_file):
-    """The verified build at ``path``, or None while it is mid-publish.
+def load_tables(path, read_bytes=_read_file, expected=None):
+    """``(snapshot, digests, tables)`` of the verified build at ``path``, or
+    None while it is mid-publish.
 
     Every file is read once through ``read_bytes``; its digest is checked and a
     table is parsed from those same bytes, so a file swapped between two reads
-    surfaces as a digest mismatch, never as a mixed generation.
+    surfaces as a digest mismatch, never as a mixed generation. With
+    ``expected``, the snapshot read must equal it: a caller that chose the
+    build on a snapshot loads that generation or none.
     """
     path = Path(path)
     try:
         snapshot = json.loads(read_bytes(path / "snapshot.json"))
+        if expected is not None and snapshot != expected:
+            return None
         files = snapshot_files(snapshot)
         if files is None:
             return None
@@ -564,13 +637,26 @@ def load_build(build_id, path, read_bytes=_read_file):
         for name in REQUIRED_COLUMNS:
             if not _has_columns(tables[name], name, REQUIRED_COLUMNS):
                 return None
-        return Build(build_id, path, snapshot, digests, tables)
+        return snapshot, digests, tables
     except _BUILD_ERRORS:
         return None
 
 
-def _is_build_dir(index, root):
-    """A real directory inside ``root`` holding a regular ``snapshot.json``.
+def load_build(build_id, path, read_bytes=_read_file):
+    """The verified build at ``path``, or None while it is mid-publish or
+    when its tables are not a build's (undecodable WKB, malformed service)."""
+    loaded = load_tables(path, read_bytes)
+    if loaded is None:
+        return None
+    try:
+        return Build(build_id, Path(path), *loaded)
+    except _BUILD_ERRORS:
+        return None
+
+
+def _is_build_dir(index, root, listed=True):
+    """A real directory inside ``root`` holding a regular ``snapshot.json``
+    (any such directory, snapshot or not, when ``listed`` is False).
 
     Neither the directory nor the snapshot may be a symlink, and the directory
     must *resolve* under the resolved cache root, so a link anywhere in the
@@ -581,19 +667,25 @@ def _is_build_dir(index, root):
         return (
             index.is_dir()
             and not index.is_symlink()
-            and _is_regular_file(index / "snapshot.json")
+            and (not listed or _is_regular_file(index / "snapshot.json"))
             and index.resolve().is_relative_to(root)
         )
     except OSError:
         return False
 
 
-def discover(cache):
-    """``{build_id: index directory}`` for every build under ``cache``."""
+def discover(cache, listed=True):
+    """``{build_id: index directory}`` for every build under ``cache``.
+
+    With ``listed`` False the plain entries without a snapshot, or without
+    their index directory, yet are included too: the catalogue's
+    candidates, where a run being written must rank ahead of an older run
+    of its label.
+    """
     cache = Path(cache)
     root = cache.resolve()
     found = {}
-    if _is_build_dir(cache / "index", root):
+    if _is_build_dir(cache / "index", root, listed):
         found[LATEST] = cache / "index"
     builds = cache / "builds"
     try:
@@ -601,12 +693,15 @@ def discover(cache):
     except OSError:  # no builds/ directory, or it went away mid-scan
         entries = []
     for entry in entries:
-        # ``latest`` is reserved for cache/index, and a symlinked entry
-        # could redirect discovery outside the cache.
-        if entry.name == LATEST or entry.is_symlink():
+        # ``latest`` (cache/index) and ``catalogue`` are reserved ids, and a
+        # symlinked entry could redirect discovery outside the cache.
+        if entry.name in (LATEST, CATALOGUE) or entry.is_symlink():
             continue
-        if _is_build_dir(entry / "index", root):
-            found[entry.name] = entry / "index"
+        index = entry / "index"
+        if _is_build_dir(index, root, listed) or (
+            not listed and _is_build_dir(entry, root, False)
+        ):
+            found[entry.name] = index
     return found
 
 
@@ -640,13 +735,286 @@ def describe(build_id, path, read_bytes=_read_file):
     return row
 
 
+def label_of(build_id):
+    """A build's label: an archived run's id without its snapshot suffix."""
+    return LABEL_SUFFIX.sub("", build_id)
+
+
+_EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def _built_at(snapshot):
+    """A snapshot's build date as an aware datetime, None when unreadable."""
+    value = snapshot.get("built_at") if isinstance(snapshot, dict) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=datetime.timezone.utc)
+
+
+def run_signature(path, snapshot):
+    """What repairing a run that did not verify changes while its snapshot
+    stays: the identity (inode, size, mode, modification and change times)
+    of every file the snapshot lists and of every partition directory. On
+    Windows the change time is the creation time, so a repair there that
+    keeps a file's size and modification time is not noticed until the
+    snapshot or another file changes."""
+    files = snapshot_files(snapshot) or ()
+    nodes = {*files, *(name.rpartition("/")[0] for name in files if "/" in name)}
+    signature = []
+    for name in sorted(nodes):
+        try:
+            info = os.lstat(Path(path) / name)
+        except OSError:
+            signature.append((name,))
+            continue
+        signature.append(
+            (
+                name,
+                info.st_ino,
+                info.st_size,
+                info.st_mode,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+        )
+    return tuple(signature)
+
+
+def catalogue_sources(cache, read_bytes=_read_file):
+    """``(sources, skipped)``: the newest build of every label under ``cache``.
+
+    ``sources`` lists ``(build_id, path, snapshot)`` by label; ``skipped``
+    the labels whose newest run cannot be a source, with the reason: not
+    complete, undated, not partitioned (before schema 7), or without a feeds
+    table. An older run of a skipped label is never consulted: it would show
+    stale data as current. Newest is by build date, ties to the lower id; a
+    run whose snapshot or date cannot be read — one still being written —
+    ranks first and is skipped.
+    """
+    runs = {}
+    for build_id, path in discover(cache, listed=False).items():
+        try:
+            snapshot = json.loads(read_bytes(path / "snapshot.json"))
+        except _SNAPSHOT_ERRORS:
+            snapshot = None
+        runs.setdefault(label_of(build_id), []).append(
+            (_built_at(snapshot), build_id, path, snapshot)
+        )
+    sources, skipped = [], []
+    for label in sorted(runs):
+        ranked = sorted(runs[label], key=lambda run: run[1])
+        ranked.sort(key=lambda run: (run[0] is None, run[0] or _EPOCH), reverse=True)
+        stamp, build_id, path, snapshot = ranked[0]
+        files = snapshot_files(snapshot)
+        if files is None or not _files_present(path, files):
+            reason = "incomplete"
+        elif stamp is None:
+            reason = "undated"
+        elif "partitions" not in snapshot or not (
+            isinstance(snapshot.get("schema_version"), int)
+            and snapshot["schema_version"] >= 7
+        ):
+            reason = "not partitioned"
+        elif not any(name.endswith("/feeds.parquet") for name in files):
+            reason = "no feeds"
+        else:
+            sources.append((build_id, path, snapshot))
+            continue
+        skipped.append({"id": build_id, "reason": reason})
+    return sources, skipped
+
+
+def catalogue_row(build, skipped):
+    """The catalogue's listing row from its assembled snapshot; incomplete,
+    with the runs skipped, when nothing could be assembled."""
+    if build is None:
+        return {
+            "id": CATALOGUE,
+            "complete": False,
+            "built_at": None,
+            "sources": 0,
+            "skipped": skipped,
+        }
+    snapshot = build.snapshot
+    return {
+        "id": CATALOGUE,
+        "complete": True,
+        "built_at": snapshot["built_at"],
+        "counts": snapshot["counts"],
+        "sources": len(snapshot["sources"]),
+        "skipped": snapshot["skipped"],
+    }
+
+
+def _keys(table, columns, order):
+    """The key columns of a stacked table as a frame, with each row's
+    position (``row``) and the rank of its source (``order``)."""
+    frame = table.select([*columns, "build_id"]).to_pandas()
+    frame["order"] = frame["build_id"].map(order)
+    frame["row"] = np.arange(len(frame))
+    return frame
+
+
+def _value_counts(column):
+    return {k: int(v) for k, v in column.to_pandas().value_counts().items()}
+
+
+def merge_tables(sources, skipped=()):
+    """The catalogue's ``(snapshot, tables)`` over loaded ``sources``, each a
+    ``(build_id, snapshot, tables)`` as ``load_tables`` returns them.
+
+    One row per id: a feed from the newest source carrying it (ties to the
+    lower id); a feed's edges from the source that won the feed, so one
+    build's classification is never mixed with another's; a place from the
+    source contributing the most kept edges to it, from the newest when none
+    does. A realtime companion follows its static feed, an unlinked one the
+    newest source. Every table gains ``build_id``. The snapshot recounts the
+    merged tables and lists the ``sources`` and the ``skipped`` runs.
+    """
+    ranked = sorted(sources, key=lambda source: source[0])
+    ranked.sort(key=lambda source: _built_at(source[1]) or _EPOCH, reverse=True)
+    order = {build_id: rank for rank, (build_id, _, _) in enumerate(ranked)}
+    stacked = {}
+    for build_id, _, tables in ranked:
+        for name, table in tables.items():
+            column = pa.repeat(build_id, len(table))
+            stacked.setdefault(name, []).append(table.append_column("build_id", column))
+    merged = {
+        name: pa.concat_tables(parts, promote_options="default")
+        for name, parts in stacked.items()
+    }
+    feeds = _keys(merged["feeds.parquet"], ["feed_id"], order)
+    winners = feeds.sort_values("order", kind="stable").drop_duplicates("feed_id")
+    won = winners[["feed_id", "build_id"]]
+    edges = _keys(merged["edges.parquet"], ["place_id", "feed_id"], order)
+    kept = edges.merge(won, on=["feed_id", "build_id"])
+    places = _keys(merged["places.parquet"], ["place_id"], order)
+    contributed = kept.groupby(["place_id", "build_id"]).size().rename("kept")
+    places = places.merge(contributed.reset_index(), how="left")
+    places["kept"] = places["kept"].fillna(0)
+    chosen = places.sort_values(
+        ["kept", "order"], ascending=[False, True], kind="stable"
+    ).drop_duplicates("place_id")
+    taken = {
+        "feeds.parquet": winners["row"],
+        "edges.parquet": kept["row"],
+        "places.parquet": chosen["row"],
+    }
+    if "realtime.parquet" in merged:
+        realtime = _keys(
+            merged["realtime.parquet"], ["feed_id", "static_feed_id"], order
+        )
+        # A companion of a won feed comes with that feed's source or not at
+        # all; one linked to no won feed comes from the newest source.
+        static = won.rename(columns={"feed_id": "static_feed_id"})
+        follows = realtime.merge(static, on=["static_feed_id", "build_id"])
+        loose = realtime[~realtime["static_feed_id"].isin(static["static_feed_id"])]
+        loose = loose.sort_values("order", kind="stable")
+        rows = pd.concat([follows["row"], loose["row"]])
+        taken["realtime.parquet"] = rows[
+            ~pd.concat([follows["feed_id"], loose["feed_id"]]).duplicated().to_numpy()
+        ]
+    tables = {
+        name: merged[name].take(pa.array(np.sort(rows.to_numpy())))
+        for name, rows in taken.items()
+    }
+    counts = {
+        "places": len(tables["places.parquet"]),
+        "places_by_kind": _value_counts(tables["places.parquet"]["kind"]),
+        "feeds": len(tables["feeds.parquet"]),
+        "edges": len(tables["edges.parquet"]),
+        "edges_by_tier": _value_counts(tables["edges.parquet"]["tier"]),
+    }
+    if "realtime.parquet" in tables:
+        counts["realtime"] = len(tables["realtime.parquet"])
+    versions = [
+        snapshot["schema_version"]
+        for _, snapshot, _ in ranked
+        if isinstance(snapshot.get("schema_version"), int)
+    ]
+    snapshot = {
+        "catalogue": True,
+        "built_at": ranked[0][1].get("built_at"),
+        "schema_version": min(versions) if versions else None,
+        "licensed": all(snapshot.get("licensed") for _, snapshot, _ in ranked),
+        "counts": counts,
+        "sources": [
+            {
+                "id": build_id,
+                "label": label_of(build_id),
+                "built_at": snapshot.get("built_at"),
+                "snapshot_id": _snapshot_digest(snapshot),
+                "schema_version": snapshot.get("schema_version"),
+                "partitions": sorted(snapshot.get("partitions") or ()),
+            }
+            for build_id, snapshot, _ in sorted(ranked, key=lambda s: label_of(s[0]))
+        ],
+        "skipped": list(skipped),
+    }
+    return snapshot, tables
+
+
+def _merged_build(cache, loaded, skipped):
+    if not loaded:
+        return None
+    try:
+        sources = [(build_id, s, t) for build_id, _, s, t, _ in loaded]
+        snapshot, tables = merge_tables(sources, skipped)
+        return Build(CATALOGUE, Path(cache), snapshot, {}, tables)
+    except _BUILD_ERRORS:
+        return None
+
+
+def assemble_catalogue(cache, sources, skipped, read_bytes=_read_file):
+    """``(build, skipped, unverified)``: the catalogue ``Build`` over
+    ``sources`` (None when none of them loads); every run skipped — the
+    selection's, plus a source that does not verify when read: a snapshot
+    rewritten since it was selected, a digest mismatch, or tables that are
+    not a build's (undecodable WKB, malformed service), found source by
+    source only when the merged build fails; and, for those unverified
+    runs, ``{build_id: (path, snapshot, signature)}``, the file signature a
+    repair changes, taken before the run was read so that a repair landing
+    right after the read is not missed."""
+    loaded, skipped, unverified = [], list(skipped), {}
+
+    def refuse(build_id, path, snapshot, signature):
+        skipped.append({"id": build_id, "reason": "does not verify"})
+        unverified[build_id] = (path, snapshot, signature)
+
+    for build_id, path, snapshot in sources:
+        signature = run_signature(path, snapshot)
+        verified = load_tables(path, read_bytes, expected=snapshot)
+        if verified is None:
+            refuse(build_id, path, snapshot, signature)
+        else:
+            loaded.append((build_id, path, verified[0], verified[2], signature))
+    build = _merged_build(cache, loaded, skipped)
+    if build is None and loaded:
+        sound = []
+        for source in loaded:
+            build_id, path, snapshot, tables, signature = source
+            try:
+                Build(build_id, Path(cache), snapshot, {}, tables)
+                sound.append(source)
+            except _BUILD_ERRORS:
+                refuse(build_id, path, snapshot, signature)
+        build = _merged_build(cache, sound, skipped)
+    return build, skipped, unverified
+
+
 class BuildCache:
     """Verified builds by id, reloaded exactly when a snapshot's digests change.
 
     ``get`` re-reads the small ``snapshot.json`` on every call and compares its
     digests with the cached build's: the churning ``cache/index`` is reloaded
-    when it changes, a per-country build is hashed once. The most recent
-    ``size`` builds are kept.
+    when it changes, a per-country build is hashed once. The catalogue is
+    assembled on its first request and again when the set of its sources or
+    any source's snapshot changes. The most recent ``size`` builds are kept,
+    the catalogue among them.
     """
 
     def __init__(self, cache, size=CACHED_BUILDS, read_bytes=_read_file):
@@ -654,19 +1022,68 @@ class BuildCache:
         self.size = size
         self.read_bytes = read_bytes
         self._builds = collections.OrderedDict()
+        # What the last catalogue assembly saw: its key (the sources and the
+        # skipped runs; None once the catalogue is evicted), the runs it
+        # skipped, and the file signatures of those that did not verify.
+        self._catalogue_key = None
+        self._catalogue_skipped = []
+        self._catalogue_unverified = {}
         # The web app's handlers run in worker threads; a get is one
         # lookup-load-evict transaction, so it holds the lock throughout.
         self._lock = threading.Lock()
 
     def summaries(self):
-        return [
+        """The catalogue's row first (assembled now if need be), then every
+        discovered build's."""
+        rows = [
             describe(build_id, path, self.read_bytes)
             for build_id, path in discover(self.cache).items()
         ]
+        with self._lock:
+            catalogue = self._catalogue()
+            skipped = self._catalogue_skipped
+        return [catalogue_row(catalogue, skipped), *rows]
 
     def get(self, build_id):
         with self._lock:
+            if build_id == CATALOGUE:
+                return self._catalogue()
             return self._get(build_id)
+
+    def _keep(self, build_id, build):
+        self._builds[build_id] = build
+        self._builds.move_to_end(build_id)
+        while len(self._builds) > self.size:
+            evicted, _ = self._builds.popitem(last=False)
+            if evicted == CATALOGUE:
+                self._catalogue_key = None
+        return build
+
+    def _catalogue(self):
+        sources, skipped = catalogue_sources(self.cache, self.read_bytes)
+        key = [(build_id, _snapshot_digest(s)) for build_id, _, s in sources]
+        key += [(run["id"], run["reason"]) for run in skipped]
+        if self._catalogue_key == key and not self._repaired():
+            cached = self._builds.get(CATALOGUE)
+            if cached is not None:
+                self._builds.move_to_end(CATALOGUE)
+            return cached
+        build, skipped, unverified = assemble_catalogue(
+            self.cache, sources, skipped, self.read_bytes
+        )
+        self._catalogue_key, self._catalogue_skipped = key, skipped
+        self._catalogue_unverified = unverified
+        if build is None:
+            self._builds.pop(CATALOGUE, None)
+            return None
+        return self._keep(CATALOGUE, build)
+
+    def _repaired(self):
+        """A run that did not verify at the last assembly has changed since."""
+        return any(
+            run_signature(path, snapshot) != signature
+            for path, snapshot, signature in self._catalogue_unverified.values()
+        )
 
     def _get(self, build_id):
         path = discover(self.cache).get(build_id)
@@ -688,11 +1105,7 @@ class BuildCache:
         if build is None:
             self._builds.pop(build_id, None)
             return None
-        self._builds[build_id] = build
-        self._builds.move_to_end(build_id)
-        while len(self._builds) > self.size:
-            self._builds.popitem(last=False)
-        return build
+        return self._keep(build_id, build)
 
 
 def parse_kinds(value):
@@ -731,9 +1144,11 @@ def filter_places(
     None for every kind. With ``bounded`` (the default, for map slices) a
     slice that can include cities must be bounded by ``parent_id`` or
     ``bbox`` (``ValueError`` otherwise); the geometry-free table passes
-    ``bounded=False``. ``feed_id`` keeps the places that feed serves, through the
-    edges. ``served`` and ``feed_id`` read the ``view`` (the build's default
-    when omitted). Every test is a vectorized mask over the build's arrays.
+    ``bounded=False``. ``q`` matches the search text (name, aliases and names
+    in other languages, any case). ``feed_id`` keeps the places that feed
+    serves, through the edges. ``served`` and ``feed_id`` read the ``view``
+    (the build's default when omitted). Every test is a vectorized mask over
+    the build's arrays.
     """
     places = build.places
     view = view or build.view()
@@ -757,7 +1172,8 @@ def filter_places(
     if served is not None:
         mask &= view.served if served else ~view.served
     if q:
-        mask &= places["name"].str.contains(q, case=False, na=False, regex=False)
+        hits = pc.match_substring(build.search_text, q, ignore_case=True)
+        mask &= pc.fill_null(hits, False).to_numpy(zero_copy_only=False)
     if feed_id is not None:
         edges = build.edges[view.edge_mask]
         serving = set(edges.loc[edges["feed_id"] == feed_id, "place_id"])
@@ -805,7 +1221,7 @@ def _place_table(build, view):
     """The geometry-free table of a build's places under ``view``, one row each."""
     places = build.places
     names = pd.Series(places["name"].to_numpy(), index=places["place_id"].to_numpy())
-    table = places[["place_id", "name", "kind", "parent_id", "country_code"]].copy()
+    table = places[[c for c in TABLE_COLUMNS if c in places.columns]].copy()
     table["parent_name"] = places["parent_id"].map(names).to_numpy()
     table["served"] = view.served
     table["feed_count"] = view.feed_count
@@ -849,6 +1265,136 @@ def places_table(build, mask, sort="name", order="asc", offset=0, limit=50, view
         "offset": offset,
         "limit": limit,
         "rows": _json_ready(page),
+    }
+
+
+def _ancestors(build, parent):
+    """The chain above a place, root first, as ``{place_id, name, kind}``."""
+    ancestors = []
+    for _ in range(8):  # a bounded walk: a cycle in the data cannot loop
+        if not isinstance(parent, str) or parent not in build._row_of.index:
+            break
+        ancestor = build.places.iloc[int(build._row_of[parent])]
+        ancestors.append(
+            {"place_id": parent, "name": ancestor["name"], "kind": ancestor["kind"]}
+        )
+        parent = ancestor["parent_id"]
+    return ancestors[::-1]
+
+
+def _list(value):
+    """An Arrow list cell as a list; a null cell is empty."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value if isinstance(value, list) else []
+
+
+def _matched(place, needle):
+    """The alias or other-language name of ``place`` containing ``needle``
+    when its name does not, else None; the value as stored."""
+    names = _as_map(place.get("names")) or {}
+    candidates = [*_list(place.get("aliases")), *names.values()]
+    candidates = [c for c in candidates if isinstance(c, str)]
+    flat = _flat(pa.array([place["name"], *candidates], pa.string())).to_pylist()
+    if needle in flat[0]:
+        return None
+    for candidate, line in zip(candidates, flat[1:]):
+        if needle in line:
+            return candidate
+    return None
+
+
+def search_places(build, q, limit=SEARCH_LIMIT, view=None):
+    """``{"total", "rows"}``: the places ``q`` matches, the best ``limit`` first.
+
+    Ranked: the name equals ``q`` (any case); an alias or a name in another
+    language does; a word of the name starts with ``q``; ``q`` is a substring
+    of any of them. Within a rank served places first, then more feeds, then
+    the name. A row carries the place's ``chain`` (its ancestors' names, root
+    first), the view's served flag, feed count and class, and ``matched``:
+    the alias or other name that matched when the name itself does not
+    contain ``q``.
+    """
+    q = " ".join(q.split())  # one space between words, none around, no newline
+    if len(q) < 2:
+        raise ValueError("q needs at least two characters")
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    view = view or build.view()
+    hits = np.flatnonzero(filter_places(build, None, q=q, bounded=False, view=view))
+    if not hits.size:
+        return {"total": 0, "rows": []}
+    needle = _flat(pa.array([q]))[0].as_py()
+    pattern = re.escape(needle)
+    text = build.search_text.take(pa.array(hits))
+    # The name as the text holds it (its first line), so that a name with a
+    # newline in it ranks as the text matched it.
+    names = pd.Series(pc.list_element(pc.split_pattern(text, "\n", max_splits=1), 0))
+    exact_line = pc.fill_null(pc.match_substring_regex(text, f"(?m)^{pattern}$"), False)
+    rank = np.select(
+        [
+            (names == needle).to_numpy(),
+            exact_line.to_numpy(zero_copy_only=False),
+            names.str.contains(rf"\b{pattern}", regex=True, na=False).to_numpy(),
+        ],
+        [0, 1, 2],
+        default=3,
+    )
+    order = pd.DataFrame(
+        {
+            "rank": rank,
+            "unserved": ~view.served[hits],
+            "feeds": -view.feed_count[hits],
+            "name": names.to_numpy(),
+        }
+    ).sort_values(["rank", "unserved", "feeds", "name"], kind="stable")
+    top = hits[order.index[: min(limit, SEARCH_MAX)]]
+    places = build.places.iloc[top]
+    rows = _json_ready(places[[c for c in SEARCH_COLUMNS if c in places.columns]])
+    for row, (_, place), position in zip(rows, places.iterrows(), top):
+        row["chain"] = [a["name"] for a in _ancestors(build, place["parent_id"])]
+        row["served"] = bool(view.served[position])
+        row["feed_count"] = int(view.feed_count[position])
+        row[build.class_column] = view.category[position]
+        row["matched"] = _matched(place, needle)
+    return {"total": int(hits.size), "rows": rows}
+
+
+def _metros_of(places):
+    """``{member place_id: [metro place_ids]}`` from the metros' member lists;
+    a member's own ``metro_ids`` is empty in the published index."""
+    if "member_ids" not in places.columns:
+        return {}
+    members = places[["place_id", "member_ids"]].explode("member_ids").dropna()
+    return members.groupby("member_ids")["place_id"].agg(list).to_dict()
+
+
+def _rows_of(build, ids):
+    """The row positions of the places ``ids`` names, those the build holds."""
+    present = [i for i in _list(ids) if i in build._row_of.index]
+    return build._row_of[present].to_numpy() if present else np.array([], dtype=int)
+
+
+def _metro_rows(build, place_id, ids):
+    """The metros a place belongs to — those listing it as a member, and
+    ``ids`` — as ``METRO_COLUMNS`` records."""
+    ids = dict.fromkeys([*build.metros_of.get(place_id, ()), *_list(ids)])
+    places = build.places.iloc[_rows_of(build, list(ids))]
+    return _json_ready(places[[c for c in METRO_COLUMNS if c in places.columns]])
+
+
+def _member_rows(build, ids):
+    """``{"count", "served", "rows"}``: how many members ``ids`` names, and
+    of those the build holds, how many are served and their rows, the most
+    served first, at most ``MEMBERS_LIMIT`` of them."""
+    rows = build.table.iloc[_rows_of(build, ids)][list(MEMBER_COLUMNS)]
+    rows = rows.sort_values(
+        ["feed_count", "name"], ascending=[False, True], kind="stable"
+    )
+    return {
+        "count": len(_list(ids)),
+        "served": int(rows["served"].sum()),
+        "rows": _json_ready(rows.iloc[:MEMBERS_LIMIT]),
     }
 
 
@@ -901,9 +1447,11 @@ def place_record(build, place_id):
 
     The properties carry the row's descriptive columns present in this build,
     its parsed ``service``, ``served`` and ``feed_count``, its ``bbox``, the
-    ``ancestors`` root first, a ``children`` summary, its ``edges`` joined
-    with the feed table, the distinct feeds by spec and, on schema 7, the
-    feeds reaching it over a border by partition (``reached_from``).
+    ``ancestors`` root first, a ``children`` summary, its ``metros`` and
+    ``members`` (the metro rows it belongs to; the member rows it holds), its
+    ``edges`` joined with the feed table, the distinct feeds by spec and, on
+    schema 7, the feeds reaching it over a border by partition
+    (``reached_from``).
     """
     if place_id not in build._row_of.index:
         return None
@@ -919,17 +1467,9 @@ def place_record(build, place_id):
     props["served"] = bool(build.served[row])
     props["feed_count"] = int(build.feed_count[row])
     props["bbox"] = [_cell(v) for v in build.bounds[row]]
-    ancestors = []
-    parent = place["parent_id"]
-    for _ in range(8):  # a bounded walk: a cycle in the data cannot loop
-        if not isinstance(parent, str) or parent not in build._row_of.index:
-            break
-        ancestor = places.iloc[int(build._row_of[parent])]
-        ancestors.append(
-            {"place_id": parent, "name": ancestor["name"], "kind": ancestor["kind"]}
-        )
-        parent = ancestor["parent_id"]
-    props["ancestors"] = ancestors[::-1]
+    props["ancestors"] = _ancestors(build, place["parent_id"])
+    props["metros"] = _metro_rows(build, place_id, place.get("metro_ids"))
+    props["members"] = _member_rows(build, place.get("member_ids"))
     children = (places["parent_id"] == place_id).to_numpy()
     props["children"] = {
         "count": int(children.sum()),
@@ -1422,6 +1962,22 @@ def create_app(cache, size=CACHED_BUILDS):
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
         return JSONResponse(page, headers={"X-Snapshot": build.snapshot_id})
+
+    @app.get("/api/builds/{build_id}/search")
+    def search(
+        build_id: str,
+        q: str = "",
+        limit: int = SEARCH_LIMIT,
+        spec: str | None = None,
+        level: str | None = None,
+    ):
+        build = opened(build_id)
+        view = viewed(build, spec, level)
+        try:
+            reply = search_places(build, q, limit, view)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return JSONResponse(reply, headers={"X-Snapshot": build.snapshot_id})
 
     @app.get("/api/builds/{build_id}/places/{place_id}")
     def place(build_id: str, place_id: str):

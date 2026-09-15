@@ -52,11 +52,16 @@ export function paddedBounds(bounds, factor = 0.5) {
   };
 }
 
-export function sliceParams(zoom, bounds, view = INITIAL_VIEW) {
+// ``coarse``: a build with more countries and regions than a slice may hold
+// (the catalogue) shows countries alone below the viewport zoom, whatever
+// the level; regions join with the viewport bbox from there, as cities do
+// from the city zoom (the city level is bounded at any zoom).
+export function sliceParams(zoom, bounds, view = INITIAL_VIEW, coarse = false) {
   const params = { zoom, ...viewParams(view) };
   // The city level shows cities at any zoom, and a slice with cities is bounded.
   if (zoom >= VIEWPORT_ZOOM || view.level === "city") params.bbox = bboxParam(paddedBounds(bounds));
   if (zoom >= CITY_ZOOM && !view.level) params.kind = "all";
+  else if (coarse && zoom < VIEWPORT_ZOOM && view.level !== "city") params.kind = "country";
   return params;
 }
 
@@ -64,17 +69,98 @@ export function sliceParams(zoom, bounds, view = INITIAL_VIEW) {
 // it: no bbox, and never finer than the coarsest zoom band, so a large build
 // stays under the byte cap whatever the current zoom. No level: the fit spans
 // the build, whatever the selectors say; the spec still colours it.
-export function overviewParams(zoom, view = INITIAL_VIEW) {
-  return { zoom: Math.min(zoom, VIEWPORT_ZOOM - 1), ...viewParams({ ...view, level: "" }) };
+export function overviewParams(zoom, view = INITIAL_VIEW, coarse = false) {
+  const params = { zoom: Math.min(zoom, VIEWPORT_ZOOM - 1), ...viewParams({ ...view, level: "" }) };
+  if (coarse) params.kind = "country";
+  return params;
+}
+
+export const SLICE_CAP = 3000; // the server's feature cap on one slice
+
+export function isCoarse(summary) {
+  const byKind = (summary.counts || {}).places_by_kind || {};
+  return (byKind.country || 0) + (byKind.region || 0) > SLICE_CAP;
+}
+
+export function searchUrl(build, q, view = INITIAL_VIEW) {
+  const query = new URLSearchParams({ q });
+  for (const [key, value] of Object.entries(viewParams(view))) {
+    if (value != null) query.set(key, String(value));
+  }
+  return `/api/builds/${encodeURIComponent(build)}/search?${query}`;
+}
+
+// What a place covers, from its kind and source subtype: a metro names its
+// source (the three the build writes) and its code; another kind its
+// subtype when that adds something.
+export const METRO_SOURCES = {
+  "metropolitan region": "Eurostat metropolitan region",
+  "city-region (FAO)": "FAO city-region",
+  "metropolitan statistical area": "US metropolitan statistical area",
+};
+
+// A lookup by a value from the data: an own entry, never an inherited one.
+const named = (table, key) => (Object.hasOwn(table, key) ? table[key] : undefined);
+
+export function coverageLabel(p) {
+  const subtype = p.source_subtype;
+  if (p.kind === "metro") {
+    const source = named(METRO_SOURCES, subtype) ?? subtype ?? "metropolitan area";
+    return p.statistical_area_id ? `${source} ${p.statistical_area_id}` : source;
+  }
+  return subtype && subtype !== p.kind ? `${p.kind} · ${subtype}` : p.kind;
+}
+
+export function kindBadge(kind) {
+  const color = named(KIND_COLORS, kind) ?? "#999";
+  return `<span class="badge" style="background:${color}">${escapeHtml(kind)}</span>`;
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+function hitHtml(row, field) {
+  const where = row.chain.slice(1).join(" › ");
+  const served = row.served
+    ? `served by ${escapeHtml(plural(row.feed_count, "feed"))}${row[field] ? ` · ${escapeHtml(row[field])}` : ""}`
+    : "unserved";
+  const matched = row.matched ? ` · as ${escapeHtml(row.matched)}` : "";
+  const build = row.build_id ? ` · ${escapeHtml(row.build_id)}` : "";
+  return (
+    `<button type="button" class="hit" data-id="${escapeHtml(row.place_id)}">` +
+    `${kindBadge(row.kind)}<strong>${escapeHtml(row.name)}</strong> ` +
+    `<span class="muted">${escapeHtml(coverageLabel(row))}</span>` +
+    `<br><small>${where ? `${escapeHtml(where)} · ` : ""}${served}${matched}${build}</small></button>`
+  );
+}
+
+// Search hits grouped by country — the chain's root, a country row itself —
+// so that a name shared across countries reads apart at a glance.
+export function searchResultsHtml(reply, q, field = "tier") {
+  if (!reply.rows.length) return `<p class="muted">Nothing matches “${escapeHtml(q)}”.</p>`;
+  const groups = new Map();
+  for (const row of reply.rows) {
+    const country = row.kind === "country" ? row.name : (row.chain[0] ?? row.country_code ?? "—");
+    if (!groups.has(country)) groups.set(country, []);
+    groups.get(country).push(row);
+  }
+  const sections = [...groups].map(([country, rows]) => {
+    const code = rows[0].country_code ? ` · ${escapeHtml(rows[0].country_code)}` : "";
+    return `<h4>${escapeHtml(country)}${code}</h4>${rows.map((row) => hitHtml(row, field)).join("")}`;
+  });
+  const more =
+    reply.total > reply.rows.length
+      ? `<p class="muted">${reply.rows.length} of ${reply.total} matches shown; type more to narrow.</p>`
+      : "";
+  return sections.join("") + more;
 }
 
 export function buildLabel(row) {
   if (!row.complete) return `${row.id} (incomplete)`;
   const date = (row.built_at || "").slice(0, 10);
   const places = row.counts && row.counts.places;
-  return [row.id, date, places === undefined ? null : `${places} places`]
-    .filter(Boolean)
-    .join(" · ");
+  const count =
+    row.sources !== undefined ? `${row.sources} builds` : places === undefined ? null : `${places} places`;
+  return [row.id, date, count].filter(Boolean).join(" · ");
 }
 
 export function summaryLabel(summary) {
@@ -250,7 +336,57 @@ const specLine = (bySpec) =>
     .map(([spec, n]) => `${escapeHtml(n)} ${escapeHtml(spec)}`)
     .join(", ");
 
-export function detailsHtml(record, field = "tier") {
+// The coverage line: what the place is (a metro's source and code, another
+// kind's subtype), a metro's member count and boundary, a place's metros.
+export const GEOMETRY_SOURCES = { member_union: "union of members" };
+
+export function coverageLine(p) {
+  const parts = [`${kindBadge(p.kind)}${escapeHtml(coverageLabel(p))}`];
+  if (p.kind === "metro") {
+    const members = p.members || { count: 0, served: 0 };
+    const cities = members.count === 1 ? "member city" : "member cities";
+    parts.push(`${escapeHtml(members.count)} ${cities}, ${escapeHtml(members.served)} served`);
+    if (p.geometry_source) {
+      parts.push(`boundary: ${escapeHtml(named(GEOMETRY_SOURCES, p.geometry_source) ?? p.geometry_source)}`);
+    }
+  }
+  const metros = (p.metros || []).map(
+    (m) =>
+      `<button type="button" class="crumb" data-id="${escapeHtml(m.place_id)}">${escapeHtml(m.name)}</button>` +
+      ` (${escapeHtml(coverageLabel({ kind: "metro", source_subtype: m.source_subtype }))})`,
+  );
+  if (metros.length) parts.push(`member of ${metros.join(", ")}`);
+  return `<p class="coverage">${parts.join(" · ")}</p>`;
+}
+
+export function membersHtml(members) {
+  if (!members || !members.rows || !members.rows.length) return "";
+  const items = members.rows
+    .map(
+      (m) =>
+        `<li><button type="button" class="crumb" data-id="${escapeHtml(m.place_id)}">${escapeHtml(m.name)}</button> ` +
+        `<small class="muted">${m.served ? escapeHtml(plural(m.feed_count, "feed")) : "unserved"}</small></li>`,
+    )
+    .join("");
+  const cut =
+    members.count > members.rows.length ? `<li class="muted">${members.rows.length} of ${escapeHtml(members.count)} shown</li>` : "";
+  return `<details class="members"><summary>${escapeHtml(members.count)} members</summary><ul>${items}${cut}</ul></details>`;
+}
+
+// The tier checkboxes over a place's feeds; an edge without a tier is unknown.
+export const ALL_TIERS = ["local", "regional", "national", "international", "unknown"];
+const tierOf = (edge) => edge.tier ?? "unknown";
+
+export function tierFilterHtml(tiers) {
+  const boxes = ALL_TIERS.map(
+    (tier) => `<label><input type="checkbox" name="tier" value="${tier}"${tiers.has(tier) ? " checked" : ""}> ${tier}</label>`,
+  );
+  return `<p class="tiers">${boxes.join(" ")}</p>`;
+}
+
+// ``tiers``: the tiers whose feeds to list (every tier when null); ``sources``:
+// build id to built_at, for the source build line of a catalogue record.
+export function detailsHtml(record, field = "tier", { tiers = null, sources = {} } = {}) {
   const p = record.properties;
   const chain = crumbs(record)
     .map((c, i, all) =>
@@ -263,7 +399,7 @@ export function detailsHtml(record, field = "tier") {
   const reach = specLine(p.reached_from);
   const validity = validityHtml(p.validity);
   const served = p.served
-    ? `served by ${p.feed_count} feed${p.feed_count === 1 ? "" : "s"}${specs ? ` (${specs})` : ""}` +
+    ? `served by ${escapeHtml(plural(p.feed_count, "feed"))}${specs ? ` (${specs})` : ""}` +
       (reach ? ` · reached from ${reach}` : "")
     : "not served";
   const stats = Object.entries(p.service || {})
@@ -274,10 +410,14 @@ export function detailsHtml(record, field = "tier") {
         .map(([kind, n]) => `${escapeHtml(n)} ${escapeHtml(kind)}`)
         .join(", ")}), ${escapeHtml(p.children.served)} served</p>`
     : "";
-  const feeds = (p.edges || [])
+  const edges = p.edges || [];
+  const shown = tiers ? edges.filter((e) => tiers.has(tierOf(e))) : edges;
+  const category = field === "category";
+  const feeds = shown
     .map(
       (e) =>
-        `<tr><td>${escapeHtml(e.feed_name ?? e.feed_id)}</td><td>${escapeHtml(edgeClass(e, field))}</td>` +
+        `<tr><td>${escapeHtml(e.feed_name ?? e.feed_id)}</td><td>${escapeHtml(tierOf(e))}</td>` +
+        (category ? `<td>${escapeHtml(e.relevance_category ?? DASH)}</td>` : "") +
         `<td>${e.relevance == null ? DASH : e.relevance.toFixed(2)}</td>` +
         `<td>${e.tier_confidence == null ? DASH : e.tier_confidence.toFixed(2)}</td>` +
         `<td>${escapeHtml(e.method ?? DASH)}${e.cross_border ? " · cross-border" : ""}</td></tr>`,
@@ -290,16 +430,25 @@ export function detailsHtml(record, field = "tier") {
         : `<li>${label}: ${escapeHtml(p[key])}</li>`,
     )
     .join("");
+  const built = sources[p.build_id];
+  const source = p.build_id
+    ? `<p><small>from build ${escapeHtml(p.build_id)}${built ? `, built ${escapeHtml(String(built).slice(0, 10))}` : ""}</small></p>`
+    : "";
+  const count =
+    tiers && shown.length !== edges.length ? `<p class="muted">${shown.length} of ${edges.length} feeds</p>` : "";
+  const header = `<th>Feed</th><th>Tier</th>${category ? "<th>Category</th>" : ""}<th>Rel.</th><th>Conf.</th><th>Method</th>`;
   return (
     `<p class="chain">${chain}</p>` +
+    coverageLine(p) +
     `<p><small>${escapeHtml(p.kind)} · ${escapeHtml(p.place_id)}</small> · ${served}</p>` +
     (stats ? `<ul class="stats">${stats}</ul>` : "") +
     children +
-    (feeds
-      ? `<table class="feeds"><thead><tr><th>Feed</th><th>Class</th><th>Rel.</th><th>Conf.</th><th>Method</th></tr></thead><tbody>${feeds}</tbody></table>`
-      : "") +
+    membersHtml(p.members) +
+    (edges.length ? tierFilterHtml(tiers ?? new Set(ALL_TIERS)) + count : "") +
+    (feeds ? `<table class="feeds"><thead><tr>${header}</tr></thead><tbody>${feeds}</tbody></table>` : "") +
     (ids ? `<ul class="ids">${ids}</ul>` : "") +
-    validity
+    validity +
+    source
   );
 }
 
@@ -568,9 +717,10 @@ async function fetchJson(url) {
   return response.json();
 }
 
-// A slice, with the snapshot digest the server stamped on it.
-async function fetchSlice(url) {
-  const response = await fetch(url);
+// A slice, with the snapshot digest the server stamped on it; ``signal``
+// aborts the request.
+async function fetchSlice(url, signal = undefined) {
+  const response = await fetch(url, signal ? { signal } : undefined);
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
   return { data: await response.json(), snapshot: response.headers.get("x-snapshot") };
 }
@@ -601,8 +751,14 @@ async function main() {
   const treeSection = document.getElementById("tree");
   const levelSelect = document.getElementById("level");
   const specSelect = document.getElementById("spec");
+  const searchInput = document.getElementById("search");
+  const searchResults = document.getElementById("search-results");
   let view = { ...INITIAL_VIEW }; // the level and spec every request carries
   let classField = "tier"; // the build's class field, from its summary
+  let coarse = false; // the build's countries and regions overflow a slice
+  let sources = {}; // the catalogue's source builds by id, to their build date
+  let tiers = new Set(ALL_TIERS); // the tiers the details list feeds of
+  const renderDetails = (record) => detailsHtml(record, classField, { tiers, sources });
   let selectedId = null; // the selected place, marked in the tree
   let selectedRecord = null; // `{ record, mine }`: revealed once the tree has loaded
   let pendingScroll = null; // the tree item to scroll to when the Tree tab is next shown
@@ -657,7 +813,9 @@ async function main() {
   // fits the map to it; the fit's moveend then requests the viewport slice.
   async function refresh(build, gen, fit) {
     const mine = ++sequence;
-    const params = fit ? overviewParams(map.getZoom(), view) : sliceParams(map.getZoom(), boundsOf(), view);
+    const params = fit
+      ? overviewParams(map.getZoom(), view, coarse)
+      : sliceParams(map.getZoom(), boundsOf(), view, coarse);
     let slice;
     try {
       slice = await fetchSlice(placesUrl(build, params));
@@ -719,6 +877,9 @@ async function main() {
     // are dropped when they land.
     loadSelection = ++selectionSequence;
     tableSequence++;
+    closeSearch();
+    searchInput.value = "";
+    searchResults.innerHTML = "";
     recordCache.clear();
     dropPopup();
     details.innerHTML = PLACEHOLDER;
@@ -752,6 +913,8 @@ async function main() {
     snapshot = summary.snapshot_id;
     stats.textContent = summaryLabel(summary);
     classField = summary.category_field ?? "tier";
+    coarse = isCoarse(summary);
+    sources = Object.fromEntries((summary.sources || []).map((s) => [s.id, s.built_at]));
     specSelect.parentElement.hidden = !specSelectable(summary);
     if (specSelect.parentElement.hidden && view.spec !== "all") {
       specSelect.value = "all";
@@ -834,9 +997,9 @@ async function main() {
     selectedId = record.properties.place_id;
     loadEdges({ place_id: id }, record.properties.name, mine).catch(console.error);
     selectedRecord = { record, mine }; // with the sequence it was accepted under
-    details.innerHTML = detailsHtml(record, classField);
+    details.innerHTML = renderDetails(record);
     revealInTree(record, mine).catch(console.error);
-    if (fromPopup && popup === fromPopup && popup.isOpen()) popup.setHTML(detailsHtml(record, classField));
+    if (fromPopup && popup === fromPopup && popup.isOpen()) popup.setHTML(renderDetails(record));
     showTab("details");
     map.getSource("selected").setData(record);
     map.getSource("ancestors").setData(EMPTY); // the old chain goes with the old selection
@@ -855,6 +1018,77 @@ async function main() {
     const features = replies.filter(Boolean).map((r) => r.data);
     map.getSource("ancestors").setData({ type: "FeatureCollection", features });
   }
+
+  // --- the search box: the whole build by name, alias or other-language name
+  // One query at a time: every keystroke, close, view change and build change
+  // outdates whatever is pending or in flight (the sequence), and a new
+  // request aborts the one in flight, so a stale reply never renders and a
+  // closed panel never reopens on its own.
+  let searchSequence = 0;
+  let searchTimer = null;
+  let searchAbort = null; // the controller of the request in flight
+  const outdateSearch = () => {
+    searchSequence++;
+    clearTimeout(searchTimer);
+    if (searchAbort) searchAbort.abort();
+  };
+  const closeSearch = () => {
+    outdateSearch();
+    searchResults.hidden = true;
+  };
+  async function runSearch() {
+    outdateSearch();
+    const q = searchInput.value.trim();
+    const mine = searchSequence;
+    if (q.length < 2 || !current) {
+      searchResults.hidden = true;
+      return;
+    }
+    const build = current;
+    const controller = new AbortController();
+    searchAbort = controller;
+    let reply;
+    try {
+      reply = await fetchSlice(searchUrl(build, q, view), controller.signal);
+    } catch (error) {
+      if (mine !== searchSequence || controller.signal.aborted) return;
+      searchResults.innerHTML = `<p class="muted">${escapeHtml(String(error))}</p>`;
+      searchResults.hidden = false;
+      return;
+    }
+    if (mine !== searchSequence) return;
+    if (reply.snapshot !== snapshot) {
+      startLoad(build); // ``latest`` was republished: one snapshot for all
+      return;
+    }
+    searchResults.innerHTML = searchResultsHtml(reply.data, q, classField);
+    searchResults.hidden = false;
+  }
+  const pickHit = (id) => {
+    closeSearch();
+    selectPlace(id, { zoom: true }).catch(console.error);
+  };
+  searchInput.addEventListener("input", () => {
+    outdateSearch();
+    searchTimer = setTimeout(() => runSearch().catch(console.error), 250);
+  });
+  searchInput.addEventListener("focus", () => {
+    if (searchResults.innerHTML && searchInput.value.trim().length >= 2) searchResults.hidden = false;
+  });
+  searchInput.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeSearch();
+    if (event.key === "Enter" && !searchResults.hidden) {
+      const first = searchResults.querySelector(".hit");
+      if (first) pickHit(first.dataset.id);
+    }
+  });
+  searchResults.addEventListener("click", (event) => {
+    const hit = event.target.closest(".hit");
+    if (hit) pickHit(hit.dataset.id);
+  });
+  document.addEventListener("click", (event) => {
+    if (!searchResults.hidden && !event.target.closest("#search-box")) closeSearch();
+  });
 
   // --- the Places tab: the whole build, paged and sorted by the server
   let table = { ...INITIAL_TABLE };
@@ -890,10 +1124,10 @@ async function main() {
     table = tableState(table, action);
     loadTable().catch(console.error);
   };
-  let searchTimer = null;
+  let tableTimer = null;
   tableSearch.addEventListener("input", () => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => dispatch({ type: "search", query: tableSearch.value.trim() }), 250);
+    clearTimeout(tableTimer);
+    tableTimer = setTimeout(() => dispatch({ type: "search", query: tableSearch.value.trim() }), 250);
   });
   tableKind.addEventListener("change", () => dispatch({ type: "filter", field: "kind", value: tableKind.value }));
   tableServed.addEventListener("change", () =>
@@ -909,9 +1143,26 @@ async function main() {
     const row = event.target.closest("tr[data-id]");
     if (row) selectPlace(row.dataset.id, { zoom: true }).catch(console.error);
   });
-  details.addEventListener("click", (event) => {
+  // The details render in the panel and, after a map click, in the popup
+  // too; both hold the same crumbs and tier checkboxes, so both are handled
+  // here and re-rendered together. The tier choice outlives the selection.
+  const detailsRoot = (target) => target.closest("#details, .maplibregl-popup-content");
+  const renderSelected = () => {
+    if (!selectedRecord) return;
+    const html = renderDetails(selectedRecord.record);
+    details.innerHTML = html;
+    if (popup && popup.isOpen()) popup.setHTML(html);
+  };
+  document.addEventListener("click", (event) => {
     const crumb = event.target.closest(".crumb");
-    if (crumb) selectPlace(crumb.dataset.id, { zoom: true }).catch(console.error);
+    if (crumb && detailsRoot(event.target)) selectPlace(crumb.dataset.id, { zoom: true }).catch(console.error);
+  });
+  document.addEventListener("change", (event) => {
+    const root = event.target.closest('input[name="tier"]') && detailsRoot(event.target);
+    if (!root) return;
+    const checked = root.querySelectorAll('input[name="tier"]:checked');
+    tiers = new Set([...checked].map((box) => box.value));
+    renderSelected();
   });
   for (const button of panel.querySelectorAll("nav button")) {
     button.addEventListener("click", () => showTab(button.dataset.tab));
@@ -1263,6 +1514,14 @@ async function main() {
     } else if (selectedRecord && selectedRecord.mine === selectionSequence) {
       const { record } = selectedRecord;
       loadEdges({ place_id: record.properties.place_id }, record.properties.name, selectionSequence).catch(console.error);
+    }
+    // Open results answer the old view: ask again; closed ones are dropped
+    // rather than shown again on focus.
+    if (!searchResults.hidden) {
+      runSearch().catch(console.error);
+    } else {
+      closeSearch();
+      searchResults.innerHTML = "";
     }
   };
   levelSelect.addEventListener("change", changeView);

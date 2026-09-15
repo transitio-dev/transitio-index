@@ -21,7 +21,12 @@ import {
   kindRank,
   legendHtml,
   buildLabel,
+  isCoarse,
   collectionBounds,
+  membersHtml,
+  coverageLabel,
+  searchResultsHtml,
+  searchUrl,
   overflowText,
   overviewParams,
   paddedBounds,
@@ -74,12 +79,54 @@ test("the overview has no bbox; from zoom 7 the slice follows the padded viewpor
   // A build change loads the overview: never a bbox, never finer than zoom 6.
   assert.deepEqual(overviewParams(12.4), { zoom: 6 });
   assert.deepEqual(overviewParams(3), { zoom: 3 });
+  // A coarse build (the catalogue) shows countries alone below the viewport zoom.
+  assert.equal(isCoarse({ counts: { places_by_kind: { country: 116, region: 24000 } } }), true);
+  assert.equal(isCoarse({ counts: { places_by_kind: { country: 1, region: 1563 } } }), false);
+  assert.deepEqual(overviewParams(3, INITIAL_VIEW, true), { zoom: 3, kind: "country" });
+  assert.deepEqual(sliceParams(5, bounds, INITIAL_VIEW, true), { zoom: 5, kind: "country" });
+  assert.equal(sliceParams(7, bounds, INITIAL_VIEW, true).kind, undefined);
+  assert.equal(sliceParams(5, bounds, { level: "regional", spec: "all" }, true).kind, "country");
+  assert.equal(sliceParams(5, bounds, { level: "city", spec: "all" }, true).kind, undefined);
+});
+
+test("a coverage label names a metro's source and code, else the kind and subtype", () => {
+  const metro = { kind: "metro", source_subtype: "metropolitan region", statistical_area_id: "FI001MC" };
+  assert.equal(coverageLabel(metro), "Eurostat metropolitan region FI001MC");
+  assert.equal(coverageLabel({ kind: "metro", source_subtype: "city-region (FAO)", statistical_area_id: "1" }), "FAO city-region 1");
+  assert.equal(coverageLabel({ kind: "metro", source_subtype: "conurbation" }), "conurbation");
+  assert.equal(coverageLabel({ kind: "metro", source_subtype: "constructor" }), "constructor"); // no inherited entry
+  assert.equal(coverageLabel({ kind: "metro" }), "metropolitan area");
+  assert.equal(coverageLabel({ kind: "city", source_subtype: "locality" }), "city · locality");
+  assert.equal(coverageLabel({ kind: "country", source_subtype: "country" }), "country");
+  assert.equal(coverageLabel({ kind: "region" }), "region");
+});
+
+test("search results group by country, name what each hit covers and how it matched", () => {
+  const state = { place_id: "ga", name: "Georgia", kind: "region", source_subtype: "state", country_code: "US",
+    chain: ["United States"], served: true, feed_count: 12, tier: "regional", matched: null };
+  const country = { place_id: "ge", name: "Georgia", kind: "country", source_subtype: "country", country_code: "GE",
+    chain: [], served: false, feed_count: 0, tier: null, matched: null, build_id: "ge-0000000000000001" };
+  const alias = { place_id: "hel", name: "Helsinki", kind: "city", source_subtype: "locality", country_code: "FI",
+    chain: ["Finland", "Uusimaa"], served: true, feed_count: 3, tier: "local", matched: "Helsingfors" };
+  const html = searchResultsHtml({ total: 3, rows: [state, country, alias] }, "ge");
+  assert.match(html, /<h4>United States · US<\/h4>.*<h4>Georgia · GE<\/h4>.*<h4>Finland · FI<\/h4>/s);
+  assert.match(html, /data-id="ga".*Georgia<\/strong> <span class="muted">region · state<\/span><br><small>served by 12 feeds · regional/);
+  assert.match(html, /data-id="ge".*country<\/span><br><small>unserved · ge-0000000000000001/);
+  assert.match(html, /data-id="hel".*Uusimaa · served by 3 feeds · local · as Helsingfors/);
+  assert.doesNotMatch(html, /matches shown/);
+  const cut = searchResultsHtml({ total: 40, rows: [alias] }, "hel", "category");
+  assert.match(cut, /1 of 40 matches shown/);
+  assert.match(searchResultsHtml({ total: 0, rows: [] }, "<x>"), /Nothing matches “&lt;x&gt;”/);
+  assert.equal(searchUrl("fi", "hel sinki"), "/api/builds/fi/search?q=hel+sinki");
+  assert.equal(searchUrl("fi", "x", { level: "city", spec: "gtfs" }), "/api/builds/fi/search?q=x&level=city&spec=gtfs");
 });
 
 test("labels name a build by id, date and count, and mark an incomplete one", () => {
   const row = { id: "es-full", complete: true, built_at: "2026-09-11T00:00:00+00:00", counts: { places: 11875 } };
   assert.equal(buildLabel(row), "es-full · 2026-09-11 · 11875 places");
   assert.equal(buildLabel({ id: "half", complete: false }), "half (incomplete)");
+  const catalogue = { id: "catalogue", complete: true, built_at: "2026-09-15T05:45:01+00:00", sources: 104 };
+  assert.equal(buildLabel(catalogue), "catalogue · 2026-09-15 · 104 builds");
   assert.equal(
     summaryLabel({ counts: { places: 6, feeds: 1, edges: 1 }, served_places: 1 }),
     "6 places · 1 feeds · 1 edges · 1 served",
@@ -218,7 +265,8 @@ test("the details render the chain, feeds and external ids, escaped", () => {
   assert.match(html, /<td>HSL<\/td><td>local<\/td><td>—<\/td><td>0.85<\/td><td>crawl<\/td>/);
   // On schema 7 the class is the relevance category, with relevance and the border flag.
   const ranked = { properties: { ...record.properties, reached_from: { international: 1 }, edges: [{ ...record.properties.edges[0], relevance_category: "international", relevance: 0.3, cross_border: true }] } };
-  assert.match(detailsHtml(ranked, "category"), /<td>HSL<\/td><td>international<\/td><td>0.30<\/td><td>0.85<\/td><td>crawl · cross-border<\/td>/);
+  assert.match(detailsHtml(ranked, "category"), /<th>Feed<\/th><th>Tier<\/th><th>Category<\/th>/);
+  assert.match(detailsHtml(ranked, "category"), /<td>HSL<\/td><td>local<\/td><td>international<\/td><td>0.30<\/td><td>0.85<\/td><td>crawl · cross-border<\/td>/);
   assert.match(detailsHtml(ranked, "category"), /served by 1 feed \(1 gtfs\) · reached from 1 international</);
   // Validity: the dated feeds, the span, the best window and every window.
   const validity = {
@@ -245,12 +293,53 @@ test("the details render the chain, feeds and external ids, escaped", () => {
   const hostile = {
     properties: {
       ...record.properties,
+      feed_count: "<s>",
       children: { count: "<img>", by_kind: { "<b>": "<i>" }, served: "<u>" },
     },
   };
   const escaped = detailsHtml(hostile);
+  assert.match(escaped, /served by &lt;s&gt; feeds/);
   assert.match(escaped, /&lt;img&gt; children \(&lt;i&gt; &lt;b&gt;\), &lt;u&gt; served/);
-  assert.doesNotMatch(escaped, /<img>|<b>|<i>|<u>/);
+  assert.doesNotMatch(escaped, /<img>|<b>|<i>|<u>|<s>/);
+});
+
+test("details say what a place covers, list its members or metros, name its source build and filter feeds by tier", () => {
+  const edge = { feed_id: "f1", feed_name: "HSL", tier: "local", tier_confidence: 0.85, method: "crawl" };
+  const city = { place_id: "hel", name: "Helsinki", kind: "city", served: true, feed_count: 1, ancestors: [], children: { count: 0 }, edges: [edge] };
+  const metro = {
+    properties: {
+      ...city, place_id: "hma", kind: "metro", source_subtype: "metropolitan region", statistical_area_id: "FI001MC",
+      geometry_source: "member_union", metros: [], build_id: "fi-0000000000000001",
+      members: { count: 2, served: 1, rows: [
+        { place_id: "hel", name: "Helsinki", kind: "city", served: true, feed_count: 3 },
+        { place_id: "esp", name: "Espoo", kind: "city", served: false, feed_count: 0 },
+      ] },
+    },
+  };
+  const html = detailsHtml(metro, "tier", { sources: { "fi-0000000000000001": "2026-09-14T00:00:00+00:00" } });
+  assert.match(html, /<p class="coverage"><span class="badge" style="background:#db2777">metro<\/span>Eurostat metropolitan region FI001MC · 2 member cities, 1 served · boundary: union of members<\/p>/);
+  assert.match(html, /<details class="members"><summary>2 members<\/summary><ul><li><button type="button" class="crumb" data-id="hel">Helsinki<\/button> <small class="muted">3 feeds<\/small><\/li><li>.*Espoo.*unserved/);
+  assert.match(html, /from build fi-0000000000000001, built 2026-09-14/);
+  assert.match(membersHtml({ count: 3, served: 1, rows: metro.properties.members.rows }), /2 of 3 shown/);
+  assert.equal(membersHtml({ count: 0, served: 0, rows: [] }), "");
+  const hostile = membersHtml({ count: 1, served: 1, rows: [{ place_id: "x", name: "<i>", served: true, feed_count: "<b>" }] });
+  assert.match(hostile, /&lt;i&gt;<\/button> <small class="muted">&lt;b&gt; feeds<\/small>/);
+  assert.doesNotMatch(hostile, /<i>|<b>/);
+  const odd = { properties: { ...city, kind: "metro", geometry_source: "constructor", members: { count: 0, served: 0, rows: [] } } };
+  assert.match(detailsHtml(odd), /0 member cities, 0 served · boundary: constructor</);
+  const member = { properties: { ...city, metros: [{ place_id: "hma", name: "Helsinki", source_subtype: "metropolitan region", statistical_area_id: "FI001MC" }] } };
+  assert.match(detailsHtml(member), /city · member of <button type="button" class="crumb" data-id="hma">Helsinki<\/button> \(Eurostat metropolitan region\)<\/p>/);
+  assert.doesNotMatch(detailsHtml(member), /from build|<details/);
+  // The tier checkboxes: an unchecked tier hides its rows and the count says so.
+  const two = { properties: { ...city, edges: [edge, { feed_id: "f2", feed_name: "Ferry", tier: null }] } };
+  const all = detailsHtml(two);
+  assert.match(all, /<input type="checkbox" name="tier" value="local" checked> local/);
+  assert.match(all, /<td>Ferry<\/td><td>unknown<\/td>/);
+  assert.doesNotMatch(all, /of 2 feeds/);
+  const local = detailsHtml(two, "tier", { tiers: new Set(["local"]) });
+  assert.match(local, /value="unknown"> unknown/);
+  assert.match(local, /1 of 2 feeds/);
+  assert.doesNotMatch(local, /Ferry/);
 });
 
 test("tree nodes render a caret only with children, nest arrived children and mark the selection", () => {

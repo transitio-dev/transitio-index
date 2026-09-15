@@ -30,7 +30,7 @@ _spec.loader.exec_module(iv)
 BOX = shapely.box
 
 
-def _place(place_id, kind, name, parent_id, geom, country="FI"):
+def _place(place_id, kind, name, parent_id, geom, country="FI", **extra):
     return {
         "place_id": place_id,
         "kind": kind,
@@ -39,7 +39,21 @@ def _place(place_id, kind, name, parent_id, geom, country="FI"):
         "country_code": country,
         "service": json.dumps({"feeds": 1}),
         "geometry": shapely.to_wkb(geom),
+        **extra,
     }
+
+
+def _places_table(places):
+    """The places as Arrow: every key any row has (``from_pylist`` reads the
+    first row's), ``names`` typed as the map the publisher writes."""
+    keys = [k for k in dict.fromkeys(k for p in places for k in p) if k != "names"]
+    table = pa.Table.from_pylist([{k: p.get(k) for k in keys} for p in places])
+    if any("names" in p for p in places):
+        names = [list((p.get("names") or {}).items()) for p in places]
+        table = table.append_column(
+            "names", pa.array(names, pa.map_(pa.string(), pa.string()))
+        )
+    return table
 
 
 # A country, two regions and three cities; only Helsinki is served, by feed f1.
@@ -47,7 +61,15 @@ PLACES = [
     _place("fi", "country", "Finland", None, BOX(19, 59, 32, 71)),
     _place("uus", "region", "Uusimaa", "fi", BOX(23, 59.8, 26.5, 60.9)),
     _place("lap", "region", "Lapland", "fi", BOX(20, 66, 30, 70)),
-    _place("hel", "city", "Helsinki", "uus", BOX(24.8, 60.1, 25.3, 60.35)),
+    _place(
+        "hel",
+        "city",
+        "Helsinki",
+        "uus",
+        BOX(24.8, 60.1, 25.3, 60.35),
+        names={"sv": "Helsingfors"},
+        aliases=["Hki"],
+    ),
     _place("esp", "city", "Espoo", "uus", BOX(24.4, 60.1, 24.9, 60.3)),
     _place("rov", "city", "Rovaniemi", "lap", BOX(25.5, 66.4, 26.0, 66.6)),
 ]
@@ -67,7 +89,7 @@ def write_build(path, places=PLACES, edges=EDGES, feeds=FEEDS, notice=b"NOTICE\n
         "counts": {"places": len(places)},
     }
     tables = {
-        "places.parquet": pa.Table.from_pylist(places),
+        "places.parquet": _places_table(places),
         "edges.parquet": pa.Table.from_pylist(edges),
         "feeds.parquet": pa.Table.from_pylist(feeds),
     }
@@ -392,6 +414,7 @@ def test_the_api_serves_the_listing_summaries_and_bounded_slices(tmp_path, monke
     assert module.headers["content-type"].startswith("text/javascript")
     assert module.text.startswith("//")
     assert [row["id"] for row in client.get("/api/builds").json()] == [
+        iv.CATALOGUE,
         iv.LATEST,
         "fi-abc",
     ]
@@ -603,6 +626,197 @@ def test_the_places_table_is_sorted_paged_and_geometry_free(tmp_path):
     assert [r["place_id"] for r in served["rows"]] == ["hel"]
     with pytest.raises(ValueError, match="sort must be"):
         iv.places_table(build, everything, sort="geometry")
+
+
+@pytest.mark.parametrize(
+    ("q", "limit", "total", "ids", "matched"),
+    [
+        ("Helsinki", 50, 1, ["hel"], None),
+        ("helsingfors", 50, 1, ["hel"], "Helsingfors"),
+        ("HKI", 50, 1, ["hel"], "Hki"),
+        ("sink", 50, 1, ["hel"], None),
+        ("la", 50, 2, ["lap", "fi"], None),
+        ("land", 50, 2, ["fi", "lap"], None),
+        ("la", 1, 2, ["lap"], None),
+        ("zz", 50, 0, [], None),
+        (" h ", 50, None, ValueError, None),
+    ],
+    ids=[
+        "name",
+        "other-language-name",
+        "alias",
+        "substring",
+        "word-prefix-before-substring",
+        "name-order-within-a-rank",
+        "limit",
+        "no-match",
+        "too-short",
+    ],
+)
+def test_search_ranks_names_then_aliases_then_prefixes(
+    tmp_path, q, limit, total, ids, matched
+):
+    build = iv.load_build("b", write_build(tmp_path) and tmp_path)
+    if ids is ValueError:
+        with pytest.raises(ValueError, match="two characters"):
+            iv.search_places(build, q, limit)
+        return
+    reply = iv.search_places(build, q, limit)
+    assert reply["total"] == total
+    assert [row["place_id"] for row in reply["rows"]] == ids
+    chains = {"hel": ["Finland", "Uusimaa"], "lap": ["Finland"], "fi": []}
+    for row in reply["rows"]:
+        assert row["chain"] == chains[row["place_id"]]
+    if ids:
+        first = reply["rows"][0]
+        assert first["matched"] == matched
+        assert (first["served"], first["feed_count"], first["tier"]) == (
+            (True, 1, "local") if ids[0] == "hel" else (False, 0, None)
+        )
+
+
+def test_search_orders_every_rank_and_serves_the_route(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    box = BOX(-0.2, 50.8, 0, 50.9)
+    places = [
+        _place("alb", "city", "Albrighton", None, box),  # a substring
+        _place("bbe", "city", "Brighton Beach", None, box),  # a word starts with it
+        _place("bhi", "city", "Brighton Hill", None, box),
+        _place("bri", "city", "Brighton", None, box),  # the name
+        _place("hov", "city", "Hove", None, box, aliases=["Brighton"]),  # an alias
+        _place(
+            "nbr",
+            "city",
+            "New\r\nBrighton",
+            None,
+            box,
+            names={"cy": "Brighton\rNewydd"},
+        ),
+        _place("vol", "city", "ΒΟΛΟΣ", None, box),  # a final sigma
+    ]
+    edges = [
+        {"place_id": "nbr", "feed_id": "f1", "tier": "local"},
+        {"place_id": "nbr", "feed_id": "f2", "tier": "local"},
+        {"place_id": "bbe", "feed_id": "f1", "tier": "local"},
+    ]
+    feeds = [{"feed_id": f, "name": f, "coverage": None} for f in ("f1", "f2")]
+    cache = tmp_path / "cache"
+    write_build(cache / "index", places=places, edges=edges, feeds=feeds)
+    build = iv.load_build("b", cache / "index")
+    # Rank, then served before unserved, then more feeds, then the name; a
+    # newline inside a value or the query never joins two values.
+    rows = iv.search_places(build, "  brighton\n ")["rows"]
+    assert [r["place_id"] for r in rows] == ["bri", "hov", "nbr", "bbe", "bhi", "alb"]
+    assert [r["matched"] for r in rows] == [None, "Brighton", None, None, None, None]
+    assert [r["place_id"] for r in iv.search_places(build, "newydd")["rows"]] == ["nbr"]
+    assert [
+        r["place_id"] for r in iv.search_places(build, "brighton newydd")["rows"]
+    ] == ["nbr"]
+    assert iv.search_places(build, "hove brighton")["total"] == 0  # two values, not one
+    # A value with a newline in it ranks as the text matched it: the name
+    # exactly, a word of it, or an alias (returned as stored).
+    exact = iv.search_places(build, "new brighton")["rows"]
+    assert [(r["place_id"], r["matched"]) for r in exact] == [("nbr", None)]
+    prefix = iv.search_places(build, "bright")["rows"]
+    assert [r["place_id"] for r in prefix] == ["nbr", "bbe", "bri", "bhi", "alb", "hov"]
+    assert [r["matched"] for r in prefix] == [None, None, None, None, None, "Brighton"]
+    assert iv.search_places(build, "newydd")["rows"][0]["matched"] == "Brighton\rNewydd"
+    volos = iv.search_places(build, "ΒΟΛΟΣ")["rows"]
+    assert [(r["place_id"], r["matched"]) for r in volos] == [("vol", None)]
+    client = TestClient(iv.create_app(cache))
+    reply = client.get(
+        f"/api/builds/{iv.LATEST}/search", params={"q": "Brighton", "limit": 2}
+    )
+    assert reply.status_code == 200 and reply.headers["X-Snapshot"] == build.snapshot_id
+    assert reply.json()["total"] == 6 and [
+        r["place_id"] for r in reply.json()["rows"]
+    ] == ["bri", "hov"]
+    assert set(reply.json()["rows"][0]) == {
+        "place_id",
+        "name",
+        "kind",
+        "parent_id",
+        "country_code",
+        "chain",
+        "served",
+        "feed_count",
+        "tier",
+        "matched",
+    }
+    at_level = client.get(
+        f"/api/builds/{iv.LATEST}/search", params={"q": "Brighton", "level": "national"}
+    )
+    assert [r["served"] for r in at_level.json()["rows"]].count(
+        True
+    ) == 0  # local edges do not count
+    monkeypatch.setattr(iv, "SEARCH_MAX", 3)
+    capped = client.get(
+        f"/api/builds/{iv.LATEST}/search", params={"q": "Brighton", "limit": 500}
+    )
+    assert len(capped.json()["rows"]) == 3
+    for params in (
+        {"q": "b"},
+        {"q": "Brighton", "limit": 0},
+        {"q": "Brighton", "level": "x"},
+    ):
+        assert (
+            client.get(f"/api/builds/{iv.LATEST}/search", params=params).status_code
+            == 400
+        )
+
+
+def test_a_place_record_names_its_metros_and_members(tmp_path, monkeypatch):
+    metro = _place(
+        "hma",
+        "metro",
+        "Helsinki metropolitan area",
+        None,
+        BOX(24, 60, 26, 61),
+        source_subtype="metropolitan region",
+        statistical_area_id="FI001MC",
+        member_ids=["hel", "esp", "ghost"],  # a member the build does not hold
+    )
+    # Helsinki names its metro; Espoo is known as a member from the metro alone.
+    places = [
+        dict(p, metro_ids=["hma"] if p["place_id"] == "hel" else []) for p in PLACES
+    ]
+    build = iv.load_build("b", write_build(tmp_path, places + [metro]) and tmp_path)
+    hma = {
+        "place_id": "hma",
+        "name": "Helsinki metropolitan area",
+        "source_subtype": "metropolitan region",
+        "statistical_area_id": "FI001MC",
+    }
+    city = json.loads(iv.place_record(build, "hel"))["properties"]
+    assert city["metros"] == [hma]
+    assert city["members"] == {"count": 0, "served": 0, "rows": []}
+    assert json.loads(iv.place_record(build, "esp"))["properties"]["metros"] == [hma]
+    area = json.loads(iv.place_record(build, "hma"))["properties"]
+    assert area["metros"] == [] and area["members"] == {
+        "count": 3,  # the ghost counts; it has no row
+        "served": 1,
+        "rows": [
+            {
+                "place_id": "hel",
+                "name": "Helsinki",
+                "kind": "city",
+                "served": True,
+                "feed_count": 1,
+            },
+            {
+                "place_id": "esp",
+                "name": "Espoo",
+                "kind": "city",
+                "served": False,
+                "feed_count": 0,
+            },
+        ],
+    }
+    monkeypatch.setattr(iv, "MEMBERS_LIMIT", 1)
+    cut = json.loads(iv.place_record(build, "hma"))["properties"]["members"]
+    assert cut["count"] == 3 and len(cut["rows"]) == 1
 
 
 def test_a_place_record_carries_ancestors_children_and_feeds(tmp_path):
@@ -845,13 +1059,16 @@ def write_partitioned_build(
     edges=PARTITIONED_EDGES,
     notice=b"NOTICE\n",
     realtime=None,
+    built_at="2026-09-12T00:00:00+00:00",
 ):
-    """A schema-7 build: FI places and domestic edges, feeds by home country
-    (``international`` without one), the cross-border edges under ``links``,
-    every table listed with its rows and digest; ``notice=None`` publishes
-    it unlicensed."""
+    """A schema-7 build: places by country, feeds by home country
+    (``international`` without one), domestic edges by partition and the
+    cross-border edges under ``links``, every table listed with its rows and
+    digest; ``notice=None`` publishes it unlicensed."""
     path.mkdir(parents=True, exist_ok=True)
-    tables = {"FI/places.parquet": pa.Table.from_pylist(places)}
+    tables = {}
+    for place in places:
+        tables.setdefault(f"{place['country_code']}/places.parquet", []).append(place)
     for feed in feeds:
         partition = feed["home_country"] or "international"
         key = f"{partition}/feeds.parquet"
@@ -863,7 +1080,10 @@ def write_partitioned_build(
     listing = {}
     for name, table in tables.items():
         if isinstance(table, list):
-            table = pa.Table.from_pylist(table)
+            rows = table
+            table = (
+                _places_table(rows) if "places" in name else pa.Table.from_pylist(rows)
+            )
         partition, _, file = name.partition("/")
         (path / partition).mkdir(exist_ok=True)
         sink = io.BytesIO()
@@ -875,7 +1095,7 @@ def write_partitioned_build(
         }
     snapshot = {
         "schema_version": 8 if realtime else 7,
-        "built_at": "2026-09-12T00:00:00+00:00",
+        "built_at": built_at,
         "counts": {"places": len(places)},
         "partitions": listing,
         "licensed": notice is not None,
@@ -1045,7 +1265,7 @@ def test_the_cache_and_the_api_serve_a_partitioned_build(tmp_path):
     second = builds.get(iv.LATEST)
     assert second is not first and second.feed_count.max() == 1
     client = TestClient(iv.create_app(cache))
-    listing = client.get("/api/builds").json()
+    listing = client.get("/api/builds").json()[1:]  # after the catalogue's row
     assert listing[0]["complete"] is True and listing[0]["schema_version"] == 7
     summary = client.get(f"/api/builds/{iv.LATEST}/summary").json()
     assert summary["schema_version"] == 7 and set(summary["partitions"]) == {"FI"}
@@ -1191,6 +1411,324 @@ def test_the_feed_side_api_filters_by_spec_level_and_country(tmp_path):
     assert (
         "category_primary" not in client.get("/api/builds/flat/feeds").json()["rows"][0]
     )
+
+
+# ---- the catalogue: every label's newest build, merged ----
+
+
+def _run(builds, label, digit, **kwargs):
+    """A partitioned build archived as ``<label>-<16 hex>`` under ``builds``."""
+    path = builds / f"{label}-{digit:016x}" / "index"
+    write_partitioned_build(path, **kwargs)
+    return path.parent.name
+
+
+def test_the_catalogue_takes_each_label_s_newest_run_or_says_why_not(tmp_path):
+    cache = tmp_path / "cache"
+    builds = cache / "builds"
+    day = "2026-09-{:02d}T00:00:00+00:00".format
+    _run(builds, "fi", 1, built_at=day(13))
+    fi = _run(builds, "fi", 2, built_at=day(14))
+    de = _run(builds, "de", 3, built_at=day(15))
+    se = _run(builds, "se", 6, built_at=day(15))  # a tie: the lower id wins
+    _run(builds, "se", 7, built_at=day(15))
+    nl = _run(builds, "nl", 4, feeds=[], edges={})
+    gone = _run(builds, "gone", 5)
+    _notice_listed_but_gone(builds / gone / "index")
+    six = _run(builds, "six", 8)  # partitioned, yet claiming schema 6
+    _rewrite_snapshot(builds / six / "index", lambda s: s.update(schema_version=6))
+    _run(builds, "bad", 9, built_at=day(13))  # a run whose snapshot cannot be
+    bad = _run(builds, "bad", 10)  # read ranks first, so the label is skipped
+    (builds / bad / "index" / "snapshot.json").write_text("{")
+    _run(builds, "when", 11, built_at=day(13))  # so does one without a date
+    when = _run(builds, "when", 12, built_at="yesterday")
+    nodate = _run(builds, "nodate", 13)
+    _rewrite_snapshot(builds / nodate / "index", lambda s: s.pop("built_at"))
+    _run(builds, "raw", 14, built_at=day(13))  # a run without its index yet
+    (builds / "raw-000000000000000f").mkdir()
+    write_build(builds / "old" / "index")
+    write_build(cache / "index")
+    write_build(builds / iv.CATALOGUE / "index")  # a reserved id: not a build
+    sources, skipped = iv.catalogue_sources(cache)
+    assert [(b, s["built_at"][8:10]) for b, _, s in sources] == [
+        (de, "15"),
+        (fi, "14"),
+        (se, "15"),
+    ]
+    assert all(path == builds / b / "index" for b, path, _ in sources)
+    assert skipped == [
+        {"id": bad, "reason": "incomplete"},
+        {"id": gone, "reason": "incomplete"},
+        {"id": iv.LATEST, "reason": "not partitioned"},
+        {"id": nl, "reason": "no feeds"},
+        {"id": nodate, "reason": "undated"},
+        {"id": "old", "reason": "not partitioned"},
+        {"id": "raw-000000000000000f", "reason": "incomplete"},
+        {"id": six, "reason": "not partitioned"},
+        {"id": when, "reason": "undated"},
+    ]
+
+
+def test_the_catalogue_merges_feeds_edges_and_places_by_source(tmp_path):
+    spill = json.dumps({"feeds": 2})  # the German build's own view of Finland
+    a = _run(
+        tmp_path,
+        "fi",
+        1,
+        feeds=[
+            _feed7("hsl", "HSL", "FI", "domestic"),
+            _feed7("tram", "Tram", "FI", "d"),
+            _feed7("nat", "Nat", "FI", "domestic"),
+        ],
+        edges={
+            "FI": [
+                _edge7("hel", "hsl", "local", "primary", 0.9, False),
+                _edge7("hel", "tram", "local", "primary", 0.5, False),
+                _edge7("esp", "tram", "local", "primary", 0.5, False),
+                _edge7("uus", "nat", "regional", "secondary", 0.5, False),
+            ]
+        },
+        realtime={
+            "FI": [
+                _rt("nat-rt", "nat", {"realtime_trip_updates": "https://a"}),
+                _rt("nat-rt2", "nat", {"realtime_alerts": "https://a2"}),
+                _rt("lost", None, {}, method="none"),
+            ]
+        },
+        built_at="2026-09-14T00:00:00+00:00",
+    )
+    b = _run(
+        tmp_path,
+        "de",
+        2,
+        places=[
+            _place("de", "country", "Germany", None, BOX(5, 47, 15, 55), country="DE"),
+            _place("ber", "city", "Berlin", "de", BOX(13, 52, 14, 53), country="DE"),
+            {**PLACES[0], "service": spill},
+            {**PLACES[2], "service": spill},  # unserved in both runs
+            {**PLACES[3], "service": spill},
+            {**PLACES[4], "service": spill},  # one edge in both runs
+        ],
+        feeds=[
+            _feed7("flix", "Flix", "DE", "domestic"),
+            _feed7("nat", "Nat 2", "FI", "d"),
+        ],
+        edges={
+            "DE": [_edge7("ber", "flix", "local", "primary", 0.9, False)],
+            "FI": [_edge7("fi", "nat", "national", "tertiary", 0.4, False)],
+            "links": [
+                _edge7(
+                    "hel", "flix", "international", "international", 0.3, True, "DE"
+                ),
+                _edge7(
+                    "esp", "flix", "international", "international", 0.3, True, "DE"
+                ),
+            ],
+        },
+        realtime={"FI": [_rt("nat-rt", "nat", {"realtime_trip_updates": "https://b"})]},
+        built_at="2026-09-15T00:00:00+00:00",
+    )
+    sources = []
+    for run in (a, b):
+        snapshot, _, tables = iv.load_tables(tmp_path / run / "index")
+        sources.append((run, snapshot, tables))
+    snapshot, tables = iv.merge_tables(
+        sources, skipped=[{"id": "nl", "reason": "no feeds"}]
+    )
+    build = iv.Build(iv.CATALOGUE, tmp_path, snapshot, {}, tables)
+    # A feed from the newest run carrying it, its edges from that run only.
+    feeds = build.feeds.set_index("feed_id")
+    assert feeds["build_id"].to_dict() == {"hsl": a, "tram": a, "flix": b, "nat": b}
+    assert feeds.loc["nat", "name"] == "Nat 2"
+    edges = build.edges[["place_id", "feed_id", "build_id"]]
+    assert set(map(tuple, edges.to_numpy())) == {
+        ("hel", "hsl", a),
+        ("hel", "tram", a),
+        ("esp", "tram", a),
+        ("ber", "flix", b),
+        ("fi", "nat", b),
+        ("hel", "flix", b),
+        ("esp", "flix", b),
+    }
+    # A place from the run serving it most (two edges beat one), the newest
+    # run on a tie (esp: one each) or when nothing serves it (lap); the row's
+    # service is that run's.
+    places = build.places.set_index("place_id")
+    ids = ["hel", "fi", "uus", "ber", "esp", "lap"]
+    assert places.loc[ids, "build_id"].to_list() == [a, b, a, b, b, b]
+    by_id = list(build.places["place_id"])
+    assert build.service[by_id.index("hel")] == {"feeds": 1}
+    assert build.service[by_id.index("lap")] == {"feeds": 2}
+    assert build.feed_count[by_id.index("hel")] == 3
+    # A companion of a won feed comes with that feed's run or not at all
+    # (nat-rt2 is the older run's); an unlinked one from the newest run.
+    assert build.realtime.set_index("feed_id")["build_id"].to_dict() == {
+        "nat-rt": b,
+        "lost": a,
+    }
+    assert build.realtime_urls[list(build.realtime["feed_id"]).index("nat-rt")] == {
+        "realtime_trip_updates": "https://b"
+    }
+    assert snapshot["counts"] == {
+        "places": 8,
+        "places_by_kind": {"city": 4, "region": 2, "country": 2},
+        "feeds": 4,
+        "edges": 7,
+        "edges_by_tier": {"local": 4, "international": 2, "national": 1},
+        "realtime": 2,
+    }
+    assert snapshot["built_at"][8:10] == "15" and snapshot["schema_version"] == 8
+    assert snapshot["licensed"] is True and snapshot["catalogue"] is True
+    assert [(s["label"], s["partitions"]) for s in snapshot["sources"]] == [
+        ("de", ["DE", "FI", "links"]),
+        ("fi", ["FI"]),
+    ]
+    assert snapshot["skipped"] == [{"id": "nl", "reason": "no feeds"}]
+    assert build.snapshot_id == iv._snapshot_digest(snapshot)
+
+
+def test_the_cache_and_the_api_serve_the_catalogue(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    cache = tmp_path / "cache"
+    builds = cache / "builds"
+    builds.mkdir(parents=True)
+    repairs = {}  # a file to restore the moment the cache has read it
+
+    def reading(path):
+        data = iv._read_file(path)
+        intact = repairs.pop(Path(path), None)
+        if intact is not None:
+            Path(path).write_bytes(intact)
+        return data
+
+    cached = iv.BuildCache(cache, read_bytes=reading)
+    assert cached.get(iv.CATALOGUE) is None  # nothing to merge yet
+    assert cached.summaries() == [
+        {
+            "id": iv.CATALOGUE,
+            "complete": False,
+            "built_at": None,
+            "sources": 0,
+            "skipped": [],
+        }
+    ]
+    fi = _run(builds, "fi", 1, built_at="2026-09-14T00:00:00+00:00")
+    de = _run(
+        builds,
+        "de",
+        2,
+        places=[
+            _place("de", "country", "Germany", None, BOX(5, 47, 15, 55), country="DE")
+        ],
+        feeds=[_feed7("flix", "Flix", "DE", "domestic")],
+        edges={
+            "links": [
+                _edge7("hel", "flix", "international", "international", 0.3, True, "DE")
+            ]
+        },
+        built_at="2026-09-15T00:00:00+00:00",
+    )
+    nl = _run(builds, "nl", 3, feeds=[], edges={})
+    first = cached.get(iv.CATALOGUE)
+    assert first is not None and cached.get(iv.CATALOGUE) is first
+    assert first.snapshot["skipped"] == [{"id": nl, "reason": "no feeds"}]
+    client = TestClient(iv.create_app(cache))
+    listing = client.get("/api/builds").json()
+    assert listing[0]["id"] == iv.CATALOGUE and listing[0]["complete"] is True
+    assert listing[0]["sources"] == 2 and listing[0]["built_at"][8:10] == "15"
+    assert listing[0]["counts"]["places"] == 7 and listing[0]["skipped"] == [
+        {"id": nl, "reason": "no feeds"}
+    ]
+    assert [row["id"] for row in listing[1:]] == [de, fi, nl]
+    summary = client.get(f"/api/builds/{iv.CATALOGUE}/summary")
+    assert (
+        summary.json()["catalogue"] is True and summary.json()["counts"]["places"] == 7
+    )
+    assert [s["label"] for s in summary.json()["sources"]] == ["de", "fi"]
+    # Every projection names the row's source build and the snapshot it is of.
+    table = client.get(f"/api/builds/{iv.CATALOGUE}/places/table", params={"q": "Hel"})
+    assert table.json()["rows"][0]["build_id"] == fi
+    assert table.headers["X-Snapshot"] == summary.json()["snapshot_id"]
+    record = client.get(f"/api/builds/{iv.CATALOGUE}/places/hel").json()["properties"]
+    assert record["build_id"] == fi and record["feed_count"] == 4
+    feeds = client.get(f"/api/builds/{iv.CATALOGUE}/feeds").json()["rows"]
+    assert {row["feed_id"]: row["build_id"] for row in feeds} == {
+        "f1": fi,
+        "f2": fi,
+        "f3": fi,
+        "flix": de,
+    }
+    feed = client.get(f"/api/builds/{iv.CATALOGUE}/feeds/flix").json()["properties"]
+    assert feed["build_id"] == de
+    # A new run reassembles the catalogue; one that does not verify is
+    # skipped, whether its digests mismatch or its tables are not a build's.
+    broken = _run(builds, "xx", 4)
+    edges_file = builds / broken / "index" / "FI" / "edges.parquet"
+    intact = edges_file.read_bytes()
+    edges_file.write_bytes(intact[:-1] + bytes([intact[-1] ^ 1]))  # same size
+    repairs[edges_file] = intact  # restored right after the failed read
+    junk = _run(
+        builds,
+        "yy",
+        5,
+        places=[{**PLACES[0], "geometry": b"not wkb"}],
+        feeds=[_feed7("j", "J", "FI", "domestic")],
+        edges={"FI": [_edge7("fi", "j", "national", "tertiary", 0.4, False)]},
+    )
+    second = cached.get(iv.CATALOGUE)
+    assert second is not first
+    assert second.snapshot["skipped"] == [
+        {"id": nl, "reason": "no feeds"},
+        {"id": broken, "reason": "does not verify"},
+        {"id": junk, "reason": "does not verify"},
+    ]
+    # The repair landed after the read that failed; it is noticed all the same.
+    third = cached.get(iv.CATALOGUE)
+    assert third is not second and cached.get(iv.CATALOGUE) is third
+    assert third.snapshot["skipped"] == [
+        {"id": nl, "reason": "no feeds"},
+        {"id": junk, "reason": "does not verify"},
+    ]
+    assert client.get("/api/builds").json()[0]["skipped"] == third.snapshot["skipped"]
+    # So are a source rewritten under its id, and a skipped run that goes away.
+    write_partitioned_build(
+        builds / fi / "index",
+        feeds=PARTITIONED_FEEDS[:1],
+        edges={"FI": PARTITIONED_EDGES["FI"][:1]},
+        built_at="2026-09-14T00:00:00+00:00",
+    )
+    fourth = cached.get(iv.CATALOGUE)
+    assert fourth is not third and fourth.snapshot["counts"]["feeds"] == 4
+    by_feed = dict(zip(fourth.feeds["feed_id"], fourth.feeds["build_id"]))
+    assert by_feed["f1"] == fi and by_feed["f2"] == broken  # f2 left the fi run
+    shutil.rmtree(builds / nl)
+    fifth = cached.get(iv.CATALOGUE)
+    assert fifth is not fourth and fifth.snapshot["skipped"] == [
+        {"id": junk, "reason": "does not verify"}
+    ]
+    # A repair that keeps the file's size and modification time is noticed
+    # too: the change time cannot be kept — except on Windows, whose change
+    # time is the creation time, so the repair there keeps its new mtime.
+    edges_file.write_bytes(intact[:-1] + bytes([intact[-1] ^ 1]))
+    _run(builds, "zz", 6)  # a new source: the next request reassembles
+    sixth = cached.get(iv.CATALOGUE)
+    assert [run["id"] for run in sixth.snapshot["skipped"]] == [broken, junk]
+    tampered = os.stat(edges_file)
+    edges_file.write_bytes(intact)
+    if os.name != "nt":
+        os.utime(edges_file, ns=(tampered.st_atime_ns, tampered.st_mtime_ns))
+    seventh = cached.get(iv.CATALOGUE)
+    assert seventh is not sixth and [r["id"] for r in seventh.snapshot["skipped"]] == [
+        junk
+    ]
+    later = client.get(f"/api/builds/{iv.CATALOGUE}/summary").json()
+    assert later["snapshot_id"] != summary.json()["snapshot_id"]
+    table = client.get(f"/api/builds/{iv.CATALOGUE}/places/table", params={"q": "Hel"})
+    assert table.headers["X-Snapshot"] == later["snapshot_id"]
+    # A source is loaded on the snapshot it was selected on, or not at all.
+    assert iv.load_tables(builds / fi / "index", expected={"other": True}) is None
 
 
 def test_a_schema_8_build_carries_its_realtime_companions(tmp_path):

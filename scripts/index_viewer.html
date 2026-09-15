@@ -14,6 +14,13 @@
   header { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; padding: 0.5rem 1rem; border-bottom: 1px solid #ddd; background: #fafafa; }
   header label { font-weight: 600; }
   header select { margin-left: 0.5rem; max-width: 24rem; }
+  #search-box { position: relative; }
+  #search { margin-left: 0.5rem; width: 16rem; }
+  .results { position: absolute; z-index: 5; top: 100%; left: 0; width: 34rem; max-width: calc(100vw - 2rem); max-height: 60vh; overflow: auto; background: #fff; border: 1px solid #ccc; border-radius: 0.3rem; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); padding: 0.3rem 0.5rem; font-size: 13px; font-weight: normal; }
+  .results h4 { margin: 0.4rem 0 0.1rem; font-size: 12px; color: #555; }
+  .results .hit { display: block; width: 100%; text-align: left; border: none; background: none; padding: 0.2rem 0.3rem; cursor: pointer; font: inherit; border-radius: 0.2rem; }
+  .results .hit:hover { background: #eef2ff; }
+  .badge { display: inline-block; padding: 0 0.35rem; border-radius: 0.6rem; color: #fff; font-size: 11px; margin-right: 0.3rem; vertical-align: middle; }
   #stats { color: #444; }
   #hint { padding: 0.15rem 0.6rem; border-radius: 0.3rem; background: #fde68a; color: #4a3600; }
   #body { flex: 1; display: flex; min-height: 0; }
@@ -23,6 +30,9 @@
   #panel nav button { border: 1px solid #ccc; background: #f3f4f6; padding: 0.2rem 0.7rem; border-radius: 0.3rem; cursor: pointer; }
   #panel nav button.active { background: #2563eb; border-color: #2563eb; color: #fff; }
   .muted { color: #666; }
+  .coverage { margin: 0.2rem 0; }
+  .tiers label { margin-right: 0.6rem; font-weight: normal; }
+  .members ul { margin: 0.2rem 0; padding-left: 1.1rem; }
   .chain button.crumb { border: none; background: none; color: #2563eb; padding: 0; cursor: pointer; font: inherit; }
   .filters { display: flex; gap: 0.4rem; margin-bottom: 0.4rem; }
   .filters input { flex: 1; min-width: 0; }
@@ -64,6 +74,10 @@
     <option value="gtfs-rt">GTFS-RT</option>
     <option value="gbfs">GBFS</option>
   </select></label>
+  <div id="search-box">
+    <label>Search <input id="search" type="search" placeholder="Place name or alias…" autocomplete="off"></label>
+    <div id="search-results" class="results" hidden></div>
+  </div>
   <span id="stats"></span>
   <span id="hint" hidden></span>
   <span id="legend" class="legend"></span>

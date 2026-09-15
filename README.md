@@ -177,7 +177,15 @@ python scripts/index_viewer.py --cache cache --open
 
 Pick a build in the top bar; the map fits itself to the build's countries and
 regions, hovering names a place, clicking opens its details, and from zoom 7
-the loaded slice follows the viewport. The viewer only reads the parquet and
+the loaded slice follows the viewport. The first entry, `catalogue`, merges
+the newest run of every build under `cache/builds/` (and `cache/index`) into
+one view: a feed comes from the newest build carrying it, its edges from that
+same build, a place from the build serving it most, and every row names its
+source build. Point `--cache` at `~/.cache/transitio-index` to browse the
+archived runs that way; a run that does not verify, or holds no feeds, is
+listed as skipped rather than replaced by an older run. Assembling the
+catalogue over a hundred archived runs takes about ten seconds and several
+gigabytes of memory, once per change to the runs. The viewer only reads the parquet and
 JSON files a build publishes and verifies their digests before showing them,
 so a build that is mid-publish is listed but reported unavailable until the
 publish completes.
