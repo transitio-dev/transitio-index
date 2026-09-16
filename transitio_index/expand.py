@@ -276,15 +276,16 @@ def _draw_member_geometry(places_by_id, keys):
 
 
 def _derived_inputs(cache_dir, recorded):
-    """The Eurostat and FAO inputs, and the UCDB names, the metros stage
-    published metros from: ``(eurostat, fao, names)``, loaded under the
-    digests the run's ``derived_inputs`` recorded — so expansion derives
-    metros from the run's snapshot, never from the module's current pins —
-    each None (the names empty) where the run records none, that branch
-    having published none. A recorded input the raw store no longer holds, or
-    one no longer allowlisted, refuses the expansion: the seeded metros were
-    derived from it, so only a gazetteer rerun keeps the output consistent."""
-    from transitio_index import eurostat, fao, ucdb
+    """The Eurostat, Urban Audit and FAO inputs, and the UCDB names, the
+    metros stage published metros from: ``(eurostat, urau, fao, names)``,
+    loaded under the digests the run's ``derived_inputs`` recorded — so
+    expansion derives metros from the run's snapshot, never from the modules'
+    current pins — each None (the names empty) where the run records none,
+    that definition or branch having published none. A recorded input the
+    raw store no longer holds, or one no longer allowlisted, refuses the
+    expansion: the seeded metros were derived from it, so only a gazetteer
+    rerun keeps the output consistent."""
+    from transitio_index import eurostat, fao, ucdb, urau
 
     def load(branch, keys, read):
         pins = recorded.get(branch)
@@ -308,6 +309,11 @@ def _derived_inputs(cache_dir, recorded):
         metros.EUROSTAT_DERIVED,
         lambda pins: eurostat.load_inputs(cache_dir, expected=pins),
     )
+    urau_inputs = load(
+        "urau",
+        metros.URAU_DERIVED,
+        lambda pins: urau.load_inputs(cache_dir, expected=pins),
+    )
     fao_inputs = load(
         "fao",
         metros.FAO_DERIVED,
@@ -320,7 +326,7 @@ def _derived_inputs(cache_dir, recorded):
             (ucdb.DERIVED,),
             lambda pins: ucdb.load_names(cache_dir, expected=pins),
         )
-    return euro, fao_inputs, names[0] if names is not None else {}
+    return euro, urau_inputs, fao_inputs, names[0] if names is not None else {}
 
 
 class _SeededPlacement:
@@ -658,13 +664,22 @@ def _discover(
     new_metros, metro_pairs = _attach_metros(
         places_by_id, codes, new_cities, wikidata, report, registry
     )
-    euro = fao_inputs = None
+    euro = urau_inputs = fao_inputs = None
     names = {}
     if city_rows:
-        euro, fao_inputs, names = _derived_inputs(cache_dir, derived)
-    eurostat_metros, eurostat_touched, assignments = _attach_eurostat_metros(
-        places_by_id, codes, city_rows, areas, euro, metros.METROPOLITAN_REGION
-    )
+        euro, urau_inputs, fao_inputs, names = _derived_inputs(cache_dir, derived)
+    # One join per Eurostat definition the run derived, over the same cities.
+    eurostat_metros, eurostat_touched, assignments = [], set(), []
+    for definition, inputs in (
+        (metros.METROPOLITAN_REGION, euro),
+        (metros.FUNCTIONAL_URBAN_AREA, urau_inputs),
+    ):
+        added, touched, rows = _attach_eurostat_metros(
+            places_by_id, codes, city_rows, areas, inputs, definition
+        )
+        eurostat_metros += added
+        eurostat_touched |= touched
+        assignments += rows
     # The official metros — US and Eurostat, minted or joined — are
     # partitioned before the FAO branch, as in the metros stage, so a FAO
     # region is deduplicated only against metros that publish and a city

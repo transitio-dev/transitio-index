@@ -16,6 +16,7 @@ from transitio_index import (  # noqa: E402
     metros,
     overture,
     store,
+    urau,
 )
 
 # A source the geometry allowlist accepts, and one it does not.
@@ -370,10 +371,50 @@ def test_a_discovered_city_gains_the_eurostat_metro_the_run_derived(tmp_path):
     assert manifest["metros_added"] == 1
 
 
-def test_a_recorded_derived_input_the_raw_store_lost_refuses_expansion(tmp_path):
+def test_a_discovered_city_gains_the_functional_urban_area_the_run_derived(
+    tmp_path,
+):
+    from test_index_metros import _urau_inputs
+
     cache = tmp_path / "cache"
-    pins = {eurostat.COMPOSITION_FILE: "0" * 64, eurostat.BOUNDARIES_FILE: "1" * 64}
-    _publish_names(cache, SEED_PLACES, derived_inputs={"eurostat": pins})
+    # The metros stage read one area holding Tampere and recorded that
+    # snapshot in the run; expansion derives the second definition from it.
+    area = ("FI002F", "F", "FI", "Tampere", shapely.box(21.0, 60.5, 25.0, 62.0))
+    pins = _urau_inputs(tmp_path, cache, [area])
+    derived = {"eurostat": None, "urau": pins, "fao": None, "ucdb": None}
+    _publish_names(cache, SEED_PLACES, derived_inputs=derived)
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    manifest, places, _ = _expand(tmp_path, cache)
+    metro = places["eurostat_fua:FI002F"]
+    assert (metro["kind"], metro["source_subtype"], metro["name"]) == (
+        "metro",
+        "functional urban area",
+        "Tampere",
+    )
+    assert metro["country_code"] == "FI" and metro["member_ids"] == ["Q40840"]
+    assert places["Q40840"]["metro_ids"] == ["eurostat_fua:FI002F"]
+    assert metro["geometry_source"] == "member_union"
+    assert manifest["metros_added"] == 1
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        {
+            "eurostat": {
+                eurostat.COMPOSITION_FILE: "0" * 64,
+                eurostat.BOUNDARIES_FILE: "1" * 64,
+            }
+        },
+        {"urau": {urau.AREAS_FILE: "2" * 64}},
+    ],
+    ids=["eurostat", "urau"],
+)
+def test_a_recorded_derived_input_the_raw_store_lost_refuses_expansion(
+    tmp_path, recorded
+):
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES, derived_inputs=recorded)
     _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
     with pytest.raises(overture.GazetteerError, match="rerun the gazetteer"):
         _expand(tmp_path, cache)
