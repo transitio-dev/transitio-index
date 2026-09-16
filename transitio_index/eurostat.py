@@ -220,9 +220,8 @@ def load_inputs(cache_dir, *, expected=PINS):
 
 
 def countries(metros):
-    """The countries the composition covers, as the gazetteer's codes; a
-    metro without one (an area astride a border) covers none by itself."""
-    return {metro["country"] for metro in metros.values()} - {None}
+    """The countries the composition covers, as the gazetteer's codes."""
+    return {metro["country"] for metro in metros.values()}
 
 
 class Containment:
