@@ -30,7 +30,7 @@ ATHINA = shapely.box(23.5, 37.8, 24.0, 38.2)
 AREAS = [
     ("FI001F", "F", "FI", "Helsinki", HELSINKI),
     ("FI002F", "F", "FI", "Tampere", TAMPERE),
-    ("CB003F", "F", "CB", "Como/Chiasso", COMO),  # astride a border
+    ("CB003F", "F", "CB", "Como/Chiasso", COMO, "CH070"),  # a cross-border part
     ("EL001F", "F", "EL", "Athina", ATHINA),  # Eurostat's prefix for Greece
 ]
 
@@ -49,16 +49,17 @@ def test_the_verified_generation_is_parsed(tmp_path):
     composition, boundaries, loaded = urau.load_inputs(cache, expected=expected)
     assert loaded["generation"] == manifest["generation"]
     # One region per area under its own code, the country as the gazetteer
-    # knows it, none for the cross-border area; the polygons as drawn.
+    # knows it, the cross-border part's from its NUTS-3 region; the polygons
+    # as drawn.
     assert composition == {
         "FI001F": {"name": "Helsinki", "country": "FI", "nuts3": ["FI001F"]},
         "FI002F": {"name": "Tampere", "country": "FI", "nuts3": ["FI002F"]},
-        "CB003F": {"name": "Como/Chiasso", "country": None, "nuts3": ["CB003F"]},
+        "CB003F": {"name": "Como/Chiasso", "country": "CH", "nuts3": ["CB003F"]},
         "EL001F": {"name": "Athina", "country": "GR", "nuts3": ["EL001F"]},
     }
     assert set(boundaries) == set(composition)
     assert boundaries["FI001F"].equals(HELSINKI)
-    assert eurostat.countries(composition) == {"FI", "GR"}
+    assert eurostat.countries(composition) == {"CH", "FI", "GR"}
     # Other pins than the generation carries are refused.
     with pytest.raises(urau.UrauError, match="other inputs"):
         urau.load_inputs(cache)
@@ -74,6 +75,12 @@ def test_the_verified_generation_is_parsed(tmp_path):
         ([("FI001F", "F", "FI", "", HELSINKI)], {}, "has no name"),
         ([("FI001F", "F", "", "Helsinki", HELSINKI)], {}, "has no country"),
         ([("FI001F", "F", "SE", "Helsinki", HELSINKI)], {}, "filed under country 'SE'"),
+        ([("CB003F", "F", "CB", "Como/Chiasso", COMO)], {}, "has no NUTS-3 region"),
+        (
+            [("CB003F", "F", "CB", "Como/Chiasso", COMO, "Ticino")],
+            {},
+            "in NUTS-3 region 'Ticino'",
+        ),
         (
             [("FI001F", "F", "FI", "Helsinki", shapely.LineString([(0, 0), (1, 1)]))],
             {},
@@ -90,6 +97,8 @@ def test_the_verified_generation_is_parsed(tmp_path):
         "no-name",
         "no-country",
         "other-country",
+        "no-nuts3",
+        "bad-nuts3",
         "not-a-polygon",
         "other-crs",
         "no-crs",
