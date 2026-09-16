@@ -5,10 +5,10 @@ publication of them.
 The city-region patches (a zipped shapefile, converted once to GeoParquet
 from the verified bytes) and the regions table are pinned like the Eurostat
 inputs. Regions nest — each is one urban centre's patch set at its tier — so
-a patch's region is that of its highest-tier centre. Gazetteer cities with no
-metro and no known official assignment are joined to their patch's region and
-grouped, one report entry per region, for a curator to publish through the
-``set_statistical_area`` crosswalk. Nothing is minted here.
+a patch's region is that of its highest-tier centre. Every gazetteer city is
+joined to its patch's region, whatever other metros it belongs to, and
+grouped, one report entry per region, beside the metros the metros stage
+publishes from the same placement. Nothing is minted here.
 """
 
 import collections
