@@ -6,15 +6,17 @@ export const CITY_ZOOM = 9; // from here the slice includes cities
 const KIND_COLORS = { country: "#6b7280", region: "#2563eb", city: "#f59e0b", metro: "#db2777" };
 const KIND_MATCH = ["match", ["get", "kind"], ...Object.entries(KIND_COLORS).flat(), "#999"];
 
-// --- level and spec: the top bar's two selectors, applied to every request
-// A level names its place kinds and the edge classes that count on the
-// server; the page only passes it on. At the defaults nothing is added.
-export const INITIAL_VIEW = { level: "", spec: "all" };
+// --- level, spec and definitions: the top bar's selectors, applied to every
+// request. A level names its place kinds and the edge classes that count on
+// the server; the page only passes it on. ``subtypes`` lists the metro
+// definitions to keep, null for every one. At the defaults nothing is added.
+export const INITIAL_VIEW = { level: "", spec: "all", subtypes: null };
 
 export function viewParams(view) {
   const params = {};
   if (view.level) params.level = view.level;
   if (view.spec && view.spec !== "all") params.spec = view.spec;
+  if (view.subtypes) params.subtype = view.subtypes.join(",");
   return params;
 }
 
@@ -91,13 +93,32 @@ export function searchUrl(build, q, view = INITIAL_VIEW) {
 }
 
 // What a place covers, from its kind and source subtype: a metro names its
-// source (the three the build writes) and its code; another kind its
-// subtype when that adds something.
+// source (the four definitions the build writes) and its code; another kind
+// its subtype when that adds something.
 export const METRO_SOURCES = {
-  "metropolitan region": "Eurostat metropolitan region",
-  "city-region (FAO)": "FAO city-region",
   "metropolitan statistical area": "US metropolitan statistical area",
+  "metropolitan region": "Eurostat metropolitan region",
+  "functional urban area": "Eurostat functional urban area",
+  "city-region (FAO)": "FAO city-region",
 };
+
+// The definition selector: one box per metro definition, checked for the
+// ``subtypes`` listed (every one when null).
+export function definitionFilterHtml(subtypes = null) {
+  return Object.entries(METRO_SOURCES)
+    .map(([subtype, label]) => {
+      const on = subtypes === null || subtypes.includes(subtype) ? " checked" : "";
+      return `<label><input type="checkbox" name="subtype" value="${subtype}"${on}> ${label}</label>`;
+    })
+    .join(" ");
+}
+
+// The definitions checked among the selector's ``boxes``: null when every
+// one is (no filter), else the list, empty for none.
+export function checkedSubtypes(boxes) {
+  const checked = boxes.filter((box) => box.checked).map((box) => box.value);
+  return checked.length === Object.keys(METRO_SOURCES).length ? null : checked;
+}
 
 // A lookup by a value from the data: an own entry, never an inherited one.
 const named = (table, key) => (Object.hasOwn(table, key) ? table[key] : undefined);
@@ -751,9 +772,10 @@ async function main() {
   const treeSection = document.getElementById("tree");
   const levelSelect = document.getElementById("level");
   const specSelect = document.getElementById("spec");
+  const definitions = document.getElementById("definitions");
   const searchInput = document.getElementById("search");
   const searchResults = document.getElementById("search-results");
-  let view = { ...INITIAL_VIEW }; // the level and spec every request carries
+  let view = { ...INITIAL_VIEW }; // the level, spec and definitions every request carries
   let classField = "tier"; // the build's class field, from its summary
   let coarse = false; // the build's countries and regions overflow a slice
   let sources = {}; // the catalogue's source builds by id, to their build date
@@ -1496,10 +1518,12 @@ async function main() {
     map.setPaintProperty("served-line", "line-color", classColorExpression(classField));
   };
 
-  // A new level or spec: every view of the build follows — the map slice and
-  // the served outline, the tables, and the edges of what is selected.
+  // A new level, spec or definition selection: every view of the build
+  // follows — the map slice and the served outline, the tables, and the
+  // edges of what is selected.
   const changeView = () => {
-    view = { level: levelSelect.value, spec: specSelect.value };
+    const boxes = [...definitions.querySelectorAll('input[name="subtype"]')];
+    view = { level: levelSelect.value, spec: specSelect.value, subtypes: checkedSubtypes(boxes) };
     if (!current) return;
     paintClasses();
     // While a build fit is in flight its own moveend requests the viewport
@@ -1526,6 +1550,8 @@ async function main() {
   };
   levelSelect.addEventListener("change", changeView);
   specSelect.addEventListener("change", changeView);
+  definitions.innerHTML = definitionFilterHtml();
+  definitions.addEventListener("change", changeView);
 
   map.on("load", () => {
     map.addSource("places", { type: "geojson", data: EMPTY });
