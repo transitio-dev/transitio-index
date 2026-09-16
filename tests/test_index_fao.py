@@ -1,4 +1,3 @@
-import hashlib
 import io
 import urllib.request
 
@@ -107,21 +106,8 @@ ASSIGNMENTS = [
 ]
 
 
-def _pinned(tmp_path, payloads):
-    """``(files, expected)`` for pinned inputs written from ``{name: bytes}``."""
-    files = {}
-    for name, data in payloads.items():
-        files[name] = tmp_path / name
-        files[name].write_bytes(data)
-    expected = {
-        name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for name, path in files.items()
-    }
-    return files, expected
-
-
 def _inputs(tmp_path, patches=None, regions=None):
-    return _pinned(
+    return ffx.pinned_files(
         tmp_path,
         {
             fao.PATCHES_FILE: patches or ffx.patches_zip(PATCHES),
@@ -140,7 +126,7 @@ UCDB = [
 
 
 def _ucdb_inputs(tmp_path):
-    return _pinned(
+    return ffx.pinned_files(
         tmp_path,
         {
             ucdb.CENTRES_FILE: ffx.centres_zip(CENTRES),

@@ -1,6 +1,8 @@
-"""Builders for the FAO city-region and GHS-UCDB inputs the tests pin: zipped
-shapefiles, a zipped GeoPackage and a regions table, as bytes."""
+"""Builders for the FAO city-region, GHS-UCDB and Urban Audit inputs the
+tests pin: zipped shapefiles, a zipped GeoPackage and a regions table, as
+bytes, and the files-and-digests pair a pinned input is prepared from."""
 
+import hashlib
 import io
 import os
 import tempfile
@@ -61,6 +63,36 @@ def ucdb_zip(rows, member, layer, crs="EPSG:4326", columns=UCDB_COLUMNS):
         crs=crs,
     )
     return _zipped(frame, member, driver="GPKG", layer=layer)
+
+
+def fua_zip(rows, crs="EPSG:4326"):
+    """A zipped shapefile of Urban Audit areas: ``(code, category, country,
+    name, geometry)`` rows."""
+    frame = geopandas.GeoDataFrame(
+        {
+            "URAU_CODE": [row[0] for row in rows],
+            "URAU_CATG": [row[1] for row in rows],
+            "CNTR_CODE": [row[2] for row in rows],
+            "URAU_NAME": [row[3] for row in rows],
+        },
+        geometry=[row[4] for row in rows],
+        crs=crs,
+    )
+    return _zipped(frame, "areas.shp")
+
+
+def pinned_files(directory, payloads):
+    """``(files, expected)`` for pinned inputs written from ``{name: bytes}``
+    under ``directory``: the paths to prepare from and their digests."""
+    directory.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for name, data in payloads.items():
+        files[name] = directory / name
+        files[name].write_bytes(data)
+    expected = {
+        name: hashlib.sha256(data).hexdigest() for name, data in payloads.items()
+    }
+    return files, expected
 
 
 def regions_csv(rows):
