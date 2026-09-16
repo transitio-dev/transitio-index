@@ -7,6 +7,7 @@ import pytest
 
 pytest.importorskip("pyarrow")
 import eurostat_fixture as efx  # noqa: E402
+import fao_fixture as ffx  # noqa: E402
 import overture_fixture as fx  # noqa: E402
 import shapely  # noqa: E402
 
@@ -20,6 +21,7 @@ from transitio_index import (  # noqa: E402
     registry,
     seed,
     store,
+    urau,
 )
 
 
@@ -184,6 +186,9 @@ AREAS = [
 MEMBERS = ["Q1757", "Q7"]
 # FAO region 50's single patch, holding Chicago's land area.
 CHICAGO_PATCH = shapely.box(-89.0, 41.0, -86.0, 43.0)
+# One functional urban area, over Helsinki's land area alone: Helsinki falls
+# in it and in the metropolitan region, Espoo in the region only.
+URAU_AREAS = [("FI001F", "F", "FI", "Helsinki", shapely.box(24.3, 60.0, 24.8, 60.5))]
 
 
 def _crosswalk(digest=None, place="Q673425", code="FI001MC"):
@@ -240,6 +245,15 @@ def _inputs(tmp_path, cache, composition=COMPOSITION, boundaries=BOUNDARIES):
     return pins
 
 
+def _urau_inputs(tmp_path, cache, areas=URAU_AREAS):
+    """Publish the Urban Audit fixture input for ``cache``; return its pins."""
+    files, pins = ffx.pinned_files(
+        tmp_path / "urau", {urau.AREAS_FILE: ffx.fua_zip(areas)}
+    )
+    urau.prepare_inputs(cache, files=files, expected=pins)
+    return pins
+
+
 def _run(
     tmp_path,
     metro_map,
@@ -248,6 +262,7 @@ def _run(
     registry=None,
     fao=None,
     ucdb=None,
+    urau=None,
 ):
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
@@ -262,6 +277,7 @@ def _run(
         registry=registry,
     )
     pins = _inputs(tmp_path, cache)
+    urau_pins = _urau_inputs(tmp_path, cache, urau) if urau is not None else None
     if fao is not None:
         # The metros stage reads UCDB names for the FAO branch; prepare them
         # from fixtures so nothing reaches the network.
@@ -282,6 +298,8 @@ def _run(
         fao_pins=fao[1] if fao else None,
         ucdb_pins=ucdb_pins,
         derive_fao=bool(fao),
+        urau_pins=urau_pins,
+        derive_urau=urau is not None,
     )
     places, _ = store.read_jsonl(
         cache / "gazetteer", "metros.json", "places_seed.jsonl"
@@ -538,6 +556,7 @@ def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
             overrides_dir=directory,
             pins=_inputs(tmp_path, tmp_path / "cache"),
             derive_fao=False,
+            derive_urau=False,
         )
 
 
@@ -688,8 +707,96 @@ def test_an_unavailable_eurostat_input_degrades_to_no_eu_metros(tmp_path, monkey
         "status": "inputs unavailable",
         "metros_published": 0,
     }
-    assert manifest["derived_inputs"] == {"eurostat": None, "fao": None, "ucdb": None}
+    assert manifest["derived_inputs"] == {
+        "eurostat": None,
+        "urau": None,
+        "fao": None,
+        "ucdb": None,
+    }
     assert manifest["derived_inventory"] == []
+
+
+def test_a_city_gets_a_metro_of_each_definition_it_falls_in(tmp_path):
+    manifest, places = _run(tmp_path, {}, urau=URAU_AREAS)
+    area = places["eurostat_fua:FI001F"]
+    assert area["kind"] == "metro" and area["source_subtype"] == "functional urban area"
+    assert area["statistical_area_id"] == "FI001F" and area["country_code"] == "FI"
+    assert area["name"] == "Helsinki" and area["member_ids"] == ["Q1757"]
+    assert places["Q1757"]["metro_ids"] == [
+        "eurostat_fua:FI001F",
+        "eurostat_metro:FI001MC",
+    ]
+    assert places["Q7"]["metro_ids"] == ["eurostat_metro:FI001MC"]
+    summary = manifest["urau"]
+    assert summary["edition"] == urau.EDITION and summary["covered_countries"] == ["FI"]
+    assert summary["metros_published"] == 1 and summary["metros_reported"] == 0
+    assert summary["assignments"] == {"assigned": 1, "unassigned": 1, "unplaceable": 1}
+    assert manifest["metros"] == 2 and manifest["cities_with_metro"] == 2
+    assert set(manifest["derived_inputs"]["urau"]) == {urau.AREAS_FILE}
+    inventory = {row["dataset"]: row for row in manifest["derived_inventory"]}
+    assert inventory["GISCO Urban Audit 2024"]["allowed"] is True
+    assert inventory["GISCO Urban Audit 2024"]["memberships"] == 1
+    assert inventory["Overture Maps divisions"]["memberships"] == 3
+    rows = _artefact(tmp_path, "metro_assignments.jsonl")
+    assert sorted((r["city_id"], r["subtype"], r["status"]) for r in rows) == [
+        ("Q1757", "functional urban area", "assigned"),
+        ("Q1757", "metropolitan region", "assigned"),
+        ("Q7", "functional urban area", "unassigned"),
+        ("Q7", "metropolitan region", "assigned"),
+        ("Q8", "functional urban area", "unplaceable"),
+        ("Q8", "metropolitan region", "unplaceable"),
+    ]
+
+
+def test_an_unavailable_urban_audit_input_leaves_the_other_definition(
+    tmp_path, monkeypatch
+):
+    def unavailable(cache_dir, *, expected=urau.PINS):
+        raise urau.UrauError("areas: unavailable")
+
+    monkeypatch.setattr(urau, "load_inputs", unavailable)
+    manifest, places = _run(tmp_path, {}, urau=URAU_AREAS)
+    assert manifest["urau"] == {"status": "inputs unavailable", "metros_published": 0}
+    assert places["Q1757"]["metro_ids"] == ["eurostat_metro:FI001MC"]
+    assert manifest["derived_inputs"]["urau"] is None
+    datasets = {row["dataset"] for row in manifest["derived_inventory"]}
+    assert "GISCO Urban Audit 2024" not in datasets
+
+
+def test_the_derived_gate_closes_the_urban_audit_definition_alone(
+    tmp_path, monkeypatch
+):
+    allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {geometry.URAU_DERIVED}
+    monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
+    manifest, places = _run(tmp_path, {}, urau=URAU_AREAS)
+    assert "eurostat_fua:FI001F" not in places
+    assert places["Q1757"]["metro_ids"] == ["eurostat_metro:FI001MC"]
+    report = _artefact(tmp_path, "metro_report.jsonl")
+    reasons = {r["metro_code"]: r["reason"] for r in report if r["branch"] == "urau"}
+    assert reasons == {"FI001F": "derived inputs not allowlisted"}
+    assert manifest["derived_inputs"]["urau"] is None
+
+
+def test_a_functional_urban_area_publishes_through_its_own_crosswalk(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    entry = {
+        "place": "Q673425",
+        "set_statistical_area": {"scheme": "eurostat_fua", "code": "FI001F"},
+        "evidence_hash": overrides.canonical_digest(["Q1757"]),
+    }
+    manifest, places = _run(
+        tmp_path,
+        {},
+        overrides_dir=write_overrides(tmp_path, places=[entry]),
+        urau=URAU_AREAS,
+    )
+    area = places["Q673425"]
+    assert area["source_subtype"] == "functional urban area"
+    assert area["statistical_area_id"] == "FI001F" and area["member_ids"] == ["Q1757"]
+    assert places["Q1757"]["metro_ids"] == ["Q673425", "eurostat_metro:FI001MC"]
+    # The metropolitan region's own scheme is untouched by that entry.
+    assert "eurostat_metro:FI001MC" in places and manifest["overrides_applied"] == 1
 
 
 @pytest.mark.parametrize(
