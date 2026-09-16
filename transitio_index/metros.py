@@ -3,16 +3,18 @@
 Three branches. US cities: Wikidata links a city to the metropolitan
 statistical area it belongs to (P8138, class ``US_MSA_CLASS``), keyed by the
 metro's CBSA code (P882), and each such metro is emitted as a ``metro`` place.
-Cities of the countries Eurostat's pinned composition covers: the NUTS-3
-region containing the city's Overture land areas gives its metropolitan
-region, and every region with member cities is published as a ``metro`` keyed
-by its Eurostat metro code; a curator ``set_statistical_area`` crosswalk may
-instead merge it onto a chosen QID. Cities elsewhere: the FAO city-region a
+Cities of the countries Eurostat's pinned inputs cover get a metro of each
+Eurostat definition they fall in: the NUTS-3 region containing the city's
+Overture land areas gives its metropolitan region, the Urban Audit polygon
+containing them its functional urban area, and every region or area with
+member cities is published as a ``metro`` keyed by its Eurostat code; a
+curator ``set_statistical_area`` crosswalk may instead merge it onto a chosen
+QID. Everywhere: the FAO city-region a
 city's Overture land area falls in is published as a ``metro`` keyed by its
-region id and named from its GHS-UCDB centre. The Eurostat and FAO branches
-publish only while their derived inputs are allowlisted, and never cover a
-city another branch already placed. Every member city carries its metros in
-``metro_ids`` — a city can belong to more than one. This stage adds
+region id and named from its GHS-UCDB centre, one more definition of the
+city's area beside the others. The Eurostat and FAO branches publish only
+while their derived inputs are allowlisted. Every member city carries its
+metros in ``metro_ids`` — one per definition it falls in. This stage adds
 membership only; the geometry stage draws a metro from its members' shipped
 polygons.
 """
@@ -23,8 +25,6 @@ import functools
 import json
 import hashlib
 
-import shapely
-
 from transitio_index import (
     csv_source,
     eurostat,
@@ -34,6 +34,7 @@ from transitio_index import (
     pinned,
     seed,
     store,
+    urau,
 )
 from transitio_index.progress import progress
 
@@ -50,6 +51,28 @@ EUROSTAT_DERIVED = (
 # regions, so both are derived inputs of the published membership.
 FAO_DERIVED = (OVERTURE_DERIVED, geometry.FAO_DERIVED)
 FAO_SUBTYPE = "city-region (FAO)"
+# The Urban Audit functional urban areas as derived inputs, like the NUTS
+# boundaries: a membership is placed by Overture land areas in an area.
+URAU_DERIVED = (OVERTURE_DERIVED, geometry.URAU_DERIVED)
+# A definition of a metropolitan area the Eurostat branch derives: the
+# manifest key its inputs are recorded under, the subtype its rows carry, the
+# registry namespace (and crosswalk scheme) of its codes, the derived-source
+# keys a membership consumes, and the pinned files those are versioned by —
+# one per key after Overture's.
+Definition = collections.namedtuple(
+    "Definition", ["branch", "subtype", "namespace", "derived", "files"]
+)
+METROPOLITAN_REGION = Definition(
+    "eurostat",
+    "metropolitan region",
+    "eurostat_metro",
+    EUROSTAT_DERIVED,
+    (eurostat.COMPOSITION_FILE, eurostat.BOUNDARIES_FILE),
+)
+FUNCTIONAL_URBAN_AREA = Definition(
+    "urau", urau.SUBTYPE, urau.NAMESPACE, URAU_DERIVED, (urau.AREAS_FILE,)
+)
+DEFINITIONS = (METROPOLITAN_REGION, FUNCTIONAL_URBAN_AREA)
 # What a derived input raises when it is missing, altered, unreadable or
 # cannot be downloaded: the branch reading it is disabled, never the stage.
 INPUT_UNAVAILABLE = (
@@ -79,12 +102,12 @@ def _metro_place(metro):
     }
 
 
-def _eurostat_place(qid, code, metro):
-    """A ``metro`` place row for a crosswalked Eurostat metropolitan region."""
+def _eurostat_place(definition, qid, code, metro):
+    """A ``metro`` place row for a Eurostat metro of ``definition``."""
     return {
         "place_id": qid,
         "kind": "metro",
-        "source_subtype": "metropolitan region",
+        "source_subtype": definition.subtype,
         "name": metro["name"],
         "names": {},
         "resolution_method": "statistical_code",
@@ -334,14 +357,12 @@ def partition(rows, by_id, codes, report):
 
 
 def reconcile(assignments, codes):
-    """Clear the ``published`` flag of every Eurostat assignment whose metro
-    the partition pass dropped from the code index ``codes``, so the FAO
-    branch counts its city as covered by nothing."""
+    """Clear the ``published`` flag of every Eurostat-branch assignment (of
+    either definition, named by its ``subtype``) whose metro the partition
+    pass dropped from the code index ``codes``, so the assignments artifact
+    records what was published."""
     for row in assignments:
-        if (
-            row.get("published")
-            and ("metropolitan region", row["metro_code"]) not in codes
-        ):
+        if row.get("published") and (row["subtype"], row["metro_code"]) not in codes:
             row["published"] = False
 
 
@@ -391,8 +412,8 @@ def _attach_us(places, by_id, metros, codes, report, wikidata, registry=None):
     return {"metros_published": len(published), "metros_reported": len(reported_metros)}
 
 
-def _crosswalk(place_overrides, composition, by_id, metros):
-    """``{metro_code: entry}`` from the ``eurostat_metro`` crosswalk entries,
+def _crosswalk(place_overrides, composition, by_id, metros, scheme):
+    """``{metro_code: entry}`` from the crosswalk entries of ``scheme``,
     every target checked up front, whether or not its metro publishes this
     build. Codes and QIDs pair one to one: a code the pinned composition
     lacks, two entries naming one code, one QID naming two codes, a QID
@@ -403,7 +424,7 @@ def _crosswalk(place_overrides, composition, by_id, metros):
     qids = set()
     for entry in overrides.by_operation(place_overrides, "set_statistical_area"):
         spec = entry["set_statistical_area"]
-        if spec["scheme"] != "eurostat_metro":
+        if spec["scheme"] != scheme:
             continue
         code, qid = spec["code"], entry["place"]
         if code not in composition:
@@ -436,23 +457,23 @@ def _crosswalk(place_overrides, composition, by_id, metros):
     return crosswalk
 
 
-def _publish_eurostat(by_id, metros, codes, qid, code, metro, city_ids):
-    """Publish a Eurostat metro under ``qid`` — its own code key, or the QID a
-    crosswalk merges it onto: a new row, or the curated metro of that QID
-    (checked compatible by :func:`_crosswalk`) joined by the derived members
-    (possibly none) and given the Eurostat identity fields, the curator
-    keeping name and members."""
-    make_row = functools.partial(_eurostat_place, qid, code, metro)
+def _publish_eurostat(definition, by_id, metros, codes, qid, code, metro, city_ids):
+    """Publish a Eurostat metro of ``definition`` under ``qid`` — its own code
+    key, or the QID a crosswalk merges it onto: a new row, or the curated
+    metro of that QID (checked compatible by :func:`_crosswalk`) joined by
+    the derived members (possibly none) and given the identity fields, the
+    curator keeping name and members."""
+    make_row = functools.partial(_eurostat_place, definition, qid, code, metro)
     row = metros.get(qid) or by_id.get(qid) or make_row()
     # Indexed under its code here too, members or none: a row already there
     # under another key would be a second metro with the same concordance.
-    indexed = codes.get(("metropolitan region", code))
+    indexed = codes.get((definition.subtype, code))
     if indexed is not None and indexed is not row:
         raise overture.GazetteerError(
             f"metros {qid!r} and {indexed['place_id']!r} both carry the "
-            f"metropolitan region code {code!r}"
+            f"{definition.subtype} code {code!r}"
         )
-    metros[qid] = codes[("metropolitan region", code)] = row
+    metros[qid] = codes[(definition.subtype, code)] = row
     for city_id in city_ids:
         _join_member(
             by_id,
@@ -461,10 +482,10 @@ def _publish_eurostat(by_id, metros, codes, qid, code, metro, city_ids):
             qid,
             make_row,
             by_id[city_id],
-            ("metropolitan region", code),
+            (definition.subtype, code),
         )
     row.update(
-        source_subtype="metropolitan region",
+        source_subtype=definition.subtype,
         resolution_method="statistical_code",
         country_code=metro["country"],
         statistical_area_id=code,
@@ -534,16 +555,16 @@ def _derived_inventory(consumed):
     return rows
 
 
-def _eurostat_consumed(inputs_manifest, memberships):
-    """The Eurostat branch's derived inputs at their pinned versions."""
+def _consumed(definition, inputs_manifest, memberships):
+    """A definition's derived inputs at their pinned versions."""
     digests = inputs_manifest["digests"]
     versions = (
         overture.OVERTURE_RELEASE,
-        digests[eurostat.COMPOSITION_FILE],
-        digests[eurostat.BOUNDARIES_FILE],
+        *(digests[name] for name in definition.files),
     )
     return {
-        key: (version, memberships) for key, version in zip(EUROSTAT_DERIVED, versions)
+        key: (version, memberships)
+        for key, version in zip(definition.derived, versions)
     }
 
 
@@ -576,52 +597,6 @@ def _majority_country(city_ids, by_id):
         return None
     country, count = counts.most_common(1)[0]
     return country if count * 2 > sum(counts.values()) else None
-
-
-def official_footprints(by_id, footprint):
-    """The footprints — ``footprint(place)``, None for none — of every city in
-    a US or Eurostat metro, seeded or curated rows included, for the FAO
-    duplicate check: a FAO city-region whose core falls inside one duplicates
-    it. FAO members are excluded: a FAO region is deduplicated only against the
-    official (US/Eurostat) metros, never against another FAO metro — else a
-    city discovered in a region already published would reject the region as
-    its own duplicate."""
-    official = {
-        p["place_id"]
-        for p in by_id.values()
-        if p.get("kind") == "metro" and p.get("source_subtype") != FAO_SUBTYPE
-    }
-    footprints = []
-    for place in by_id.values():
-        if place.get("kind") != "city":
-            continue
-        if not any(mid in official for mid in place.get("metro_ids") or []):
-            continue
-        geom = footprint(place)
-        if geom is not None:
-            footprints.append(geom)
-    return footprints
-
-
-def _region_footprint(regions, patches, region_id):
-    """The land footprint of a FAO city-region: its patches' union."""
-    return eurostat._footprint(
-        [
-            {"geom": patches[p]["geom"]}
-            for p in regions[region_id]["patches"]
-            if p in patches
-        ]
-    )
-
-
-def _over_published_metro(footprint, published):
-    """Whether a FAO city-region's ``footprint`` sits over a metro already
-    published: its representative point falls inside a published metro member's
-    footprint held in the ``published`` STRtree."""
-    if footprint is None:
-        return False
-    point = footprint.representative_point()
-    return bool(len(published.query(point, predicate="covered_by")))
 
 
 def _report_fao(report, region_id, reason):
@@ -672,14 +647,13 @@ def _apply_fao(
     names,
     cache_dir,
     dataset,
-    assignments,
 ):
     """Publish an FAO city-region metro for every region of the loaded
-    ``inputs`` holding eligible cities — cities no US or Eurostat metro
-    already covers. Each metro is keyed by its FAO region id, named from the
+    ``inputs`` holding cities, whatever other metros those cities belong
+    to. Each metro is keyed by its FAO region id, named from the
     region's GHS-UCDB centre match in ``names`` (empty unless the UCDB derived
     input was read), its country the one most of its cities are in, and the
-    eligible cities joined as members. It publishes only while every FAO
+    cities joined as members. It publishes only while every FAO
     derived input is allowlisted; otherwise the regions are reported, not
     published. Returns ``(versions, touched)`` — the derived inputs read, at
     their pinned versions, as ``{(dataset, licence): version}``, and every
@@ -691,13 +665,8 @@ def _apply_fao(
         p["overture_id"] for p in places if p["kind"] == "city" and p.get("overture_id")
     }
     areas = geometry.place_areas(cache_dir, dataset, places, wanted)
-    grouped, _, _, _, _ = fao.place_cities(places, areas, regions, patches, assignments)
+    grouped, _, _, _ = fao.place_cities(places, areas, regions, patches)
     allowed = all(key in geometry.DERIVED_SOURCE_ALLOWLIST for key in FAO_DERIVED)
-    # A FAO city-region whose core sits inside a metro already published this
-    # run (Eurostat or US) duplicates it; those are dropped, not minted again.
-    duplicates = shapely.STRtree(
-        official_footprints(by_id, functools.partial(eurostat.place_footprint, areas))
-    )
     touched = {}
     for region_id in sorted(grouped):
         derived = sorted(grouped[region_id])
@@ -710,10 +679,6 @@ def _apply_fao(
             continue
         if not allowed:
             _report_fao(report, region_id, "a derived input is not allowlisted")
-            continue
-        footprint = _region_footprint(regions, patches, region_id)
-        if _over_published_metro(footprint, duplicates):
-            _report_fao(report, region_id, "duplicate of a published metro")
             continue
         key = f"fao_city_region:{region_id}"
         name = _fao_name(
@@ -745,7 +710,8 @@ def _apply_fao(
     return versions, touched
 
 
-def _attach_eurostat(
+def _attach_definition(
+    definition,
     places,
     by_id,
     metros,
@@ -754,34 +720,32 @@ def _attach_eurostat(
     override_report,
     *,
     inputs,
-    cache_dir,
-    dataset,
+    areas,
     wikidata,
     place_overrides,
 ):
-    """The Eurostat branch over the loaded ``inputs``; returns ``(assignments,
-    consumed, summary, applied)`` — the derived inputs read as ``{(dataset,
-    licence): (version, memberships)}``, and the crosswalk entries that
+    """The Eurostat branch for one ``definition`` over its loaded ``inputs``
+    and the cities' land ``areas``; returns ``(assignments, consumed,
+    summary, applied)`` — the assignment rows (each naming the definition's
+    subtype), the derived inputs read as ``{(dataset, licence): (version,
+    memberships)}``, the branch summary, and the crosswalk entries that
     published.
 
     Every city of a covered country gets an assignment row. Every crosswalk
-    entry is judged against the sorted derived member list it named, whether
-    or not its metro publishes. A metro with member cities publishes under
-    its own code, or under the QID a crosswalk entry merges it onto — even
-    before any member is derived, so the expand stage joins the cities it
-    discovers there to the curator's QID rather than minting a code-keyed
-    twin — while every derived input is allowlisted; every other composition
-    metro is reported with the reason and its candidates.
+    entry of the definition's scheme is judged against the sorted derived
+    member list it named, whether or not its metro publishes. A metro with
+    member cities publishes under its own code, or under the QID a crosswalk
+    entry merges it onto — even before any member is derived, so the expand
+    stage joins the cities it discovers there to the curator's QID rather
+    than minting a code-keyed twin — while every derived input is
+    allowlisted; every other composition metro is reported with the reason
+    and its candidates.
     """
     composition, boundaries, inputs_manifest = inputs
     covered = eurostat.countries(composition)
-    wanted = {
-        p["overture_id"]
-        for p in places
-        if p["kind"] == "city" and p["country_code"] in covered and p.get("overture_id")
-    }
-    areas = geometry.place_areas(cache_dir, dataset, places, wanted)
     assignments = eurostat.assign(places, areas, composition, boundaries)
+    for row in assignments:
+        row["subtype"] = definition.subtype
     members = {}
     for row in assignments:
         if row["status"] == "assigned":
@@ -789,8 +753,12 @@ def _attach_eurostat(
     # Canonical member lists: what the evidence hash is taken over.
     members = {code: sorted(ids) for code, ids in members.items()}
 
-    crosswalk = _crosswalk(place_overrides, composition, by_id, metros)
-    allowed = all(key in geometry.DERIVED_SOURCE_ALLOWLIST for key in EUROSTAT_DERIVED)
+    crosswalk = _crosswalk(
+        place_overrides, composition, by_id, metros, definition.namespace
+    )
+    allowed = all(
+        key in geometry.DERIVED_SOURCE_ALLOWLIST for key in definition.derived
+    )
     published = set()
     crosswalked = 0
     unpublished = {}
@@ -807,9 +775,9 @@ def _attach_eurostat(
         elif not allowed:
             reason = "derived inputs not allowlisted"
         else:
-            key = entry["place"] if entry is not None else f"eurostat_metro:{code}"
+            key = f"{definition.namespace}:{code}" if entry is None else entry["place"]
             _publish_eurostat(
-                by_id, metros, codes, key, code, composition[code], city_ids
+                definition, by_id, metros, codes, key, code, composition[code], city_ids
             )
             published.add(code)
             if entry is not None:
@@ -819,7 +787,7 @@ def _attach_eurostat(
             unpublished[code] = city_ids
         report.append(
             {
-                "branch": "eurostat",
+                "branch": definition.branch,
                 "metro_code": code,
                 "name": composition[code]["name"],
                 "country": composition[code]["country"],
@@ -829,14 +797,18 @@ def _attach_eurostat(
         )
     candidates = _candidates(wikidata, unpublished)
     for row in report:
-        if row.get("branch") == "eurostat":
+        if row.get("branch") == definition.branch:
             row["candidates"] = candidates.get(row["metro_code"], [])
     for row in assignments:
         row["published"] = (
             row["status"] == "assigned" and row["metro_code"] in published
         )
     summary = {
-        "nuts_version": inputs_manifest.get("nuts_version"),
+        **{
+            key: inputs_manifest[key]
+            for key in ("nuts_version", "edition")
+            if key in inputs_manifest
+        },
         "digests": inputs_manifest.get("digests"),
         "covered_countries": sorted(covered),
         "metros_published": len(published),
@@ -848,7 +820,7 @@ def _attach_eurostat(
     assigned = sum(1 for row in assignments if row["status"] == "assigned")
     return (
         assignments,
-        _eurostat_consumed(inputs_manifest, assigned),
+        _consumed(definition, inputs_manifest, assigned),
         summary,
         crosswalked,
     )
@@ -865,9 +837,13 @@ def _identify_metros(metros, registry, derived):
     for qid in sorted(metros):
         row = metros[qid]
         code = row.get("statistical_area_id")
-        if row.get("source_subtype") == "metropolitan region":
-            namespace = "eurostat_metro"
-            minted_in = f"eurostat {derived['eurostat'][eurostat.COMPOSITION_FILE]}"
+        definition = next(
+            (d for d in DEFINITIONS if row.get("source_subtype") == d.subtype), None
+        )
+        if definition is not None:
+            namespace = definition.namespace
+            version = derived[definition.branch][definition.files[0]]
+            minted_in = f"{definition.branch} {version}"
         elif row.get("source_subtype") == FAO_SUBTYPE:
             from transitio_index import fao
 
@@ -914,18 +890,24 @@ def attach_metros(
     fao_pins=None,
     ucdb_pins=None,
     derive_fao=True,
+    urau_pins=None,
+    derive_urau=True,
 ):
     """Add metro places and memberships to the seed places.
 
-    Runs the US, Eurostat and FAO branches and republishes the places with
+    Runs the US, Eurostat and FAO branches — the Eurostat branch once per
+    definition, the metropolitan regions and the functional urban areas, so
+    a city gets a metro of each it falls in — and republishes the places with
     metro rows appended and ``metro_ids`` / ``member_ids`` filled, beside the
-    report (``metro_report.jsonl``) and the Eurostat assignments
-    (``metro_assignments.jsonl``). ``dataset`` is the Overture
-    ``division_area`` dataset the branches read city land areas from
-    (the pinned release by default) and ``pins`` the Eurostat inputs' digests
-    (the module's pins by default). One writer lock spans the seed read, the
-    live queries and the publish, so a concurrent gazetteer run cannot shift
-    the seed under it. With a ``registry`` session every metro row gets its
+    report (``metro_report.jsonl``) and the Eurostat assignments of both
+    definitions (``metro_assignments.jsonl``, each row naming its subtype).
+    ``dataset`` is the Overture ``division_area`` dataset the branches read
+    city land areas from (the pinned release by default), ``pins`` the
+    Eurostat inputs' digests and ``urau_pins`` the Urban Audit input's (the
+    modules' pins by default); ``derive_urau`` runs the functional urban
+    areas (on by default). One writer lock spans the seed read, the live
+    queries and the publish, so a concurrent gazetteer run cannot shift the
+    seed under it. With a ``registry`` session every metro row gets its
     registry id and ``wikidata_id``. ``fao_files``, ``fao_pins`` and
     ``ucdb_pins`` name the FAO and UCDB inputs the FAO branch derives and names
     city-regions from (the modules' pins by default). ``derive_fao`` runs the
@@ -937,6 +919,7 @@ def attach_metros(
     if wikidata is None:
         wikidata = overture.WikidataClient()
     pins = dict(pins or eurostat.PINS)
+    urau_pins = dict(urau_pins or urau.PINS)
     from transitio_index import fao, ucdb
 
     fao_pins = dict(fao_pins or fao.PINS)
@@ -946,6 +929,8 @@ def attach_metros(
     # verified is left unprepared: the load under the lock then disables its
     # branch rather than aborting the stage.
     _available(lambda: eurostat.prepare_inputs(cache_dir, expected=pins))
+    if derive_urau:
+        _available(lambda: urau.prepare_inputs(cache_dir, expected=urau_pins))
     if derive_fao:
         _available(
             lambda: (
@@ -990,6 +975,11 @@ def attach_metros(
             # rather than aborting the stage. Names are a derived use of the
             # UCDB, read only while its allowlist entry stands.
             euro = _available(lambda: eurostat.load_inputs(cache_dir, expected=pins))
+            urau_inputs = None
+            if derive_urau:
+                urau_inputs = _available(
+                    lambda: urau.load_inputs(cache_dir, expected=urau_pins)
+                )
             fao_inputs = None
             names, names_manifest = {}, None
             if derive_fao:
@@ -1012,25 +1002,53 @@ def attach_metros(
             us_summary = _attach_us(
                 places, by_id, metros, codes, report, wikidata, registry
             )
+            # The cities' land areas, read once for both definitions: those
+            # of every country either one covers.
+            branches = (
+                (METROPOLITAN_REGION, euro),
+                (FUNCTIONAL_URBAN_AREA, urau_inputs),
+            )
+            covered = set()
+            for _, inputs in branches:
+                if inputs is not None:
+                    covered |= eurostat.countries(inputs[0])
+            wanted = {
+                p["overture_id"]
+                for p in places
+                if p["kind"] == "city"
+                and p["country_code"] in covered
+                and p.get("overture_id")
+            }
+            areas = geometry.place_areas(cache_dir, dataset, places, wanted)
             assignments, crosswalked = [], 0
-            eurostat_summary = {"status": "inputs unavailable", "metros_published": 0}
-            if euro is not None:
-                assignments, eurostat_consumed, eurostat_summary, crosswalked = (
-                    _attach_eurostat(
-                        places,
-                        by_id,
-                        metros,
-                        codes,
-                        report,
-                        override_report,
-                        inputs=euro,
-                        cache_dir=cache_dir,
-                        dataset=dataset,
-                        wikidata=wikidata,
-                        place_overrides=place_overrides,
-                    )
+            summaries = {}
+            for definition, inputs in branches:
+                if inputs is None:
+                    status = "inputs unavailable"
+                    if definition is FUNCTIONAL_URBAN_AREA and not derive_urau:
+                        status = "not derived"
+                    summaries[definition.subtype] = {
+                        "status": status,
+                        "metros_published": 0,
+                    }
+                    continue
+                rows, consumed_by, summary, applied = _attach_definition(
+                    definition,
+                    places,
+                    by_id,
+                    metros,
+                    codes,
+                    report,
+                    override_report,
+                    inputs=inputs,
+                    areas=areas,
+                    wikidata=wikidata,
+                    place_overrides=place_overrides,
                 )
-                consumed.append(eurostat_consumed)
+                assignments.extend(rows)
+                consumed.append(consumed_by)
+                summaries[definition.subtype] = summary
+                crosswalked += applied
 
             # The seed places' keys before the metros join them, so the metro
             # rows minted in this stage (US, Eurostat and FAO) are told apart.
@@ -1041,9 +1059,8 @@ def attach_metros(
                 overrides.by_operation(place_overrides, "set_place_members"),
                 override_report,
             )
-            # The official metros are partitioned before the FAO branch, so a
-            # city whose metro cannot publish is eligible for a city-region
-            # instead of covered by nothing; FAO metros are minted partitioned.
+            # The official metros are partitioned before the FAO branch, whose
+            # metros are minted partitioned.
             official = {
                 p["place_id"]: p
                 for p in [*places, *metros.values()]
@@ -1055,12 +1072,13 @@ def attach_metros(
                 if row is None:
                     continue  # a seeded metro this run did not publish
                 # The branch summaries describe what survives to publish.
-                if row.get("source_subtype") == "metropolitan region":
-                    eurostat_summary["metros_published"] -= 1
-                    eurostat_summary["metros_reported"] += 1
+                summary = summaries.get(row.get("source_subtype"))
+                if summary is not None:
+                    summary["metros_published"] -= 1
+                    summary["metros_reported"] += 1
                 elif row.get("source_subtype") == "metropolitan statistical area":
                     us_summary["metros_published"] -= 1
-            # A Eurostat metro the pass dropped covers nothing any more.
+            # A Eurostat metro the pass dropped published nothing after all.
             reconcile(assignments, codes)
             fao_summary = {"published": 0, "memberships": 0}
             if fao_inputs is not None:
@@ -1074,7 +1092,6 @@ def attach_metros(
                     names=names,
                     cache_dir=cache_dir,
                     dataset=dataset,
-                    assignments=assignments,
                 )
                 # A seeded FAO metro joined here is repartitioned over its
                 # grown membership; one left without a majority is dropped.
@@ -1107,6 +1124,7 @@ def attach_metros(
                 }
             derived_inputs = {
                 "eurostat": _snapshot(euro, EUROSTAT_DERIVED),
+                "urau": _snapshot(urau_inputs, URAU_DERIVED),
                 "fao": _snapshot(fao_inputs, FAO_DERIVED),
                 "ucdb": (
                     names_manifest["sources"] if names_manifest is not None else None
@@ -1145,7 +1163,8 @@ def attach_metros(
                 ),
                 "reported": len(report),
                 "us": us_summary,
-                "eurostat": eurostat_summary,
+                "eurostat": summaries[METROPOLITAN_REGION.subtype],
+                "urau": summaries[FUNCTIONAL_URBAN_AREA.subtype],
                 "fao": fao_summary,
                 "derived_inputs": derived_inputs,
                 "derived_inventory": _derived_inventory(consumed),

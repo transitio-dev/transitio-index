@@ -612,6 +612,7 @@ def _drop_places(places, keys):
 STATISTICAL_SUBTYPES = {
     "cbsa": "metropolitan statistical area",
     "eurostat_metro": "metropolitan region",
+    "eurostat_fua": "functional urban area",
 }
 
 

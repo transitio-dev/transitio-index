@@ -1827,3 +1827,62 @@ def test_a_schema_9_build_carries_the_feed_dates_and_place_validity(tmp_path):
     eight = iv.load_build("e", tmp_path / "eight")
     assert eight.validity is None
     assert "validity" not in json.loads(iv.place_record(eight, "hel"))["properties"]
+
+
+def test_the_api_keeps_the_metros_of_the_definitions_named(tmp_path):
+    pytest.importorskip("fastapi")
+    from starlette.testclient import TestClient
+
+    # Helsinki in a metro of two definitions; a filter names the definitions
+    # whose metros a slice, the table and a search keep, other kinds as they are.
+    metros = [
+        _place(
+            "hma",
+            "metro",
+            "Helsinki metropolitan area",
+            None,
+            BOX(24, 60, 26, 61),
+            source_subtype="metropolitan region",
+            statistical_area_id="FI001MC",
+            member_ids=["hel"],
+        ),
+        _place(
+            "hfua",
+            "metro",
+            "Helsinki",
+            None,
+            BOX(24.5, 60, 25.5, 60.8),
+            source_subtype="functional urban area",
+            statistical_area_id="FI001F",
+            member_ids=["hel"],
+        ),
+    ]
+    cache = tmp_path / "cache"
+    write_build(cache / "index", PLACES + metros)
+    client = TestClient(iv.create_app(cache))
+    url = f"/api/builds/{iv.LATEST}"
+
+    def ids(route, **params):
+        reply = client.get(f"{url}/{route}", params=params).json()
+        rows = reply["rows"] if "rows" in reply else reply["features"]
+        return sorted(r.get("place_id") or r["id"] for r in rows)
+
+    assert ids("places/table", kind="metro") == ["hfua", "hma"]
+    assert ids("places/table", kind="metro", subtype="functional urban area") == [
+        "hfua"
+    ]
+    assert ids("places/table", kind="metro", subtype="") == []
+    everything = ids("places/table", kind="all")
+    assert ids("places/table", kind="all", subtype="") == [
+        p for p in everything if p not in ("hfua", "hma")
+    ]
+    params = {
+        "bbox": "23,59,27,62",
+        "kind": "city,metro",
+        "subtype": "metropolitan region",
+    }
+    assert "hma" in ids("places", **params) and "hfua" not in ids("places", **params)
+    assert ids("search", q="Hel", subtype="functional urban area") == ["hel", "hfua"]
+    assert ids("search", q="Hel") == ["hel", "hfua", "hma"]
+    bad = client.get(f"{url}/places/table", params={"subtype": "conurbation"})
+    assert bad.status_code == 400 and "subtype must be one of" in bad.json()["detail"]

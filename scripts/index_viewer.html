@@ -31,7 +31,8 @@
   #panel nav button.active { background: #2563eb; border-color: #2563eb; color: #fff; }
   .muted { color: #666; }
   .coverage { margin: 0.2rem 0; }
-  .tiers label { margin-right: 0.6rem; font-weight: normal; }
+  .tiers label, #definitions label { margin-right: 0.6rem; font-weight: normal; }
+  #areas { font-weight: 600; }
   .members ul { margin: 0.2rem 0; padding-left: 1.1rem; }
   .chain button.crumb { border: none; background: none; color: #2563eb; padding: 0; cursor: pointer; font: inherit; }
   .filters { display: flex; gap: 0.4rem; margin-bottom: 0.4rem; }
@@ -74,6 +75,7 @@
     <option value="gtfs-rt">GTFS-RT</option>
     <option value="gbfs">GBFS</option>
   </select></label>
+  <span id="areas">Areas <span id="definitions"></span></span>
   <div id="search-box">
     <label>Search <input id="search" type="search" placeholder="Place name or alias…" autocomplete="off"></label>
     <div id="search-results" class="results" hidden></div>

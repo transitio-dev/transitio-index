@@ -190,6 +190,15 @@ JSON files a build publishes and verifies their digests before showing them,
 so a build that is mid-publish is listed but reported unavailable until the
 publish completes.
 
+A city can belong to a metro of each of four definitions, one `metro` row
+each, told apart by `source_subtype`: `metropolitan statistical area` (the
+US Census areas, through Wikidata), `metropolitan region` (Eurostat's NUTS-3
+approximation of a functional urban area), `functional urban area` (the
+Eurostat Urban Audit's city plus its commuting zone) and `city-region (FAO)`
+(the FAO one-hour city-regions, worldwide). The `Areas` boxes in the top bar
+pick the definitions whose metros the map, the places table and the search
+show; a city's details list every metro it is in.
+
 ### Publish a snapshot
 
 `publish` writes `cache/index/`; releasing it to GitHub is a separate step and

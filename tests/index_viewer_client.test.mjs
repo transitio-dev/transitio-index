@@ -24,7 +24,10 @@ import {
   isCoarse,
   collectionBounds,
   membersHtml,
+  checkedSubtypes,
   coverageLabel,
+  definitionFilterHtml,
+  METRO_SOURCES,
   searchResultsHtml,
   searchUrl,
   overflowText,
@@ -93,6 +96,10 @@ test("a coverage label names a metro's source and code, else the kind and subtyp
   const metro = { kind: "metro", source_subtype: "metropolitan region", statistical_area_id: "FI001MC" };
   assert.equal(coverageLabel(metro), "Eurostat metropolitan region FI001MC");
   assert.equal(coverageLabel({ kind: "metro", source_subtype: "city-region (FAO)", statistical_area_id: "1" }), "FAO city-region 1");
+  assert.equal(
+    coverageLabel({ kind: "metro", source_subtype: "functional urban area", statistical_area_id: "FI001F" }),
+    "Eurostat functional urban area FI001F",
+  );
   assert.equal(coverageLabel({ kind: "metro", source_subtype: "conurbation" }), "conurbation");
   assert.equal(coverageLabel({ kind: "metro", source_subtype: "constructor" }), "constructor"); // no inherited entry
   assert.equal(coverageLabel({ kind: "metro" }), "metropolitan area");
@@ -185,10 +192,12 @@ test("from zoom 9 the viewport slice asks for every kind", () => {
   assert.equal(sliceParams(9, bounds).kind, "all");
 });
 
-test("a level and a spec reach every request; the defaults add nothing", () => {
+test("a level, a spec and a definition selection reach every request; the defaults add nothing", () => {
   assert.deepEqual(viewParams(INITIAL_VIEW), {});
   const view = { level: "city", spec: "gbfs" };
   assert.deepEqual(viewParams(view), { level: "city", spec: "gbfs" });
+  assert.deepEqual(viewParams({ ...INITIAL_VIEW, subtypes: ["functional urban area"] }), { subtype: "functional urban area" });
+  assert.deepEqual(viewParams({ ...INITIAL_VIEW, subtypes: [] }), { subtype: "" });
   // The level names the kinds, so no kind=all; the city level is bounded at any zoom.
   const slice = sliceParams(3, bounds, view);
   assert.deepEqual([slice.level, slice.spec, slice.kind, typeof slice.bbox], ["city", "gbfs", undefined, "string"]);
@@ -467,4 +476,17 @@ test("the kind filter lists the build's own kinds in tree order with counts", ()
       '<option value="metro">metro (3)</option>',
   );
   assert.equal(kindOptionsHtml(undefined), '<option value="">any kind</option>');
+});
+
+test("the definition selector lists every definition, all on; a full selection is no filter", () => {
+  const html = definitionFilterHtml();
+  assert.equal((html.match(/type="checkbox"/g) || []).length, Object.keys(METRO_SOURCES).length);
+  assert.equal((html.match(/ checked/g) || []).length, Object.keys(METRO_SOURCES).length);
+  assert.match(html, /value="functional urban area" checked> Eurostat functional urban area/);
+  assert.doesNotMatch(definitionFilterHtml(["metropolitan region"]), /value="city-region \(FAO\)" checked/);
+  const boxes = Object.keys(METRO_SOURCES).map((value) => ({ value, checked: true }));
+  assert.equal(checkedSubtypes(boxes), null);
+  boxes[0].checked = false;
+  assert.deepEqual(checkedSubtypes(boxes), boxes.slice(1).map((box) => box.value));
+  assert.deepEqual(checkedSubtypes(boxes.map((box) => ({ ...box, checked: false }))), []);
 });

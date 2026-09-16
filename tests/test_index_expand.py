@@ -16,6 +16,7 @@ from transitio_index import (  # noqa: E402
     metros,
     overture,
     store,
+    urau,
 )
 
 # A source the geometry allowlist accepts, and one it does not.
@@ -370,16 +371,84 @@ def test_a_discovered_city_gains_the_eurostat_metro_the_run_derived(tmp_path):
     assert manifest["metros_added"] == 1
 
 
-def test_a_recorded_derived_input_the_raw_store_lost_refuses_expansion(tmp_path):
+@pytest.mark.parametrize("seeded", [False, True], ids=["minted", "joined"])
+def test_a_discovered_city_gains_the_functional_urban_area_the_run_derived(
+    tmp_path, seeded
+):
+    from test_index_metros import _urau_inputs
+
     cache = tmp_path / "cache"
-    pins = {eurostat.COMPOSITION_FILE: "0" * 64, eurostat.BOUNDARIES_FILE: "1" * 64}
-    _publish_names(cache, SEED_PLACES, derived_inputs={"eurostat": pins})
+    # The metros stage read one area holding Tampere and recorded that
+    # snapshot in the run; expansion derives the second definition from it,
+    # minting the area's metro or joining the one the seed published.
+    area = ("FI002F", "F", "FI", "Tampere", shapely.box(21.0, 60.5, 25.0, 62.0))
+    pins = _urau_inputs(tmp_path, cache, [area])
+    derived = {"eurostat": None, "urau": pins, "fao": None, "ucdb": None}
+    seed = list(SEED_PLACES)
+    if seeded:
+        seed += [
+            {
+                "place_id": "eurostat_fua:FI002F",
+                "kind": "metro",
+                "source_subtype": "functional urban area",
+                "name": "Tampere",
+                "country_code": "FI",
+                "statistical_area_id": "FI002F",
+                "metro_ids": [],
+                "member_ids": ["Q1"],
+            },
+            {
+                "place_id": "Q1",
+                "kind": "city",
+                "name": "Nokia",
+                "country_code": "FI",
+                "overture_id": "fi-nokia",
+                "metro_ids": ["eurostat_fua:FI002F"],
+                "member_ids": [],
+            },
+        ]
+    _publish_names(cache, seed, derived_inputs=derived)
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    manifest, places, _ = _expand(tmp_path, cache)
+    metro = places["eurostat_fua:FI002F"]
+    assert (metro["kind"], metro["source_subtype"], metro["name"]) == (
+        "metro",
+        "functional urban area",
+        "Tampere",
+    )
+    assert metro["country_code"] == "FI"
+    assert metro["member_ids"] == (["Q1", "Q40840"] if seeded else ["Q40840"])
+    assert places["Q40840"]["metro_ids"] == ["eurostat_fua:FI002F"]
+    assert metro["geometry_source"] == "member_union"
+    assert manifest["metros_added"] == (0 if seeded else 1)
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        {
+            "eurostat": {
+                eurostat.COMPOSITION_FILE: "0" * 64,
+                eurostat.BOUNDARIES_FILE: "1" * 64,
+            }
+        },
+        {"urau": {urau.AREAS_FILE: "2" * 64}},
+    ],
+    ids=["eurostat", "urau"],
+)
+def test_a_recorded_derived_input_the_raw_store_lost_refuses_expansion(
+    tmp_path, recorded
+):
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES, derived_inputs=recorded)
     _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
     with pytest.raises(overture.GazetteerError, match="rerun the gazetteer"):
         _expand(tmp_path, cache)
 
 
-def test_a_seeded_fao_metro_an_official_metro_grows_over_is_dropped(tmp_path):
+def test_a_seeded_fao_metro_keeps_its_members_when_an_official_metro_grows(
+    tmp_path,
+):
     from test_index_metros import _fao_inputs
     from transitio_index import fao
 
@@ -411,15 +480,14 @@ def test_a_seeded_fao_metro_an_official_metro_grows_over_is_dropped(tmp_path):
     _publish_names(cache, SEED_PLACES + [region, chatham], derived_inputs=derived)
     _write_crawl(cache, "f-spring", ["s1,39.8,-89.65\n"])
     manifest, places, report = _expand(tmp_path, cache)
-    # Springfield joins its MSA, whose member footprint now covers the region's
-    # core: the seeded FAO metro duplicates an official one and is dropped, its
-    # member unjoined, as the metros stage would have decided with both known.
+    # Springfield joins its MSA and the seeded FAO region alike: two
+    # definitions of its area, neither suppressing the other; the region
+    # keeps its seeded member.
     assert places["Q912579"]["member_ids"] == ["Q28515"]
-    assert "fao_city_region:50" not in places
-    assert places["Q1"]["metro_ids"] == []
-    assert [r["reason"] for r in report if r.get("branch") == "fao"] == [
-        "duplicate of a published metro"
-    ]
+    assert places["fao_city_region:50"]["member_ids"] == ["Q1", "Q28515"]
+    assert places["Q28515"]["metro_ids"] == ["Q912579", "fao_city_region:50"]
+    assert places["Q1"]["metro_ids"] == ["fao_city_region:50"]
+    assert not any(r.get("branch") == "fao" for r in report)
     assert manifest["metros_added"] == 1
 
 

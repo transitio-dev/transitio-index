@@ -1,4 +1,3 @@
-import hashlib
 import urllib.request
 
 import pytest
@@ -47,19 +46,14 @@ UCDB = [
 
 
 def _inputs(tmp_path, centres=None, ucdb_rows=None):
-    files = {
-        ucdb.CENTRES_FILE: tmp_path / "centres.zip",
-        ucdb.UCDB_FILE: tmp_path / "ucdb.zip",
-    }
-    files[ucdb.CENTRES_FILE].write_bytes(centres or ffx.centres_zip(CENTRES))
-    files[ucdb.UCDB_FILE].write_bytes(
-        ucdb_rows or ffx.ucdb_zip(UCDB, ucdb.UCDB_MEMBER, ucdb.UCDB_LAYER)
+    return ffx.pinned_files(
+        tmp_path,
+        {
+            ucdb.CENTRES_FILE: centres or ffx.centres_zip(CENTRES),
+            ucdb.UCDB_FILE: ucdb_rows
+            or ffx.ucdb_zip(UCDB, ucdb.UCDB_MEMBER, ucdb.UCDB_LAYER),
+        },
     )
-    expected = {
-        name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for name, path in files.items()
-    }
-    return files, expected
 
 
 def test_centres_are_named_by_overlap_once_and_loaded(tmp_path):

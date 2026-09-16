@@ -1,13 +1,14 @@
 """FAO multi-tier city-regions at the 1-hour cutoff: the pinned inputs and
-the suggested-curation report for metros the official sources do not cover.
+the report of every region holding cities, beside the metros stage's own
+publication of them.
 
 The city-region patches (a zipped shapefile, converted once to GeoParquet
 from the verified bytes) and the regions table are pinned like the Eurostat
 inputs. Regions nest — each is one urban centre's patch set at its tier — so
-a patch's region is that of its highest-tier centre. Gazetteer cities with no
-metro and no known official assignment are joined to their patch's region and
-grouped, one report entry per region, for a curator to publish through the
-``set_statistical_area`` crosswalk. Nothing is minted here.
+a patch's region is that of its highest-tier centre. Every gazetteer city is
+joined to its patch's region, whatever other metros it belongs to, and
+grouped, one report entry per region, beside the metros the metros stage
+publishes from the same placement. Nothing is minted here.
 """
 
 import collections
@@ -311,20 +312,18 @@ def _patch_of(footprint, containment, geoms, region_by_patch):
     return eurostat._pick(hits, footprint, geoms, region_by_patch)
 
 
-def place_cities(places, areas, regions, patches, assignments):
+def place_cities(places, areas, regions, patches):
     """Every city placed in its FAO region by its representative point:
-    ``(grouped, context, countries, unplaced, qid_of)`` — the eligible cities
-    per region (no metro covers them: none joined, no published Eurostat
-    assignment), the cities a metro already covers there, the gazetteer
-    countries per region, the cities that could not be placed with the
-    reason, and each city's QID. The one derivation the suggestion report
-    and the published FAO metros both use."""
-    known = {row["city_id"] for row in assignments if row.get("published")}
+    ``(grouped, countries, unplaced, qid_of)`` — the cities per region,
+    whatever other metros they belong to (a city-region is one more
+    definition of a city's area, never suppressed by another), the
+    gazetteer countries per region, the cities that could not be placed with
+    the reason, and each city's QID. The one derivation the report and the
+    published FAO metros both use."""
     geoms = {pid: p["geom"] for pid, p in patches.items()}
     region_by_patch = {pid: region_of(p) for pid, p in patches.items()}
     containment = eurostat.Containment(geoms)
     grouped = {}
-    context = {}
     countries = {}
     unplaced = []
     qid_of = {}
@@ -333,21 +332,14 @@ def place_cities(places, areas, regions, patches, assignments):
             continue
         city = place["place_id"]
         qid_of[city] = place.get("wikidata_id")
-        eligible = not place.get("metro_ids") and city not in known
         footprint = eurostat.place_footprint(areas, place)
         if footprint is None:
-            unplaced.append(
-                {"city_id": city, "eligible": eligible, "reason": "no usable land area"}
-            )
+            unplaced.append({"city_id": city, "reason": "no usable land area"})
             continue
         patch_id, ambiguous = _patch_of(footprint, containment, geoms, region_by_patch)
         if ambiguous:
             unplaced.append(
-                {
-                    "city_id": city,
-                    "eligible": eligible,
-                    "reason": "on a boundary between regions",
-                }
+                {"city_id": city, "reason": "on a boundary between regions"}
             )
             continue
         if patch_id is None:
@@ -355,26 +347,22 @@ def place_cities(places, areas, regions, patches, assignments):
         region_id = region_by_patch[patch_id]
         if region_id is None:
             continue
-        (grouped if eligible else context).setdefault(region_id, []).append(city)
+        grouped.setdefault(region_id, []).append(city)
         countries.setdefault(region_id, set()).add(place.get("country_code"))
-    return grouped, context, countries, unplaced, qid_of
+    return grouped, countries, unplaced, qid_of
 
 
-def suggest(places, areas, regions, patches, assignments, provenance, names=None):
-    """``(entries, unplaced)``: one report entry per city-region holding an
-    eligible city — a city no metro covers —
-    with the cities already in a metro there as context; and every city, eligible
-    or not, that could not be placed (no usable land area, or a footprint on a
-    boundary between regions) with the reason. ``provenance`` (DOI, cutoff,
+def suggest(places, areas, regions, patches, provenance, names=None):
+    """``(entries, unplaced)``: one report entry per city-region holding a
+    city, and every city that could not be placed (no usable land area, or
+    a footprint on a boundary between regions) with the reason. ``provenance`` (DOI, cutoff,
     licence, credit, input digests) is copied into every entry so each stands
     on its own. ``names`` maps a centre id to its matched UCDB name row; a
     region is named after its centre (a region's id is its centre's), the
     match's ambiguity and candidates carried along, and the pasteable
     ``add_place`` prefilled with the name — a region without one keeps the
     placeholder."""
-    grouped, context, countries, unplaced, qid_of = place_cities(
-        places, areas, regions, patches, assignments
-    )
+    grouped, countries, unplaced, qid_of = place_cities(places, areas, regions, patches)
     entries = []
     for region_id, cities in progress(sorted(grouped.items()), "fao"):
         region = regions[region_id]
@@ -400,7 +388,6 @@ def suggest(places, areas, regions, patches, assignments, provenance, names=None
                 "cities": cities,
                 # The QID beside each city's own id, where it has one.
                 "cities_wikidata": [qid_of.get(city) for city in cities],
-                "context": sorted(context.get(region_id, [])),
                 "evidence_hash": overrides.canonical_digest(cities),
                 # The pair a curator pastes into places.yaml, keyed by the
                 # region's own concordance — the metro is minted from it and
@@ -424,9 +411,9 @@ def suggest(places, areas, regions, patches, assignments, provenance, names=None
 
 
 def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=None):
-    """Publish ``gazetteer/fao.json``: the suggested-curation report of FAO
-    city-regions holding cities no official metro covers, each named after
-    its centre's GHS-UCDB match. ``dataset`` is the Overture ``division_area``
+    """Publish ``gazetteer/fao.json``: the report of the FAO city-regions
+    holding cities, each named after its centre's GHS-UCDB match. ``dataset``
+    is the Overture ``division_area``
     dataset (the pinned release by default), ``pins`` the FAO inputs' digests
     and ``ucdb_pins`` the UCDB inputs'. Returns the generation manifest."""
     # Both build on this module, so imported here.
@@ -452,12 +439,6 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
                 cache_dir / "gazetteer",
                 "metros.json",
                 "places_seed.jsonl",
-                generations=run,
-            )
-            assignments, _ = store.read_jsonl(
-                cache_dir / "gazetteer",
-                "metros.json",
-                "metro_assignments.jsonl",
                 generations=run,
             )
             # The report follows the snapshot the metros stage records having
@@ -510,7 +491,6 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
                     areas,
                     regions,
                     patches,
-                    assignments,
                     provenance,
                     names if allowed else {},
                 )
@@ -526,7 +506,7 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
                 "names_generation": names_manifest.get("generation"),
                 "entries": len(entries),
                 "named_entries": sum(1 for entry in entries if entry["name"]),
-                "eligible_cities": sum(len(entry["cities"]) for entry in entries),
+                "cities": sum(len(entry["cities"]) for entry in entries),
                 "tiers": dict(
                     sorted(collections.Counter(e["tier"] for e in entries).items())
                 ),

@@ -124,6 +124,18 @@ DERIVED_SOURCES = {
         "url": "https://ec.europa.eu/eurostat/en/web/gisco/geodata/statistical-units",
         "share_alike": False,
     },
+    ("GISCO Urban Audit 2024", "EuroGeographics-NC"): {
+        "credit": (
+            "Source: Eurostat, Urban Audit functional urban areas (2024); "
+            "© EuroGeographics for the administrative boundaries"
+        ),
+        "licence": "Eurostat/GISCO conditions of use (non-commercial)",
+        "url": (
+            "https://ec.europa.eu/eurostat/web/gisco/geodata/"
+            "statistical-units/urban-audit"
+        ),
+        "share_alike": False,
+    },
     ("GHS-UCDB R2024A", "CC-BY-4.0"): {
         "credit": (
             "GHS Urban Centre Database 2025 (GHS-UCDB R2024A), European "
@@ -147,6 +159,7 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
         ("Overture Maps divisions", "CDLA-Permissive-2.0"),
         ("Eurostat metropolitan regions", "Eurostat-2011/833/EU"),
         ("GISCO NUTS 2021", "EuroGeographics-NC"),
+        ("GISCO Urban Audit 2024", "EuroGeographics-NC"),
         ("GHS-UCDB R2024A", "CC-BY-4.0"),
         ("FAO city-regions 2024", "CC-BY-4.0"),
     }
@@ -155,6 +168,9 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
 # The FAO city-regions as a derived input: a curated FAO metro publishes
 # only with this row and Overture's allowlisted.
 FAO_DERIVED = ("FAO city-regions 2024", "CC-BY-4.0")
+# The Urban Audit functional urban areas as a derived input, like the NUTS
+# boundaries: point-in-polygon at build time, never shipped.
+URAU_DERIVED = ("GISCO Urban Audit 2024", "EuroGeographics-NC")
 
 # ~55 m near the equator, ~28 m at 60° N; the deviation in metres shrinks
 # toward the poles, so this never over-simplifies much beyond that. The boundary

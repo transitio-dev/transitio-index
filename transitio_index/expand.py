@@ -276,15 +276,16 @@ def _draw_member_geometry(places_by_id, keys):
 
 
 def _derived_inputs(cache_dir, recorded):
-    """The Eurostat and FAO inputs, and the UCDB names, the metros stage
-    published metros from: ``(eurostat, fao, names)``, loaded under the
-    digests the run's ``derived_inputs`` recorded — so expansion derives
-    metros from the run's snapshot, never from the module's current pins —
-    each None (the names empty) where the run records none, that branch
-    having published none. A recorded input the raw store no longer holds, or
-    one no longer allowlisted, refuses the expansion: the seeded metros were
-    derived from it, so only a gazetteer rerun keeps the output consistent."""
-    from transitio_index import eurostat, fao, ucdb
+    """The Eurostat, Urban Audit and FAO inputs, and the UCDB names, the
+    metros stage published metros from: ``(eurostat, urau, fao, names)``,
+    loaded under the digests the run's ``derived_inputs`` recorded — so
+    expansion derives metros from the run's snapshot, never from the modules'
+    current pins — each None (the names empty) where the run records none,
+    that definition or branch having published none. A recorded input the
+    raw store no longer holds, or one no longer allowlisted, refuses the
+    expansion: the seeded metros were derived from it, so only a gazetteer
+    rerun keeps the output consistent."""
+    from transitio_index import eurostat, fao, ucdb, urau
 
     def load(branch, keys, read):
         pins = recorded.get(branch)
@@ -308,6 +309,11 @@ def _derived_inputs(cache_dir, recorded):
         metros.EUROSTAT_DERIVED,
         lambda pins: eurostat.load_inputs(cache_dir, expected=pins),
     )
+    urau_inputs = load(
+        "urau",
+        metros.URAU_DERIVED,
+        lambda pins: urau.load_inputs(cache_dir, expected=pins),
+    )
     fao_inputs = load(
         "fao",
         metros.FAO_DERIVED,
@@ -320,14 +326,14 @@ def _derived_inputs(cache_dir, recorded):
             (ucdb.DERIVED,),
             lambda pins: ucdb.load_names(cache_dir, expected=pins),
         )
-    return euro, fao_inputs, names[0] if names is not None else {}
+    return euro, urau_inputs, fao_inputs, names[0] if names is not None else {}
 
 
 class _SeededPlacement:
-    """The seeded cities no metro covers, placed in their FAO regions from
-    their Overture land areas as the metros stage placed them — once, and
-    only when a region the seed left unpublished is minted, since the seed's
-    own FAO metros already hold their cities."""
+    """The seeded cities placed in their FAO regions from their Overture land
+    areas as the metros stage placed them — once, and only when a region the
+    seed left unpublished is minted, since the seed's own FAO metros already
+    hold their cities."""
 
     def __init__(self, cache_dir, dataset, places_by_id, city_rows, regions, patches):
         discovered = {row["place_id"] for row in city_rows}
@@ -342,17 +348,13 @@ class _SeededPlacement:
         self._grouped = None
 
     def cities(self, region_id):
-        """The eligible seeded cities in ``region_id``."""
+        """The seeded cities in ``region_id``."""
         if self._grouped is None:
             from transitio_index import fao
 
             wanted = {r["overture_id"] for r in self._rows if r.get("overture_id")}
-            self._grouped, _, _, _, _ = fao.place_cities(
-                self._rows,
-                self._read(self._rows, wanted),
-                self._regions,
-                self._patches,
-                [],
+            self._grouped, _, _, _ = fao.place_cities(
+                self._rows, self._read(self._rows, wanted), self._regions, self._patches
             )
         return self._grouped.get(region_id, [])
 
@@ -374,13 +376,14 @@ def _mint(places_by_id, codes, added, key, metro):
     return metro
 
 
-def _attach_eurostat_metros(places_by_id, codes, city_rows, areas, euro):
-    """Eurostat metro membership for the discovered cities, mirroring the
-    metros stage over the inputs it read (``euro``, None for none): each
-    city is assigned to its metropolitan region, whose metro is found among
-    the published places by its code (``codes``) or minted, and joined.
-    Returns ``(added, touched, assignments)`` — the metro keys minted, every
-    metro a city joined, and the assignment rows the FAO branch reads."""
+def _attach_eurostat_metros(places_by_id, codes, city_rows, areas, euro, definition):
+    """Eurostat metro membership of one ``definition`` for the discovered
+    cities, mirroring the metros stage over the inputs it read (``euro``,
+    None for none): each city is assigned to its area, whose metro is found
+    among the published places by its code (``codes``) or minted, and
+    joined. Returns ``(added, touched, assignments)`` — the metro keys
+    minted, every metro a city joined, and the assignment rows the FAO
+    branch reads."""
     from transitio_index import eurostat
 
     added = []
@@ -391,19 +394,20 @@ def _attach_eurostat_metros(places_by_id, codes, city_rows, areas, euro):
     assignments = eurostat.assign(city_rows, areas, composition, nuts_boundaries)
     for row in assignments:
         # Every assigned city's metro publishes here, found or minted.
+        row["subtype"] = definition.subtype
         row["published"] = row["status"] == "assigned"
         if not row["published"]:
             continue
         code = row["metro_code"]
-        metro = codes.get(("metropolitan region", code))
+        metro = codes.get((definition.subtype, code))
         if metro is None:
-            key = f"eurostat_metro:{code}"
+            key = f"{definition.namespace}:{code}"
             metro = _mint(
                 places_by_id,
                 codes,
                 added,
                 key,
-                metros._eurostat_place(key, code, composition[code]),
+                metros._eurostat_place(definition, key, code, composition[code]),
             )
         touched.add(metro["place_id"])
         metros.join(metro, places_by_id[row["city_id"]])
@@ -420,17 +424,13 @@ def _attach_fao_metros(
     report,
     fao_inputs,
     names,
-    assignments,
 ):
-    """FAO city-region membership for the discovered cities no official
-    metro covers, mirroring the metros stage over the inputs it read
-    (``fao_inputs``, None for none, and the UCDB ``names``): each such city
-    joins its region's metro, found by its code (``codes``) or minted — over
-    every eligible city in the region, the seeded ones included, when the
-    seed left it unpublished. A region already published is never
-    deduplicated against itself; one the official metros cover now, a
-    discovered city having joined them, is dropped as the metros stage would
-    have found it. Returns ``(added, touched)``."""
+    """FAO city-region membership for the discovered cities, mirroring the
+    metros stage over the inputs it read (``fao_inputs``, None for none, and
+    the UCDB ``names``): each city joins its region's metro, found by its
+    code (``codes``) or minted — over every city in the region, the seeded
+    ones included, when the seed left it unpublished. Returns ``(added,
+    touched)``."""
     from transitio_index import fao
 
     added = []
@@ -438,21 +438,7 @@ def _attach_fao_metros(
     if fao_inputs is None:
         return added, touched
     regions, patches, _ = fao_inputs
-    grouped, _, _, _, _ = fao.place_cities(
-        city_rows, areas, regions, patches, assignments
-    )
-    published = shapely.STRtree(
-        metros.official_footprints(places_by_id, _shipped_footprint)
-    )
-    for (subtype, region_id), metro in list(codes.items()):
-        if subtype != metros.FAO_SUBTYPE or region_id not in regions:
-            continue
-        footprint = metros._region_footprint(regions, patches, region_id)
-        if metros._over_published_metro(footprint, published):
-            metros._unjoin(metro, places_by_id)
-            del places_by_id[metro["place_id"]]
-            del codes[(subtype, region_id)]
-            metros._report_fao(report, region_id, "duplicate of a published metro")
+    grouped, _, _, _ = fao.place_cities(city_rows, areas, regions, patches)
     seeded = _SeededPlacement(
         cache_dir, dataset, places_by_id, city_rows, regions, patches
     )
@@ -460,11 +446,8 @@ def _attach_fao_metros(
         metro = codes.get((metros.FAO_SUBTYPE, region_id))
         members = grouped[region_id]
         if metro is None:
-            footprint = metros._region_footprint(regions, patches, region_id)
-            if metros._over_published_metro(footprint, published):
-                continue
             # A region the seed left unpublished — for want of a majority
-            # country, say — is minted over every eligible city in it, the
+            # country, say — is minted over every city in it, the
             # seeded ones included, so its partition, name and members do
             # not depend on which cities the crawl found first.
             members = sorted({*members, *seeded.cities(region_id)})
@@ -656,17 +639,24 @@ def _discover(
     new_metros, metro_pairs = _attach_metros(
         places_by_id, codes, new_cities, wikidata, report, registry
     )
-    euro = fao_inputs = None
+    euro = urau_inputs = fao_inputs = None
     names = {}
     if city_rows:
-        euro, fao_inputs, names = _derived_inputs(cache_dir, derived)
-    eurostat_metros, eurostat_touched, assignments = _attach_eurostat_metros(
-        places_by_id, codes, city_rows, areas, euro
-    )
+        euro, urau_inputs, fao_inputs, names = _derived_inputs(cache_dir, derived)
+    # One join per Eurostat definition the run derived, over the same cities.
+    eurostat_metros, eurostat_touched, assignments = [], set(), []
+    for definition, inputs in (
+        (metros.METROPOLITAN_REGION, euro),
+        (metros.FUNCTIONAL_URBAN_AREA, urau_inputs),
+    ):
+        added, touched, rows = _attach_eurostat_metros(
+            places_by_id, codes, city_rows, areas, inputs, definition
+        )
+        eurostat_metros += added
+        eurostat_touched |= touched
+        assignments += rows
     # The official metros — US and Eurostat, minted or joined — are
-    # partitioned before the FAO branch, as in the metros stage, so a FAO
-    # region is deduplicated only against metros that publish and a city
-    # whose official metro cannot is eligible for a city-region instead.
+    # partitioned before the FAO branch, as in the metros stage.
     official = set(new_metros) | set(metro_pairs) | eurostat_touched
     dropped = metros.partition(
         {key: places_by_id[key] for key in official}, places_by_id, codes, report
@@ -682,7 +672,6 @@ def _discover(
         report,
         fao_inputs,
         names,
-        assignments,
     )
     dropped |= metros.partition(
         {key: places_by_id[key] for key in fao_touched}, places_by_id, codes, report

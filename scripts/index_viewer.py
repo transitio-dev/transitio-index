@@ -161,6 +161,14 @@ SEARCH_COLUMNS = (
     "build_id",
 )
 METRO_COLUMNS = ("place_id", "name", "source_subtype", "statistical_area_id")
+# The metro definitions a build publishes, by ``source_subtype``; a slice can
+# keep the metros of some of them.
+METRO_SUBTYPES = (
+    "metropolitan statistical area",
+    "metropolitan region",
+    "functional urban area",
+    "city-region (FAO)",
+)
 MEMBER_COLUMNS = ("place_id", "name", "kind", "served", "feed_count")
 KIND_RANK = {"country": 0, "region": 1, "city": 2}  # the tree's order
 SERVICE_STATS = ("stops", "routes", "departures_per_day")
@@ -1117,6 +1125,19 @@ def parse_kinds(value):
     return {kind.strip() for kind in value.split(",") if kind.strip()}
 
 
+def parse_subtypes(value):
+    """The metro definitions a ``subtype=`` parameter names, as a set of
+    ``source_subtype`` values: None (every definition) when omitted, empty
+    when blank."""
+    if value is None:
+        return None
+    subtypes = {part.strip() for part in value.split(",") if part.strip()}
+    unknown = subtypes - set(METRO_SUBTYPES)
+    if unknown:
+        raise ValueError(f"subtype must be one of {', '.join(METRO_SUBTYPES)}")
+    return subtypes
+
+
 def parse_bbox(value):
     """``minx,miny,maxx,maxy``: four finite numbers with min <= max on each axis."""
     parts = [float(part) for part in value.split(",")]
@@ -1137,6 +1158,7 @@ def filter_places(
     feed_id=None,
     bounded=True,
     view=None,
+    subtypes=None,
 ):
     """A boolean mask over the build's places for one slice.
 
@@ -1147,8 +1169,10 @@ def filter_places(
     ``bounded=False``. ``q`` matches the search text (name, aliases and names
     in other languages, any case). ``feed_id`` keeps the places that feed
     serves, through the edges. ``served`` and ``feed_id`` read the ``view``
-    (the build's default when omitted). Every test is a vectorized mask over
-    the build's arrays.
+    (the build's default when omitted). ``subtypes`` keeps the metros of the
+    definitions named (their ``source_subtype``) and every other kind as it
+    is; None keeps every metro. Every test is a vectorized mask over the
+    build's arrays.
     """
     places = build.places
     view = view or build.view()
@@ -1158,6 +1182,12 @@ def filter_places(
     mask = np.ones(len(places), dtype=bool)
     if kinds is not None:
         mask &= places["kind"].isin(set(kinds)).to_numpy()
+    if subtypes is not None:
+        metro = (places["kind"] == "metro").to_numpy()
+        named = np.zeros(len(places), dtype=bool)
+        if "source_subtype" in places.columns:
+            named = places["source_subtype"].isin(set(subtypes)).to_numpy()
+        mask &= ~metro | named
     if parent_id is not None:
         mask &= (places["parent_id"] == parent_id).to_numpy()
     if bbox is not None:
@@ -1304,7 +1334,7 @@ def _matched(place, needle):
     return None
 
 
-def search_places(build, q, limit=SEARCH_LIMIT, view=None):
+def search_places(build, q, limit=SEARCH_LIMIT, view=None, subtypes=None):
     """``{"total", "rows"}``: the places ``q`` matches, the best ``limit`` first.
 
     Ranked: the name equals ``q`` (any case); an alias or a name in another
@@ -1313,7 +1343,8 @@ def search_places(build, q, limit=SEARCH_LIMIT, view=None):
     the name. A row carries the place's ``chain`` (its ancestors' names, root
     first), the view's served flag, feed count and class, and ``matched``:
     the alias or other name that matched when the name itself does not
-    contain ``q``.
+    contain ``q``. ``subtypes`` keeps the metros of the definitions named, as
+    in :func:`filter_places`.
     """
     q = " ".join(q.split())  # one space between words, none around, no newline
     if len(q) < 2:
@@ -1321,7 +1352,9 @@ def search_places(build, q, limit=SEARCH_LIMIT, view=None):
     if limit < 1:
         raise ValueError("limit must be at least 1")
     view = view or build.view()
-    hits = np.flatnonzero(filter_places(build, None, q=q, bounded=False, view=view))
+    hits = np.flatnonzero(
+        filter_places(build, None, q=q, bounded=False, view=view, subtypes=subtypes)
+    )
     if not hits.size:
         return {"total": 0, "rows": []}
     needle = _flat(pa.array([q]))[0].as_py()
@@ -1881,6 +1914,7 @@ def create_app(cache, size=CACHED_BUILDS):
         zoom: float | None = None,
         spec: str | None = None,
         level: str | None = None,
+        subtype: str | None = None,
     ):
         build = opened(build_id)
         view = viewed(build, spec, level)
@@ -1903,6 +1937,7 @@ def create_app(cache, size=CACHED_BUILDS):
                 q=q,
                 feed_id=feed_id,
                 view=view,
+                subtypes=parse_subtypes(subtype),
             )
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
@@ -1940,6 +1975,7 @@ def create_app(cache, size=CACHED_BUILDS):
         limit: int = 50,
         spec: str | None = None,
         level: str | None = None,
+        subtype: str | None = None,
     ):
         # Geometry-free, so every kind by default and no bound required.
         build = opened(build_id)
@@ -1957,6 +1993,7 @@ def create_app(cache, size=CACHED_BUILDS):
                 q=q,
                 bounded=False,
                 view=view,
+                subtypes=parse_subtypes(subtype),
             )
             page = places_table(build, mask, sort, order, offset, limit, view)
         except ValueError as error:
@@ -1970,11 +2007,12 @@ def create_app(cache, size=CACHED_BUILDS):
         limit: int = SEARCH_LIMIT,
         spec: str | None = None,
         level: str | None = None,
+        subtype: str | None = None,
     ):
         build = opened(build_id)
         view = viewed(build, spec, level)
         try:
-            reply = search_places(build, q, limit, view)
+            reply = search_places(build, q, limit, view, parse_subtypes(subtype))
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
         return JSONResponse(reply, headers={"X-Snapshot": build.snapshot_id})

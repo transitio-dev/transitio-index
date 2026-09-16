@@ -35,6 +35,7 @@ NAMESPACES = (
     "overture",
     "osm_relation",
     "eurostat_metro",
+    "eurostat_fua",
     "cbsa",
     "fao_city_region",
     "ghs_ucdb",
