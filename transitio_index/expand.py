@@ -330,10 +330,10 @@ def _derived_inputs(cache_dir, recorded):
 
 
 class _SeededPlacement:
-    """The seeded cities no metro covers, placed in their FAO regions from
-    their Overture land areas as the metros stage placed them — once, and
-    only when a region the seed left unpublished is minted, since the seed's
-    own FAO metros already hold their cities."""
+    """The seeded cities placed in their FAO regions from their Overture land
+    areas as the metros stage placed them — once, and only when a region the
+    seed left unpublished is minted, since the seed's own FAO metros already
+    hold their cities."""
 
     def __init__(self, cache_dir, dataset, places_by_id, city_rows, regions, patches):
         discovered = {row["place_id"] for row in city_rows}
@@ -348,17 +348,13 @@ class _SeededPlacement:
         self._grouped = None
 
     def cities(self, region_id):
-        """The eligible seeded cities in ``region_id``."""
+        """The seeded cities in ``region_id``."""
         if self._grouped is None:
             from transitio_index import fao
 
             wanted = {r["overture_id"] for r in self._rows if r.get("overture_id")}
-            self._grouped, _, _, _, _ = fao.place_cities(
-                self._rows,
-                self._read(self._rows, wanted),
-                self._regions,
-                self._patches,
-                [],
+            self._grouped, _, _, _ = fao.place_cities(
+                self._rows, self._read(self._rows, wanted), self._regions, self._patches
             )
         return self._grouped.get(region_id, [])
 
@@ -428,17 +424,13 @@ def _attach_fao_metros(
     report,
     fao_inputs,
     names,
-    assignments,
 ):
-    """FAO city-region membership for the discovered cities no official
-    metro covers, mirroring the metros stage over the inputs it read
-    (``fao_inputs``, None for none, and the UCDB ``names``): each such city
-    joins its region's metro, found by its code (``codes``) or minted — over
-    every eligible city in the region, the seeded ones included, when the
-    seed left it unpublished. A region already published is never
-    deduplicated against itself; one the official metros cover now, a
-    discovered city having joined them, is dropped as the metros stage would
-    have found it. Returns ``(added, touched)``."""
+    """FAO city-region membership for the discovered cities, mirroring the
+    metros stage over the inputs it read (``fao_inputs``, None for none, and
+    the UCDB ``names``): each city joins its region's metro, found by its
+    code (``codes``) or minted — over every city in the region, the seeded
+    ones included, when the seed left it unpublished. Returns ``(added,
+    touched)``."""
     from transitio_index import fao
 
     added = []
@@ -446,21 +438,7 @@ def _attach_fao_metros(
     if fao_inputs is None:
         return added, touched
     regions, patches, _ = fao_inputs
-    grouped, _, _, _, _ = fao.place_cities(
-        city_rows, areas, regions, patches, assignments
-    )
-    published = shapely.STRtree(
-        metros.official_footprints(places_by_id, _shipped_footprint)
-    )
-    for (subtype, region_id), metro in list(codes.items()):
-        if subtype != metros.FAO_SUBTYPE or region_id not in regions:
-            continue
-        footprint = metros._region_footprint(regions, patches, region_id)
-        if metros._over_published_metro(footprint, published):
-            metros._unjoin(metro, places_by_id)
-            del places_by_id[metro["place_id"]]
-            del codes[(subtype, region_id)]
-            metros._report_fao(report, region_id, "duplicate of a published metro")
+    grouped, _, _, _ = fao.place_cities(city_rows, areas, regions, patches)
     seeded = _SeededPlacement(
         cache_dir, dataset, places_by_id, city_rows, regions, patches
     )
@@ -468,11 +446,8 @@ def _attach_fao_metros(
         metro = codes.get((metros.FAO_SUBTYPE, region_id))
         members = grouped[region_id]
         if metro is None:
-            footprint = metros._region_footprint(regions, patches, region_id)
-            if metros._over_published_metro(footprint, published):
-                continue
             # A region the seed left unpublished — for want of a majority
-            # country, say — is minted over every eligible city in it, the
+            # country, say — is minted over every city in it, the
             # seeded ones included, so its partition, name and members do
             # not depend on which cities the crawl found first.
             members = sorted({*members, *seeded.cities(region_id)})
@@ -681,9 +656,7 @@ def _discover(
         eurostat_touched |= touched
         assignments += rows
     # The official metros — US and Eurostat, minted or joined — are
-    # partitioned before the FAO branch, as in the metros stage, so a FAO
-    # region is deduplicated only against metros that publish and a city
-    # whose official metro cannot is eligible for a city-region instead.
+    # partitioned before the FAO branch, as in the metros stage.
     official = set(new_metros) | set(metro_pairs) | eurostat_touched
     dropped = metros.partition(
         {key: places_by_id[key] for key in official}, places_by_id, codes, report
@@ -699,7 +672,6 @@ def _discover(
         report,
         fao_inputs,
         names,
-        assignments,
     )
     dropped |= metros.partition(
         {key: places_by_id[key] for key in fao_touched}, places_by_id, codes, report

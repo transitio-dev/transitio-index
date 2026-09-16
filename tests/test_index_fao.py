@@ -54,19 +54,17 @@ def _city(place_id, country, overture_id, metro_ids=()):
 
 
 PLACES = [
-    _city("Q_A", "FI", "a"),  # eligible, patch 1
-    _city("Q_B", "FI", "b"),  # eligible, patch 2: same tier-2 region as A
-    _city("Q_C", "FI", "c", metro_ids=["Q_M"]),  # already in a metro: context
-    _city("Q_D", "SE", "d"),  # a published official metro covers it: context
-    _city("Q_E", "SE", "e"),  # eligible, patch 3: no metro covers it
+    _city("Q_A", "FI", "a"),  # patch 1
+    _city("Q_B", "FI", "b"),  # patch 2: same tier-2 region as A
+    _city("Q_C", "FI", "c", metro_ids=["Q_M"]),  # already in a metro: placed too
+    _city("Q_D", "SE", "d"),  # patch 3
+    _city("Q_E", "SE", "e"),  # patch 3
     _city("Q_F", "FI", "f"),  # outside every patch
     _city("Q_G", "FI", None),  # no land area: unplaceable
-    _city("Q_H", "SE", "h"),  # eligible, patch 3
-    _city("Q_I", "SE", "i"),  # eligible, patch 3: its official assignment ambiguous
-    _city("Q_J", "SE", "j"),  # explicitly unassigned officially: eligible
-    _city(
-        "Q_K", "FI", None, metro_ids=["Q_M"]
-    ),  # no land area, not eligible: still listed
+    _city("Q_H", "SE", "h"),  # patch 3
+    _city("Q_I", "SE", "i"),  # patch 3
+    _city("Q_J", "SE", "j"),  # patch 3
+    _city("Q_K", "FI", None, metro_ids=["Q_M"]),  # no land area: still listed
     _city("Q_L", "FI", "l"),  # astride patches 1 and 2, one region: placed
     _city(
         "Q_N", "FI", "n"
@@ -348,10 +346,9 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
                 {"ucdb_id": 572, "name": "Helsinki", "share": 0.6},
                 {"ucdb_id": 573, "name": "Espoo", "share": 0.4},
             ],
-            "cities": ["Q_A", "Q_B", "Q_L"],
-            "cities_wikidata": [None] * len(["Q_A", "Q_B", "Q_L"]),
-            "context": ["Q_C"],
-            "evidence_hash": digest(["Q_A", "Q_B", "Q_L"]),
+            "cities": ["Q_A", "Q_B", "Q_C", "Q_L"],
+            "cities_wikidata": [None] * 4,
+            "evidence_hash": digest(["Q_A", "Q_B", "Q_C", "Q_L"]),
             "override": [
                 {
                     "place": "fao_city_region:20",
@@ -364,7 +361,7 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
                 {
                     "place": "fao_city_region:20",
                     "set_statistical_area": {"scheme": "fao_city_region", "code": "20"},
-                    "evidence_hash": digest(["Q_A", "Q_B", "Q_L"]),
+                    "evidence_hash": digest(["Q_A", "Q_B", "Q_C", "Q_L"]),
                 },
             ],
         },
@@ -377,10 +374,9 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
             "name": None,
             "name_ambiguous": False,
             "name_candidates": [],
-            "cities": ["Q_E", "Q_H", "Q_I", "Q_J", "Q_O"],
-            "cities_wikidata": [None] * 5,
-            "context": ["Q_D"],
-            "evidence_hash": digest(["Q_E", "Q_H", "Q_I", "Q_J", "Q_O"]),
+            "cities": ["Q_D", "Q_E", "Q_H", "Q_I", "Q_J", "Q_O"],
+            "cities_wikidata": [None] * 6,
+            "evidence_hash": digest(["Q_D", "Q_E", "Q_H", "Q_I", "Q_J", "Q_O"]),
             "override": [
                 {
                     "place": "fao_city_region:30",
@@ -389,18 +385,18 @@ def test_the_stage_reports_eligible_cities_by_highest_tier_region(
                 {
                     "place": "fao_city_region:30",
                     "set_statistical_area": {"scheme": "fao_city_region", "code": "30"},
-                    "evidence_hash": digest(["Q_E", "Q_H", "Q_I", "Q_J", "Q_O"]),
+                    "evidence_hash": digest(["Q_D", "Q_E", "Q_H", "Q_I", "Q_J", "Q_O"]),
                 },
             ],
         },
     ]
     unplaced, _ = store.read_jsonl(cache / "gazetteer", "fao.json", "unplaced.jsonl")
     assert unplaced == [
-        {"city_id": "Q_G", "eligible": True, "reason": "no usable land area"},
-        {"city_id": "Q_K", "eligible": False, "reason": "no usable land area"},
-        {"city_id": "Q_N", "eligible": True, "reason": "on a boundary between regions"},
+        {"city_id": "Q_G", "reason": "no usable land area"},
+        {"city_id": "Q_K", "reason": "no usable land area"},
+        {"city_id": "Q_N", "reason": "on a boundary between regions"},
     ]
-    assert manifest["entries"] == 2 and manifest["eligible_cities"] == 8
+    assert manifest["entries"] == 2 and manifest["cities"] == 10
     assert manifest["tiers"] == {1: 1, 2: 1}
     assert manifest["unplaced"] == 3 and manifest["doi"] == fao.DOI
     assert manifest["named_entries"] == 1 and manifest["names"] == names

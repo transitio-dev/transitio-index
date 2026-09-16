@@ -1204,21 +1204,6 @@ def test_a_registry_backed_fao_metro_carries_its_region_not_a_cbsa(tmp_path):
         assert again.minted == 0
 
 
-def test_a_fao_region_over_a_published_metro_is_a_duplicate():
-    # A FAO city-region whose core (its footprint's representative point) falls
-    # inside a metro already published is a duplicate; one whose core lies
-    # elsewhere is not.
-    member = shapely.box(24.4, 60.1, 24.6, 60.3)
-    published = shapely.STRtree([member])
-    over = shapely.unary_union(
-        [shapely.box(24.35, 60.05, 24.65, 60.35), shapely.box(26.05, 60.4, 26.15, 60.5)]
-    )
-    elsewhere = shapely.box(25.0, 64.0, 25.5, 64.5)
-    assert metros._over_published_metro(over, published) is True
-    assert metros._over_published_metro(elsewhere, published) is False
-    assert metros._over_published_metro(None, published) is False
-
-
 def test_the_fao_derived_version_covers_both_inputs():
     from transitio_index import fao
 

@@ -9,12 +9,12 @@ Overture land areas gives its metropolitan region, the Urban Audit polygon
 containing them its functional urban area, and every region or area with
 member cities is published as a ``metro`` keyed by its Eurostat code; a
 curator ``set_statistical_area`` crosswalk may instead merge it onto a chosen
-QID. Cities elsewhere: the FAO city-region a
+QID. Everywhere: the FAO city-region a
 city's Overture land area falls in is published as a ``metro`` keyed by its
-region id and named from its GHS-UCDB centre. The Eurostat and FAO branches
-publish only while their derived inputs are allowlisted, and never cover a
-city another branch already placed. Every member city carries its metros in
-``metro_ids`` — a city can belong to more than one. This stage adds
+region id and named from its GHS-UCDB centre, one more definition of the
+city's area beside the others. The Eurostat and FAO branches publish only
+while their derived inputs are allowlisted. Every member city carries its
+metros in ``metro_ids`` — one per definition it falls in. This stage adds
 membership only; the geometry stage draws a metro from its members' shipped
 polygons.
 """
@@ -24,8 +24,6 @@ import datetime
 import functools
 import json
 import hashlib
-
-import shapely
 
 from transitio_index import (
     csv_source,
@@ -361,8 +359,8 @@ def partition(rows, by_id, codes, report):
 def reconcile(assignments, codes):
     """Clear the ``published`` flag of every Eurostat-branch assignment (of
     either definition, named by its ``subtype``) whose metro the partition
-    pass dropped from the code index ``codes``, so the FAO branch counts its
-    city as covered by nothing."""
+    pass dropped from the code index ``codes``, so the assignments artifact
+    records what was published."""
     for row in assignments:
         if row.get("published") and (row["subtype"], row["metro_code"]) not in codes:
             row["published"] = False
@@ -601,52 +599,6 @@ def _majority_country(city_ids, by_id):
     return country if count * 2 > sum(counts.values()) else None
 
 
-def official_footprints(by_id, footprint):
-    """The footprints — ``footprint(place)``, None for none — of every city in
-    a US or Eurostat metro, seeded or curated rows included, for the FAO
-    duplicate check: a FAO city-region whose core falls inside one duplicates
-    it. FAO members are excluded: a FAO region is deduplicated only against the
-    official (US/Eurostat) metros, never against another FAO metro — else a
-    city discovered in a region already published would reject the region as
-    its own duplicate."""
-    official = {
-        p["place_id"]
-        for p in by_id.values()
-        if p.get("kind") == "metro" and p.get("source_subtype") != FAO_SUBTYPE
-    }
-    footprints = []
-    for place in by_id.values():
-        if place.get("kind") != "city":
-            continue
-        if not any(mid in official for mid in place.get("metro_ids") or []):
-            continue
-        geom = footprint(place)
-        if geom is not None:
-            footprints.append(geom)
-    return footprints
-
-
-def _region_footprint(regions, patches, region_id):
-    """The land footprint of a FAO city-region: its patches' union."""
-    return eurostat._footprint(
-        [
-            {"geom": patches[p]["geom"]}
-            for p in regions[region_id]["patches"]
-            if p in patches
-        ]
-    )
-
-
-def _over_published_metro(footprint, published):
-    """Whether a FAO city-region's ``footprint`` sits over a metro already
-    published: its representative point falls inside a published metro member's
-    footprint held in the ``published`` STRtree."""
-    if footprint is None:
-        return False
-    point = footprint.representative_point()
-    return bool(len(published.query(point, predicate="covered_by")))
-
-
 def _report_fao(report, region_id, reason):
     """One report row for a FAO city-region left unpublished."""
     report.append(
@@ -695,14 +647,13 @@ def _apply_fao(
     names,
     cache_dir,
     dataset,
-    assignments,
 ):
     """Publish an FAO city-region metro for every region of the loaded
-    ``inputs`` holding eligible cities — cities no US or Eurostat metro
-    already covers. Each metro is keyed by its FAO region id, named from the
+    ``inputs`` holding cities, whatever other metros those cities belong
+    to. Each metro is keyed by its FAO region id, named from the
     region's GHS-UCDB centre match in ``names`` (empty unless the UCDB derived
     input was read), its country the one most of its cities are in, and the
-    eligible cities joined as members. It publishes only while every FAO
+    cities joined as members. It publishes only while every FAO
     derived input is allowlisted; otherwise the regions are reported, not
     published. Returns ``(versions, touched)`` — the derived inputs read, at
     their pinned versions, as ``{(dataset, licence): version}``, and every
@@ -714,13 +665,8 @@ def _apply_fao(
         p["overture_id"] for p in places if p["kind"] == "city" and p.get("overture_id")
     }
     areas = geometry.place_areas(cache_dir, dataset, places, wanted)
-    grouped, _, _, _, _ = fao.place_cities(places, areas, regions, patches, assignments)
+    grouped, _, _, _ = fao.place_cities(places, areas, regions, patches)
     allowed = all(key in geometry.DERIVED_SOURCE_ALLOWLIST for key in FAO_DERIVED)
-    # A FAO city-region whose core sits inside a metro already published this
-    # run (Eurostat or US) duplicates it; those are dropped, not minted again.
-    duplicates = shapely.STRtree(
-        official_footprints(by_id, functools.partial(eurostat.place_footprint, areas))
-    )
     touched = {}
     for region_id in sorted(grouped):
         derived = sorted(grouped[region_id])
@@ -733,10 +679,6 @@ def _apply_fao(
             continue
         if not allowed:
             _report_fao(report, region_id, "a derived input is not allowlisted")
-            continue
-        footprint = _region_footprint(regions, patches, region_id)
-        if _over_published_metro(footprint, duplicates):
-            _report_fao(report, region_id, "duplicate of a published metro")
             continue
         key = f"fao_city_region:{region_id}"
         name = _fao_name(
@@ -1117,9 +1059,8 @@ def attach_metros(
                 overrides.by_operation(place_overrides, "set_place_members"),
                 override_report,
             )
-            # The official metros are partitioned before the FAO branch, so a
-            # city whose metro cannot publish is eligible for a city-region
-            # instead of covered by nothing; FAO metros are minted partitioned.
+            # The official metros are partitioned before the FAO branch, whose
+            # metros are minted partitioned.
             official = {
                 p["place_id"]: p
                 for p in [*places, *metros.values()]
@@ -1137,7 +1078,7 @@ def attach_metros(
                     summary["metros_reported"] += 1
                 elif row.get("source_subtype") == "metropolitan statistical area":
                     us_summary["metros_published"] -= 1
-            # A Eurostat metro the pass dropped covers nothing any more.
+            # A Eurostat metro the pass dropped published nothing after all.
             reconcile(assignments, codes)
             fao_summary = {"published": 0, "memberships": 0}
             if fao_inputs is not None:
@@ -1151,7 +1092,6 @@ def attach_metros(
                     names=names,
                     cache_dir=cache_dir,
                     dataset=dataset,
-                    assignments=assignments,
                 )
                 # A seeded FAO metro joined here is repartitioned over its
                 # grown membership; one left without a majority is dropped.

@@ -446,7 +446,9 @@ def test_a_recorded_derived_input_the_raw_store_lost_refuses_expansion(
         _expand(tmp_path, cache)
 
 
-def test_a_seeded_fao_metro_an_official_metro_grows_over_is_dropped(tmp_path):
+def test_a_seeded_fao_metro_keeps_its_members_when_an_official_metro_grows(
+    tmp_path,
+):
     from test_index_metros import _fao_inputs
     from transitio_index import fao
 
@@ -478,15 +480,14 @@ def test_a_seeded_fao_metro_an_official_metro_grows_over_is_dropped(tmp_path):
     _publish_names(cache, SEED_PLACES + [region, chatham], derived_inputs=derived)
     _write_crawl(cache, "f-spring", ["s1,39.8,-89.65\n"])
     manifest, places, report = _expand(tmp_path, cache)
-    # Springfield joins its MSA, whose member footprint now covers the region's
-    # core: the seeded FAO metro duplicates an official one and is dropped, its
-    # member unjoined, as the metros stage would have decided with both known.
+    # Springfield joins its MSA and the seeded FAO region alike: two
+    # definitions of its area, neither suppressing the other; the region
+    # keeps its seeded member.
     assert places["Q912579"]["member_ids"] == ["Q28515"]
-    assert "fao_city_region:50" not in places
-    assert places["Q1"]["metro_ids"] == []
-    assert [r["reason"] for r in report if r.get("branch") == "fao"] == [
-        "duplicate of a published metro"
-    ]
+    assert places["fao_city_region:50"]["member_ids"] == ["Q1", "Q28515"]
+    assert places["Q28515"]["metro_ids"] == ["Q912579", "fao_city_region:50"]
+    assert places["Q1"]["metro_ids"] == ["fao_city_region:50"]
+    assert not any(r.get("branch") == "fao" for r in report)
     assert manifest["metros_added"] == 1
 
 
