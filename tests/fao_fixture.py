@@ -67,13 +67,14 @@ def ucdb_zip(rows, member, layer, crs="EPSG:4326", columns=UCDB_COLUMNS):
 
 def fua_zip(rows, crs="EPSG:4326"):
     """A zipped shapefile of Urban Audit areas: ``(code, category, country,
-    name, geometry)`` rows."""
+    name, geometry)`` rows, with a sixth NUTS-3 region where one is named."""
     frame = geopandas.GeoDataFrame(
         {
             "URAU_CODE": [row[0] for row in rows],
             "URAU_CATG": [row[1] for row in rows],
             "CNTR_CODE": [row[2] for row in rows],
             "URAU_NAME": [row[3] for row in rows],
+            "NUTS3_2024": [row[5] if len(row) > 5 else None for row in rows],
         },
         geometry=[row[4] for row in rows],
         crs=crs,

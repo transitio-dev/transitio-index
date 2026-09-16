@@ -28,11 +28,13 @@ URLS = {AREAS_FILE: AREAS_URL}
 SUBTYPE = "functional urban area"
 NAMESPACE = "eurostat_fua"
 DERIVED = geometry.URAU_DERIVED
-COLUMNS = ("URAU_CODE", "URAU_CATG", "CNTR_CODE", "URAU_NAME")
+NUTS3_COLUMN = f"NUTS3_{EDITION}"
+COLUMNS = ("URAU_CODE", "URAU_CATG", "CNTR_CODE", "URAU_NAME", NUTS3_COLUMN)
 CATEGORY = "F"  # the file's other categories are cities and greater cities
 # Country code, three digits, then F.
 AREA_CODE = re.compile(r"\A([A-Z]{2})[0-9]{3}F\Z")
-CROSS_BORDER = "CB"  # an area astride a border: no country of its own
+CROSS_BORDER = "CB"  # one country's part of an area astride a border
+NUTS3_CODE = re.compile(r"\A([A-Z]{2})[0-9A-Z]{3}\Z")
 
 
 class UrauError(pinned.PinnedInputError):
@@ -66,12 +68,13 @@ def read_areas(data):
     ``eurostat.assign`` reads: ``{code: {"name", "country", "nuts3": [code]}}``
     — each area the one region of its own metro — and ``{code: polygon}``.
 
-    The country is the gazetteer's ISO code (Eurostat's prefixes mapped), None
-    for an area astride a border. A file whose codes repeat or are not area
-    codes, whose rows are not functional urban areas, whose country is missing
-    or not the one its code names, whose names are missing or whose geometry
-    is not a valid polygon refuses the build rather than changing what an
-    area means.
+    The country is the gazetteer's ISO code (Eurostat's prefixes mapped); a
+    part of an area astride a border, filed under ``CB``, takes it from the
+    NUTS-3 region the file names for it. A file whose codes repeat or are not
+    area codes, whose rows are not functional urban areas, whose country is
+    missing or not the one its code names, whose cross-border part names no
+    NUTS-3 region, whose names are missing or whose geometry is not a valid
+    polygon refuses the build rather than changing what an area means.
     """
     from transitio_index import fao
 
@@ -104,9 +107,17 @@ def read_areas(data):
             raise UrauError(f"{AREAS_FILE}: {code} has no country")
         if prefix != match.group(1):
             raise UrauError(f"{AREAS_FILE}: {code} is filed under country {prefix!r}")
-        country = None
-        if prefix != CROSS_BORDER:
-            country = eurostat.EUROSTAT_COUNTRY.get(prefix, prefix)
+        if prefix == CROSS_BORDER:
+            # The file draws the part of a cross-border area outside its
+            # core's country as a row of its own, in a NUTS-3 region it names.
+            nuts3 = eurostat._cell(getattr(row, NUTS3_COLUMN))
+            if nuts3 is None:
+                raise UrauError(f"{AREAS_FILE}: {code} has no NUTS-3 region")
+            region = NUTS3_CODE.match(nuts3)
+            if region is None:
+                raise UrauError(f"{AREAS_FILE}: {code} is in NUTS-3 region {nuts3!r}")
+            prefix = region.group(1)
+        country = eurostat.EUROSTAT_COUNTRY.get(prefix, prefix)
         composition[code] = {"name": name, "country": country, "nuts3": [code]}
         boundaries[code] = repaired
     if not composition:
