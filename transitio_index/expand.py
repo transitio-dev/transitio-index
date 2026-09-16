@@ -374,13 +374,14 @@ def _mint(places_by_id, codes, added, key, metro):
     return metro
 
 
-def _attach_eurostat_metros(places_by_id, codes, city_rows, areas, euro):
-    """Eurostat metro membership for the discovered cities, mirroring the
-    metros stage over the inputs it read (``euro``, None for none): each
-    city is assigned to its metropolitan region, whose metro is found among
-    the published places by its code (``codes``) or minted, and joined.
-    Returns ``(added, touched, assignments)`` — the metro keys minted, every
-    metro a city joined, and the assignment rows the FAO branch reads."""
+def _attach_eurostat_metros(places_by_id, codes, city_rows, areas, euro, definition):
+    """Eurostat metro membership of one ``definition`` for the discovered
+    cities, mirroring the metros stage over the inputs it read (``euro``,
+    None for none): each city is assigned to its area, whose metro is found
+    among the published places by its code (``codes``) or minted, and
+    joined. Returns ``(added, touched, assignments)`` — the metro keys
+    minted, every metro a city joined, and the assignment rows the FAO
+    branch reads."""
     from transitio_index import eurostat
 
     added = []
@@ -389,7 +390,6 @@ def _attach_eurostat_metros(places_by_id, codes, city_rows, areas, euro):
         return added, touched, []
     composition, nuts_boundaries, _ = euro
     assignments = eurostat.assign(city_rows, areas, composition, nuts_boundaries)
-    definition = metros.METROPOLITAN_REGION
     for row in assignments:
         # Every assigned city's metro publishes here, found or minted.
         row["subtype"] = definition.subtype
@@ -663,7 +663,7 @@ def _discover(
     if city_rows:
         euro, fao_inputs, names = _derived_inputs(cache_dir, derived)
     eurostat_metros, eurostat_touched, assignments = _attach_eurostat_metros(
-        places_by_id, codes, city_rows, areas, euro
+        places_by_id, codes, city_rows, areas, euro, metros.METROPOLITAN_REGION
     )
     # The official metros — US and Eurostat, minted or joined — are
     # partitioned before the FAO branch, as in the metros stage, so a FAO
