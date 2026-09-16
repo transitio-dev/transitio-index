@@ -389,21 +389,23 @@ def _attach_eurostat_metros(places_by_id, codes, city_rows, areas, euro):
         return added, touched, []
     composition, nuts_boundaries, _ = euro
     assignments = eurostat.assign(city_rows, areas, composition, nuts_boundaries)
+    definition = metros.METROPOLITAN_REGION
     for row in assignments:
         # Every assigned city's metro publishes here, found or minted.
+        row["subtype"] = definition.subtype
         row["published"] = row["status"] == "assigned"
         if not row["published"]:
             continue
         code = row["metro_code"]
-        metro = codes.get(("metropolitan region", code))
+        metro = codes.get((definition.subtype, code))
         if metro is None:
-            key = f"eurostat_metro:{code}"
+            key = f"{definition.namespace}:{code}"
             metro = _mint(
                 places_by_id,
                 codes,
                 added,
                 key,
-                metros._eurostat_place(key, code, composition[code]),
+                metros._eurostat_place(definition, key, code, composition[code]),
             )
         touched.add(metro["place_id"])
         metros.join(metro, places_by_id[row["city_id"]])
