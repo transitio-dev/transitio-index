@@ -371,18 +371,43 @@ def test_a_discovered_city_gains_the_eurostat_metro_the_run_derived(tmp_path):
     assert manifest["metros_added"] == 1
 
 
+@pytest.mark.parametrize("seeded", [False, True], ids=["minted", "joined"])
 def test_a_discovered_city_gains_the_functional_urban_area_the_run_derived(
-    tmp_path,
+    tmp_path, seeded
 ):
     from test_index_metros import _urau_inputs
 
     cache = tmp_path / "cache"
     # The metros stage read one area holding Tampere and recorded that
-    # snapshot in the run; expansion derives the second definition from it.
+    # snapshot in the run; expansion derives the second definition from it,
+    # minting the area's metro or joining the one the seed published.
     area = ("FI002F", "F", "FI", "Tampere", shapely.box(21.0, 60.5, 25.0, 62.0))
     pins = _urau_inputs(tmp_path, cache, [area])
     derived = {"eurostat": None, "urau": pins, "fao": None, "ucdb": None}
-    _publish_names(cache, SEED_PLACES, derived_inputs=derived)
+    seed = list(SEED_PLACES)
+    if seeded:
+        seed += [
+            {
+                "place_id": "eurostat_fua:FI002F",
+                "kind": "metro",
+                "source_subtype": "functional urban area",
+                "name": "Tampere",
+                "country_code": "FI",
+                "statistical_area_id": "FI002F",
+                "metro_ids": [],
+                "member_ids": ["Q1"],
+            },
+            {
+                "place_id": "Q1",
+                "kind": "city",
+                "name": "Nokia",
+                "country_code": "FI",
+                "overture_id": "fi-nokia",
+                "metro_ids": ["eurostat_fua:FI002F"],
+                "member_ids": [],
+            },
+        ]
+    _publish_names(cache, seed, derived_inputs=derived)
     _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
     manifest, places, _ = _expand(tmp_path, cache)
     metro = places["eurostat_fua:FI002F"]
@@ -391,10 +416,11 @@ def test_a_discovered_city_gains_the_functional_urban_area_the_run_derived(
         "functional urban area",
         "Tampere",
     )
-    assert metro["country_code"] == "FI" and metro["member_ids"] == ["Q40840"]
+    assert metro["country_code"] == "FI"
+    assert metro["member_ids"] == (["Q1", "Q40840"] if seeded else ["Q40840"])
     assert places["Q40840"]["metro_ids"] == ["eurostat_fua:FI002F"]
     assert metro["geometry_source"] == "member_union"
-    assert manifest["metros_added"] == 1
+    assert manifest["metros_added"] == (0 if seeded else 1)
 
 
 @pytest.mark.parametrize(
