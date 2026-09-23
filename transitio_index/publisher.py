@@ -57,29 +57,33 @@ def _sha256(data):
 
 
 def _members(index_dir):
-    """The index files to pack, in a fixed order, as ``(name, bytes)``: the
-    snapshot, every partition table it lists and the NOTICE, read under the
-    index's writer lock so a publish cannot interleave with the capture."""
+    """The index files to pack as ``(name, bytes)``, in the order the release
+    contract lists them (the snapshot, every partition table it lists, the
+    NOTICE), read under the index's writer lock so a publish cannot
+    interleave with the capture."""
     directory = store.open_directory(pathlib.Path(index_dir))
     try:
         with store.exclusive_writer(directory):
             found = [("snapshot.json", _member(directory, "snapshot.json"))]
             snapshot = json.loads(found[0][1].decode("utf-8"))
-            partitions = snapshot.get("partitions") or {}
-            for table in ("places", "edges"):
-                if not any(table in listed for listed in partitions.values()):
-                    raise PublishIndexError(
-                        f"{table}.parquet: missing; a release ships every table"
-                    )
-            for part, tables in sorted(partitions.items()):
+            try:
+                names = contract.members(snapshot)
+            except ValueError as error:
+                raise PublishIndexError(
+                    f"snapshot.json: {error}; a release ships every table"
+                ) from error
+            for name in names:
+                if name == "snapshot.json":
+                    continue
+                part, _, file = name.rpartition("/")
+                if not part:
+                    found.append((name, _member(directory, name)))
+                    continue
                 child = directory.subdirectory(part)
                 try:
-                    for table in sorted(tables):
-                        name = f"{table}.parquet"
-                        found.append((f"{part}/{name}", _member(child, name)))
+                    found.append((name, _member(child, file)))
                 finally:
                     child.close()
-            found.append(("NOTICE", _member(directory, "NOTICE")))
             return found
     finally:
         directory.close()
