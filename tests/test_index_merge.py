@@ -3,9 +3,11 @@ sources' tables become one set with one row per id, and what a merge
 refuses to load."""
 
 import hashlib
+import io
 import json
 import os
 
+import pyarrow.parquet as pq
 import pytest
 
 from builds_fixture import (
@@ -351,6 +353,26 @@ def _a_look_alike_classifier(archived, fi, de):
     )
 
 
+def _a_negative_tolerance(archived, fi, de):
+    _rewrite_snapshot(
+        archived / de / "index", lambda s: s.update(simplify_tolerance_deg=-0.1)
+    )
+
+
+def _feeds_without_service_spans(archived, fi, de):
+    # Schema-8-shaped feeds under a schema-9 manifest, digests intact.
+    file = archived / fi / "index" / "FI" / "feeds.parquet"
+    table = pq.read_table(file).drop_columns(["service_start", "service_end"])
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    file.write_bytes(sink.getvalue())
+    digest = hashlib.sha256(sink.getvalue()).hexdigest()
+    _rewrite_snapshot(
+        archived / fi / "index",
+        lambda s: s["partitions"]["FI"]["feeds"].update(sha256=digest),
+    )
+
+
 def _with_an_override_digest(archived, fi, de):
     _rewrite_snapshot(archived / de / "index", lambda s: s.update(overrides_sha256="x"))
 
@@ -373,6 +395,8 @@ def _rewritten_notice(archived, fi, de):
         (_below_schema_9, "schema_version 8"),
         (_without_a_release, "no usable overture_release"),
         (_a_look_alike_classifier, "classifier differs"),
+        (_a_negative_tolerance, "no usable simplify_tolerance_deg"),
+        (_feeds_without_service_spans, "does not verify"),
         (_with_an_override_digest, "carries no overrides"),
         (_tampered_table, "does not verify"),
         (_rewritten_notice, "does not verify"),

@@ -11,6 +11,7 @@ not ship.
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -251,7 +252,12 @@ def _well_formed(field, value):
     if field == "overture_release":
         return isinstance(value, str) and bool(value)
     if field == "simplify_tolerance_deg":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+        )
     return isinstance(value, dict) and bool(value)
 
 
