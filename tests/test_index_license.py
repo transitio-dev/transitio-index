@@ -308,9 +308,11 @@ def test_prohibited_hulls_are_nulled_and_the_judgement_ships(tmp_path):
         and rows.loc["f-a", "redistribution_allowed"] is False
     )
     assert rows.loc["f-c", "coverage"] == bytes.fromhex(HULL)
+    # Every category: this build has no rank stage, so the default view of a
+    # city (primary and secondary feeds) would list nothing.
     feed = next(
         f
-        for f in transitio_index.place("Q1757", index=index).feeds()
+        for f in transitio_index.place("Q1757", index=index).feeds(categories=None)
         if f.feed_id == "f-a"
     )
     assert feed.redistribution_allowed is False and feed.coverage is None
