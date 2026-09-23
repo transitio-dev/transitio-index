@@ -344,6 +344,13 @@ def _without_a_release(archived, fi, de):
     _rewrite_snapshot(archived / fi / "index", lambda s: s.pop("overture_release"))
 
 
+def _a_look_alike_classifier(archived, fi, de):
+    # ``true`` is not ``1``: the classifier's thresholds differ.
+    _rewrite_snapshot(
+        archived / de / "index", lambda s: s.update(classifier={"rules_version": True})
+    )
+
+
 def _with_an_override_digest(archived, fi, de):
     _rewrite_snapshot(archived / de / "index", lambda s: s.update(overrides_sha256="x"))
 
@@ -364,7 +371,8 @@ def _rewritten_notice(archived, fi, de):
         (_unlicensed, "not a licensed build"),
         (_mixed_overture, "overture_release differs"),
         (_below_schema_9, "schema_version 8"),
-        (_without_a_release, "no overture_release"),
+        (_without_a_release, "no usable overture_release"),
+        (_a_look_alike_classifier, "classifier differs"),
         (_with_an_override_digest, "carries no overrides"),
         (_tampered_table, "does not verify"),
         (_rewritten_notice, "does not verify"),
@@ -376,6 +384,18 @@ def test_a_selection_a_merge_cannot_ship_is_refused(tmp_path, tamper, message):
     tamper(tmp_path, fi, de)
     sources, _ = merge.select_sources(tmp_path)
     with pytest.raises(merge.MergeError, match=message):
+        merge.load_sources(sources)
+
+
+def test_a_manifest_rewritten_after_selection_is_refused_even_when_equal_in_python(
+    tmp_path,
+):
+    fx = pytest.importorskip("index_fixture")
+    fi, _ = _two_runs(fx, tmp_path)
+    sources, _ = merge.select_sources(tmp_path)
+    # ``1 == True`` in Python; in JSON the manifest changed.
+    _rewrite_snapshot(tmp_path / fi / "index", lambda s: s.update(licensed=1))
+    with pytest.raises(merge.MergeError, match="changed since it was selected"):
         merge.load_sources(sources)
 
 

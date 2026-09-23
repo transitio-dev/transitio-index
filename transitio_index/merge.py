@@ -48,6 +48,12 @@ class MergeError(RuntimeError):
     """The selected builds cannot be merged into one snapshot."""
 
 
+def _canonical(value):
+    """A JSON value as its canonical text, so that comparisons are as strict
+    as JSON: ``true`` is not ``1`` and ``9`` is not ``9.0``."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 def select_sources(builds, read_bytes=_read_file):
     """``(sources, skipped)``: the newest run of every label archived under
     ``builds``.
@@ -228,15 +234,25 @@ def _check_sources(snapshots):
                 )
         for field in AGREED_FIELDS:
             value = snapshot.get(field)
-            if value is None:
-                raise MergeError(f"{build_id}: no {field}")
-            if field in agreed and agreed[field][1] != value:
+            if not _well_formed(field, value):
+                raise MergeError(f"{build_id}: no usable {field}: {value!r}")
+            if field in agreed and _canonical(agreed[field][1]) != _canonical(value):
                 first, other = agreed[field]
                 raise MergeError(
                     f"{field} differs: {first} has {other!r}, {build_id} has {value!r}"
                 )
             agreed.setdefault(field, (build_id, value))
     return {field: value for field, (_, value) in agreed.items()}
+
+
+def _well_formed(field, value):
+    """Whether an agreed field holds what publish records there: a release
+    name, a tolerance in degrees, the classifier's thresholds."""
+    if field == "overture_release":
+        return isinstance(value, str) and bool(value)
+    if field == "simplify_tolerance_deg":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, dict) and bool(value)
 
 
 def load_sources(sources, read_bytes=_read_file):
@@ -248,9 +264,11 @@ def load_sources(sources, read_bytes=_read_file):
     The manifests are checked first (``_check_sources``). Each manifest is
     read once, and the tables are verified against those same bytes, so the
     recorded digest names exactly the manifest generation that vouched for
-    the tables. A source that does not verify — a manifest rewritten since
-    it was selected, a digest mismatch, tables that are not a build's — is
-    refused: the merge ships every selected label or nothing.
+    the tables, and the ``snapshot`` kept is what those bytes say. A source
+    that does not verify — a manifest rewritten since it was selected (even
+    to an equal value of another JSON type), a digest mismatch, tables that
+    are not a build's — is refused: the merge ships every selected label or
+    nothing.
     """
     _check_sources([(build_id, snapshot) for build_id, _, snapshot in sources])
     loaded = []
@@ -268,7 +286,9 @@ def load_sources(sources, read_bytes=_read_file):
         verified = load_tables(path, reading, expected=snapshot)
         if verified is None:
             raise MergeError(f"{build_id}: the build does not verify")
-        _, digests, tables = verified
+        current, digests, tables = verified
+        if _canonical(current) != _canonical(snapshot):
+            raise MergeError(f"{build_id}: snapshot.json changed since it was selected")
         try:
             notice = read_bytes(path / "NOTICE")
         except OSError as error:
@@ -280,7 +300,7 @@ def load_sources(sources, read_bytes=_read_file):
                 "label": label_of(build_id),
                 "build_id": build_id,
                 "path": path,
-                "snapshot": snapshot,
+                "snapshot": current,
                 "snapshot_sha256": hashlib.sha256(manifest).hexdigest(),
                 "notice": notice,
                 "notice_sha256": digests["NOTICE"],
