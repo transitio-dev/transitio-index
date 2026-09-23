@@ -317,6 +317,10 @@ def _below_schema_9(archived, fi, de):
     _rewrite_snapshot(archived / fi / "index", lambda s: s.update(schema_version=8))
 
 
+def _without_a_release(archived, fi, de):
+    _rewrite_snapshot(archived / fi / "index", lambda s: s.pop("overture_release"))
+
+
 def _with_an_override_digest(archived, fi, de):
     _rewrite_snapshot(archived / de / "index", lambda s: s.update(overrides_sha256="x"))
 
@@ -337,6 +341,7 @@ def _rewritten_notice(archived, fi, de):
         (_unlicensed, "not a licensed build"),
         (_mixed_overture, "overture_release differs"),
         (_below_schema_9, "schema_version 8"),
+        (_without_a_release, "no overture_release"),
         (_with_an_override_digest, "carries no overrides"),
         (_tampered_table, "does not verify"),
         (_rewritten_notice, "does not verify"),
@@ -349,3 +354,28 @@ def test_a_selection_a_merge_cannot_ship_is_refused(tmp_path, tamper, message):
     sources, _ = merge.select_sources(tmp_path)
     with pytest.raises(merge.MergeError, match=message):
         merge.load_sources(sources)
+
+
+def test_the_recorded_manifest_digest_is_of_the_bytes_the_tables_were_checked_against(
+    tmp_path,
+):
+    fx = pytest.importorskip("index_fixture")
+    fi, _ = _two_runs(fx, tmp_path)
+    reads = []
+
+    def reading(path):  # serves the manifest re-serialised: same JSON, other bytes
+        data = builds._read_file(path)
+        if path.name == "snapshot.json":
+            reads.append(path)
+            return json.dumps(json.loads(data), indent=1).encode()
+        return data
+
+    sources, _ = merge.select_sources(tmp_path, reading)
+    loaded = merge.load_sources(sources, reading)
+    served = json.dumps(loaded[1]["snapshot"], indent=1).encode()
+    assert loaded[1]["build_id"] == fi
+    assert loaded[1]["snapshot_sha256"] == hashlib.sha256(served).hexdigest()
+    disk = (tmp_path / fi / "index" / "snapshot.json").read_bytes()
+    assert loaded[1]["snapshot_sha256"] != hashlib.sha256(disk).hexdigest()
+    # Selection reads each manifest once, loading once more.
+    assert len(reads) == 4

@@ -11,6 +11,7 @@ not ship.
 
 import hashlib
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -201,8 +202,9 @@ def merge_tables(sources, skipped=()):
 
 def _check_sources(snapshots):
     """Refuse a selection the merge cannot ship: a source below schema 9, an
-    unlicensed one, one carrying an override digest, or sources disagreeing
-    on a field of ``AGREED_FIELDS``. Returns the agreed values."""
+    unlicensed one, one carrying an override digest, one without a field of
+    ``AGREED_FIELDS``, or sources disagreeing on one. Returns the agreed
+    values."""
     agreed = {}
     for build_id, snapshot in snapshots:
         version = snapshot.get("schema_version")
@@ -223,7 +225,7 @@ def _check_sources(snapshots):
         for field in AGREED_FIELDS:
             value = snapshot.get(field)
             if value is None:
-                continue
+                raise MergeError(f"{build_id}: no {field}")
             if field in agreed and agreed[field][1] != value:
                 first, other = agreed[field]
                 raise MergeError(
@@ -239,21 +241,28 @@ def load_sources(sources, read_bytes=_read_file):
     of its ``snapshot.json`` and ``NOTICE`` bytes, the ``notice`` itself and
     its ``tables`` as ``load_tables`` joins them.
 
-    The manifests are checked first (``_check_sources``). A source that
-    then does not verify — a manifest rewritten since it was selected, a
-    digest mismatch, tables that are not a build's — is refused: the merge
-    ships every selected label or nothing.
+    The manifests are checked first (``_check_sources``). Each manifest is
+    read once, and the tables are verified against those same bytes, so the
+    recorded digest names exactly the manifest generation that vouched for
+    the tables. A source that does not verify — a manifest rewritten since
+    it was selected, a digest mismatch, tables that are not a build's — is
+    refused: the merge ships every selected label or nothing.
     """
     _check_sources([(build_id, snapshot) for build_id, _, snapshot in sources])
     loaded = []
     for build_id, path, snapshot in sources:
         try:
             manifest = read_bytes(path / "snapshot.json")
-            current = json.loads(manifest)
-        except _SNAPSHOT_ERRORS:
-            manifest, current = b"", None
-        verified = load_tables(path, read_bytes, expected=snapshot)
-        if verified is None or current != snapshot:
+        except OSError as error:
+            raise MergeError(f"{build_id}: snapshot.json: {error}") from error
+
+        def reading(file, manifest=manifest, path=path):
+            return (
+                manifest if Path(file) == path / "snapshot.json" else read_bytes(file)
+            )
+
+        verified = load_tables(path, reading, expected=snapshot)
+        if verified is None:
             raise MergeError(f"{build_id}: the build does not verify")
         _, digests, tables = verified
         try:
