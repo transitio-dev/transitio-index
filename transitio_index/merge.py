@@ -23,6 +23,7 @@ from .builds import (
     _SNAPSHOT_ERRORS,
     _built_at,
     _files_present,
+    _plain_directory,
     _read_file,
     _snapshot_digest,
     archived,
@@ -56,15 +57,18 @@ def select_sources(builds, read_bytes=_read_file):
     complete, undated, not partitioned (before schema 7), or without a feeds
     table. An older run of a skipped label is never consulted: it would show
     stale data as current. Newest is by build date, ties to the lower id; a
-    run whose snapshot or date cannot be read — one still being written —
+    run whose snapshot or date cannot be read — one still being written, or
+    one whose index is not a plain directory and is not read through —
     ranks first and is skipped.
     """
     runs = {}
     for build_id, path in archived(builds, listed=False).items():
-        try:
-            snapshot = json.loads(read_bytes(path / "snapshot.json"))
-        except _SNAPSHOT_ERRORS:
-            snapshot = None
+        snapshot = None
+        if _plain_directory(path):
+            try:
+                snapshot = json.loads(read_bytes(path / "snapshot.json"))
+            except _SNAPSHOT_ERRORS:
+                pass
         runs.setdefault(label_of(build_id), []).append(
             (_built_at(snapshot), build_id, path, snapshot)
         )

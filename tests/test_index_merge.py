@@ -4,6 +4,7 @@ refuses to load."""
 
 import hashlib
 import json
+import os
 
 import pytest
 
@@ -69,6 +70,28 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
         {"id": six, "reason": "not partitioned"},
         {"id": when, "reason": "undated"},
     ]
+
+
+def test_a_run_whose_index_is_a_link_is_skipped_unread_and_not_replaced(tmp_path):
+    archived = tmp_path / "builds"
+    real = _run(archived, "fi", 1, built_at=BUILT(14))
+    _run(archived, "se", 2, built_at=BUILT(13))  # an older, complete run of se
+    linked = archived / "se-0000000000000003"
+    linked.mkdir()
+    try:
+        os.symlink(archived / real / "index", linked / "index")
+    except OSError:
+        pytest.skip("this platform cannot create symlinks")
+    reads = []
+
+    def reading(path):
+        reads.append(path)
+        return builds._read_file(path)
+
+    sources, skipped = merge.select_sources(archived, reading)
+    assert [build_id for build_id, _, _ in sources] == [real]
+    assert skipped == [{"id": linked.name, "reason": "incomplete"}]
+    assert not any(linked in path.parents for path in reads)
 
 
 def _frame(tables, name, index):
