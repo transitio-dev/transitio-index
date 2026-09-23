@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
-from . import publish
+from . import classify, publish
 from .builds import (
     _EPOCH,
     _SNAPSHOT_ERRORS,
@@ -246,19 +246,26 @@ def _check_sources(snapshots):
     return {field: value for field, (_, value) in agreed.items()}
 
 
+def _number(value):
+    """A finite JSON number that is not a boolean."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return isinstance(value, int) or math.isfinite(value)
+
+
 def _well_formed(field, value):
     """Whether an agreed field holds what publish records there: a release
-    name, a tolerance in degrees, the classifier's thresholds."""
+    name, a tolerance in degrees, the classifier's settings — every setting
+    ``classify.classifier_settings`` records, each a number."""
     if field == "overture_release":
         return isinstance(value, str) and bool(value)
     if field == "simplify_tolerance_deg":
-        return (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(value)
-            and value >= 0
-        )
-    return isinstance(value, dict) and bool(value)
+        return _number(value) and value >= 0
+    return (
+        isinstance(value, dict)
+        and set(value) == set(classify.classifier_settings())
+        and all(_number(setting) for setting in value.values())
+    )
 
 
 def load_sources(sources, read_bytes=_read_file):

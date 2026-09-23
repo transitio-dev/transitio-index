@@ -22,7 +22,7 @@ from builds_fixture import (
     _run,
     write_build,
 )
-from transitio_index import builds, merge
+from transitio_index import builds, classify, merge
 
 BUILT = "2026-09-{:02d}T00:00:00+00:00".format
 
@@ -219,7 +219,7 @@ def test_feeds_edges_and_places_merge_by_source(tmp_path):
 MANIFEST_9 = {
     "overture_release": "2026-08-19.0",
     "simplify_tolerance_deg": 0.0005,
-    "classifier": {"rules_version": 3},
+    "classifier": classify.classifier_settings(),
     "coverage_mode": "crawled",
     "sources": {"atlas": {"archive_sha256": "a" * 64}, "mdb": {"csv_sha256": "b" * 64}},
     "stale_place_overrides": 0,
@@ -346,11 +346,18 @@ def _without_a_release(archived, fi, de):
     _rewrite_snapshot(archived / fi / "index", lambda s: s.pop("overture_release"))
 
 
-def _a_look_alike_classifier(archived, fi, de):
-    # ``true`` is not ``1``: the classifier's thresholds differ.
-    _rewrite_snapshot(
-        archived / de / "index", lambda s: s.update(classifier={"rules_version": True})
-    )
+def _another_classifier(archived, fi, de):
+    settings = {**classify.classifier_settings(), "margin": 0.25}
+    _rewrite_snapshot(archived / de / "index", lambda s: s.update(classifier=settings))
+
+
+def _a_malformed_classifier_everywhere(archived, fi, de):
+    # Agreement cannot mask it: ``true`` is not a threshold in either run.
+    settings = {**classify.classifier_settings(), "rules_version": True}
+    for run in (fi, de):
+        _rewrite_snapshot(
+            archived / run / "index", lambda s: s.update(classifier=settings)
+        )
 
 
 def _a_negative_tolerance(archived, fi, de):
@@ -394,7 +401,8 @@ def _rewritten_notice(archived, fi, de):
         (_mixed_overture, "overture_release differs"),
         (_below_schema_9, "schema_version 8"),
         (_without_a_release, "no usable overture_release"),
-        (_a_look_alike_classifier, "classifier differs"),
+        (_another_classifier, "classifier differs"),
+        (_a_malformed_classifier_everywhere, "no usable classifier"),
         (_a_negative_tolerance, "no usable simplify_tolerance_deg"),
         (_feeds_without_service_spans, "does not verify"),
         (_with_an_override_digest, "carries no overrides"),
@@ -430,19 +438,31 @@ def test_the_recorded_manifest_digest_is_of_the_bytes_the_tables_were_checked_ag
     fi, _ = _two_runs(fx, tmp_path)
     reads = []
 
-    def reading(path):  # serves the manifest re-serialised: same JSON, other bytes
+    def reading(path):
         data = builds._read_file(path)
-        if path.name == "snapshot.json":
-            reads.append(path)
-            return json.dumps(json.loads(data), indent=1).encode()
-        return data
+        if path.name != "snapshot.json":
+            return data
+        reads.append(path)
+        if reads.count(path) == 2:  # the load's one read: the disk moves on after it
+            _rewrite_snapshot(path.parent, lambda s: s.update(built_at=BUILT(20)))
+        return json.dumps(json.loads(data), indent=1).encode()  # same JSON, other bytes
 
     sources, _ = merge.select_sources(tmp_path, reading)
     loaded = merge.load_sources(sources, reading)
     served = json.dumps(loaded[1]["snapshot"], indent=1).encode()
     assert loaded[1]["build_id"] == fi
+    assert loaded[1]["snapshot"]["built_at"] == BUILT(14)
     assert loaded[1]["snapshot_sha256"] == hashlib.sha256(served).hexdigest()
-    disk = (tmp_path / fi / "index" / "snapshot.json").read_bytes()
-    assert loaded[1]["snapshot_sha256"] != hashlib.sha256(disk).hexdigest()
-    # Selection reads each manifest once, loading once more.
-    assert len(reads) == 4
+    disk = json.loads((tmp_path / fi / "index" / "snapshot.json").read_text())
+    assert disk["built_at"] == BUILT(20)
+    assert len(reads) == 4  # each manifest once for the selection, once for the load
+
+
+def test_a_large_integer_tolerance_is_a_number_not_an_error(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    for run in _two_runs(fx, tmp_path):
+        _rewrite_snapshot(
+            tmp_path / run / "index", lambda s: s.update(simplify_tolerance_deg=10**400)
+        )
+    sources, _ = merge.select_sources(tmp_path)
+    assert len(merge.load_sources(sources)) == 2
