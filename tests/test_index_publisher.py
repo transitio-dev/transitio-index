@@ -11,7 +11,6 @@ from index_fixture import (  # noqa: E402
     FakeGitHub,
     manifest_bytes as _manifest_bytes,
     pack as _fixture_pack,
-    write_index,
 )
 
 from transitio_index import publish_cli as publish_index  # noqa: E402
@@ -242,7 +241,7 @@ def test_the_cli_needs_a_token(monkeypatch, capsys):
 
 def test_a_partial_index_is_not_releasable(tmp_path):
     cache, _ = _build_index(tmp_path)  # feeds only
-    with pytest.raises(publisher.PublishIndexError, match="places.parquet: missing"):
+    with pytest.raises(publisher.PublishIndexError, match="no places partition"):
         publisher.pack(cache / "index")
 
 
@@ -449,7 +448,22 @@ def test_the_reader_fixture_packs_the_way_the_publisher_does(tmp_path):
     reads, verifies and packs into a compatible release whose archive holds
     the same members the fixture's own packer produces -- the guard that the
     two cannot drift apart. It moves to transitio-index with the build."""
-    directory = write_index(tmp_path / "index")
+    from index_fixture import covered_feed, edge, place, write_partitioned_index
+
+    # The fixture's partitioned index at the schema the build publishes: a
+    # domestic feed and a place it serves, and an edge across a border.
+    feeds = [
+        {**covered_feed("f-hsl"), "home_country": "FI", "scope": "domestic"},
+        {**covered_feed("f-ferry"), "home_country": None, "scope": "international"},
+    ]
+    places = [place("hel", "city", country_code="FI", name="Helsinki")]
+    edges = [
+        edge("hel", "f-hsl", tier="local", relevance_category="primary"),
+        edge("hel", "f-ferry", tier="international", cross_border=True),
+    ]
+    directory = write_partitioned_index(
+        tmp_path / "index", feeds=feeds, places=places, edges=edges, validity={}
+    )
     assets, manifest = publisher.pack(directory)
     ok, reason = contract.compatible(manifest)
     assert ok, reason

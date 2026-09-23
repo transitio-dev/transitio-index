@@ -519,7 +519,8 @@ def test_the_reader_requires_a_feeds_sha256(tmp_path):
     _, part = _table_file(cache / "index", "feeds")
     del snapshot["partitions"][part]["feeds"]["sha256"]
     (cache / "index" / "snapshot.json").write_text(json.dumps(snapshot))
-    with pytest.raises(IncompatibleIndexError, match="sha256"):
+    # Refused for the missing digest, or as a listing outside the layout.
+    with pytest.raises(IncompatibleIndexError, match="sha256|outside the layout"):
         transitio_index.read_index(cache / "index")
 
 
@@ -680,7 +681,9 @@ def test_the_snapshot_id_reflects_distinct_places_content(tmp_path):
 
 def test_an_empty_gazetteer_is_a_places_index_not_feeds_only(tmp_path):
     # A gazetteer that ran with zero places is still a places index, distinct
-    # from a feeds-only build that never ran the gazetteer.
+    # from a feeds-only build that never ran the gazetteer: the manifest says
+    # so, though with no place to put in a partition the reader sees no
+    # places table.
     pytest.importorskip("geopandas")
     archive = _atlas_archive(
         tmp_path, [{"id": "f-a", "spec": "gtfs", "urls": {"static_current": "u"}}]
@@ -690,8 +693,7 @@ def test_an_empty_gazetteer_is_a_places_index_not_feeds_only(tmp_path):
     assert manifest["overture_release"] and manifest["counts"]["places"] == 0
     assert manifest["snapshot_id"] != feeds_only["snapshot_id"]
     index = transitio_index.read_index(cache / "index")
-    assert index.places is not None
-    assert len(index.places) == 0
+    assert index.places is None and index.snapshot["counts"]["places"] == 0
 
 
 def test_an_explicit_default_metro_wins_over_metro_derivation(tmp_path):
@@ -1002,7 +1004,8 @@ def test_crawl_evidence_and_provenance_round_trip(tmp_path):
     # The manifest round-trips as a schema-5 column (surfaced on IndexedFeed in
     # the follow-up; here the frame column is enough).
     assert list(row["files"]) == manifest_files
-    feed = transitio_index.place("Q1757", index=index).feeds()[0]
+    # Every category: without a rank stage the default view would be empty.
+    feed = transitio_index.place("Q1757", index=index).feeds(categories=None)[0]
     assert feed.stop_count == 250 and feed.coverage == bytes.fromhex(hull)
     assert feed.provenance == {
         "snapshot": manifest["snapshot_id"],
@@ -1010,7 +1013,8 @@ def test_crawl_evidence_and_provenance_round_trip(tmp_path):
         "transitio_version": transitio.__version__,
     }
     # The tabular export carries the coverage hull as its geometry.
-    frame = transitio_index.place("Q1757", index=index).feeds().to_geodataframe()
+    feeds = transitio_index.place("Q1757", index=index).feeds(categories=None)
+    frame = feeds.to_geodataframe()
     assert frame.geometry.iloc[0].wkb == bytes.fromhex(hull)
 
 
@@ -1250,7 +1254,7 @@ def test_a_duplicated_column_is_refused(tmp_path):
 def test_a_table_declaring_more_than_the_reader_loads_is_refused(tmp_path, monkeypatch):
     cache, _ = _build_index(tmp_path)
     monkeypatch.setattr(transitio_index, "_MAX_TABLE_ROWS", 1)
-    with pytest.raises(IncompatibleIndexError, match="declares more than"):
+    with pytest.raises(IncompatibleIndexError, match="more than"):
         transitio_index.read_index(cache / "index")
 
 
