@@ -373,11 +373,22 @@ def discover(cache, listed=True):
     found = {}
     if _is_build_dir(cache / "index", root, listed):
         found[LATEST] = cache / "index"
-    builds = cache / "builds"
+    found.update(archived(cache / "builds", listed, root))
+    return found
+
+
+def archived(builds, listed=True, root=None):
+    """``{build_id: index directory}`` for the runs archived under ``builds``
+    (``<label>-<snapshot>/index``), each resolving under ``root`` (the
+    builds directory itself unless the caller names the cache around it).
+    ``listed`` as for ``discover``."""
+    builds = Path(builds)
+    root = builds.resolve() if root is None else root
     try:
         entries = sorted(builds.iterdir()) if not builds.is_symlink() else []
     except OSError:  # no builds/ directory, or it went away mid-scan
         entries = []
+    found = {}
     for entry in entries:
         # ``latest`` (cache/index) and ``catalogue`` are reserved ids, and a
         # symlinked entry could redirect discovery outside the cache.

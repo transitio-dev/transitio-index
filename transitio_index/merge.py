@@ -1,18 +1,22 @@
 """The rules that merge the builds of every label into one index.
 
-``select_sources`` picks the newest complete run of every label under a
-cache and ``merge_tables`` joins the selected builds' tables into one set
-with one row per id. The viewer's catalogue page and the merged snapshot
-both use them, so the page and the release cannot disagree on what the
-merged index holds.
+``select_sources`` picks the newest complete run of every label archived
+under a builds directory and ``merge_tables`` joins the selected builds'
+tables into one set with one row per id. The viewer's catalogue page and
+the merged snapshot both use them, so the page and the release cannot
+disagree on what the merged index holds. ``load_sources`` verifies and
+loads the selection for a merge, refusing what a merged snapshot could
+not ship.
 """
 
+import hashlib
 import json
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 
+from . import publish
 from .builds import (
     _EPOCH,
     _SNAPSHOT_ERRORS,
@@ -20,14 +24,31 @@ from .builds import (
     _files_present,
     _read_file,
     _snapshot_digest,
-    discover,
+    archived,
     label_of,
+    load_tables,
     snapshot_files,
 )
 
+# Manifest fields every source must agree on: a disagreement means builds
+# of different code or data would be mixed into one index.
+AGREED_FIELDS = ("overture_release", "simplify_tolerance_deg", "classifier")
+# The override digests; a merged index carries none, so every source's
+# must be null.
+OVERRIDE_FIELDS = (
+    "overrides_sha256",
+    "feeds_overrides_sha256",
+    "places_overrides_sha256",
+)
 
-def select_sources(cache, read_bytes=_read_file):
-    """``(sources, skipped)``: the newest build of every label under ``cache``.
+
+class MergeError(RuntimeError):
+    """The selected builds cannot be merged into one snapshot."""
+
+
+def select_sources(builds, read_bytes=_read_file):
+    """``(sources, skipped)``: the newest run of every label archived under
+    ``builds``.
 
     ``sources`` lists ``(build_id, path, snapshot)`` by label; ``skipped``
     the labels whose newest run cannot be a source, with the reason: not
@@ -38,7 +59,7 @@ def select_sources(cache, read_bytes=_read_file):
     ranks first and is skipped.
     """
     runs = {}
-    for build_id, path in discover(cache, listed=False).items():
+    for build_id, path in archived(builds, listed=False).items():
         try:
             snapshot = json.loads(read_bytes(path / "snapshot.json"))
         except _SNAPSHOT_ERRORS:
@@ -176,3 +197,82 @@ def merge_tables(sources, skipped=()):
         "skipped": list(skipped),
     }
     return snapshot, tables
+
+
+def _check_sources(snapshots):
+    """Refuse a selection the merge cannot ship: a source below schema 9, an
+    unlicensed one, one carrying an override digest, or sources disagreeing
+    on a field of ``AGREED_FIELDS``. Returns the agreed values."""
+    agreed = {}
+    for build_id, snapshot in snapshots:
+        version = snapshot.get("schema_version")
+        if version != publish.SCHEMA_VERSION:
+            raise MergeError(
+                f"{build_id}: schema_version {version!r}; the merge takes schema "
+                f"{publish.SCHEMA_VERSION} builds only"
+            )
+        if snapshot.get("licensed") is not True or not isinstance(
+            snapshot.get("notice_sha256"), str
+        ):
+            raise MergeError(f"{build_id}: not a licensed build")
+        for field in OVERRIDE_FIELDS:
+            if snapshot.get(field) is not None:
+                raise MergeError(
+                    f"{build_id}: {field} is set; a merged index carries no overrides"
+                )
+        for field in AGREED_FIELDS:
+            value = snapshot.get(field)
+            if value is None:
+                continue
+            if field in agreed and agreed[field][1] != value:
+                first, other = agreed[field]
+                raise MergeError(
+                    f"{field} differs: {first} has {other!r}, {build_id} has {value!r}"
+                )
+            agreed.setdefault(field, (build_id, value))
+    return {field: value for field, (_, value) in agreed.items()}
+
+
+def load_sources(sources, read_bytes=_read_file):
+    """The selection verified and loaded for a merge, in label order: per
+    source its ``label``, ``build_id``, ``path``, ``snapshot``, the SHA-256
+    of its ``snapshot.json`` and ``NOTICE`` bytes, the ``notice`` itself and
+    its ``tables`` as ``load_tables`` joins them.
+
+    The manifests are checked first (``_check_sources``). A source that
+    then does not verify — a manifest rewritten since it was selected, a
+    digest mismatch, tables that are not a build's — is refused: the merge
+    ships every selected label or nothing.
+    """
+    _check_sources([(build_id, snapshot) for build_id, _, snapshot in sources])
+    loaded = []
+    for build_id, path, snapshot in sources:
+        try:
+            manifest = read_bytes(path / "snapshot.json")
+            current = json.loads(manifest)
+        except _SNAPSHOT_ERRORS:
+            manifest, current = b"", None
+        verified = load_tables(path, read_bytes, expected=snapshot)
+        if verified is None or current != snapshot:
+            raise MergeError(f"{build_id}: the build does not verify")
+        _, digests, tables = verified
+        try:
+            notice = read_bytes(path / "NOTICE")
+        except OSError as error:
+            raise MergeError(f"{build_id}: NOTICE: {error}") from error
+        if hashlib.sha256(notice).hexdigest() != digests["NOTICE"]:
+            raise MergeError(f"{build_id}: NOTICE does not match its digest")
+        loaded.append(
+            {
+                "label": label_of(build_id),
+                "build_id": build_id,
+                "path": path,
+                "snapshot": snapshot,
+                "snapshot_sha256": hashlib.sha256(manifest).hexdigest(),
+                "notice": notice,
+                "notice_sha256": digests["NOTICE"],
+                "tables": tables,
+            }
+        )
+    loaded.sort(key=lambda source: source["label"])
+    return loaded

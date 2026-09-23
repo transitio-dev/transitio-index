@@ -556,7 +556,7 @@ class BuildCache:
         return build
 
     def _catalogue(self):
-        sources, skipped = select_sources(self.cache, self.read_bytes)
+        sources, skipped = select_sources(self.cache / "builds", self.read_bytes)
         key = [(build_id, _snapshot_digest(s)) for build_id, _, s in sources]
         key += [(run["id"], run["reason"]) for run in skipped]
         if self._catalogue_key == key and not self._repaired():

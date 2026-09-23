@@ -1,7 +1,11 @@
-"""Tests of the merge rules: which run of each label is a source, and how the
-sources' tables become one set with one row per id."""
+"""Tests of the merge rules: which run of each label is a source, how the
+sources' tables become one set with one row per id, and what a merge
+refuses to load."""
 
+import hashlib
 import json
+
+import pytest
 
 from builds_fixture import (
     BOX,
@@ -17,13 +21,15 @@ from builds_fixture import (
 )
 from transitio_index import builds, merge
 
+BUILT = "2026-09-{:02d}T00:00:00+00:00".format
+
 
 def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     tmp_path,
 ):
     cache = tmp_path / "cache"
     archived = cache / "builds"
-    day = "2026-09-{:02d}T00:00:00+00:00".format
+    day = BUILT
     _run(archived, "fi", 1, built_at=day(13))
     fi = _run(archived, "fi", 2, built_at=day(14))
     de = _run(archived, "de", 3, built_at=day(15))
@@ -44,9 +50,9 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     _run(archived, "raw", 14, built_at=day(13))  # a run without its index yet
     (archived / "raw-000000000000000f").mkdir()
     write_build(archived / "old" / "index")
-    write_build(cache / "index")
+    write_build(cache / "index")  # the cache's own index is not an archived run
     write_build(archived / builds.CATALOGUE / "index")  # a reserved id: not a build
-    sources, skipped = merge.select_sources(cache)
+    sources, skipped = merge.select_sources(archived)
     assert [(b, s["built_at"][8:10]) for b, _, s in sources] == [
         (de, "15"),
         (fi, "14"),
@@ -56,7 +62,6 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     assert skipped == [
         {"id": bad, "reason": "incomplete"},
         {"id": gone, "reason": "incomplete"},
-        {"id": builds.LATEST, "reason": "not partitioned"},
         {"id": nl, "reason": "no feeds"},
         {"id": nodate, "reason": "undated"},
         {"id": "old", "reason": "not partitioned"},
@@ -181,3 +186,166 @@ def test_feeds_edges_and_places_merge_by_source(tmp_path):
         ("fi", ["FI"]),
     ]
     assert snapshot["skipped"] == [{"id": "nl", "reason": "no feeds"}]
+
+
+# ---- loading a selection for a merge: the reader's schema-9 fixture ----
+
+# What a schema-9 build's manifest carries that a merge checks or copies.
+MANIFEST_9 = {
+    "overture_release": "2026-08-19.0",
+    "simplify_tolerance_deg": 0.0005,
+    "classifier": {"rules_version": 3},
+    "coverage_mode": "crawled",
+    "sources": {"atlas": {"archive_sha256": "a" * 64}, "mdb": {"csv_sha256": "b" * 64}},
+    "stale_place_overrides": 0,
+    "stale_feed_overrides": 1,
+    "stale_edge_overrides": 0,
+    "overrides_sha256": None,
+    "feeds_overrides_sha256": None,
+    "places_overrides_sha256": None,
+}
+
+
+def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fields):
+    """A schema-9 run archived as ``<label>-<16 hex>``: the reader fixture's
+    partitioned index with the manifest fields a merge checks."""
+    path = archived / f"{label}-{digit:016x}" / "index"
+    fx.write_partitioned_index(
+        path,
+        feeds=fields.pop("feeds"),
+        places=fields.pop("places"),
+        edges=fields.pop("edges"),
+        realtime=fields.pop("realtime", []),
+        validity={},
+        snapshot_id=f"{digit:016x}",
+        notice=notice,
+    )
+    _rewrite_snapshot(
+        path, lambda s: s.update({**MANIFEST_9, "built_at": built_at, **fields})
+    )
+    return path.parent.name
+
+
+def _two_runs(fx, archived):
+    """A Finnish run and a newer German one that also carries Helsinki."""
+    fi = _archive(
+        fx,
+        archived,
+        "fi",
+        1,
+        built_at=BUILT(14),
+        feeds=[
+            {**fx.covered_feed("hsl"), "home_country": "FI", "scope": "domestic"},
+            {**fx.covered_feed("nat"), "home_country": "FI", "scope": "domestic"},
+        ],
+        places=[
+            fx.place("fi", "country", country_code="FI"),
+            fx.place("hel", "city", country_code="FI", parent_id="fi"),
+        ],
+        edges=[
+            fx.edge("hel", "hsl", tier="local", relevance_category="primary"),
+            fx.edge("fi", "nat", tier="national", relevance_category="secondary"),
+        ],
+        realtime=[fx.realtime_feed("hsl-rt", "hsl"), fx.realtime_feed("lost", None)],
+    )
+    de = _archive(
+        fx,
+        archived,
+        "de",
+        2,
+        built_at=BUILT(15),
+        feeds=[
+            {**fx.covered_feed("flix"), "home_country": "DE", "scope": "domestic"},
+            {
+                **fx.covered_feed("ferry"),
+                "home_country": None,
+                "scope": "international",
+            },
+        ],
+        places=[
+            fx.place("ber", "city", country_code="DE"),
+            fx.place("hel", "city", country_code="FI", parent_id="fi"),
+        ],
+        edges=[
+            fx.edge("ber", "flix", tier="local", relevance_category="primary"),
+            fx.edge("hel", "flix", tier="international", cross_border=True),
+            fx.edge("hel", "ferry", tier="international", cross_border=True),
+        ],
+    )
+    return fi, de
+
+
+def test_a_selection_loads_verified_in_label_order_with_its_digests(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    fi, de = _two_runs(fx, tmp_path)
+    sources, skipped = merge.select_sources(tmp_path)
+    assert skipped == []
+    loaded = merge.load_sources(sources)
+    assert [(s["label"], s["build_id"]) for s in loaded] == [("de", de), ("fi", fi)]
+    for source in loaded:
+        index = tmp_path / source["build_id"] / "index"
+        assert source["path"] == index
+        assert source["snapshot"] == json.loads((index / "snapshot.json").read_text())
+        for name, file in (
+            ("snapshot_sha256", "snapshot.json"),
+            ("notice_sha256", "NOTICE"),
+        ):
+            assert (
+                source[name] == hashlib.sha256((index / file).read_bytes()).hexdigest()
+            )
+        assert source["notice"] == b"NOTICE\n"
+        assert {"feeds.parquet", "places.parquet", "edges.parquet"} <= set(
+            source["tables"]
+        )
+    # The companions ride with the run that has them.
+    assert "realtime.parquet" in loaded[1]["tables"]
+    assert "realtime.parquet" not in loaded[0]["tables"]
+    assert loaded[1]["tables"]["feeds.parquet"]["feed_id"].to_pylist() == ["hsl", "nat"]
+
+
+def _unlicensed(archived, fi, de):
+    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(licensed=False))
+
+
+def _mixed_overture(archived, fi, de):
+    _rewrite_snapshot(
+        archived / de / "index", lambda s: s.update(overture_release="2026-09-01.0")
+    )
+
+
+def _below_schema_9(archived, fi, de):
+    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(schema_version=8))
+
+
+def _with_an_override_digest(archived, fi, de):
+    _rewrite_snapshot(archived / de / "index", lambda s: s.update(overrides_sha256="x"))
+
+
+def _tampered_table(archived, fi, de):
+    file = archived / fi / "index" / "FI" / "edges.parquet"
+    data = file.read_bytes()
+    file.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))  # same size, other bytes
+
+
+def _rewritten_notice(archived, fi, de):
+    (archived / de / "index" / "NOTICE").write_bytes(b"another attribution\n")
+
+
+@pytest.mark.parametrize(
+    "tamper, message",
+    [
+        (_unlicensed, "not a licensed build"),
+        (_mixed_overture, "overture_release differs"),
+        (_below_schema_9, "schema_version 8"),
+        (_with_an_override_digest, "carries no overrides"),
+        (_tampered_table, "does not verify"),
+        (_rewritten_notice, "does not verify"),
+    ],
+)
+def test_a_selection_a_merge_cannot_ship_is_refused(tmp_path, tamper, message):
+    fx = pytest.importorskip("index_fixture")
+    fi, de = _two_runs(fx, tmp_path)
+    tamper(tmp_path, fi, de)
+    sources, _ = merge.select_sources(tmp_path)
+    with pytest.raises(merge.MergeError, match=message):
+        merge.load_sources(sources)
