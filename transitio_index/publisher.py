@@ -339,17 +339,26 @@ def pack(
     written into ``out_dir`` when given. The members are read once, and the
     reader validates that very copy (staged privately), so a build replacing
     the index meanwhile cannot put unvalidated bytes under a validated id.
-    With ``cache_dir``, the lineage the index records must still be current:
-    for a built index its stage generations, checked under the stage locks
-    the publish stage takes, in its order, so nothing moves between the
-    check and the capture; for a merged index its sources against the
-    archived builds under ``builds_dir``."""
+    The lineage the index records must still be current, unless the index
+    is packed with neither ``cache_dir`` nor ``builds_dir`` (the assets-only
+    escape hatch): for a built index its stage generations, checked under
+    the stage locks the publish stage takes, in its order, so nothing moves
+    between the check and the capture; for a merged index its sources
+    against the archived builds under ``builds_dir``. A merged index is
+    keyed by ``builds_dir`` and a built one by ``cache_dir``, so a merged
+    snapshot can never be packed with only ``cache_dir`` and slip its
+    lineage check."""
+    merged = _is_merged(_peek(index_dir))
+    verify = cache_dir is not None or builds_dir is not None
+    if verify and not merged and cache_dir is None:
+        raise PublishIndexError(
+            "a built index is checked against its cache; name the cache directory"
+        )
     with contextlib.ExitStack() as stack:
-        if cache_dir is not None:
-            merged = _is_merged(_peek(index_dir))
+        if verify:
             _lock_lineage(stack, cache_dir, merged)
         members = _members(index_dir)
-        if cache_dir is not None:
+        if verify:
             snapshot = json.loads(dict(members)["snapshot.json"].decode("utf-8"))
             if _is_merged(snapshot) != merged:
                 raise PublishIndexError(
