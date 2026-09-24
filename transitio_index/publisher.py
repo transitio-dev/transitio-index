@@ -141,6 +141,109 @@ def _lock_stages(stack, cache_dir):
     stack.enter_context(crawl.reading(cache_dir))
 
 
+def _is_merged(snapshot):
+    """Whether a manifest is a merge's: it records a ``merged`` block in
+    place of stage generations."""
+    return "merged" in snapshot
+
+
+def _peek(index_dir):
+    """The index's manifest, read to choose the locks its lineage check
+    needs; the check itself reads the manifest again under them."""
+    directory = store.open_directory(pathlib.Path(index_dir))
+    try:
+        return json.loads(_member(directory, "snapshot.json").decode("utf-8"))
+    finally:
+        directory.close()
+
+
+def _lock_lineage(stack, cache_dir, merged):
+    """Hold what the lineage check needs held: for a built index the stage
+    locks the publish stage takes. A merged index needs none beyond its
+    own, which the member read holds and the merge commits under; its
+    lineage lies in the archived builds, which no stage rewrites."""
+    if not merged:
+        _lock_stages(stack, cache_dir)
+
+
+def _check_lineage(cache_dir, snapshot, overrides_dir, builds_dir):
+    if _is_merged(snapshot):
+        _merged_current(snapshot, builds_dir)
+    else:
+        _current(cache_dir, snapshot, overrides_dir)
+
+
+def _merged_current(snapshot, builds_dir):
+    """Refuse a merged index that is no longer the merge of the newest
+    archive of every label under ``builds_dir``: a label added since, a
+    label whose newest run is another, a recorded label no longer archived,
+    or a source whose ``snapshot.json`` or ``NOTICE`` bytes changed since
+    the merge read them. An index recording no merge lineage, or an
+    unlicensed one, cannot ship."""
+    from transitio_index import builds, merge
+
+    records = snapshot.get("merged")
+    if (
+        not isinstance(records, list)
+        or not records
+        or not all(
+            isinstance(record, dict)
+            and all(
+                isinstance(record.get(key), str)
+                for key in ("label", "build_id", "snapshot_sha256", "notice_sha256")
+            )
+            for record in records
+        )
+    ):
+        raise PublishIndexError(
+            "the index records no merge lineage to check; re-run the merge"
+        )
+    if snapshot.get("licensed") is not True:
+        raise PublishIndexError("the index is not licensed; re-run the merge")
+    if builds_dir is None:
+        raise PublishIndexError(
+            "a merged index is checked against its archived builds; name their directory"
+        )
+    sources, _ = merge.select_sources(builds_dir)
+    selected = {
+        builds.label_of(build_id): (build_id, path) for build_id, path, _ in sources
+    }
+    recorded = {record["label"]: record["build_id"] for record in records}
+    moved = {
+        "labels not merged": sorted(set(selected) - set(recorded)),
+        "labels no longer archived": sorted(set(recorded) - set(selected)),
+        "labels with another newest run": sorted(
+            label
+            for label in set(recorded) & set(selected)
+            if selected[label][0] != recorded[label]
+        ),
+    }
+    if any(moved.values()):
+        detail = "; ".join(
+            f"{what}: {', '.join(labels)}" for what, labels in moved.items() if labels
+        )
+        raise PublishIndexError(
+            "the index is no longer the merge of the newest archive of every label "
+            f"({detail}); re-run the merge"
+        )
+    for record in records:
+        path = selected[record["label"]][1]
+        for file, key in (
+            ("snapshot.json", "snapshot_sha256"),
+            ("NOTICE", "notice_sha256"),
+        ):
+            try:
+                data = builds._read_file(path / file)
+            except OSError as error:
+                raise PublishIndexError(
+                    f"{record['build_id']}: {file}: {error}"
+                ) from error
+            if _sha256(data) != record[key]:
+                raise PublishIndexError(
+                    f"{record['build_id']}: {file} changed since the merge; re-run the merge"
+                )
+
+
 def _current(cache_dir, snapshot, overrides_dir):
     """Refuse an index that is no longer what a publish stage would write
     now: a recorded stage generation (the leaf that produced each shipped
@@ -221,21 +324,30 @@ def _current(cache_dir, snapshot, overrides_dir):
             )
 
 
-def pack(index_dir, out_dir=None, *, cache_dir=None, overrides_dir=None):
+def pack(
+    index_dir, out_dir=None, *, cache_dir=None, overrides_dir=None, builds_dir=None
+):
     """The three release assets, as ``(bytes by asset name, manifest)``, and
     written into ``out_dir`` when given. The members are read once, and the
     reader validates that very copy (staged privately), so a build replacing
     the index meanwhile cannot put unvalidated bytes under a validated id.
-    With ``cache_dir``, the stage generations the index records must still
-    be the current ones, checked under the stage locks the publish stage
-    takes, in its order, so nothing moves between the check and the capture."""
+    With ``cache_dir``, the lineage the index records must still be current:
+    for a built index its stage generations, checked under the stage locks
+    the publish stage takes, in its order, so nothing moves between the
+    check and the capture; for a merged index its sources against the
+    archived builds under ``builds_dir``."""
     with contextlib.ExitStack() as stack:
         if cache_dir is not None:
-            _lock_stages(stack, cache_dir)
+            merged = _is_merged(_peek(index_dir))
+            _lock_lineage(stack, cache_dir, merged)
         members = _members(index_dir)
         if cache_dir is not None:
             snapshot = json.loads(dict(members)["snapshot.json"].decode("utf-8"))
-            _current(cache_dir, snapshot, overrides_dir)
+            if _is_merged(snapshot) != merged:
+                raise PublishIndexError(
+                    "the index changed while its lineage was being checked; pack again"
+                )
+            _check_lineage(cache_dir, snapshot, overrides_dir, builds_dir)
             if snapshot.get("notice_sha256") != _sha256(dict(members)["NOTICE"]):
                 raise PublishIndexError(
                     "NOTICE does not match the snapshot's notice_sha256; re-run the "
@@ -280,7 +392,8 @@ def pack(index_dir, out_dir=None, *, cache_dir=None, overrides_dir=None):
                 "crawl_digest",
                 "licensed",
             )
-        },
+        }
+        | ({"merged": snapshot["merged"]} if _is_merged(snapshot) else {}),
     }
     ok, reason = contract.compatible(manifest)
     if not ok:
@@ -367,13 +480,18 @@ def publish_index(
     transport=None,
     cache_dir,
     overrides_dir=None,
+    builds_dir=None,
 ):
     """Pack ``index_dir`` and publish it as the release for its snapshot;
     returns a summary. A failure before the draft is flipped leaves it a
     draft (invisible to clients); a failed round trip afterwards reports a
     release that is already published."""
     assets, manifest = pack(
-        index_dir, out_dir, cache_dir=cache_dir, overrides_dir=overrides_dir
+        index_dir,
+        out_dir,
+        cache_dir=cache_dir,
+        overrides_dir=overrides_dir,
+        builds_dir=builds_dir,
     )
     snapshot_id = manifest["snapshot_id"]
     tag = contract.release_tag(snapshot_id)
@@ -434,8 +552,9 @@ def publish_index(
         # have moved on. A lost response leaves the outcome ambiguous, so
         # the release is read back before deciding.
         with contextlib.ExitStack() as stack:
-            _lock_stages(stack, cache_dir)
-            _current(cache_dir, manifest["lineage"], overrides_dir)
+            lineage = manifest["lineage"]
+            _lock_lineage(stack, cache_dir, _is_merged(lineage))
+            _check_lineage(cache_dir, lineage, overrides_dir, builds_dir)
             try:
                 _check(
                     client.patch(

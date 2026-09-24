@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 from transitio_index.build import DEFAULT_CACHE_DIR  # noqa: E402
+from transitio_index.merge import DEFAULT_BUILDS_DIR  # noqa: E402
 from transitio_index import publisher  # noqa: E402
 from transitio.index import release as contract  # noqa: E402
 
@@ -33,6 +34,13 @@ def parse_args(argv=None):
         type=Path,
         default=Path("overrides"),
         help="directory of override YAML files the build applied (default: overrides)",
+    )
+    parser.add_argument(
+        "--builds-dir",
+        type=Path,
+        default=DEFAULT_BUILDS_DIR,
+        help="the archived builds a merged index is checked against "
+        f"(default: {DEFAULT_BUILDS_DIR})",
     )
     parser.add_argument(
         "--repository",
@@ -76,6 +84,7 @@ def main(argv=None):
                     out_dir=out_dir,
                     cache_dir=arguments.cache_dir,
                     overrides_dir=arguments.overrides_dir,
+                    builds_dir=arguments.builds_dir,
                 )
         else:
             summary = publisher.publish_index(
@@ -86,6 +95,7 @@ def main(argv=None):
                 out_dir=arguments.out_dir,
                 cache_dir=arguments.cache_dir,
                 overrides_dir=arguments.overrides_dir,
+                builds_dir=arguments.builds_dir,
             )
     except Exception as error:  # noqa: B902 - the CLI boundary reads as one line
         if os.environ.get("TRANSITIO_TRACEBACK"):

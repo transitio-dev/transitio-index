@@ -1157,3 +1157,105 @@ def test_a_failure_mid_commit_leaves_an_index_the_reader_refuses_and_the_next_me
     index = read_index(cache / "index")
     assert index.snapshot["snapshot_id"] == manifest["snapshot_id"]
     assert sorted(index.partitions) == ["DE", "FI", "SE", "international", "links"]
+
+
+# ---- releasing a merged snapshot ----
+
+
+def _small_run(fx, archived, label, digit, built_at):
+    """A run of one Swedish feed, place and edge."""
+    return _archive(
+        fx,
+        archived,
+        label,
+        digit,
+        built_at=built_at,
+        notice=_notice_text([GEOB]),
+        feeds=[{**fx.covered_feed("sl"), "home_country": "SE", "scope": "domestic"}],
+        places=[fx.place("sto", "city", country_code="SE")],
+        edges=[fx.edge("sto", "sl", tier="local", relevance_category="primary")],
+    )
+
+
+def _merged_cache(fx, tmp_path):
+    builds, cache = tmp_path / "builds", tmp_path / "cache"
+    fi, de = _two_runs(
+        fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
+    )
+    _run(builds, "nl", 3, feeds=[], edges={})  # skipped: no feeds
+    manifest = merge.merge_builds(builds, cache, log=lambda line: None)
+    return builds, cache, fi, de, manifest
+
+
+def test_the_publisher_packs_a_merged_snapshot_with_its_lineage_checked(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    from transitio_index import publisher
+
+    builds, cache, fi, de, manifest = _merged_cache(fx, tmp_path)
+    assets, release = publisher.pack(
+        cache / "index", cache_dir=cache, builds_dir=builds
+    )
+    assert release["snapshot_id"] == manifest["snapshot_id"]
+    assert release["lineage"]["merged"] == manifest["merged"]
+    assert (
+        release["lineage"]["licensed"] is True
+        and release["lineage"]["generations"] is None
+    )
+    archive = f"transitio-index-{manifest['snapshot_id']}.tar.gz"
+    assert {archive, archive + ".sha256"} < set(assets) and len(assets) == 3
+    # Without the archived builds the lineage cannot be checked.
+    with pytest.raises(publisher.PublishIndexError, match="name their directory"):
+        publisher.pack(cache / "index", cache_dir=cache)
+    # The merge's commit lock is the one the pack takes.
+    index = store.open_subdir(cache, "index")
+    try:
+        with store.exclusive_writer(index):
+            with pytest.raises(store.StoreError, match="another build is publishing"):
+                publisher.pack(cache / "index", cache_dir=cache, builds_dir=builds)
+    finally:
+        index.close()
+
+
+def _a_source_manifest_changed(fx, builds, fi, de):
+    _rewrite_snapshot(builds / de / "index", lambda s: s.update(stale_edge_overrides=1))
+
+
+def _a_source_notice_changed(fx, builds, fi, de):
+    (builds / de / "index" / "NOTICE").write_bytes(_notice_text([GEOB]))
+
+
+def _a_label_with_a_newer_run(fx, builds, fi, de):
+    _small_run(fx, builds, "de", 9, BUILT(16))
+
+
+def _a_label_added(fx, builds, fi, de):
+    _small_run(fx, builds, "se", 5, BUILT(16))
+
+
+def _a_skipped_label_now_valid(fx, builds, fi, de):
+    _small_run(fx, builds, "nl", 4, BUILT(16))
+
+
+def _a_label_gone(fx, builds, fi, de):
+    shutil.rmtree(builds / fi)
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        (_a_source_manifest_changed, "snapshot.json changed since the merge"),
+        (_a_source_notice_changed, "NOTICE changed since the merge"),
+        (_a_label_with_a_newer_run, "labels with another newest run: de"),
+        (_a_label_added, "labels not merged: se"),
+        (_a_skipped_label_now_valid, "labels not merged: nl"),
+        (_a_label_gone, "labels no longer archived: fi"),
+    ],
+)
+def test_a_merged_snapshot_whose_lineage_moved_is_refused(tmp_path, change, message):
+    fx = pytest.importorskip("index_fixture")
+    from transitio_index import publisher
+
+    builds, cache, fi, de, _ = _merged_cache(fx, tmp_path)
+    change(fx, builds, fi, de)
+    with pytest.raises(publisher.PublishIndexError, match=message):
+        publisher.pack(cache / "index", cache_dir=cache, builds_dir=builds)
