@@ -149,7 +149,9 @@ def _is_merged(snapshot):
     A merged release manifest keeps the built-lineage keys as null, which
     is not a stage generation and so not the ambiguity refused here."""
     merged = snapshot.get("merged") is not None
-    built = snapshot.get("generations") or snapshot.get("leaves")
+    built = (
+        snapshot.get("generations") is not None or snapshot.get("leaves") is not None
+    )
     if merged and built:
         raise PublishIndexError(
             "the index records both a merge and a stage lineage; one index is one "
@@ -377,9 +379,9 @@ def pack(
                 )
             _check_lineage(cache_dir, snapshot, overrides_dir, builds_dir)
             if snapshot.get("notice_sha256") != _sha256(dict(members)["NOTICE"]):
+                stage = "merge" if merged else "publish stage"
                 raise PublishIndexError(
-                    "NOTICE does not match the snapshot's notice_sha256; re-run the "
-                    "publish stage"
+                    f"NOTICE does not match the snapshot's notice_sha256; re-run the {stage}"
                 )
     staged = pathlib.Path(tempfile.mkdtemp(prefix="transitio-index-"))
     try:
