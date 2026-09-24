@@ -442,12 +442,14 @@ def pack(
 
 def write_assets(assets, out_dir):
     """Write the assets into ``out_dir`` through the store: atomic replace,
-    never through a symlink someone left under a fixed name."""
+    never through a symlink someone left under a fixed name. A release archive
+    is a stream the reader accepts up to the contract's asset ceiling, larger
+    than a cache table's, so the assets are written under that ceiling."""
     os.makedirs(out_dir, exist_ok=True)
     directory = store.open_directory(pathlib.Path(out_dir))
     try:
         for name, data in assets.items():
-            store.write_bytes(directory, name, data)
+            store.write_bytes(directory, name, data, limit=contract.MAX_ASSET_BYTES)
     finally:
         directory.close()
 

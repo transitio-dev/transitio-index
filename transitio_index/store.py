@@ -428,18 +428,19 @@ def write_file(directory, name, write):
     return digest.hexdigest(), written
 
 
-def write_bytes(directory, name, data):
+def write_bytes(directory, name, data, limit=None):
     """Create ``name`` under ``directory`` from ``data``; return its sha256.
 
     Like :func:`write_file` but for a binary payload produced whole rather than
     as text chunks (the Parquet index). Written to an ``O_EXCL`` temporary,
-    fsynced, then replaced into place, so the name is never half-written.
+    fsynced, then replaced into place, so the name is never half-written. With
+    no ``limit`` the per-artifact ceiling a cache table must stay under
+    applies; a caller writing a release asset, which the reader streams under a
+    larger ceiling, passes that one instead.
     """
-    if len(data) > MAX_ARTIFACT_BYTES:
-        raise StoreError(
-            f"{directory.path / name}: over the "
-            f"{MAX_ARTIFACT_BYTES}-byte artifact ceiling"
-        )
+    ceiling = MAX_ARTIFACT_BYTES if limit is None else limit
+    if len(data) > ceiling:
+        raise StoreError(f"{directory.path / name}: over the {ceiling}-byte ceiling")
     temporary = _temporary_name()
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_BINARY
     handle = directory.open(temporary, flags)

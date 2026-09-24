@@ -826,3 +826,16 @@ def test_a_run_manifest_swaps_a_whole_set_at_once(tmp_path):
     assert current() == {"seed": b"seed-1\n", "metros": b"metros-1\n"}
     run(second)
     assert current() == {"seed": b"seed-2\n", "metros": b"metros-2\n"}
+
+
+def test_write_bytes_honors_an_explicit_limit(tmp_path):
+    directory = store.open_directory(tmp_path)
+    try:
+        with pytest.raises(store.StoreError, match="ceiling"):
+            store.write_bytes(directory, "big", b"x" * 64, limit=8)
+        assert not (tmp_path / "big").exists()  # nothing half-written
+        digest = store.write_bytes(directory, "ok", b"x" * 64, limit=128)
+        assert (tmp_path / "ok").read_bytes() == b"x" * 64
+        assert digest == hashlib.sha256(b"x" * 64).hexdigest()
+    finally:
+        directory.close()

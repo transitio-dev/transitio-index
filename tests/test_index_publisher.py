@@ -506,3 +506,24 @@ def test_pack_ships_a_listed_realtime_table(tmp_path):
     archive = assets[contract.archive_name(manifest["snapshot_id"])]
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
         assert tar.extractfile(f"{part}/realtime.parquet").read() == data
+
+
+def test_write_assets_allows_a_release_asset_over_the_cache_artifact_ceiling(
+    tmp_path, monkeypatch
+):
+    # A merged snapshot's archive is larger than a cache table but well under
+    # the contract's asset ceiling; write_assets must write it all the same.
+    from transitio_index import store
+
+    monkeypatch.setattr(store, "MAX_ARTIFACT_BYTES", 8)
+    asset = b"x" * 64  # over the 8-byte artifact ceiling, under the asset one
+    publisher.write_assets({"transitio-index-0123456789abcdef.tar.gz": asset}, tmp_path)
+    written = tmp_path / "transitio-index-0123456789abcdef.tar.gz"
+    assert written.read_bytes() == asset
+    # A plain cache write of the same bytes is still held to the artifact ceiling.
+    directory = store.open_directory(tmp_path)
+    try:
+        with pytest.raises(store.StoreError, match="ceiling"):
+            store.write_bytes(directory, "cache-table", asset)
+    finally:
+        directory.close()
