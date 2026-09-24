@@ -529,10 +529,10 @@ def test_every_merged_row_lands_in_its_partition_sorted_without_the_merge_column
             assert ("feed_partition" in rows.column_names) == (partition == "links")
 
 
-def _tiny(country="FI", edge_feed="f", edge_place="p"):
+def _tiny(country="FI", edge_feed="f", edge_place="p", home="FI"):
     return {
         "feeds.parquet": pa.table(
-            {"feed_id": ["f"], "home_country": ["FI"], "snapshot": ["x"]}
+            {"feed_id": ["f"], "home_country": [home], "snapshot": ["x"]}
         ),
         "places.parquet": pa.table(
             {"place_id": ["p"], "country_code": [country], "snapshot": ["x"]}
@@ -547,6 +547,9 @@ def _tiny(country="FI", edge_feed="f", edge_place="p"):
     "tables, message",
     [
         (_tiny(country=None), "has no country_code"),
+        (_tiny(country=""), "has no country_code"),
+        (_tiny(country="links"), "not a country partition"),
+        (_tiny(home="../x"), "not a country partition"),
         (_tiny(edge_feed="g"), "edge of a feed the index lacks"),
         (_tiny(edge_place="q"), "edge to a place the index lacks"),
     ],
@@ -554,6 +557,13 @@ def _tiny(country="FI", edge_feed="f", edge_place="p"):
 def test_routing_refuses_what_publish_refuses(tables, message):
     with pytest.raises(merge.MergeError, match=message):
         merge._route(tables)
+
+
+@pytest.mark.parametrize("home", [None, ""])
+def test_a_feed_without_a_home_country_is_international(home):
+    routed = merge._route(_tiny(home=home))
+    assert routed[("international", "feeds")]["feed_id"].to_pylist() == ["f"]
+    assert routed[("links", "edges")]["feed_partition"].to_pylist() == ["international"]
 
 
 def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadata(

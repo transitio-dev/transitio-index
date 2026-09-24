@@ -338,6 +338,22 @@ def _split(table, names):
     return {name: table.take(pa.array(rows)) for name, rows in groups.items()}
 
 
+def _countries(table, key, column):
+    """The country partition of each row of ``table``, keyed by ``key``: the
+    two-letter code in ``column``, None for a null or empty value (what
+    ``publish.partition`` treats as no country). Any other value is refused:
+    a reserved name or a path fragment is not a country partition."""
+    frame = table.select([key, column]).to_pandas().set_index(key)[column]
+    frame = frame.mask(frame == "")
+    codes = frame.dropna()
+    odd = codes[~codes.astype(str).str.fullmatch(r"[A-Z]{2}")]
+    if len(odd):
+        raise MergeError(
+            f"{key} {odd.index[0]} has {column} {odd.iloc[0]!r}; not a country partition"
+        )
+    return frame
+
+
 def _route(tables):
     """The merged tables as ``{(partition, table): rows}``, the rules of
     ``publish.partition`` applied by column values: a feed under its home
@@ -354,10 +370,8 @@ def _route(tables):
     places = _without(tables["places.parquet"], ("build_id",)).sort_by("place_id")
     edges = _without(tables["edges.parquet"], ("feed_partition", "build_id"))
     edges = edges.sort_by([("place_id", "ascending"), ("feed_id", "ascending")])
-    home = feeds.select(["feed_id", "home_country"]).to_pandas()
-    home = home.set_index("feed_id")["home_country"]
-    country = places.select(["place_id", "country_code"]).to_pandas()
-    country = country.set_index("place_id")["country_code"]
+    home = _countries(feeds, "feed_id", "home_country")
+    country = _countries(places, "place_id", "country_code")
     if country.isna().any():
         raise MergeError(
             f"place {country.index[country.isna()][0]} has no country_code; every "
