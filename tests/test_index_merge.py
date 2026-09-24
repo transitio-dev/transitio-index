@@ -1,7 +1,14 @@
-"""Tests of the merge rules: which run of each label is a source, and how the
-sources' tables become one set with one row per id."""
+"""Tests of the merge rules: which run of each label is a source, how the
+sources' tables become one set with one row per id, and what a merge
+refuses to load."""
 
+import hashlib
+import io
 import json
+import os
+
+import pyarrow.parquet as pq
+import pytest
 
 from builds_fixture import (
     BOX,
@@ -15,7 +22,9 @@ from builds_fixture import (
     _run,
     write_build,
 )
-from transitio_index import builds, merge
+from transitio_index import builds, classify, merge
+
+BUILT = "2026-09-{:02d}T00:00:00+00:00".format
 
 
 def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
@@ -23,7 +32,7 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
 ):
     cache = tmp_path / "cache"
     archived = cache / "builds"
-    day = "2026-09-{:02d}T00:00:00+00:00".format
+    day = BUILT
     _run(archived, "fi", 1, built_at=day(13))
     fi = _run(archived, "fi", 2, built_at=day(14))
     de = _run(archived, "de", 3, built_at=day(15))
@@ -44,9 +53,9 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     _run(archived, "raw", 14, built_at=day(13))  # a run without its index yet
     (archived / "raw-000000000000000f").mkdir()
     write_build(archived / "old" / "index")
-    write_build(cache / "index")
+    write_build(cache / "index")  # the cache's own index is not an archived run
     write_build(archived / builds.CATALOGUE / "index")  # a reserved id: not a build
-    sources, skipped = merge.select_sources(cache)
+    sources, skipped = merge.select_sources(archived)
     assert [(b, s["built_at"][8:10]) for b, _, s in sources] == [
         (de, "15"),
         (fi, "14"),
@@ -56,7 +65,6 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     assert skipped == [
         {"id": bad, "reason": "incomplete"},
         {"id": gone, "reason": "incomplete"},
-        {"id": builds.LATEST, "reason": "not partitioned"},
         {"id": nl, "reason": "no feeds"},
         {"id": nodate, "reason": "undated"},
         {"id": "old", "reason": "not partitioned"},
@@ -64,6 +72,28 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
         {"id": six, "reason": "not partitioned"},
         {"id": when, "reason": "undated"},
     ]
+
+
+def test_a_run_whose_index_is_a_link_is_skipped_unread_and_not_replaced(tmp_path):
+    archived = tmp_path / "builds"
+    real = _run(archived, "fi", 1, built_at=BUILT(14))
+    _run(archived, "se", 2, built_at=BUILT(13))  # an older, complete run of se
+    linked = archived / "se-0000000000000003"
+    linked.mkdir()
+    try:
+        os.symlink(archived / real / "index", linked / "index")
+    except OSError:
+        pytest.skip("this platform cannot create symlinks")
+    reads = []
+
+    def reading(path):
+        reads.append(path)
+        return builds._read_file(path)
+
+    sources, skipped = merge.select_sources(archived, reading)
+    assert [build_id for build_id, _, _ in sources] == [real]
+    assert skipped == [{"id": linked.name, "reason": "incomplete"}]
+    assert not any(linked in path.parents for path in reads)
 
 
 def _frame(tables, name, index):
@@ -181,3 +211,258 @@ def test_feeds_edges_and_places_merge_by_source(tmp_path):
         ("fi", ["FI"]),
     ]
     assert snapshot["skipped"] == [{"id": "nl", "reason": "no feeds"}]
+
+
+# ---- loading a selection for a merge: the reader's schema-9 fixture ----
+
+# What a schema-9 build's manifest carries that a merge checks or copies.
+MANIFEST_9 = {
+    "overture_release": "2026-08-19.0",
+    "simplify_tolerance_deg": 0.0005,
+    "classifier": classify.classifier_settings(),
+    "coverage_mode": "crawled",
+    "sources": {"atlas": {"archive_sha256": "a" * 64}, "mdb": {"csv_sha256": "b" * 64}},
+    "stale_place_overrides": 0,
+    "stale_feed_overrides": 1,
+    "stale_edge_overrides": 0,
+    "overrides_sha256": None,
+    "feeds_overrides_sha256": None,
+    "places_overrides_sha256": None,
+}
+
+
+def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fields):
+    """A schema-9 run archived as ``<label>-<16 hex>``: the reader fixture's
+    partitioned index with the manifest fields a merge checks."""
+    path = archived / f"{label}-{digit:016x}" / "index"
+    fx.write_partitioned_index(
+        path,
+        feeds=fields.pop("feeds"),
+        places=fields.pop("places"),
+        edges=fields.pop("edges"),
+        realtime=fields.pop("realtime", []),
+        validity={},
+        snapshot_id=f"{digit:016x}",
+        notice=notice,
+    )
+    _rewrite_snapshot(
+        path, lambda s: s.update({**MANIFEST_9, "built_at": built_at, **fields})
+    )
+    return path.parent.name
+
+
+def _two_runs(fx, archived):
+    """A Finnish run and a newer German one that also carries Helsinki."""
+    fi = _archive(
+        fx,
+        archived,
+        "fi",
+        1,
+        built_at=BUILT(14),
+        feeds=[
+            {**fx.covered_feed("hsl"), "home_country": "FI", "scope": "domestic"},
+            {**fx.covered_feed("nat"), "home_country": "FI", "scope": "domestic"},
+        ],
+        places=[
+            fx.place("fi", "country", country_code="FI"),
+            fx.place("hel", "city", country_code="FI", parent_id="fi"),
+        ],
+        edges=[
+            fx.edge("hel", "hsl", tier="local", relevance_category="primary"),
+            fx.edge("fi", "nat", tier="national", relevance_category="secondary"),
+        ],
+        realtime=[fx.realtime_feed("hsl-rt", "hsl"), fx.realtime_feed("lost", None)],
+    )
+    de = _archive(
+        fx,
+        archived,
+        "de",
+        2,
+        built_at=BUILT(15),
+        feeds=[
+            {**fx.covered_feed("flix"), "home_country": "DE", "scope": "domestic"},
+            {
+                **fx.covered_feed("ferry"),
+                "home_country": None,
+                "scope": "international",
+            },
+        ],
+        places=[
+            fx.place("ber", "city", country_code="DE"),
+            fx.place("hel", "city", country_code="FI", parent_id="fi"),
+        ],
+        edges=[
+            fx.edge("ber", "flix", tier="local", relevance_category="primary"),
+            fx.edge("hel", "flix", tier="international", cross_border=True),
+            fx.edge("hel", "ferry", tier="international", cross_border=True),
+        ],
+    )
+    return fi, de
+
+
+def test_a_selection_loads_verified_in_label_order_with_its_digests(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    fi, de = _two_runs(fx, tmp_path)
+    sources, skipped = merge.select_sources(tmp_path)
+    assert skipped == []
+    loaded = merge.load_sources(sources)
+    assert [(s["label"], s["build_id"]) for s in loaded] == [("de", de), ("fi", fi)]
+    for source in loaded:
+        index = tmp_path / source["build_id"] / "index"
+        assert source["path"] == index
+        assert source["snapshot"] == json.loads((index / "snapshot.json").read_text())
+        for name, file in (
+            ("snapshot_sha256", "snapshot.json"),
+            ("notice_sha256", "NOTICE"),
+        ):
+            assert (
+                source[name] == hashlib.sha256((index / file).read_bytes()).hexdigest()
+            )
+        assert source["notice"] == b"NOTICE\n"
+        assert {"feeds.parquet", "places.parquet", "edges.parquet"} <= set(
+            source["tables"]
+        )
+    # The companions ride with the run that has them.
+    assert "realtime.parquet" in loaded[1]["tables"]
+    assert "realtime.parquet" not in loaded[0]["tables"]
+    assert loaded[1]["tables"]["feeds.parquet"]["feed_id"].to_pylist() == ["hsl", "nat"]
+
+
+def _unlicensed(archived, fi, de):
+    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(licensed=False))
+
+
+def _mixed_overture(archived, fi, de):
+    _rewrite_snapshot(
+        archived / de / "index", lambda s: s.update(overture_release="2026-09-01.0")
+    )
+
+
+def _below_schema_9(archived, fi, de):
+    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(schema_version=8))
+
+
+def _without_a_release(archived, fi, de):
+    _rewrite_snapshot(archived / fi / "index", lambda s: s.pop("overture_release"))
+
+
+def _another_classifier(archived, fi, de):
+    settings = {**classify.classifier_settings(), "margin": 0.25}
+    _rewrite_snapshot(archived / de / "index", lambda s: s.update(classifier=settings))
+
+
+def _a_malformed_classifier_everywhere(archived, fi, de):
+    # Agreement cannot mask it: ``true`` is not a threshold in either run.
+    settings = {**classify.classifier_settings(), "rules_version": True}
+    for run in (fi, de):
+        _rewrite_snapshot(
+            archived / run / "index", lambda s: s.update(classifier=settings)
+        )
+
+
+def _a_negative_tolerance(archived, fi, de):
+    _rewrite_snapshot(
+        archived / de / "index", lambda s: s.update(simplify_tolerance_deg=-0.1)
+    )
+
+
+def _feeds_without_service_spans(archived, fi, de):
+    # Schema-8-shaped feeds under a schema-9 manifest, digests intact.
+    file = archived / fi / "index" / "FI" / "feeds.parquet"
+    table = pq.read_table(file).drop_columns(["service_start", "service_end"])
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    file.write_bytes(sink.getvalue())
+    digest = hashlib.sha256(sink.getvalue()).hexdigest()
+    _rewrite_snapshot(
+        archived / fi / "index",
+        lambda s: s["partitions"]["FI"]["feeds"].update(sha256=digest),
+    )
+
+
+def _with_an_override_digest(archived, fi, de):
+    _rewrite_snapshot(archived / de / "index", lambda s: s.update(overrides_sha256="x"))
+
+
+def _tampered_table(archived, fi, de):
+    file = archived / fi / "index" / "FI" / "edges.parquet"
+    data = file.read_bytes()
+    file.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))  # same size, other bytes
+
+
+def _rewritten_notice(archived, fi, de):
+    (archived / de / "index" / "NOTICE").write_bytes(b"another attribution\n")
+
+
+@pytest.mark.parametrize(
+    "tamper, message",
+    [
+        (_unlicensed, "not a licensed build"),
+        (_mixed_overture, "overture_release differs"),
+        (_below_schema_9, "schema_version 8"),
+        (_without_a_release, "no usable overture_release"),
+        (_another_classifier, "classifier differs"),
+        (_a_malformed_classifier_everywhere, "no usable classifier"),
+        (_a_negative_tolerance, "no usable simplify_tolerance_deg"),
+        (_feeds_without_service_spans, "does not verify"),
+        (_with_an_override_digest, "carries no overrides"),
+        (_tampered_table, "does not verify"),
+        (_rewritten_notice, "does not verify"),
+    ],
+)
+def test_a_selection_a_merge_cannot_ship_is_refused(tmp_path, tamper, message):
+    fx = pytest.importorskip("index_fixture")
+    fi, de = _two_runs(fx, tmp_path)
+    tamper(tmp_path, fi, de)
+    sources, _ = merge.select_sources(tmp_path)
+    with pytest.raises(merge.MergeError, match=message):
+        merge.load_sources(sources)
+
+
+def test_a_manifest_rewritten_after_selection_is_refused_even_when_equal_in_python(
+    tmp_path,
+):
+    fx = pytest.importorskip("index_fixture")
+    fi, _ = _two_runs(fx, tmp_path)
+    sources, _ = merge.select_sources(tmp_path)
+    # ``1 == True`` in Python; in JSON the manifest changed.
+    _rewrite_snapshot(tmp_path / fi / "index", lambda s: s.update(licensed=1))
+    with pytest.raises(merge.MergeError, match="changed since it was selected"):
+        merge.load_sources(sources)
+
+
+def test_the_recorded_manifest_digest_is_of_the_bytes_the_tables_were_checked_against(
+    tmp_path,
+):
+    fx = pytest.importorskip("index_fixture")
+    fi, _ = _two_runs(fx, tmp_path)
+    reads = []
+
+    def reading(path):
+        data = builds._read_file(path)
+        if path.name != "snapshot.json":
+            return data
+        reads.append(path)
+        if reads.count(path) == 2:  # the load's one read: the disk moves on after it
+            _rewrite_snapshot(path.parent, lambda s: s.update(built_at=BUILT(20)))
+        return json.dumps(json.loads(data), indent=1).encode()  # same JSON, other bytes
+
+    sources, _ = merge.select_sources(tmp_path, reading)
+    loaded = merge.load_sources(sources, reading)
+    served = json.dumps(loaded[1]["snapshot"], indent=1).encode()
+    assert loaded[1]["build_id"] == fi
+    assert loaded[1]["snapshot"]["built_at"] == BUILT(14)
+    assert loaded[1]["snapshot_sha256"] == hashlib.sha256(served).hexdigest()
+    disk = json.loads((tmp_path / fi / "index" / "snapshot.json").read_text())
+    assert disk["built_at"] == BUILT(20)
+    assert len(reads) == 4  # each manifest once for the selection, once for the load
+
+
+def test_a_large_integer_tolerance_is_a_number_not_an_error(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    for run in _two_runs(fx, tmp_path):
+        _rewrite_snapshot(
+            tmp_path / run / "index", lambda s: s.update(simplify_tolerance_deg=10**400)
+        )
+    sources, _ = merge.select_sources(tmp_path)
+    assert len(merge.load_sources(sources)) == 2

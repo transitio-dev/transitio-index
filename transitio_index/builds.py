@@ -81,6 +81,11 @@ SCHEMA_7_COLUMNS = {
         "urls",
     },
 }
+# What schema 9 adds: the feeds' service spans and the places' validity.
+SCHEMA_9_COLUMNS = {
+    "feeds.parquet": {"service_start", "service_end"},
+    "places.parquet": {"validity"},
+}
 
 
 LATEST = "latest"  # the id of the build at cache/index
@@ -306,6 +311,8 @@ def load_tables(path, read_bytes=_read_file, expected=None):
         files = snapshot_files(snapshot)
         if files is None:
             return None
+        version = snapshot.get("schema_version")
+        dated = isinstance(version, int) and version >= 9
         digests, tables = {}, {}
         for name, (digest, rows) in files.items():
             partition = name.rpartition("/")[0]
@@ -325,6 +332,7 @@ def load_tables(path, read_bytes=_read_file, expected=None):
                 if "partitions" in snapshot and not (
                     _has_columns(table, base, REQUIRED_COLUMNS)
                     and _has_columns(table, base, SCHEMA_7_COLUMNS)
+                    and (not dated or _has_columns(table, base, SCHEMA_9_COLUMNS))
                 ):
                     return None
                 tables[name] = table
@@ -373,11 +381,22 @@ def discover(cache, listed=True):
     found = {}
     if _is_build_dir(cache / "index", root, listed):
         found[LATEST] = cache / "index"
-    builds = cache / "builds"
+    found.update(archived(cache / "builds", listed, root))
+    return found
+
+
+def archived(builds, listed=True, root=None):
+    """``{build_id: index directory}`` for the runs archived under ``builds``
+    (``<label>-<snapshot>/index``), each resolving under ``root`` (the
+    builds directory itself unless the caller names the cache around it).
+    ``listed`` as for ``discover``."""
+    builds = Path(builds)
+    root = builds.resolve() if root is None else root
     try:
         entries = sorted(builds.iterdir()) if not builds.is_symlink() else []
     except OSError:  # no builds/ directory, or it went away mid-scan
         entries = []
+    found = {}
     for entry in entries:
         # ``latest`` (cache/index) and ``catalogue`` are reserved ids, and a
         # symlinked entry could redirect discovery outside the cache.
