@@ -232,7 +232,10 @@ GITHUB_TOKEN=... python -m transitio_index.publish_cli --cache-dir cache
 
 It creates a draft release, uploads and verifies the assets, then publishes,
 and prints the round trip a client would make. The publisher refuses an
-unlicensed or lineage-incomplete build.
+unlicensed or lineage-incomplete build. A merged snapshot is released the same
+way from its own cache (`--cache-dir cache/merged`); its lineage is checked
+against the archived builds (`--builds-dir`, the merge's `--builds`), and a
+merge that is no longer of the newest archive of every label is refused.
 
 ## Conventions
 
