@@ -587,3 +587,121 @@ def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadat
     # The same tables give the same bytes again.
     again, _ = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
     assert again == files
+
+
+# ---- the merged snapshot: its id and its manifest ----
+
+
+def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
+    tmp_path, monkeypatch
+):
+    fx = pytest.importorskip("index_fixture")
+    import transitio
+    from transitio.index import DISCOVERY_SEMANTICS_VERSION, MIN_READER_VERSIONS
+
+    fi, de = _two_runs(fx, tmp_path)
+    loaded, tables = _merged(tmp_path)
+    manifest, files = merge.assemble(loaded, tables, b"NOTICE\n")
+    snapshot_id = manifest["snapshot_id"]
+    assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
+    read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
+    assert set(read["snapshot"].to_pylist()) == {snapshot_id}
+    assert manifest["schema_version"] == 9
+    assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
+    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[9]
+    assert manifest["built_with"] == transitio.__version__
+    assert manifest["built_at"] == BUILT(15)  # the newest source's, not the clock
+    assert manifest["counts"] == {
+        "feeds": 4,
+        "by_source": {"atlas": 4},
+        "feeds_dated": 0,
+        "realtime": 2,
+        "realtime_linked": 1,
+        "realtime_unlinked": 1,
+        "places": 3,
+        "places_by_kind": {"city": 2, "country": 1},
+        "edges": 5,
+        "edges_by_tier": {"international": 2, "local": 2, "national": 1},
+    }
+    assert {
+        p: {t: e["rows"] for t, e in ts.items()}
+        for p, ts in manifest["partitions"].items()
+    } == {
+        "DE": {"edges": 1, "feeds": 1, "places": 1},
+        "FI": {"edges": 2, "feeds": 2, "places": 2, "realtime": 1},
+        "international": {"feeds": 1, "realtime": 1},
+        "links": {"edges": 2},
+    }
+    for (partition, table), data in files.items():
+        assert (
+            manifest["partitions"][partition][table]["sha256"]
+            == hashlib.sha256(data).hexdigest()
+        )
+    assert manifest["licensed"] is True
+    assert manifest["notice_sha256"] == hashlib.sha256(b"NOTICE\n").hexdigest()
+    assert manifest["overture_release"] == "2026-08-19.0"
+    assert manifest["simplify_tolerance_deg"] == 0.0005
+    assert manifest["classifier"] == classify.classifier_settings()
+    assert manifest["coverage_mode"] == "crawled"
+    assert manifest["unknown_share"] == 0.0 and manifest["margin_share"] == 0.0
+    assert all(manifest[field] is None for field in merge.OVERRIDE_FIELDS)
+    assert manifest["stale_feed_overrides"] == 2 and manifest["stale_overrides"] == 2
+    # The sources by portable identities only, in label order.
+    assert [(s["label"], s["build_id"]) for s in manifest["merged"]] == [
+        ("de", de),
+        ("fi", fi),
+    ]
+    for record, source in zip(manifest["merged"], loaded):
+        assert record["snapshot_id"] == source["snapshot"]["snapshot_id"]
+        assert record["built_at"] == source["snapshot"]["built_at"]
+        assert record["coverage_mode"] == "crawled"
+        assert record["sources"] == MANIFEST_9["sources"]
+        assert record["partitions"] == source["snapshot"]["partitions"]
+        assert record["snapshot_sha256"] == source["snapshot_sha256"]
+        assert record["notice_sha256"] == source["notice_sha256"]
+    assert str(tmp_path) not in json.dumps(manifest)
+    assert "generations" not in manifest and "leaves" not in manifest
+    # The same sources give the same id, manifest and bytes; another
+    # NOTICE changes only its digest; another merge format, the id.
+    again, files_again = merge.assemble(*_merged(tmp_path), b"NOTICE\n")
+    assert again == manifest and files_again == files
+    other, _ = merge.assemble(loaded, tables, b"other\n")
+    assert (
+        other["snapshot_id"] == snapshot_id
+        and other["notice_sha256"] != manifest["notice_sha256"]
+    )
+    monkeypatch.setattr(merge, "MERGE_FORMAT", merge.MERGE_FORMAT + 1)
+    assert merge.assemble(loaded, tables, b"NOTICE\n")[0]["snapshot_id"] != snapshot_id
+
+
+def test_assemble_recounts_the_shares_and_marks_a_mixed_coverage(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    _two_runs(fx, tmp_path)
+    _archive(
+        fx,
+        tmp_path,
+        "se",
+        3,
+        built_at=BUILT(13),
+        coverage_mode="declared",
+        feeds=[{**fx.covered_feed("sl"), "home_country": "SE", "scope": "domestic"}],
+        places=[fx.place("sto", "city", country_code="SE")],
+        edges=[
+            {
+                **fx.edge("sto", "sl", tier="unknown"),
+                "evidence": {"near_threshold": True},
+            }
+        ],
+    )
+    loaded, tables = _merged(tmp_path)
+    manifest, _ = merge.assemble(loaded, tables, b"NOTICE\n")
+    assert manifest["coverage_mode"] == "mixed"
+    assert manifest["counts"]["edges"] == 6
+    assert manifest["unknown_share"] == pytest.approx(1 / 6)
+    assert manifest["margin_share"] == pytest.approx(1 / 6)
+    assert manifest["built_at"] == BUILT(15)
+    assert [s["coverage_mode"] for s in manifest["merged"]] == [
+        "crawled",
+        "crawled",
+        "declared",
+    ]
