@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import time
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -671,6 +672,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     # The same sources give the same id, manifest and bytes; another
     # NOTICE changes only its digest; another merge format, the id; so
     # does any change to a source's manifest, and nothing else does.
+    monkeypatch.setattr(time, "time", lambda: 4102444800.0)  # another day
     again, files_again = merge.assemble(*_merged(tmp_path), b"NOTICE\n")
     assert again == manifest and files_again == files
     other, _ = merge.assemble(loaded, tables, b"other\n")
@@ -756,6 +758,26 @@ def test_the_merged_block_carries_portable_identities_only(tmp_path):
     }
     assert set(record["partitions"]["FI"]["feeds"]) == {"rows", "sha256"}
     assert "/tmp" not in json.dumps(manifest)
-    _rewrite_snapshot(tmp_path / fi / "index", lambda s: s.pop("sources"))
-    with pytest.raises(merge.MergeError, match="no catalogue sources"):
-        merge.assemble(*_merged(tmp_path), b"NOTICE\n")
+    for sources, message in (
+        ({}, "no catalogue sources"),
+        ({"other": {"x": 1}}, "no catalogue sources"),
+        ({"atlas": "a4d0204"}, "catalogue atlas is not a record"),
+    ):
+        _rewrite_snapshot(tmp_path / fi / "index", lambda s: s.update(sources=sources))
+        with pytest.raises(merge.MergeError, match=message):
+            merge.assemble(*_merged(tmp_path), b"NOTICE\n")
+
+
+def test_the_snapshot_id_tells_apart_fields_a_delimiter_would_blur():
+    def loaded(label, build_id):
+        return [
+            {
+                "label": label,
+                "build_id": build_id,
+                "snapshot_sha256": "0" * 64,
+                "notice_sha256": "1" * 64,
+            }
+        ]
+
+    assert merge._merged_id(loaded("a|b", "c")) != merge._merged_id(loaded("a", "b|c"))
+    assert merge._merged_id(loaded("a", "b")) == merge._merged_id(loaded("a", "b"))

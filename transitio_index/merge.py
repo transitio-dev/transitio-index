@@ -455,20 +455,18 @@ def _merged_id(loaded):
     names another."""
     from transitio import __version__ as transitio_version
 
-    parts = [
-        str(publish.SCHEMA_VERSION),
-        str(MERGE_FORMAT),
-        transitio_version,
-        pa.__version__,
-    ]
+    parts = [publish.SCHEMA_VERSION, MERGE_FORMAT, transitio_version, pa.__version__]
     for source in sorted(loaded, key=lambda s: s["label"]):
-        parts += [
-            source["label"],
-            source["build_id"],
-            source["snapshot_sha256"],
-            source["notice_sha256"],
-        ]
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+        parts.append(
+            [
+                source["label"],
+                source["build_id"],
+                source["snapshot_sha256"],
+                source["notice_sha256"],
+            ]
+        )
+    # Canonical JSON: a typed list, unambiguous whatever a label contains.
+    return hashlib.sha256(_canonical(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def _shares(edges):
@@ -500,15 +498,20 @@ CATALOGUE_PINS = {
 
 def _pins(snapshot, build_id):
     """A source's catalogue pins, projected to ``CATALOGUE_PINS``: portable
-    identities only, whatever else the manifest carries there."""
+    identities only, whatever else the manifest carries there. A manifest
+    naming no catalogue, or one whose record is not an object, is refused."""
     sources = snapshot.get("sources")
-    if not isinstance(sources, dict):
+    if not isinstance(sources, dict) or not set(sources) & set(CATALOGUE_PINS):
         raise MergeError(f"{build_id}: no catalogue sources in the manifest")
-    return {
-        catalogue: {key: pinned.get(key) for key in keys}
-        for catalogue, keys in CATALOGUE_PINS.items()
-        if isinstance(pinned := sources.get(catalogue), dict)
-    }
+    pins = {}
+    for catalogue, keys in CATALOGUE_PINS.items():
+        if catalogue not in sources:
+            continue
+        pinned = sources[catalogue]
+        if not isinstance(pinned, dict):
+            raise MergeError(f"{build_id}: catalogue {catalogue} is not a record")
+        pins[catalogue] = {key: pinned.get(key) for key in keys}
+    return pins
 
 
 def _listing(snapshot):
