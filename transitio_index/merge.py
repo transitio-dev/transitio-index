@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import math
+import re
 from pathlib import Path
 
 import numpy as np
@@ -703,16 +704,29 @@ def _agree(current, value, what, build_id):
     return value
 
 
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
 def _catalogue_lines(loaded):
-    """One line per catalogue archive or CSV the sources read, by digest."""
-    lines = []
-    for dataset, catalogue, key, called in NOTICE_CATALOGUES:
-        pins = {
-            _pins(s["snapshot"], s["build_id"]).get(catalogue, {}).get(key)
-            for s in loaded
-        }
-        lines += [f"  - {dataset}, {called} {pin}" for pin in sorted(pins - {None})]
-    return lines
+    """One line per catalogue archive or CSV the sources read, by digest. A
+    catalogue a source names must carry its digest as a SHA-256 string."""
+    digests = {catalogue: set() for _, catalogue, _, _ in NOTICE_CATALOGUES}
+    for source in loaded:
+        pins = _pins(source["snapshot"], source["build_id"])
+        for _, catalogue, key, _ in NOTICE_CATALOGUES:
+            if catalogue not in pins:
+                continue
+            digest = pins[catalogue].get(key)
+            if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+                raise MergeError(
+                    f"{source['build_id']}: {catalogue} {key} is not a SHA-256: {digest!r}"
+                )
+            digests[catalogue].add(digest)
+    return [
+        f"  - {dataset}, {called} {digest}"
+        for dataset, catalogue, _, called in NOTICE_CATALOGUES
+        for digest in sorted(digests[catalogue])
+    ]
 
 
 def _licence_records(feeds):
@@ -728,15 +742,29 @@ def _licence_records(feeds):
     )
     for atlas, mdb, judged in zip(*columns):
         try:
-            blocks = [json.loads(block) if block else None for block in (atlas, mdb)]
+            blocks = [
+                None if block is None else json.loads(block) for block in (atlas, mdb)
+            ]
         except (TypeError, ValueError, RecursionError) as error:
             raise MergeError(f"feed catalogue block is not JSON: {error}") from error
         if not all(block is None or isinstance(block, dict) for block in blocks):
             raise MergeError("feed catalogue block is not a record")
+        licence = (blocks[0] or {}).get("license")
+        if licence is not None and not isinstance(licence, dict):
+            raise MergeError("feed licence block is not a record")
         records.append(
             {"atlas": blocks[0], "mdb": blocks[1], "redistribution_allowed": judged}
         )
     return records
+
+
+def _licence_rows(feeds):
+    """The feed-licence inventory of the merged feeds, as the license stage
+    writes it; a block the stage's inventory cannot take is refused."""
+    try:
+        return licensing._feed_rows(_licence_records(feeds))
+    except (TypeError, AttributeError) as error:
+        raise MergeError(f"feed licences cannot be inventoried: {error}") from error
 
 
 def compose_notice(loaded, feeds):
@@ -766,8 +794,7 @@ def compose_notice(loaded, feeds):
     if metro is not None:
         paragraphs.append([*metro, *sorted(credits)])
     paragraphs.append([CATALOGUE_OPENING, *_catalogue_lines(loaded)])
-    rows = licensing._feed_rows(_licence_records(feeds))
-    paragraphs.append(licensing._licence_lines(rows))
+    paragraphs.append(licensing._licence_lines(_licence_rows(feeds)))
     return ("\n\n".join("\n".join(lines) for lines in paragraphs) + "\n").encode(
         "utf-8"
     )

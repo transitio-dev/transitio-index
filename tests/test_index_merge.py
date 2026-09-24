@@ -952,22 +952,35 @@ def test_a_source_notice_the_merge_cannot_compose_from_is_refused(
         merge.compose_notice(loaded, tables["feeds.parquet"])
 
 
+def _feeds_with(atlas):
+    return pa.table({"atlas": [atlas], "mdb": [None], "redistribution_allowed": [None]})
+
+
 @pytest.mark.parametrize(
     "feeds, message",
     [
         (pa.table({"feed_id": ["f"]}), "without atlas"),
-        (
-            pa.table(
-                {"atlas": ["[1]"], "mdb": [None], "redistribution_allowed": [None]}
-            ),
-            "is not a record",
-        ),
-        (
-            pa.table({"atlas": ["{"], "mdb": [None], "redistribution_allowed": [None]}),
-            "is not JSON",
-        ),
+        (_feeds_with("[1]"), "block is not a record"),
+        (_feeds_with("{"), "is not JSON"),
+        (_feeds_with(""), "is not JSON"),
+        (_feeds_with('{"license": [1]}'), "licence block is not a record"),
+        (_feeds_with('{"license": {"url": ["x"]}}'), "cannot be inventoried"),
     ],
 )
 def test_feeds_whose_catalogue_blocks_cannot_be_inventoried_are_refused(feeds, message):
     with pytest.raises(merge.MergeError, match=message):
-        merge._licence_records(feeds)
+        merge._licence_rows(feeds)
+
+
+@pytest.mark.parametrize(
+    "pins, message",
+    [
+        ({"atlas": {}}, "atlas archive_sha256 is not a SHA-256: None"),
+        ({"mdb": {"csv_sha256": "short"}}, "mdb csv_sha256 is not a SHA-256"),
+        ({"gbfs": {"csv_sha256": ["x"]}}, "gbfs csv_sha256 is not a SHA-256"),
+    ],
+)
+def test_a_catalogue_without_its_digest_is_refused(pins, message):
+    loaded = [{"build_id": "b", "snapshot": {"sources": pins}}]
+    with pytest.raises(merge.MergeError, match=message):
+        merge._catalogue_lines(loaded)
