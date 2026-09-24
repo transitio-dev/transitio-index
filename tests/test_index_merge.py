@@ -253,14 +253,24 @@ def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fiel
     return path.parent.name
 
 
-def _two_runs(fx, archived):
-    """A Finnish run and a newer German one that also carries Helsinki."""
+HSL_LICENCE = {"spdx_identifier": "CC-BY-4.0", "url": "https://hsl.example/licence"}
+DE_SOURCES = {
+    "atlas": {"archive_sha256": "d" * 64},
+    "mdb": {"csv_sha256": "e" * 64},
+    "gbfs": {"csv_sha256": "f" * 64},
+}
+
+
+def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
+    """A Finnish run and a newer German one that also carries Helsinki; the
+    German run read other catalogue samples."""
     fi = _archive(
         fx,
         archived,
         "fi",
         1,
         built_at=BUILT(14),
+        notice=fi_notice,
         feeds=[
             {
                 **fx.covered_feed("hsl"),
@@ -268,6 +278,7 @@ def _two_runs(fx, archived):
                 "scope": "domestic",
                 "service_start": "2026-01-01",
                 "service_end": "2026-12-31",
+                "atlas": {"license": HSL_LICENCE},
             },
             {**fx.covered_feed("nat"), "home_country": "FI", "scope": "domestic"},
         ],
@@ -287,6 +298,8 @@ def _two_runs(fx, archived):
         "de",
         2,
         built_at=BUILT(15),
+        notice=de_notice,
+        sources=DE_SOURCES,
         feeds=[
             {**fx.covered_feed("flix"), "home_country": "DE", "scope": "domestic"},
             {
@@ -662,14 +675,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         assert record["snapshot_id"] == source["snapshot"]["snapshot_id"]
         assert record["built_at"] == source["snapshot"]["built_at"]
         assert record["coverage_mode"] == "crawled"
-        assert record["sources"] == {
-            "atlas": {
-                "commit": None,
-                "archive_sha256": "a" * 64,
-                "commit_verified": None,
-            },
-            "mdb": {"csv_label": None, "csv_sha256": "b" * 64},
-        }
+        assert record["sources"] == merge._pins(source["snapshot"], source["build_id"])
         assert record["partitions"] == source["snapshot"]["partitions"]
         assert record["snapshot_sha256"] == source["snapshot_sha256"]
         assert record["notice_sha256"] == source["notice_sha256"]
@@ -829,3 +835,152 @@ def test_the_snapshot_id_tells_apart_fields_a_delimiter_would_blur():
 
     assert merge._merged_id(loaded("a|b", "c")) != merge._merged_id(loaded("a", "b|c"))
     assert merge._merged_id(loaded("a", "b")) == merge._merged_id(loaded("a", "b"))
+
+
+# ---- the merged NOTICE ----
+
+GEOMETRY = [
+    "This index includes place boundary geometry from the Overture Maps",
+    "divisions theme (release 2026-08-19.0), provided under CDLA-Permissive-2.0",
+    "(https://cdla.dev/permissive-2-0/) and derived from:",
+]
+ODBL = [
+    "Geometry derived from OpenStreetMap is a Derived Database under the",
+    "Open Database License (ODbL 1.0) and is made available under that same",
+    "licence; its share-alike terms apply.",
+]
+METRO = [
+    "Metro memberships were derived at build time from these sources;",
+    "the derived use ships no boundary data of its own:",
+]
+ESRI = (
+    "  - Esri Community Maps — CC0 1.0 (https://creativecommons.org/publicdomain/zero/)"
+)
+OSM = (
+    "  - OpenStreetMap, © OpenStreetMap contributors — ODbL 1.0 (https://odbl.example/)"
+)
+GEOB = "  - geoBoundaries — CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)"
+EUROSTAT = (
+    "  - Source: Eurostat, metropolitan regions (NUTS 2021) — Eurostat copyright notice"
+)
+GHS = "  - GHS Urban Centre Database 2025 (GHS-UCDB R2024A) — CC BY 4.0"
+CATALOGUES = [
+    "Feed identities and coverage were compiled from:",
+    "  - Transitland Atlas, commit 84829aaf23e7f07a9633fbed1a4a7d3e44ae9362",
+]
+LICENCES = [
+    "Feed licences declared by the catalogues (feeds per licence):",
+    "  - none declared: 2",
+]
+
+
+def _paragraphs(paragraphs):
+    return ("\n\n".join("\n".join(lines) for lines in paragraphs) + "\n").encode()
+
+
+def _notice_text(derived=(), odbl=ODBL, metro=(), geometry=GEOMETRY):
+    """A NOTICE as the license stage writes it for one build."""
+    paragraphs = [[*geometry, *derived]]
+    if odbl:
+        paragraphs.append(odbl)
+    if metro:
+        paragraphs.append([*METRO, *metro])
+    return _paragraphs([*paragraphs, CATALOGUES, LICENCES])
+
+
+def test_the_merged_notice_credits_every_source_once_and_recounts_the_licences(
+    tmp_path,
+):
+    fx = pytest.importorskip("index_fixture")
+    _two_runs(
+        fx,
+        tmp_path,
+        fi_notice=_notice_text(odbl=None, metro=[EUROSTAT]),  # a feeds-only style run
+        de_notice=_notice_text([OSM, ESRI, GEOB], metro=[GHS, EUROSTAT]),
+    )
+    loaded, tables = _merged(tmp_path)
+    notice = merge.compose_notice(loaded, tables["feeds.parquet"])
+    assert notice == _paragraphs(
+        [
+            [*GEOMETRY, *sorted([ESRI, OSM, GEOB])],
+            ODBL,
+            [*METRO, *sorted([EUROSTAT, GHS])],
+            [
+                "Feed identities and coverage were compiled from:",
+                "  - Transitland Atlas, archive sha256 " + "a" * 64,
+                "  - Transitland Atlas, archive sha256 " + "d" * 64,
+                "  - Mobility Database catalog, sha256 " + "b" * 64,
+                "  - Mobility Database catalog, sha256 " + "e" * 64,
+                "  - GBFS systems.csv, sha256 " + "f" * 64,
+            ],
+            [
+                "Feed licences declared by the catalogues (feeds per licence):",
+                "  - CC-BY-4.0: 1",
+                "      url: https://hsl.example/licence",
+                "  - none declared: 3",
+            ],
+        ]
+    )
+    assert b"84829aaf" not in notice  # the commit no build verified is not named
+    assert merge.compose_notice(loaded, tables["feeds.parquet"]) == notice
+
+
+@pytest.mark.parametrize(
+    "de_notice, message",
+    [
+        (b"NOTICE\n", "paragraph unknown"),
+        (_paragraphs([GEOMETRY, LICENCES]), "lacks its catalogue paragraph"),
+        (
+            _paragraphs([GEOMETRY, CATALOGUES, LICENCES, LICENCES]),
+            "repeats its licence",
+        ),
+        (
+            _notice_text(geometry=[*GEOMETRY[:1], "another release", GEOMETRY[2]]),
+            "geometry notice differs",
+        ),
+        (_notice_text(odbl=[*ODBL[:2], "other terms"]), "ODbL notice differs"),
+        (b"\xff\xfe", "not UTF-8"),
+    ],
+)
+def test_a_source_notice_the_merge_cannot_compose_from_is_refused(
+    tmp_path, de_notice, message
+):
+    fx = pytest.importorskip("index_fixture")
+    _two_runs(fx, tmp_path, fi_notice=_notice_text([ESRI, OSM]), de_notice=de_notice)
+    loaded, tables = _merged(tmp_path)
+    with pytest.raises(merge.MergeError, match=message):
+        merge.compose_notice(loaded, tables["feeds.parquet"])
+
+
+def _feeds_with(atlas):
+    return pa.table({"atlas": [atlas], "mdb": [None], "redistribution_allowed": [None]})
+
+
+@pytest.mark.parametrize(
+    "feeds, message",
+    [
+        (pa.table({"feed_id": ["f"]}), "without atlas"),
+        (_feeds_with("[1]"), "block is not a record"),
+        (_feeds_with("{"), "is not JSON"),
+        (_feeds_with(""), "is not JSON"),
+        (_feeds_with('{"license": [1]}'), "licence block is not a record"),
+        (_feeds_with('{"license": {"url": ["x"]}}'), "cannot be inventoried"),
+    ],
+)
+def test_feeds_whose_catalogue_blocks_cannot_be_inventoried_are_refused(feeds, message):
+    with pytest.raises(merge.MergeError, match=message):
+        merge._licence_rows(feeds)
+
+
+@pytest.mark.parametrize(
+    "pins, message",
+    [
+        ({"atlas": {}}, "atlas archive_sha256 is not a SHA-256: None"),
+        ({"mdb": {"csv_sha256": "short"}}, "mdb csv_sha256 is not a SHA-256"),
+        ({"gbfs": {"csv_sha256": ["x"]}}, "gbfs csv_sha256 is not a SHA-256"),
+    ],
+)
+def test_a_catalogue_without_its_digest_is_refused(pins, message):
+    loaded = [{"build_id": "b", "snapshot": {"sources": pins}}]
+    with pytest.raises(merge.MergeError, match=message):
+        merge._catalogue_lines(loaded)

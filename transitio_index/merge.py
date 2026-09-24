@@ -6,16 +6,18 @@ tables into one set with one row per id. The viewer's catalogue page and
 the merged snapshot both use them, so the page and the release cannot
 disagree on what the merged index holds. ``load_sources`` verifies and
 loads the selection for a merge, refusing what a merged snapshot could
-not ship, and ``assemble`` turns the merged tables into a schema-9
-snapshot: the partition tables, their manifest and a snapshot id that
-names exactly the sources, the merge format and the toolchain they were
-merged with.
+not ship, ``compose_notice`` writes the merged index's NOTICE from the
+sources' NOTICEs and the merged feeds, and ``assemble`` turns the merged
+tables into a schema-9 snapshot: the partition tables, their manifest and
+a snapshot id that names exactly the sources, the merge format and the
+toolchain they were merged with.
 """
 
 import hashlib
 import io
 import json
 import math
+import re
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +26,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from . import classify, publish
+from . import classify, licensing, publish
 from .builds import (
     _EPOCH,
     _SNAPSHOT_ERRORS,
@@ -631,3 +633,168 @@ def assemble(loaded, tables, notice):
         ],
     }
     return manifest, files
+
+
+# The paragraphs of a NOTICE as the license stage writes it, by their
+# opening words: the geometry credit with its derived sources, the ODbL
+# terms when OpenStreetMap is among them, the metro credits, the
+# catalogues read and the feed-licence inventory.
+GEOMETRY_OPENING = "This index includes place boundary geometry"
+ODBL_OPENING = "Geometry derived from OpenStreetMap"
+METRO_OPENING = "Metro memberships were derived"
+CATALOGUE_OPENING = "Feed identities and coverage were compiled from:"
+LICENCE_OPENING = "Feed licences declared by the catalogues"
+# The catalogue lines of a merged NOTICE: the dataset in the license
+# stage's words, the pin the merge names it by, and what the line calls
+# that pin. The Atlas is named by the archive digest each build read, not
+# by a commit no build verified.
+NOTICE_CATALOGUES = (
+    ("Transitland Atlas", "atlas", "archive_sha256", "archive sha256"),
+    ("Mobility Database catalog", "mdb", "csv_sha256", "sha256"),
+    ("GBFS systems.csv", "gbfs", "csv_sha256", "sha256"),
+)
+
+
+def _notice_sections(notice, build_id):
+    """A source NOTICE parsed into its paragraphs, keyed ``geometry``,
+    ``odbl``, ``metro``, ``catalogue`` and ``licence`` (the middle two
+    optional), each a list of lines; refused when it is not UTF-8, holds
+    a paragraph the merge does not know or repeats one, or lacks the
+    geometry, catalogue or licence paragraph."""
+    try:
+        text = notice.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise MergeError(f"{build_id}: NOTICE is not UTF-8") from error
+    openings = (
+        ("geometry", GEOMETRY_OPENING),
+        ("odbl", ODBL_OPENING),
+        ("metro", METRO_OPENING),
+        ("catalogue", CATALOGUE_OPENING),
+        ("licence", LICENCE_OPENING),
+    )
+    sections = {}
+    for block in text.split("\n\n"):
+        lines = block.strip("\n").split("\n")
+        if lines == [""]:
+            continue
+        key = next((k for k, opening in openings if lines[0].startswith(opening)), None)
+        if key is None:
+            raise MergeError(
+                f"{build_id}: NOTICE paragraph unknown to the merge: {lines[0]!r}"
+            )
+        if key in sections:
+            raise MergeError(f"{build_id}: NOTICE repeats its {key} paragraph")
+        sections[key] = lines
+    for key in ("geometry", "catalogue", "licence"):
+        if key not in sections:
+            raise MergeError(f"{build_id}: NOTICE lacks its {key} paragraph")
+    return sections
+
+
+def _items(lines):
+    """``(text, items)`` of a paragraph: its ``  - `` lines and the rest."""
+    items = [line for line in lines if line.startswith("  - ")]
+    return [line for line in lines if not line.startswith("  - ")], items
+
+
+def _agree(current, value, what, build_id):
+    """``value`` when ``current`` is unset or equal; refused otherwise."""
+    if current is not None and current != value:
+        raise MergeError(f"{what} differs at {build_id}")
+    return value
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _catalogue_lines(loaded):
+    """One line per catalogue archive or CSV the sources read, by digest. A
+    catalogue a source names must carry its digest as a SHA-256 string."""
+    digests = {catalogue: set() for _, catalogue, _, _ in NOTICE_CATALOGUES}
+    for source in loaded:
+        pins = _pins(source["snapshot"], source["build_id"])
+        for _, catalogue, key, _ in NOTICE_CATALOGUES:
+            if catalogue not in pins:
+                continue
+            digest = pins[catalogue].get(key)
+            if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+                raise MergeError(
+                    f"{source['build_id']}: {catalogue} {key} is not a SHA-256: {digest!r}"
+                )
+            digests[catalogue].add(digest)
+    return [
+        f"  - {dataset}, {called} {digest}"
+        for dataset, catalogue, _, called in NOTICE_CATALOGUES
+        for digest in sorted(digests[catalogue])
+    ]
+
+
+def _licence_records(feeds):
+    """The merged feeds as the records ``licensing._feed_rows`` inventories:
+    their catalogue blocks decoded and the licence judgement the stage
+    applied."""
+    for column in ("atlas", "mdb", "redistribution_allowed"):
+        if column not in feeds.column_names:
+            raise MergeError(f"feeds without {column}; not a published index")
+    records = []
+    columns = (
+        feeds[name].to_pylist() for name in ("atlas", "mdb", "redistribution_allowed")
+    )
+    for atlas, mdb, judged in zip(*columns):
+        try:
+            blocks = [
+                None if block is None else json.loads(block) for block in (atlas, mdb)
+            ]
+        except (TypeError, ValueError, RecursionError) as error:
+            raise MergeError(f"feed catalogue block is not JSON: {error}") from error
+        if not all(block is None or isinstance(block, dict) for block in blocks):
+            raise MergeError("feed catalogue block is not a record")
+        licence = (blocks[0] or {}).get("license")
+        if licence is not None and not isinstance(licence, dict):
+            raise MergeError("feed licence block is not a record")
+        records.append(
+            {"atlas": blocks[0], "mdb": blocks[1], "redistribution_allowed": judged}
+        )
+    return records
+
+
+def _licence_rows(feeds):
+    """The feed-licence inventory of the merged feeds, as the license stage
+    writes it; a block the stage's inventory cannot take is refused."""
+    try:
+        return licensing._feed_rows(_licence_records(feeds))
+    except (TypeError, AttributeError) as error:
+        raise MergeError(f"feed licences cannot be inventoried: {error}") from error
+
+
+def compose_notice(loaded, feeds):
+    """The merged index's NOTICE, composed from the sources' NOTICEs as the
+    license stage writes one: the geometry credit once (its text must agree
+    across the sources) with the union of their derived source lines, the
+    ODbL terms when any source carries them, the metro credits once with
+    the union of their lines, the catalogues named by every archive and
+    CSV digest the sources read, and the feed-licence inventory recounted
+    over the merged ``feeds``."""
+    opening = odbl = metro = None
+    derived, credits = set(), set()
+    for source in loaded:
+        sections = _notice_sections(source["notice"], source["build_id"])
+        text, items = _items(sections["geometry"])
+        opening = _agree(opening, text, "geometry notice", source["build_id"])
+        derived.update(items)
+        if "odbl" in sections:
+            odbl = _agree(odbl, sections["odbl"], "ODbL notice", source["build_id"])
+        if "metro" in sections:
+            header, items = _items(sections["metro"])
+            metro = _agree(metro, header, "metro notice", source["build_id"])
+            credits.update(items)
+    paragraphs = [[*opening, *sorted(derived)]]
+    if odbl is not None:
+        paragraphs.append(odbl)
+    if metro is not None:
+        paragraphs.append([*metro, *sorted(credits)])
+    paragraphs.append([CATALOGUE_OPENING, *_catalogue_lines(loaded)])
+    paragraphs.append(licensing._licence_lines(_licence_rows(feeds)))
+    return ("\n\n".join("\n".join(lines) for lines in paragraphs) + "\n").encode(
+        "utf-8"
+    )

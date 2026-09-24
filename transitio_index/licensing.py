@@ -442,7 +442,14 @@ def _notice(geometry_notice, sources, feed_rows):
     if gbfs.get("csv_sha256"):
         lines.append(f"  - GBFS systems.csv, sha256 {gbfs['csv_sha256']}")
     lines.append("")
-    lines.append("Feed licences declared by the catalogues (feeds per licence):")
+    lines.extend(_licence_lines(feed_rows))
+    return "\n".join(lines) + "\n"
+
+
+def _licence_lines(feed_rows):
+    """The feed-licence inventory as NOTICE lines: its heading, then each
+    licence with its feed count, url and attribution."""
+    lines = ["Feed licences declared by the catalogues (feeds per licence):"]
     for row in feed_rows:
         name = row["license"] or "no identifier"
         if row["license"] is None and row["url"] is None:
@@ -455,7 +462,7 @@ def _notice(geometry_notice, sources, feed_rows):
             lines.append(f"      attribution: {row['attribution_text']}")
         if row.get("attribution_instructions"):
             lines.append(f"      instructions: {row['attribution_instructions']}")
-    return "\n".join(lines) + "\n"
+    return lines
 
 
 def license_index(cache_dir, *, overrides_dir=None):
