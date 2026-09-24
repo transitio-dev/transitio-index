@@ -1203,15 +1203,16 @@ def test_the_publisher_packs_a_merged_snapshot_with_its_lineage_checked(tmp_path
     )
     archive = f"transitio-index-{manifest['snapshot_id']}.tar.gz"
     assert {archive, archive + ".sha256"} < set(assets) and len(assets) == 3
-    # Without the archived builds the lineage cannot be checked, whether the
-    # cache is named or not — a merged snapshot is never packed unchecked.
+    # Naming the cache but not the archived builds cannot check a merged
+    # index, so it is refused rather than packed unchecked.
     with pytest.raises(publisher.PublishIndexError, match="name their directory"):
         publisher.pack(cache / "index", cache_dir=cache)
-    with pytest.raises(publisher.PublishIndexError, match="name their directory"):
-        publisher.pack(cache / "index", cache_dir=cache, builds_dir=None)
     # builds_dir alone checks it, no cache named.
     assets_again, _ = publisher.pack(cache / "index", builds_dir=builds)
     assert set(assets_again) == set(assets)
+    # Neither directory is the assets-only escape hatch: built, not checked.
+    assets_bare, _ = publisher.pack(cache / "index")
+    assert set(assets_bare) == set(assets)
     # The merge's commit lock is the one the pack takes.
     index = store.open_subdir(cache, "index")
     try:
