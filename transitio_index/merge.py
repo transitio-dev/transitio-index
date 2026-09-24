@@ -478,8 +478,12 @@ def _shares(edges):
         return 0.0, 0.0
     if "evidence" not in edges.column_names:
         raise MergeError("edges without evidence; not a published index")
+    # Null is what publish writes for an edge without evidence; anything
+    # else must be a JSON object.
     try:
-        evidence = [json.loads(e) for e in edges["evidence"].to_pylist() if e]
+        evidence = [
+            json.loads(e) for e in edges["evidence"].to_pylist() if e is not None
+        ]
     except ValueError as error:
         raise MergeError(f"edge evidence is not JSON: {error}") from error
     if not all(isinstance(e, dict) for e in evidence):
@@ -532,7 +536,7 @@ def _count(snapshot, field, build_id):
     value = snapshot.get(field)
     if value is None:
         return 0
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise MergeError(f"{build_id}: {field} is not a count: {value!r}")
     return value
 

@@ -778,6 +778,7 @@ def test_the_merged_block_carries_portable_identities_only(tmp_path):
     "evidence, message",
     [
         ("not json", "is not JSON"),
+        ("", "is not JSON"),
         ('"text"', "is not a record"),
         ("[1]", "is not a record"),
     ],
@@ -786,6 +787,25 @@ def test_edges_whose_evidence_is_not_a_record_are_refused(evidence, message):
     edges = pa.table({"tier": ["local"], "evidence": [evidence]})
     with pytest.raises(merge.MergeError, match=message):
         merge._shares(edges)
+
+
+def test_an_edge_without_evidence_counts_as_not_near_a_threshold():
+    edges = pa.table(
+        {"tier": ["unknown", "local"], "evidence": [None, '{"near_threshold": true}']}
+    )
+    assert merge._shares(edges) == (0.5, 0.5)
+
+
+@pytest.mark.parametrize(
+    "value, outcome", [(None, 0), (3, 3), (-1, None), (True, None)]
+)
+def test_a_stale_count_is_a_non_negative_integer_or_nothing(value, outcome):
+    snapshot = {"stale_feed_overrides": value}
+    if outcome is None:
+        with pytest.raises(merge.MergeError, match="is not a count"):
+            merge._count(snapshot, "stale_feed_overrides", "b")
+    else:
+        assert merge._count(snapshot, "stale_feed_overrides", "b") == outcome
 
 
 def test_the_snapshot_id_tells_apart_fields_a_delimiter_would_blur():
