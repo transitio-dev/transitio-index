@@ -63,8 +63,9 @@ OVERRIDE_FIELDS = (
 
 # Bumped by every change to the merge rules, the routing, the NOTICE
 # composition or the serialisation, so a new implementation never reuses
-# an old snapshot id.
-MERGE_FORMAT = 1
+# an old snapshot id. 2: the NOTICE parser accepts the geometry credit's
+# source list as an indented continuation block.
+MERGE_FORMAT = 2
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
