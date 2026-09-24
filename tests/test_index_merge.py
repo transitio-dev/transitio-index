@@ -779,6 +779,8 @@ def test_the_merged_block_carries_portable_identities_only(tmp_path):
     [
         ("not json", "is not JSON"),
         ("", "is not JSON"),
+        (1, "is not JSON"),
+        ("[" * 100_000 + "]" * 100_000, "is not JSON"),  # past the recursion limit
         ('"text"', "is not a record"),
         ("[1]", "is not a record"),
     ],
