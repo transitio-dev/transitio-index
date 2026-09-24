@@ -825,48 +825,66 @@ def _write_index(directory, manifest, files, notice):
     )
 
 
+def _remove_staging(staged):
+    """Remove the staging directory; failing to is a merge error, and a
+    symlink or a plain file in its place is refused rather than followed."""
+    try:
+        shutil.rmtree(staged)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise MergeError(
+            f"{staged}: cannot remove the staging directory: {error}"
+        ) from error
+
+
 def write_snapshot(cache_dir, manifest, files, notice):
     """Write the assembled snapshot to ``<cache_dir>/index``.
 
-    First into a temporary sibling, ``index.<snapshot id>.tmp``, where the
-    reader reads it back; a snapshot the reader refuses is removed and the
-    live index is left untouched. Then committed as publish commits: under
-    the index's writer lock, every partition table through the store's
-    atomic replacement, the NOTICE, the manifest last. A reader overlapping
-    the commit sees at worst a new table under the old manifest, which its
-    digest check refuses; a crash mid-commit leaves an index the reader
-    refuses, and the next merge completes it. The temporary directory goes
-    whatever happens.
+    Under the index's writer lock throughout, so two merges cannot stage
+    or commit at once: first into a temporary sibling,
+    ``index.<snapshot id>.tmp``, where the reader reads it back; a snapshot
+    the reader refuses is removed and the live index is left untouched.
+    Then committed as publish commits: every partition table through the
+    store's atomic replacement, the NOTICE, the manifest last. A reader
+    overlapping the commit sees at worst a new table under the old
+    manifest, which its digest check refuses; a crash mid-commit leaves an
+    index the reader refuses, and the next merge completes it. The staging
+    directory is removed afterwards (checked on success, best effort when
+    the merge itself failed), and a leftover one is removed before writing.
     """
     from transitio.exceptions import IncompatibleIndexError
     from transitio.index import read_index
 
     cache = Path(cache_dir)
-    staging = f"index.{manifest['snapshot_id']}.tmp"
-    staged = cache / staging
-    shutil.rmtree(staged, ignore_errors=True)  # a previous attempt's leavings
+    staged = cache / f"index.{manifest['snapshot_id']}.tmp"
+    live = store.open_subdir(cache, "index")
     try:
-        directory = store.open_subdir(cache, staging)
-        try:
-            _write_index(directory, manifest, files, notice)
-        finally:
-            directory.close()
-        try:
-            read = read_index(staged)
-        except (IncompatibleIndexError, OSError, ValueError) as error:
-            raise MergeError(
-                f"the assembled snapshot does not read back: {error}"
-            ) from error
-        if read.snapshot.get("snapshot_id") != manifest["snapshot_id"]:
-            raise MergeError("the assembled snapshot reads back under another id")
-        live = store.open_subdir(cache, "index")
-        try:
-            with store.exclusive_writer(live):
+        with store.exclusive_writer(live):
+            _remove_staging(staged)
+            try:
+                directory = store.open_subdir(cache, staged.name)
+                try:
+                    _write_index(directory, manifest, files, notice)
+                finally:
+                    directory.close()
+                try:
+                    read = read_index(staged)
+                except (IncompatibleIndexError, OSError, ValueError) as error:
+                    raise MergeError(
+                        f"the assembled snapshot does not read back: {error}"
+                    ) from error
+                if read.snapshot.get("snapshot_id") != manifest["snapshot_id"]:
+                    raise MergeError(
+                        "the assembled snapshot reads back under another id"
+                    )
                 _write_index(live, manifest, files, notice)
-        finally:
-            live.close()
+            except BaseException:
+                shutil.rmtree(staged, ignore_errors=True)  # the merge's error stands
+                raise
+            _remove_staging(staged)
     finally:
-        shutil.rmtree(staged, ignore_errors=True)
+        live.close()
 
 
 def merge_builds(builds, cache_dir, read_bytes=_read_file, log=print):

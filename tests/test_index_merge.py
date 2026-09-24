@@ -1035,6 +1035,37 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
     assert "no build to merge" in capsys.readouterr().err
 
 
+def test_a_merge_is_refused_while_another_holds_the_index(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    builds, cache = tmp_path / "builds", tmp_path / "cache"
+    _two_runs(fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM]))
+    index = store.open_subdir(cache, "index")
+    try:
+        with store.exclusive_writer(index):
+            with pytest.raises(store.StoreError, match="another build is publishing"):
+                merge.merge_builds(builds, cache, log=lambda line: None)
+    finally:
+        index.close()
+    assert not list(cache.glob("index.*.tmp"))
+
+
+def test_a_staging_path_that_cannot_be_cleared_is_refused(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    builds, cache = tmp_path / "builds", tmp_path / "cache"
+    _two_runs(fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM]))
+    loaded, tables = _merged(builds)
+    manifest, _ = merge.assemble(loaded, tables, compose_notice_for(loaded, tables))
+    cache.mkdir()
+    (cache / f"index.{manifest['snapshot_id']}.tmp").write_text("not a directory")
+    with pytest.raises(merge.MergeError, match="cannot remove the staging directory"):
+        merge.merge_builds(builds, cache, log=lambda line: None)
+    assert not (cache / "index" / "snapshot.json").exists()
+
+
+def compose_notice_for(loaded, tables):
+    return merge.compose_notice(loaded, tables["feeds.parquet"])
+
+
 def test_a_second_merge_replaces_the_live_index_and_drops_what_it_lacks(tmp_path):
     fx = pytest.importorskip("index_fixture")
     read_index = _reader()
