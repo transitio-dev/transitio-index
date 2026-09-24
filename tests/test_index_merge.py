@@ -1267,6 +1267,22 @@ def test_a_merged_snapshot_whose_lineage_moved_is_refused(tmp_path, change, mess
         publisher.pack(cache / "index", cache_dir=cache, builds_dir=builds)
 
 
+def test_a_manifest_recording_both_lineages_is_refused(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    from transitio_index import publisher
+
+    builds, cache, fi, de, _ = _merged_cache(fx, tmp_path)
+    _rewrite_snapshot(
+        cache / "index",
+        lambda s: s.update(
+            generations={"crosswalk/latest": "gen-0"},
+            leaves={"feeds": "crosswalk/latest"},
+        ),
+    )
+    with pytest.raises(publisher.PublishIndexError, match="one index is one"):
+        publisher.pack(cache / "index", cache_dir=cache, builds_dir=builds)
+
+
 def test_a_merged_manifest_recording_a_label_twice_is_refused(tmp_path):
     fx = pytest.importorskip("index_fixture")
     from transitio_index import publisher

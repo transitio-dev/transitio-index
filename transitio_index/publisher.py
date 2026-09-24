@@ -143,8 +143,19 @@ def _lock_stages(stack, cache_dir):
 
 def _is_merged(snapshot):
     """Whether a manifest is a merge's: it records a ``merged`` block in
-    place of stage generations."""
-    return "merged" in snapshot
+    place of stage generations. A manifest carrying both a merged block
+    and a stage generation is neither and is refused: one index cannot be
+    two lineages, and mis-routing it would skip the checks the other needs.
+    A merged release manifest keeps the built-lineage keys as null, which
+    is not a stage generation and so not the ambiguity refused here."""
+    merged = snapshot.get("merged") is not None
+    built = snapshot.get("generations") or snapshot.get("leaves")
+    if merged and built:
+        raise PublishIndexError(
+            "the index records both a merge and a stage lineage; one index is one "
+            "lineage"
+        )
+    return merged
 
 
 def _peek(index_dir):
