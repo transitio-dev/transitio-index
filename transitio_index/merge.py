@@ -6,8 +6,10 @@ tables into one set with one row per id. The viewer's catalogue page and
 the merged snapshot both use them, so the page and the release cannot
 disagree on what the merged index holds. ``load_sources`` verifies and
 loads the selection for a merge, refusing what a merged snapshot could
-not ship, and ``_route`` and ``_partition_files`` turn the merged tables
-into the partition tables of a schema-9 snapshot.
+not ship, and ``assemble`` turns the merged tables into a schema-9
+snapshot: the partition tables, their manifest and a snapshot id that
+names exactly the sources, the merge format and the toolchain they were
+merged with.
 """
 
 import hashlib
@@ -19,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from . import classify, publish
@@ -46,6 +49,14 @@ OVERRIDE_FIELDS = (
     "feeds_overrides_sha256",
     "places_overrides_sha256",
 )
+
+
+# Bumped by every change to the merge rules, the routing, the NOTICE
+# composition or the serialisation, so a new implementation never reuses
+# an old snapshot id.
+MERGE_FORMAT = 1
+
+STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
 
 class MergeError(RuntimeError):
@@ -433,3 +444,190 @@ def _partition_files(routed, snapshot_id):
             "sha256": hashlib.sha256(data).hexdigest(),
         }
     return files, listing
+
+
+def _merged_id(loaded):
+    """The snapshot id: the first sixteen hex digits of a SHA-256 over the
+    schema version, the merge format, the transitio and pyarrow versions
+    and, per source in label order, its label, build id and the digests of
+    its manifest and NOTICE. The same sources merged the same way name the
+    same artefact; a change in any source, the format or the toolchain
+    names another."""
+    from transitio import __version__ as transitio_version
+
+    parts = [publish.SCHEMA_VERSION, MERGE_FORMAT, transitio_version, pa.__version__]
+    for source in sorted(loaded, key=lambda s: s["label"]):
+        parts.append(
+            [
+                source["label"],
+                source["build_id"],
+                source["snapshot_sha256"],
+                source["notice_sha256"],
+            ]
+        )
+    # Canonical JSON: a typed list, unambiguous whatever a label contains.
+    return hashlib.sha256(_canonical(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _shares(edges):
+    """``(unknown_share, margin_share)`` over the merged edges: the share
+    whose tier is unknown, and the share the classifier decided within its
+    margin of a threshold, from each edge's evidence as the classify stage
+    counts it."""
+    if not len(edges):
+        return 0.0, 0.0
+    if "evidence" not in edges.column_names:
+        raise MergeError("edges without evidence; not a published index")
+    # Null is what publish writes for an edge without evidence; anything
+    # else must be a JSON object.
+    try:
+        evidence = [
+            json.loads(e) for e in edges["evidence"].to_pylist() if e is not None
+        ]
+    except (TypeError, ValueError, RecursionError) as error:
+        raise MergeError(f"edge evidence is not JSON: {error}") from error
+    if not all(isinstance(e, dict) for e in evidence):
+        raise MergeError("edge evidence is not a record")
+    flagged = classify.near_threshold_count({"evidence": e} for e in evidence)
+    unknown = pc.sum(pc.equal(edges["tier"], "unknown")).as_py() or 0
+    return unknown / len(edges), flagged / len(edges)
+
+
+# The catalogue pins a source's manifest records, by catalogue: what the
+# merged block carries of its ``sources``.
+CATALOGUE_PINS = {
+    "atlas": ("commit", "archive_sha256", "commit_verified"),
+    "mdb": ("csv_label", "csv_sha256"),
+    "gbfs": ("csv_label", "csv_sha256"),
+}
+
+
+def _pins(snapshot, build_id):
+    """A source's catalogue pins, projected to ``CATALOGUE_PINS``: portable
+    identities only, whatever else the manifest carries there. A manifest
+    naming no catalogue, or one whose record is not an object, is refused."""
+    sources = snapshot.get("sources")
+    if not isinstance(sources, dict) or not set(sources) & set(CATALOGUE_PINS):
+        raise MergeError(f"{build_id}: no catalogue sources in the manifest")
+    pins = {}
+    for catalogue, keys in CATALOGUE_PINS.items():
+        if catalogue not in sources:
+            continue
+        pinned = sources[catalogue]
+        if not isinstance(pinned, dict):
+            raise MergeError(f"{build_id}: catalogue {catalogue} is not a record")
+        pins[catalogue] = {key: pinned.get(key) for key in keys}
+    return pins
+
+
+def _listing(snapshot):
+    """A source's partition listing projected to each table's rows and digest."""
+    return {
+        partition: {
+            table: {"rows": entry.get("rows"), "sha256": entry.get("sha256")}
+            for table, entry in tables.items()
+        }
+        for partition, tables in snapshot["partitions"].items()
+    }
+
+
+def _count(snapshot, field, build_id):
+    """A source's stale count, zero when unrecorded."""
+    value = snapshot.get(field)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise MergeError(f"{build_id}: {field} is not a count: {value!r}")
+    return value
+
+
+def _recount(tables):
+    """The manifest counts over the merged tables, as publish counts them."""
+    feeds, places = tables["feeds.parquet"], tables["places.parquet"]
+    edges, realtime = tables["edges.parquet"], tables.get("realtime.parquet")
+    static = set(feeds["feed_id"].to_pylist())
+    companions = realtime["static_feed_id"].to_pylist() if realtime is not None else []
+    linked = sum(1 for feed_id in companions if feed_id in static)
+    return {
+        "feeds": len(feeds),
+        "by_source": _value_counts(feeds["source"]),
+        "feeds_dated": len(feeds) - feeds["service_start"].null_count,
+        "realtime": len(companions),
+        "realtime_linked": linked,
+        "realtime_unlinked": len(companions) - linked,
+        "places": len(places),
+        "places_by_kind": _value_counts(places["kind"]),
+        "edges": len(edges),
+        "edges_by_tier": _value_counts(edges["tier"]),
+    }
+
+
+def assemble(loaded, tables, notice):
+    """``(manifest, files)`` of the merged snapshot: the partition tables as
+    Parquet bytes keyed ``(partition, table)`` and the manifest that lists
+    them, over the sources ``load_sources`` returned and the ``tables``
+    ``merge_tables`` produced from them, with the composed ``notice`` bytes.
+
+    The manifest records what publish records where a merged index has it
+    — the schema and reader floors, the counts recounted, ``built_at`` the
+    newest source's (never the wall clock), the fields the sources agree on,
+    ``coverage_mode`` crawled when every source is and mixed otherwise, the
+    shares over the merged edges, the stale counts summed — and, in place of
+    stage generations, a ``merged`` block naming each source by portable
+    identities only: its label, build id, snapshot id, build date, coverage
+    mode, catalogue pins, partition digests and the digests of its manifest
+    and NOTICE.
+    """
+    from transitio import __version__ as built_with
+    from transitio.index import DISCOVERY_SEMANTICS_VERSION, MIN_READER_VERSIONS
+
+    loaded = sorted(loaded, key=lambda s: s["label"])
+    agreed = _check_sources([(s["build_id"], s["snapshot"]) for s in loaded])
+    snapshot_id = _merged_id(loaded)
+    files, listing = _partition_files(_route(tables), snapshot_id)
+    unknown_share, margin_share = _shares(tables["edges.parquet"])
+    newest = max(loaded, key=lambda s: _built_at(s["snapshot"]) or _EPOCH)
+    stale = {
+        field: sum(_count(s["snapshot"], field, s["build_id"]) for s in loaded)
+        for field in STALE_FIELDS
+    }
+    manifest = {
+        "schema_version": publish.SCHEMA_VERSION,
+        "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
+        "min_reader_version": MIN_READER_VERSIONS.get(
+            publish.SCHEMA_VERSION, publish.MIN_READER_VERSION
+        ),
+        "built_with": built_with,
+        "snapshot_id": snapshot_id,
+        "built_at": newest["snapshot"]["built_at"],
+        "counts": _recount(tables),
+        "partitions": listing,
+        "licensed": True,
+        "notice_sha256": hashlib.sha256(notice).hexdigest(),
+        **{field: agreed.get(field) for field in AGREED_FIELDS},
+        "coverage_mode": (
+            "crawled"
+            if all(s["snapshot"].get("coverage_mode") == "crawled" for s in loaded)
+            else "mixed"
+        ),
+        "unknown_share": unknown_share,
+        "margin_share": margin_share,
+        **{field: None for field in OVERRIDE_FIELDS},
+        **stale,
+        "stale_overrides": sum(stale.values()),
+        "merged": [
+            {
+                "label": s["label"],
+                "build_id": s["build_id"],
+                "snapshot_id": s["snapshot"]["snapshot_id"],
+                "built_at": s["snapshot"].get("built_at"),
+                "coverage_mode": s["snapshot"].get("coverage_mode"),
+                "sources": _pins(s["snapshot"], s["build_id"]),
+                "partitions": _listing(s["snapshot"]),
+                "snapshot_sha256": s["snapshot_sha256"],
+                "notice_sha256": s["notice_sha256"],
+            }
+            for s in loaded
+        ],
+    }
+    return manifest, files

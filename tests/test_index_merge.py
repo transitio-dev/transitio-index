@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import time
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -261,7 +262,13 @@ def _two_runs(fx, archived):
         1,
         built_at=BUILT(14),
         feeds=[
-            {**fx.covered_feed("hsl"), "home_country": "FI", "scope": "domestic"},
+            {
+                **fx.covered_feed("hsl"),
+                "home_country": "FI",
+                "scope": "domestic",
+                "service_start": "2026-01-01",
+                "service_end": "2026-12-31",
+            },
             {**fx.covered_feed("nat"), "home_country": "FI", "scope": "domestic"},
         ],
         places=[
@@ -587,3 +594,238 @@ def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadat
     # The same tables give the same bytes again.
     again, _ = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
     assert again == files
+
+
+# ---- the merged snapshot: its id and its manifest ----
+
+
+def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
+    tmp_path, monkeypatch
+):
+    fx = pytest.importorskip("index_fixture")
+    import transitio
+    from transitio.index import DISCOVERY_SEMANTICS_VERSION, MIN_READER_VERSIONS
+
+    fi, de = _two_runs(fx, tmp_path)
+    loaded, tables = _merged(tmp_path)
+    manifest, files = merge.assemble(loaded, tables, b"NOTICE\n")
+    snapshot_id = manifest["snapshot_id"]
+    assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
+    read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
+    assert set(read["snapshot"].to_pylist()) == {snapshot_id}
+    assert manifest["schema_version"] == 9
+    assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
+    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[9]
+    assert manifest["built_with"] == transitio.__version__
+    assert manifest["built_at"] == BUILT(15)  # the newest source's, not the clock
+    assert manifest["counts"] == {
+        "feeds": 4,
+        "by_source": {"atlas": 4},
+        "feeds_dated": 1,
+        "realtime": 2,
+        "realtime_linked": 1,
+        "realtime_unlinked": 1,
+        "places": 3,
+        "places_by_kind": {"city": 2, "country": 1},
+        "edges": 5,
+        "edges_by_tier": {"international": 2, "local": 2, "national": 1},
+    }
+    assert {
+        p: {t: e["rows"] for t, e in ts.items()}
+        for p, ts in manifest["partitions"].items()
+    } == {
+        "DE": {"edges": 1, "feeds": 1, "places": 1},
+        "FI": {"edges": 2, "feeds": 2, "places": 2, "realtime": 1},
+        "international": {"feeds": 1, "realtime": 1},
+        "links": {"edges": 2},
+    }
+    for (partition, table), data in files.items():
+        assert (
+            manifest["partitions"][partition][table]["sha256"]
+            == hashlib.sha256(data).hexdigest()
+        )
+    assert manifest["licensed"] is True
+    assert manifest["notice_sha256"] == hashlib.sha256(b"NOTICE\n").hexdigest()
+    assert manifest["overture_release"] == "2026-08-19.0"
+    assert manifest["simplify_tolerance_deg"] == 0.0005
+    assert manifest["classifier"] == classify.classifier_settings()
+    assert manifest["coverage_mode"] == "crawled"
+    assert manifest["unknown_share"] == 0.0 and manifest["margin_share"] == 0.0
+    assert all(manifest[field] is None for field in merge.OVERRIDE_FIELDS)
+    assert manifest["stale_feed_overrides"] == 2 and manifest["stale_overrides"] == 2
+    # The sources by portable identities only, in label order.
+    assert [(s["label"], s["build_id"]) for s in manifest["merged"]] == [
+        ("de", de),
+        ("fi", fi),
+    ]
+    for record, source in zip(manifest["merged"], loaded):
+        assert record["snapshot_id"] == source["snapshot"]["snapshot_id"]
+        assert record["built_at"] == source["snapshot"]["built_at"]
+        assert record["coverage_mode"] == "crawled"
+        assert record["sources"] == {
+            "atlas": {
+                "commit": None,
+                "archive_sha256": "a" * 64,
+                "commit_verified": None,
+            },
+            "mdb": {"csv_label": None, "csv_sha256": "b" * 64},
+        }
+        assert record["partitions"] == source["snapshot"]["partitions"]
+        assert record["snapshot_sha256"] == source["snapshot_sha256"]
+        assert record["notice_sha256"] == source["notice_sha256"]
+    assert str(tmp_path) not in json.dumps(manifest)
+    assert "generations" not in manifest and "leaves" not in manifest
+    # The same sources give the same id, manifest and bytes; another
+    # NOTICE changes only its digest; another merge format, the id; so
+    # does any change to a source's manifest, and nothing else does.
+    monkeypatch.setattr(time, "time", lambda: 4102444800.0)  # another day
+    again, files_again = merge.assemble(*_merged(tmp_path), b"NOTICE\n")
+    assert again == manifest and files_again == files
+    other, _ = merge.assemble(loaded, tables, b"other\n")
+    assert (
+        other["snapshot_id"] == snapshot_id
+        and other["notice_sha256"] != manifest["notice_sha256"]
+    )
+    monkeypatch.setattr(merge, "MERGE_FORMAT", merge.MERGE_FORMAT + 1)
+    assert merge.assemble(loaded, tables, b"NOTICE\n")[0]["snapshot_id"] != snapshot_id
+    monkeypatch.undo()
+    _rewrite_snapshot(
+        tmp_path / de / "index", lambda s: s.update(stale_edge_overrides=1)
+    )
+    assert (
+        merge.assemble(*_merged(tmp_path), b"NOTICE\n")[0]["snapshot_id"] != snapshot_id
+    )
+    _rewrite_snapshot(
+        tmp_path / de / "index", lambda s: s.update(stale_edge_overrides=0)
+    )
+    assert (
+        merge.assemble(*_merged(tmp_path), b"NOTICE\n")[0]["snapshot_id"] == snapshot_id
+    )
+
+
+def test_assemble_recounts_the_shares_and_marks_a_mixed_coverage(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    _two_runs(fx, tmp_path)
+    _archive(
+        fx,
+        tmp_path,
+        "se",
+        3,
+        built_at=BUILT(13),
+        coverage_mode="declared",
+        feeds=[{**fx.covered_feed("sl"), "home_country": "SE", "scope": "domestic"}],
+        places=[fx.place("sto", "city", country_code="SE")],
+        edges=[
+            {
+                **fx.edge("sto", "sl", tier="unknown"),
+                "evidence": {"near_threshold": True},
+            }
+        ],
+    )
+    loaded, tables = _merged(tmp_path)
+    manifest, _ = merge.assemble(loaded, tables, b"NOTICE\n")
+    assert manifest["coverage_mode"] == "mixed"
+    assert manifest["counts"]["edges"] == 6
+    assert manifest["unknown_share"] == pytest.approx(1 / 6)
+    assert manifest["margin_share"] == pytest.approx(1 / 6)
+    assert manifest["built_at"] == BUILT(15)
+    assert [s["coverage_mode"] for s in manifest["merged"]] == [
+        "crawled",
+        "crawled",
+        "declared",
+    ]
+
+
+def test_the_merged_block_carries_portable_identities_only(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    fi, _ = _two_runs(fx, tmp_path)
+    sources = {
+        "atlas": {"commit": "c" * 40, "archive_sha256": "a" * 64, "path": "/tmp/atlas"},
+        "mdb": {
+            "csv_label": "2026-08-28",
+            "csv_sha256": "b" * 64,
+            "file": "/tmp/mdb.csv",
+        },
+    }
+    _rewrite_snapshot(tmp_path / fi / "index", lambda s: s.update(sources=sources))
+    _rewrite_snapshot(
+        tmp_path / fi / "index",
+        lambda s: s["partitions"]["FI"]["feeds"].update(path="/tmp/feeds.parquet"),
+    )
+    manifest, _ = merge.assemble(*_merged(tmp_path), b"NOTICE\n")
+    record = manifest["merged"][1]
+    assert record["sources"] == {
+        "atlas": {
+            "commit": "c" * 40,
+            "archive_sha256": "a" * 64,
+            "commit_verified": None,
+        },
+        "mdb": {"csv_label": "2026-08-28", "csv_sha256": "b" * 64},
+    }
+    assert set(record["partitions"]["FI"]["feeds"]) == {"rows", "sha256"}
+    assert "/tmp" not in json.dumps(manifest)
+    for sources, message in (
+        ({}, "no catalogue sources"),
+        ({"other": {"x": 1}}, "no catalogue sources"),
+        ({"atlas": "a4d0204"}, "catalogue atlas is not a record"),
+    ):
+        _rewrite_snapshot(
+            tmp_path / fi / "index",
+            lambda s, sources=sources: s.update(sources=sources),
+        )
+        with pytest.raises(merge.MergeError, match=message):
+            merge.assemble(*_merged(tmp_path), b"NOTICE\n")
+
+
+@pytest.mark.parametrize(
+    "evidence, message",
+    [
+        pytest.param("not json", "is not JSON", id="text"),
+        pytest.param("", "is not JSON", id="empty"),
+        pytest.param(1, "is not JSON", id="number"),
+        # Past the recursion limit where the decoder has one, a list elsewhere.
+        pytest.param(
+            "[" * 100_000 + "]" * 100_000, "is not (JSON|a record)", id="deep"
+        ),
+        pytest.param('"text"', "is not a record", id="string"),
+        pytest.param("[1]", "is not a record", id="list"),
+    ],
+)
+def test_edges_whose_evidence_is_not_a_record_are_refused(evidence, message):
+    edges = pa.table({"tier": ["local"], "evidence": [evidence]})
+    with pytest.raises(merge.MergeError, match=message):
+        merge._shares(edges)
+
+
+def test_an_edge_without_evidence_counts_as_not_near_a_threshold():
+    edges = pa.table(
+        {"tier": ["unknown", "local"], "evidence": [None, '{"near_threshold": true}']}
+    )
+    assert merge._shares(edges) == (0.5, 0.5)
+
+
+@pytest.mark.parametrize(
+    "value, outcome", [(None, 0), (3, 3), (-1, None), (True, None)]
+)
+def test_a_stale_count_is_a_non_negative_integer_or_nothing(value, outcome):
+    snapshot = {"stale_feed_overrides": value}
+    if outcome is None:
+        with pytest.raises(merge.MergeError, match="is not a count"):
+            merge._count(snapshot, "stale_feed_overrides", "b")
+    else:
+        assert merge._count(snapshot, "stale_feed_overrides", "b") == outcome
+
+
+def test_the_snapshot_id_tells_apart_fields_a_delimiter_would_blur():
+    def loaded(label, build_id):
+        return [
+            {
+                "label": label,
+                "build_id": build_id,
+                "snapshot_sha256": "0" * 64,
+                "notice_sha256": "1" * 64,
+            }
+        ]
+
+    assert merge._merged_id(loaded("a|b", "c")) != merge._merged_id(loaded("a", "b|c"))
+    assert merge._merged_id(loaded("a", "b")) == merge._merged_id(loaded("a", "b"))
