@@ -780,12 +780,15 @@ def test_the_merged_block_carries_portable_identities_only(tmp_path):
 @pytest.mark.parametrize(
     "evidence, message",
     [
-        ("not json", "is not JSON"),
-        ("", "is not JSON"),
-        (1, "is not JSON"),
-        ("[" * 100_000 + "]" * 100_000, "is not JSON"),  # past the recursion limit
-        ('"text"', "is not a record"),
-        ("[1]", "is not a record"),
+        pytest.param("not json", "is not JSON", id="text"),
+        pytest.param("", "is not JSON", id="empty"),
+        pytest.param(1, "is not JSON", id="number"),
+        # Past the recursion limit where the decoder has one, a list elsewhere.
+        pytest.param(
+            "[" * 100_000 + "]" * 100_000, "is not (JSON|a record)", id="deep"
+        ),
+        pytest.param('"text"', "is not a record", id="string"),
+        pytest.param("[1]", "is not a record", id="list"),
     ],
 )
 def test_edges_whose_evidence_is_not_a_record_are_refused(evidence, message):
