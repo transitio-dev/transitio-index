@@ -774,6 +774,20 @@ def test_the_merged_block_carries_portable_identities_only(tmp_path):
             merge.assemble(*_merged(tmp_path), b"NOTICE\n")
 
 
+@pytest.mark.parametrize(
+    "evidence, message",
+    [
+        ("not json", "is not JSON"),
+        ('"text"', "is not a record"),
+        ("[1]", "is not a record"),
+    ],
+)
+def test_edges_whose_evidence_is_not_a_record_are_refused(evidence, message):
+    edges = pa.table({"tier": ["local"], "evidence": [evidence]})
+    with pytest.raises(merge.MergeError, match=message):
+        merge._shares(edges)
+
+
 def test_the_snapshot_id_tells_apart_fields_a_delimiter_would_blur():
     def loaded(label, build_id):
         return [

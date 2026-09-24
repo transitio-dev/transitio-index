@@ -482,6 +482,8 @@ def _shares(edges):
         evidence = [json.loads(e) for e in edges["evidence"].to_pylist() if e]
     except ValueError as error:
         raise MergeError(f"edge evidence is not JSON: {error}") from error
+    if not all(isinstance(e, dict) for e in evidence):
+        raise MergeError("edge evidence is not a record")
     flagged = classify.near_threshold_count({"evidence": e} for e in evidence)
     unknown = pc.sum(pc.equal(edges["tier"], "unknown")).as_py() or 0
     return unknown / len(edges), flagged / len(edges)
