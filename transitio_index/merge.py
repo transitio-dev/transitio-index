@@ -489,6 +489,39 @@ def _shares(edges):
     return unknown / len(edges), flagged / len(edges)
 
 
+# The catalogue pins a source's manifest records, by catalogue: what the
+# merged block carries of its ``sources``.
+CATALOGUE_PINS = {
+    "atlas": ("commit", "archive_sha256", "commit_verified"),
+    "mdb": ("csv_label", "csv_sha256"),
+    "gbfs": ("csv_label", "csv_sha256"),
+}
+
+
+def _pins(snapshot, build_id):
+    """A source's catalogue pins, projected to ``CATALOGUE_PINS``: portable
+    identities only, whatever else the manifest carries there."""
+    sources = snapshot.get("sources")
+    if not isinstance(sources, dict):
+        raise MergeError(f"{build_id}: no catalogue sources in the manifest")
+    return {
+        catalogue: {key: pinned.get(key) for key in keys}
+        for catalogue, keys in CATALOGUE_PINS.items()
+        if isinstance(pinned := sources.get(catalogue), dict)
+    }
+
+
+def _listing(snapshot):
+    """A source's partition listing projected to each table's rows and digest."""
+    return {
+        partition: {
+            table: {"rows": entry.get("rows"), "sha256": entry.get("sha256")}
+            for table, entry in tables.items()
+        }
+        for partition, tables in snapshot["partitions"].items()
+    }
+
+
 def _count(snapshot, field, build_id):
     """A source's stale count, zero when unrecorded."""
     value = snapshot.get(field)
@@ -580,8 +613,8 @@ def assemble(loaded, tables, notice):
                 "snapshot_id": s["snapshot"]["snapshot_id"],
                 "built_at": s["snapshot"].get("built_at"),
                 "coverage_mode": s["snapshot"].get("coverage_mode"),
-                "sources": s["snapshot"].get("sources"),
-                "partitions": s["snapshot"]["partitions"],
+                "sources": _pins(s["snapshot"], s["build_id"]),
+                "partitions": _listing(s["snapshot"]),
                 "snapshot_sha256": s["snapshot_sha256"],
                 "notice_sha256": s["notice_sha256"],
             }

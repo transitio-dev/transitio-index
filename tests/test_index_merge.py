@@ -655,14 +655,22 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         assert record["snapshot_id"] == source["snapshot"]["snapshot_id"]
         assert record["built_at"] == source["snapshot"]["built_at"]
         assert record["coverage_mode"] == "crawled"
-        assert record["sources"] == MANIFEST_9["sources"]
+        assert record["sources"] == {
+            "atlas": {
+                "commit": None,
+                "archive_sha256": "a" * 64,
+                "commit_verified": None,
+            },
+            "mdb": {"csv_label": None, "csv_sha256": "b" * 64},
+        }
         assert record["partitions"] == source["snapshot"]["partitions"]
         assert record["snapshot_sha256"] == source["snapshot_sha256"]
         assert record["notice_sha256"] == source["notice_sha256"]
     assert str(tmp_path) not in json.dumps(manifest)
     assert "generations" not in manifest and "leaves" not in manifest
     # The same sources give the same id, manifest and bytes; another
-    # NOTICE changes only its digest; another merge format, the id.
+    # NOTICE changes only its digest; another merge format, the id; so
+    # does any change to a source's manifest, and nothing else does.
     again, files_again = merge.assemble(*_merged(tmp_path), b"NOTICE\n")
     assert again == manifest and files_again == files
     other, _ = merge.assemble(loaded, tables, b"other\n")
@@ -672,6 +680,19 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     )
     monkeypatch.setattr(merge, "MERGE_FORMAT", merge.MERGE_FORMAT + 1)
     assert merge.assemble(loaded, tables, b"NOTICE\n")[0]["snapshot_id"] != snapshot_id
+    monkeypatch.undo()
+    _rewrite_snapshot(
+        tmp_path / de / "index", lambda s: s.update(stale_edge_overrides=1)
+    )
+    assert (
+        merge.assemble(*_merged(tmp_path), b"NOTICE\n")[0]["snapshot_id"] != snapshot_id
+    )
+    _rewrite_snapshot(
+        tmp_path / de / "index", lambda s: s.update(stale_edge_overrides=0)
+    )
+    assert (
+        merge.assemble(*_merged(tmp_path), b"NOTICE\n")[0]["snapshot_id"] == snapshot_id
+    )
 
 
 def test_assemble_recounts_the_shares_and_marks_a_mixed_coverage(tmp_path):
@@ -705,3 +726,36 @@ def test_assemble_recounts_the_shares_and_marks_a_mixed_coverage(tmp_path):
         "crawled",
         "declared",
     ]
+
+
+def test_the_merged_block_carries_portable_identities_only(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    fi, _ = _two_runs(fx, tmp_path)
+    sources = {
+        "atlas": {"commit": "c" * 40, "archive_sha256": "a" * 64, "path": "/tmp/atlas"},
+        "mdb": {
+            "csv_label": "2026-08-28",
+            "csv_sha256": "b" * 64,
+            "file": "/tmp/mdb.csv",
+        },
+    }
+    _rewrite_snapshot(tmp_path / fi / "index", lambda s: s.update(sources=sources))
+    _rewrite_snapshot(
+        tmp_path / fi / "index",
+        lambda s: s["partitions"]["FI"]["feeds"].update(path="/tmp/feeds.parquet"),
+    )
+    manifest, _ = merge.assemble(*_merged(tmp_path), b"NOTICE\n")
+    record = manifest["merged"][1]
+    assert record["sources"] == {
+        "atlas": {
+            "commit": "c" * 40,
+            "archive_sha256": "a" * 64,
+            "commit_verified": None,
+        },
+        "mdb": {"csv_label": "2026-08-28", "csv_sha256": "b" * 64},
+    }
+    assert set(record["partitions"]["FI"]["feeds"]) == {"rows", "sha256"}
+    assert "/tmp" not in json.dumps(manifest)
+    _rewrite_snapshot(tmp_path / fi / "index", lambda s: s.pop("sources"))
+    with pytest.raises(merge.MergeError, match="no catalogue sources"):
+        merge.assemble(*_merged(tmp_path), b"NOTICE\n")
