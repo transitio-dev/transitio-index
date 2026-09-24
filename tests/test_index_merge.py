@@ -262,7 +262,13 @@ def _two_runs(fx, archived):
         1,
         built_at=BUILT(14),
         feeds=[
-            {**fx.covered_feed("hsl"), "home_country": "FI", "scope": "domestic"},
+            {
+                **fx.covered_feed("hsl"),
+                "home_country": "FI",
+                "scope": "domestic",
+                "service_start": "2026-01-01",
+                "service_end": "2026-12-31",
+            },
             {**fx.covered_feed("nat"), "home_country": "FI", "scope": "domestic"},
         ],
         places=[
@@ -615,7 +621,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert manifest["counts"] == {
         "feeds": 4,
         "by_source": {"atlas": 4},
-        "feeds_dated": 0,
+        "feeds_dated": 1,
         "realtime": 2,
         "realtime_linked": 1,
         "realtime_unlinked": 1,
