@@ -199,6 +199,27 @@ Eurostat Urban Audit's city plus its commuting zone) and `city-region (FAO)`
 pick the definitions whose metros the map, the places table and the search
 show; a city's details list every metro it is in.
 
+### Merge the builds into one snapshot
+
+The index is built one label at a time and each build is archived under
+`~/.cache/transitio-index/builds/<label>-<snapshot>/index/`. The merge takes
+the newest complete run of every label and writes one snapshot from them:
+
+```
+python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache-dir cache/merged
+```
+
+Every source must be a licensed schema-9 build, and the sources must agree on
+the Overture release, the simplification tolerance and the classifier. A feed
+comes from the newest build carrying it and its edges from that same build; a
+place comes from the build serving it most. The merged NOTICE credits every
+source once, names the catalogues by the digests each build read, and recounts
+the feed licences. The snapshot is read back through the reader before it is
+committed into `cache/merged/index/`, and its manifest records each source by
+label, build id and digests, so the publisher can check the lineage. A label
+whose newest run is incomplete or holds no feeds is skipped and reported; an
+older run never stands in for it.
+
 ### Publish a snapshot
 
 `publish` writes `cache/index/`; releasing it to GitHub is a separate step and

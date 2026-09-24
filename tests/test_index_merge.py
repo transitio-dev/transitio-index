@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import time
 
 import pyarrow as pa
@@ -24,7 +25,7 @@ from builds_fixture import (
     _run,
     write_build,
 )
-from transitio_index import builds, classify, merge
+from transitio_index import builds, classify, merge, store
 
 BUILT = "2026-09-{:02d}T00:00:00+00:00".format
 
@@ -984,3 +985,137 @@ def test_a_catalogue_without_its_digest_is_refused(pins, message):
     loaded = [{"build_id": "b", "snapshot": {"sources": pins}}]
     with pytest.raises(merge.MergeError, match=message):
         merge._catalogue_lines(loaded)
+
+
+# ---- writing the merged snapshot and the command ----
+
+
+def _reader():
+    reader = pytest.importorskip("transitio.index")
+    return reader.read_index
+
+
+def _files_under(index):
+    return {
+        p.relative_to(index): p.read_bytes()
+        for p in sorted(index.rglob("*"))
+        if p.is_file()
+    }
+
+
+def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsys):
+    fx = pytest.importorskip("index_fixture")
+    read_index = _reader()
+    builds, cache = tmp_path / "builds", tmp_path / "cache"
+    fi, de = _two_runs(
+        fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
+    )
+    _run(builds, "nl", 3, feeds=[], edges={})  # no feeds: skipped, reported
+    assert merge.main(["--builds", str(builds), "--cache-dir", str(cache)]) == 0
+    out = capsys.readouterr().out
+    assert "skipped nl-0000000000000003: no feeds" in out
+    assert (
+        "merged 2 builds into" in out
+        and "4 feeds, 3 places, 5 edges, 2 companions" in out
+    )
+    index = read_index(cache / "index")
+    assert index.snapshot["merged"][0]["build_id"] == de
+    assert len(index.feeds) == 4 and len(index.places) == 3 and len(index.edges) == 5
+    assert len(index.links) == 2 and len(index.realtime) == 2
+    assert set(index.feeds["snapshot"]) == {index.snapshot["snapshot_id"]}
+    notice = (cache / "index" / "NOTICE").read_bytes()
+    assert notice.startswith(b"This index includes place boundary geometry")
+    assert hashlib.sha256(notice).hexdigest() == index.snapshot["notice_sha256"]
+    assert not list(cache.glob("index.*.tmp"))
+    # Nothing to merge is refused, and said so.
+    assert (
+        merge.main(["--builds", str(tmp_path / "empty"), "--cache-dir", str(cache)])
+        == 1
+    )
+    assert "no build to merge" in capsys.readouterr().err
+
+
+def test_a_second_merge_replaces_the_live_index_and_drops_what_it_lacks(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    read_index = _reader()
+    builds, cache = tmp_path / "builds", tmp_path / "cache"
+    fi, de = _two_runs(
+        fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
+    )
+    first = merge.merge_builds(builds, cache, log=lambda line: None)
+    shutil.rmtree(builds / de)
+    second = merge.merge_builds(builds, cache, log=lambda line: None)
+    assert second["snapshot_id"] != first["snapshot_id"]
+    assert sorted(second["partitions"]) == ["FI", "international"]
+    assert (
+        not (cache / "index" / "DE").exists()
+        and not (cache / "index" / "links").exists()
+    )
+    index = read_index(cache / "index")
+    assert index.snapshot["snapshot_id"] == second["snapshot_id"]
+    assert len(index.feeds) == 2 and len(index.places) == 2 and index.links is None
+
+
+def test_a_snapshot_the_reader_rejects_leaves_the_live_index_untouched(
+    tmp_path, monkeypatch
+):
+    fx = pytest.importorskip("index_fixture")
+    builds, cache = tmp_path / "builds", tmp_path / "cache"
+    _two_runs(fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM]))
+    merge.merge_builds(builds, cache, log=lambda line: None)
+    before = _files_under(cache / "index")
+    assemble = merge.assemble
+
+    def tampered(loaded, tables, notice):  # a table digest the reader will not accept
+        manifest, files = assemble(loaded, tables, notice)
+        manifest["partitions"]["FI"]["feeds"]["sha256"] = "0" * 64
+        manifest["snapshot_id"] = "feedcafefeedcafe"
+        return manifest, files
+
+    monkeypatch.setattr(merge, "assemble", tampered)
+    with pytest.raises(merge.MergeError, match="does not read back"):
+        merge.merge_builds(builds, cache, log=lambda line: None)
+    assert _files_under(cache / "index") == before
+    assert not list(cache.glob("index.*.tmp"))
+
+
+def test_a_failure_mid_commit_leaves_an_index_the_reader_refuses_and_the_next_merge_completes(
+    tmp_path, monkeypatch
+):
+    fx = pytest.importorskip("index_fixture")
+    read_index = _reader()
+    exceptions = pytest.importorskip("transitio.exceptions")
+    builds, cache = tmp_path / "builds", tmp_path / "cache"
+    fi, _ = _two_runs(
+        fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
+    )
+    merge.merge_builds(builds, cache, log=lambda line: None)
+    _archive(
+        fx,
+        builds,
+        "se",
+        3,
+        built_at=BUILT(16),
+        notice=_notice_text([GEOB]),
+        feeds=[{**fx.covered_feed("sl"), "home_country": "SE", "scope": "domestic"}],
+        places=[fx.place("sto", "city", country_code="SE")],
+        edges=[fx.edge("sto", "sl", tier="local", relevance_category="primary")],
+    )
+    write_bytes = store.write_bytes
+
+    def failing(directory, name, data):  # the live NOTICE write dies after the tables
+        if name == "NOTICE" and directory.path.name == "index":
+            raise OSError("disk full")
+        return write_bytes(directory, name, data)
+
+    monkeypatch.setattr(store, "write_bytes", failing)
+    with pytest.raises(OSError, match="disk full"):
+        merge.merge_builds(builds, cache, log=lambda line: None)
+    with pytest.raises(exceptions.IncompatibleIndexError):
+        read_index(cache / "index")  # new tables under the old manifest
+    assert not list(cache.glob("index.*.tmp"))
+    monkeypatch.undo()
+    manifest = merge.merge_builds(builds, cache, log=lambda line: None)
+    index = read_index(cache / "index")
+    assert index.snapshot["snapshot_id"] == manifest["snapshot_id"]
+    assert sorted(index.partitions) == ["DE", "FI", "SE", "international", "links"]

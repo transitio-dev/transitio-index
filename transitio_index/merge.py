@@ -1,4 +1,7 @@
-"""The rules that merge the builds of every label into one index.
+"""Merge the newest build of every label into one releasable snapshot.
+
+    python -m transitio_index.merge --builds ~/.cache/transitio-index/builds \\
+        --cache-dir cache/merged
 
 ``select_sources`` picks the newest complete run of every label archived
 under a builds directory and ``merge_tables`` joins the selected builds'
@@ -10,14 +13,19 @@ not ship, ``compose_notice`` writes the merged index's NOTICE from the
 sources' NOTICEs and the merged feeds, and ``assemble`` turns the merged
 tables into a schema-9 snapshot: the partition tables, their manifest and
 a snapshot id that names exactly the sources, the merge format and the
-toolchain they were merged with.
+toolchain they were merged with. ``write_snapshot`` reads the assembled
+snapshot back through the reader before committing it into the cache's
+``index/`` as publish commits its own.
 """
 
+import argparse
 import hashlib
 import io
 import json
 import math
 import re
+import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +34,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from . import classify, licensing, publish
+from . import classify, licensing, publish, store
 from .builds import (
     _EPOCH,
     _SNAPSHOT_ERRORS,
@@ -798,3 +806,124 @@ def compose_notice(loaded, feeds):
     return ("\n\n".join("\n".join(lines) for lines in paragraphs) + "\n").encode(
         "utf-8"
     )
+
+
+DEFAULT_BUILDS_DIR = Path("~/.cache/transitio-index/builds").expanduser()
+DEFAULT_CACHE_DIR = Path("cache/merged")
+
+
+def _write_index(directory, manifest, files, notice):
+    """Write a snapshot into ``directory`` as publish writes its own: every
+    partition table (tables and partitions the snapshot lacks removed), the
+    NOTICE, and the manifest last."""
+    publish._write_partitions(directory, files, manifest["partitions"])
+    store.write_bytes(directory, publish.NOTICE_FILE, notice)
+    store.write_file(
+        directory,
+        publish.SNAPSHOT_FILE,
+        lambda: [json.dumps(manifest, indent=2, sort_keys=True)],
+    )
+
+
+def write_snapshot(cache_dir, manifest, files, notice):
+    """Write the assembled snapshot to ``<cache_dir>/index``.
+
+    First into a temporary sibling, ``index.<snapshot id>.tmp``, where the
+    reader reads it back; a snapshot the reader refuses is removed and the
+    live index is left untouched. Then committed as publish commits: under
+    the index's writer lock, every partition table through the store's
+    atomic replacement, the NOTICE, the manifest last. A reader overlapping
+    the commit sees at worst a new table under the old manifest, which its
+    digest check refuses; a crash mid-commit leaves an index the reader
+    refuses, and the next merge completes it. The temporary directory goes
+    whatever happens.
+    """
+    from transitio.exceptions import IncompatibleIndexError
+    from transitio.index import read_index
+
+    cache = Path(cache_dir)
+    staging = f"index.{manifest['snapshot_id']}.tmp"
+    staged = cache / staging
+    shutil.rmtree(staged, ignore_errors=True)  # a previous attempt's leavings
+    try:
+        directory = store.open_subdir(cache, staging)
+        try:
+            _write_index(directory, manifest, files, notice)
+        finally:
+            directory.close()
+        try:
+            read = read_index(staged)
+        except (IncompatibleIndexError, OSError, ValueError) as error:
+            raise MergeError(
+                f"the assembled snapshot does not read back: {error}"
+            ) from error
+        if read.snapshot.get("snapshot_id") != manifest["snapshot_id"]:
+            raise MergeError("the assembled snapshot reads back under another id")
+        live = store.open_subdir(cache, "index")
+        try:
+            with store.exclusive_writer(live):
+                _write_index(live, manifest, files, notice)
+        finally:
+            live.close()
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+
+
+def merge_builds(builds, cache_dir, read_bytes=_read_file, log=print):
+    """Merge the newest run of every label archived under ``builds`` into
+    ``<cache_dir>/index``; returns the manifest. The labels whose newest
+    run cannot be a source are reported through ``log`` and left out; an
+    older run never stands in for one. Nothing to merge is refused."""
+    sources, skipped = select_sources(builds, read_bytes)
+    for run in skipped:
+        log(f"skipped {run['id']}: {run['reason']}")
+    if not sources:
+        raise MergeError(f"no build to merge under {builds}")
+    loaded = load_sources(sources, read_bytes)
+    _, tables = merge_tables(
+        [(s["build_id"], s["snapshot"], s["tables"]) for s in loaded]
+    )
+    notice = compose_notice(loaded, tables["feeds.parquet"])
+    manifest, files = assemble(loaded, tables, notice)
+    write_snapshot(cache_dir, manifest, files, notice)
+    return manifest
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--builds",
+        type=Path,
+        default=DEFAULT_BUILDS_DIR,
+        help=f"the archived builds, one <label>-<snapshot>/index each "
+        f"(default: {DEFAULT_BUILDS_DIR})",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=DEFAULT_CACHE_DIR,
+        help=f"the cache whose index/ receives the merged snapshot "
+        f"(default: {DEFAULT_CACHE_DIR})",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    arguments = parse_args(argv)
+    try:
+        manifest = merge_builds(arguments.builds, arguments.cache_dir)
+    except (MergeError, store.StoreError) as error:
+        print(f"merge: {error}", file=sys.stderr)
+        return 1
+    counts = manifest["counts"]
+    print(
+        f"merged {len(manifest['merged'])} builds into {arguments.cache_dir / 'index'}: "
+        f"snapshot {manifest['snapshot_id']}, {counts['feeds']} feeds, "
+        f"{counts['places']} places, {counts['edges']} edges, "
+        f"{counts['realtime']} companions"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
