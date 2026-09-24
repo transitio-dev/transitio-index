@@ -769,7 +769,7 @@ def test_the_merged_block_carries_portable_identities_only(tmp_path):
         ({"other": {"x": 1}}, "no catalogue sources"),
         ({"atlas": "a4d0204"}, "catalogue atlas is not a record"),
     ):
-        _rewrite_snapshot(tmp_path / fi / "index", lambda s: s.update(sources=sources))
+        _rewrite_snapshot(tmp_path / fi / "index", lambda s, sources=sources: s.update(sources=sources))
         with pytest.raises(merge.MergeError, match=message):
             merge.assemble(*_merged(tmp_path), b"NOTICE\n")
 
