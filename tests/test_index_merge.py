@@ -7,6 +7,7 @@ import io
 import json
 import os
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -466,3 +467,113 @@ def test_a_large_integer_tolerance_is_a_number_not_an_error(tmp_path):
         )
     sources, _ = merge.select_sources(tmp_path)
     assert len(merge.load_sources(sources)) == 2
+
+
+# ---- routing the merged tables into the partitions of one snapshot ----
+
+
+def _merged(archived):
+    sources, skipped = merge.select_sources(archived)
+    assert skipped == []
+    loaded = merge.load_sources(sources)
+    _, tables = merge.merge_tables(
+        [(s["build_id"], s["snapshot"], s["tables"]) for s in loaded]
+    )
+    return loaded, tables
+
+
+def _pairs(rows):
+    return list(zip(rows["place_id"].to_pylist(), rows["feed_id"].to_pylist()))
+
+
+def test_every_merged_row_lands_in_its_partition_sorted_without_the_merge_columns(
+    tmp_path,
+):
+    fx = pytest.importorskip("index_fixture")
+    _two_runs(fx, tmp_path)
+    _, tables = _merged(tmp_path)
+    routed = merge._route(tables)
+    assert list(routed) == [
+        ("DE", "edges"),
+        ("DE", "feeds"),
+        ("DE", "places"),
+        ("FI", "edges"),
+        ("FI", "feeds"),
+        ("FI", "places"),
+        ("FI", "realtime"),
+        ("international", "feeds"),
+        ("international", "realtime"),
+        ("links", "edges"),
+    ]
+    # Feeds under their home country, ``international`` without one.
+    assert routed[("FI", "feeds")]["feed_id"].to_pylist() == ["hsl", "nat"]
+    assert routed[("DE", "feeds")]["feed_id"].to_pylist() == ["flix"]
+    assert routed[("international", "feeds")]["feed_id"].to_pylist() == ["ferry"]
+    # Places under their country, whichever run they came from.
+    assert routed[("FI", "places")]["place_id"].to_pylist() == ["fi", "hel"]
+    assert routed[("DE", "places")]["place_id"].to_pylist() == ["ber"]
+    # Domestic edges with their feed, the rest under ``links`` naming the
+    # feed's partition; every table sorted by its ids.
+    assert _pairs(routed[("FI", "edges")]) == [("fi", "nat"), ("hel", "hsl")]
+    assert _pairs(routed[("DE", "edges")]) == [("ber", "flix")]
+    links = routed[("links", "edges")]
+    assert _pairs(links) == [("hel", "ferry"), ("hel", "flix")]
+    assert links["feed_partition"].to_pylist() == ["international", "DE"]
+    # A companion with its static feed; an unlinked one under ``international``.
+    assert routed[("FI", "realtime")]["feed_id"].to_pylist() == ["hsl-rt"]
+    assert routed[("international", "realtime")]["feed_id"].to_pylist() == ["lost"]
+    for (partition, table), rows in routed.items():
+        assert "build_id" not in rows.column_names
+        assert "partition" not in rows.column_names
+        if table == "edges":
+            assert ("feed_partition" in rows.column_names) == (partition == "links")
+
+
+def _tiny(country="FI", edge_feed="f", edge_place="p"):
+    return {
+        "feeds.parquet": pa.table(
+            {"feed_id": ["f"], "home_country": ["FI"], "snapshot": ["x"]}
+        ),
+        "places.parquet": pa.table(
+            {"place_id": ["p"], "country_code": [country], "snapshot": ["x"]}
+        ),
+        "edges.parquet": pa.table(
+            {"place_id": [edge_place], "feed_id": [edge_feed], "snapshot": ["x"]}
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "tables, message",
+    [
+        (_tiny(country=None), "has no country_code"),
+        (_tiny(edge_feed="g"), "edge of a feed the index lacks"),
+        (_tiny(edge_place="q"), "edge to a place the index lacks"),
+    ],
+)
+def test_routing_refuses_what_publish_refuses(tables, message):
+    with pytest.raises(merge.MergeError, match=message):
+        merge._route(tables)
+
+
+def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadata(
+    tmp_path,
+):
+    fx = pytest.importorskip("index_fixture")
+    _two_runs(fx, tmp_path)
+    _, tables = _merged(tmp_path)
+    files, listing = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
+    assert set(files) == {(p, t) for p, tables_ in listing.items() for t in tables_}
+    for (partition, table), data in files.items():
+        read = pq.read_table(io.BytesIO(data))
+        assert set(read["snapshot"].to_pylist()) == {"feedcafefeedcafe"}
+        assert listing[partition][table] == {
+            "rows": len(read),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    assert listing["links"]["edges"]["rows"] == 2
+    assert listing["FI"]["realtime"]["rows"] == 1
+    assert b"geo" in pq.read_schema(io.BytesIO(files[("FI", "places")])).metadata
+    # The same tables give the same bytes again.
+    again, _ = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
+    assert again == files
