@@ -1039,14 +1039,16 @@ def test_a_merge_is_refused_while_another_holds_the_index(tmp_path):
     fx = pytest.importorskip("index_fixture")
     builds, cache = tmp_path / "builds", tmp_path / "cache"
     _two_runs(fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM]))
-    index = store.open_subdir(cache, "index")
-    try:
-        with store.exclusive_writer(index):
-            with pytest.raises(store.StoreError, match="another build is publishing"):
-                merge.merge_builds(builds, cache, log=lambda line: None)
-    finally:
-        index.close()
-    assert not list(cache.glob("index.*.tmp"))
+    for held in (store.open_directory(cache), store.open_subdir(cache, "index")):
+        try:  # the cache's lock guards the staging, the index's the commit
+            with store.exclusive_writer(held):
+                with pytest.raises(
+                    store.StoreError, match="another build is publishing"
+                ):
+                    merge.merge_builds(builds, cache, log=lambda line: None)
+        finally:
+            held.close()
+        assert not list(cache.glob("index.*.tmp"))
 
 
 def test_a_staging_path_that_cannot_be_cleared_is_refused(tmp_path):
@@ -1108,6 +1110,11 @@ def test_a_snapshot_the_reader_rejects_leaves_the_live_index_untouched(
         merge.merge_builds(builds, cache, log=lambda line: None)
     assert _files_under(cache / "index") == before
     assert not list(cache.glob("index.*.tmp"))
+    # A cache that had no index has none afterwards either.
+    fresh = tmp_path / "fresh"
+    with pytest.raises(merge.MergeError, match="does not read back"):
+        merge.merge_builds(builds, fresh, log=lambda line: None)
+    assert not (fresh / "index").exists() and not list(fresh.glob("index.*.tmp"))
 
 
 def test_a_failure_mid_commit_leaves_an_index_the_reader_refuses_and_the_next_merge_completes(

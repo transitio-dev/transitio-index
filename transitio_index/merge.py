@@ -841,29 +841,30 @@ def _remove_staging(staged):
 def write_snapshot(cache_dir, manifest, files, notice):
     """Write the assembled snapshot to ``<cache_dir>/index``.
 
-    Under the index's writer lock throughout, so two merges cannot stage
-    or commit at once: first into a temporary sibling,
-    ``index.<snapshot id>.tmp``, where the reader reads it back; a snapshot
-    the reader refuses is removed and the live index is left untouched.
-    Then committed as publish commits: every partition table through the
-    store's atomic replacement, the NOTICE, the manifest last. A reader
-    overlapping the commit sees at worst a new table under the old
-    manifest, which its digest check refuses; a crash mid-commit leaves an
-    index the reader refuses, and the next merge completes it. The staging
-    directory is removed afterwards (checked on success, best effort when
-    the merge itself failed), and a leftover one is removed before writing.
+    Under the cache's writer lock throughout, so two merges cannot stage
+    at once: first into a temporary sibling, ``index.<snapshot id>.tmp``,
+    where the reader reads it back; a snapshot the reader refuses is
+    removed and the live index is left as it was, absent included. Then
+    committed as publish commits, under the index's own lock (the one the
+    publisher takes): every partition table through the store's atomic
+    replacement, the NOTICE, the manifest last. A reader overlapping the
+    commit sees at worst a new table under the old manifest, which its
+    digest check refuses; a crash mid-commit leaves an index the reader
+    refuses, and the next merge completes it. The staging directory is
+    removed afterwards (checked on success, best effort when the merge
+    itself failed), and a leftover one is removed before writing.
     """
     from transitio.exceptions import IncompatibleIndexError
     from transitio.index import read_index
 
     cache = Path(cache_dir)
     staged = cache / f"index.{manifest['snapshot_id']}.tmp"
-    live = store.open_subdir(cache, "index")
+    root = store.open_directory(cache)
     try:
-        with store.exclusive_writer(live):
+        with store.exclusive_writer(root):
             _remove_staging(staged)
             try:
-                directory = store.open_subdir(cache, staged.name)
+                directory = root.child(staged.name)
                 try:
                     _write_index(directory, manifest, files, notice)
                 finally:
@@ -878,13 +879,18 @@ def write_snapshot(cache_dir, manifest, files, notice):
                     raise MergeError(
                         "the assembled snapshot reads back under another id"
                     )
-                _write_index(live, manifest, files, notice)
+                live = root.child("index")
+                try:
+                    with store.exclusive_writer(live):
+                        _write_index(live, manifest, files, notice)
+                finally:
+                    live.close()
             except BaseException:
                 shutil.rmtree(staged, ignore_errors=True)  # the merge's error stands
                 raise
             _remove_staging(staged)
     finally:
-        live.close()
+        root.close()
 
 
 def merge_builds(builds, cache_dir, read_bytes=_read_file, log=print):

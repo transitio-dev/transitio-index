@@ -31,8 +31,9 @@ tests/                 the build's pytest suite and its fixtures
 ```
 
 The entry points are modules, run with `python -m`:
-`python -m transitio_index.build`, `python -m transitio_index.publish_cli`
-and `python -m transitio_index.registry_history`.
+`python -m transitio_index.build`, `python -m transitio_index.merge`,
+`python -m transitio_index.publish_cli` and
+`python -m transitio_index.registry_history`.
 
 ## Develop
 
