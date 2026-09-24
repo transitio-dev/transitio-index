@@ -681,18 +681,27 @@ def _notice_sections(notice, build_id):
         ("licence", LICENCE_OPENING),
     )
     sections = {}
+    current = None
     for block in text.split("\n\n"):
         lines = block.strip("\n").split("\n")
         if lines == [""]:
             continue
         key = next((k for k, opening in openings if lines[0].startswith(opening)), None)
         if key is None:
-            raise MergeError(
-                f"{build_id}: NOTICE paragraph unknown to the merge: {lines[0]!r}"
-            )
+            # A block that opens with no known heading continues the section
+            # before it when it is indented (the license stage sets the
+            # geometry credit's source list off with a blank line); a
+            # non-indented one is a paragraph the merge does not know.
+            if current is None or not lines[0].startswith(" "):
+                raise MergeError(
+                    f"{build_id}: NOTICE paragraph unknown to the merge: {lines[0]!r}"
+                )
+            sections[current].extend(lines)
+            continue
         if key in sections:
             raise MergeError(f"{build_id}: NOTICE repeats its {key} paragraph")
         sections[key] = lines
+        current = key
     for key in ("geometry", "catalogue", "licence"):
         if key not in sections:
             raise MergeError(f"{build_id}: NOTICE lacks its {key} paragraph")

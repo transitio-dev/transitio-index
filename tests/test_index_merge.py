@@ -880,8 +880,12 @@ def _paragraphs(paragraphs):
 
 
 def _notice_text(derived=(), odbl=ODBL, metro=(), geometry=GEOMETRY):
-    """A NOTICE as the license stage writes it for one build."""
-    paragraphs = [[*geometry, *derived]]
+    """A NOTICE as the license stage writes it for one build: the geometry
+    credit's source list is a block of its own after a blank line, the way
+    the geometry audit formats it."""
+    paragraphs = [geometry]
+    if derived:
+        paragraphs.append(list(derived))
     if odbl:
         paragraphs.append(odbl)
     if metro:
@@ -930,6 +934,16 @@ def test_the_merged_notice_credits_every_source_once_and_recounts_the_licences(
     "de_notice, message",
     [
         (b"NOTICE\n", "paragraph unknown"),
+        # A non-indented block with no known opening is unknown; an indented
+        # block with no section before it has nothing to continue.
+        (
+            _paragraphs([GEOMETRY, ["An extra clause."], CATALOGUES, LICENCES]),
+            "paragraph unknown",
+        ),
+        (
+            _paragraphs([["  - orphan bullet"], GEOMETRY, CATALOGUES, LICENCES]),
+            "paragraph unknown",
+        ),
         (_paragraphs([GEOMETRY, LICENCES]), "lacks its catalogue paragraph"),
         (
             _paragraphs([GEOMETRY, CATALOGUES, LICENCES, LICENCES]),
