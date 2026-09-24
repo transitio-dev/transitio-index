@@ -1259,3 +1259,34 @@ def test_a_merged_snapshot_whose_lineage_moved_is_refused(tmp_path, change, mess
     change(fx, builds, fi, de)
     with pytest.raises(publisher.PublishIndexError, match=message):
         publisher.pack(cache / "index", cache_dir=cache, builds_dir=builds)
+
+
+def test_a_merged_manifest_recording_a_label_twice_is_refused(tmp_path):
+    fx = pytest.importorskip("index_fixture")
+    from transitio_index import publisher
+
+    builds, cache, fi, de, _ = _merged_cache(fx, tmp_path)
+    _rewrite_snapshot(
+        cache / "index",
+        lambda s: s.__setitem__("merged", [s["merged"][0], s["merged"][0]]),
+    )
+    with pytest.raises(publisher.PublishIndexError, match="records a label twice"):
+        publisher.pack(cache / "index", cache_dir=cache, builds_dir=builds)
+
+
+def test_a_builds_directory_that_cannot_be_read_is_a_publish_error(
+    tmp_path, monkeypatch
+):
+    fx = pytest.importorskip("index_fixture")
+    from transitio_index import merge as merge_module, publisher
+
+    builds, cache, fi, de, _ = _merged_cache(fx, tmp_path)
+
+    def failing(builds_dir):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(merge_module, "select_sources", failing)
+    with pytest.raises(
+        publisher.PublishIndexError, match="cannot read the archived builds"
+    ):
+        publisher.pack(cache / "index", cache_dir=cache, builds_dir=builds)

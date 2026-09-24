@@ -204,7 +204,15 @@ def _merged_current(snapshot, builds_dir):
         raise PublishIndexError(
             "a merged index is checked against its archived builds; name their directory"
         )
-    sources, _ = merge.select_sources(builds_dir)
+    labels = [record["label"] for record in records]
+    if len(set(labels)) != len(labels):
+        raise PublishIndexError("the index records a label twice; re-run the merge")
+    try:
+        sources, _ = merge.select_sources(builds_dir)
+    except (OSError, store.StoreError, ValueError) as error:
+        raise PublishIndexError(
+            f"{builds_dir}: cannot read the archived builds: {error}"
+        ) from error
     selected = {
         builds.label_of(build_id): (build_id, path) for build_id, path, _ in sources
     }
