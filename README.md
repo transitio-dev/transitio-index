@@ -1,11 +1,12 @@
 # transitio-index
 
 The feed index build for [transitio](https://github.com/cafein-py/transitio).
-It gathers the Mobility Database, Transitland Atlas and GBFS catalogues,
+It gathers the Mobility Database and Transitland Atlas catalogues (and the
+GBFS catalogue, to keep shared-mobility systems apart from the feeds),
 crosswalks and de-duplicates their feeds, resolves the places they serve
 against Overture divisions and boundary geometry, crawls the feeds for
-coverage, classifies each feed's tier per place, and publishes a versioned
-index snapshot as a GitHub release.
+coverage, classifies each feed's tier per place, ranks each place's feeds, and
+publishes a versioned index snapshot as a GitHub release.
 
 transitio's reader (`transitio.index`) installs that snapshot and answers
 place and feed queries from it. The reader lives in transitio and is what
@@ -17,8 +18,10 @@ from a checkout.
 ```
 transitio_index/       the build package: the stages (ingest, crosswalk,
                        gazetteer, resolve, crawl, expand, coverage, classify,
-                       curate, prune, license, publish) and the registry
+                       curate, rank, prune, license, publish, stats), the
+                       merge and the registry
 transitio_index/build.py              the pipeline entry point
+transitio_index/merge.py              merge the per-label builds into one snapshot
 transitio_index/publish_cli.py        release the built snapshot
 transitio_index/registry_history.py   the CI registry-history guard
 scripts/sample_catalogues.py  cut a small multi-place catalogue sample
@@ -82,8 +85,9 @@ matching registry together.
 1. `ingest` — download and read the three source catalogues: the Transitland
    Atlas archive, the Mobility Database `feeds_v2.csv` and the GBFS
    `systems.csv`.
-2. `crosswalk` — match the same feed across the three catalogues into one
-   de-duplicated table.
+2. `crosswalk` — match the same feed across the Transitland Atlas and the
+   Mobility Database into one de-duplicated table. The GBFS systems go to a
+   table of their own, which the index does not publish.
 3. `gazetteer` — resolve Overture administrative divisions to Wikidata QIDs,
    seed the cities the feeds declare, attach metros, boundary geometry and
    names, and mint the place registry.
@@ -99,11 +103,18 @@ matching registry together.
    national edge, and the edge's `service` struct says how much service that
    is.
 9. `curate` — apply the curated edge overrides on top of the classified edges.
-10. `prune` — drop the places that no kept edge needs.
-11. `license` — record each shipped feed's licence and lineage, and write the
+10. `rank` — give every edge its relevance: a category from its tier (local
+    is primary, regional secondary, national tertiary, international stays
+    international), a score within that category, and whether it crosses a
+    border.
+11. `prune` — drop the places that no kept edge needs.
+12. `license` — record each shipped feed's licence and lineage, and write the
     NOTICE.
-12. `publish` — write the shippable `cache/index/`: the GeoParquet tables and
+13. `publish` — write the shippable `cache/index/`: the GeoParquet tables and
     manifest the reader installs.
+14. `stats` — write statistics about the catalogue rows the build saw and the
+    feeds they became, for reporting; the shipped index does not depend on
+    them.
 
 ### Running the stages
 
@@ -118,10 +129,10 @@ that stage — and, in particular, that it never runs the stages *before* it:
   ones before it). This carries a build forward from a chosen stage to the end.
 
 So a full build from an empty cache starts at the first stage and runs the whole
-pipeline through to `publish`:
+pipeline through `publish` and `stats`:
 
 ```
-python -m transitio_index.build --stage ingest --downstream   # ingest -> publish
+python -m transitio_index.build --stage ingest --downstream   # ingest -> stats
 ```
 
 To redo only part of a build, run the earliest stage you need to change with
@@ -130,7 +141,7 @@ after editing a curated override, re-apply it and rebuild the shipped index
 without re-crawling:
 
 ```
-python -m transitio_index.build --stage curate --downstream   # curate -> publish
+python -m transitio_index.build --stage curate --downstream   # curate -> stats
 ```
 
 Running a single stage (no `--downstream`) is for iterating on that one stage
