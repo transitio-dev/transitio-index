@@ -185,6 +185,27 @@ def city_qids(dataset, qids):
     return found & wanted
 
 
+def council_area_cities(dataset, areas):
+    """``{area overture_id: locality record}``: the one QID-bearing locality
+    each of ``areas`` is the council area of (see ``council_area``), its
+    ancestry cut at the area so the city sits in it. One locality scan over
+    the areas' countries."""
+    by_id = {area["overture_id"]: area for area in areas}
+    countries = {area["country"] for area in areas}
+    wanted = {(area["country"], name) for area in areas for name in _area_names(area)}
+    found = {}
+    for record in read_city_candidates(dataset, countries, wanted):
+        if record["subtype"] != "locality" or not record["wikidata"]:
+            continue
+        for depth, ancestor in enumerate(record["ancestors"]):
+            area = by_id.get(ancestor.get("overture_id"))
+            if area is not None and council_area(record, area):
+                record["ancestors"] = record["ancestors"][: depth + 1]
+                found.setdefault(area["overture_id"], []).append(record)
+                break
+    return {key: cities[0] for key, cities in found.items() if len(cities) == 1}
+
+
 def _resolve_candidates(candidates, wikidata):
     """Attach a resolved ``qid``/``resolution_method`` to each candidate."""
     pending = {

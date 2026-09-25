@@ -528,15 +528,30 @@ def _discover(
     # has an area, so the stop reached it, but the place is the city — the
     # kind the seed gives the same QID from its declared name.
     shared = {c["qid"] for c in candidates if c["kind"] == "region" and c["qid"]}
+    # A memo-only lookup answered the stops from its cache; the theme is
+    # opened on first need.
+    dataset = None
     cities = set()
     if shared:
-        # A memo-only lookup answered the stops from its cache; the theme is
-        # opened here for the one scan.
         dataset = lookup.division_dataset() or overture.overture_dataset(release)
         cities = seed.city_qids(dataset, shared)
     for record in candidates:
         if record["kind"] == "region" and record["qid"] in cities:
             record["kind"] = "city"
+    # A county no QID names may be the council area of the city carrying its
+    # name (Manchester, the City of Edinburgh), which has no area of its own
+    # for a stop to reach: the city joins it, and takes its area below.
+    counties = [
+        c
+        for c in candidates
+        if c["source_subtype"] == "county" and c["resolution_method"] == "overture_id"
+    ]
+    if counties:
+        if dataset is None:
+            dataset = lookup.division_dataset() or overture.overture_dataset(release)
+        found = list(seed.council_area_cities(dataset, counties).values())
+        seed._resolve_candidates(found, wikidata)
+        candidates += [city for city in found if city["qid"]]
     skeleton = {}
     for record in candidates:
         if record["qid"] or overture.qidless_place(record):
@@ -594,6 +609,8 @@ def _discover(
             }
         )
         conflicts.append(qid)
+    # A dropped conflict's children link to the seeded row that stands.
+    survivors = {qid: canonical[qid] for qid in conflicts}
     for qid in conflicts:
         del discovered[qid]
         del canonical[qid]
@@ -617,21 +634,34 @@ def _discover(
         new_ids.append(qid)
     # Boundaries come from a complete, id-filtered area read, so a multi-part
     # place ships whole even when its stops touched only one component.
+    wanted = {discovered[qid]["overture_id"] for qid in new_ids}
+    lent = geometry.council_areas(discovered.values())
     areas = geometry.read_areas(
         area_dataset,
-        {discovered[qid]["overture_id"] for qid in new_ids},
+        wanted | {lent[key] for key in wanted if key in lent},
         simplify=geometry.SIMPLIFY_TOLERANCE_DEG,
         cache=(cache_dir, release),
         reopen=reopen,
         countries={discovered[qid].get("country_code") for qid in new_ids} - {None},
     )
+    given = geometry.lend_council_areas(areas, lent)
     for qid in new_ids:
         place = discovered[qid]
         place.setdefault("aliases", [])
         place.setdefault("statistical_area_id", None)
         place.setdefault("metro_ids", [])
         _attach_boundary(place, areas.get(place["overture_id"]))
+        if place["geometry"] and place["overture_id"] in given:
+            place["geometry_source"] = geometry.COUNCIL_AREA
         places_by_id[qid] = place
+    # A discovered place under a seeded one links to the key the seeded row
+    # is held by — its own id, for a place no QID names.
+    held = {**survivors, **canonical}
+    for qid in new_ids:
+        place = places_by_id[qid]
+        parent = place.get("parent_id")
+        if parent not in places_by_id and held.get(parent) in places_by_id:
+            place["parent_id"] = held[parent]
 
     new_cities = [qid for qid in new_ids if places_by_id[qid].get("kind") == "city"]
     city_rows = [places_by_id[qid] for qid in new_cities]

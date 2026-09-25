@@ -152,6 +152,41 @@ DIVISIONS = [
             ("fi-salo-county", "county", "Salo district"),
         ),
     ),
+    # Edinburgh: a locality with no area inside its council area, a county no
+    # QID names, "City of Edinburgh"; the hierarchy passes through a ward.
+    fx.division(
+        "gb-edi-county",
+        "GB",
+        "county",
+        name="City of Edinburgh",
+        sources=[
+            {"dataset": "geoBoundaries", "license": "CC-BY-4.0", "record_id": "E"}
+        ],
+        hierarchies=fx.chain(("gb-edi-county", "county", "City of Edinburgh")),
+    ),
+    fx.division(
+        "gb-edi-ward",
+        "GB",
+        "locality",
+        wikidata="Q999005",
+        name="Old Town",
+        hierarchies=fx.chain(
+            ("gb-edi-county", "county", "City of Edinburgh"),
+            ("gb-edi-ward", "locality", "Old Town"),
+        ),
+    ),
+    fx.division(
+        "gb-edi",
+        "GB",
+        "locality",
+        wikidata="Q23436",
+        name="Edinburgh",
+        hierarchies=fx.chain(
+            ("gb-edi-county", "county", "City of Edinburgh"),
+            ("gb-edi-ward", "locality", "Old Town"),
+            ("gb-edi", "locality", "Edinburgh"),
+        ),
+    ),
 ]
 
 AREAS = [
@@ -169,6 +204,8 @@ AREAS = [
     # Two small towns astride a border, for the FAO region the seed leaves.
     fx.area("fi-ika", _wkb(22.9, 61.7, 23.0, 61.8), GOOD, country="FI"),
     fx.area("se-hap", _wkb(24.1, 61.7, 24.2, 61.8), GOOD, country="SE"),
+    fx.area("gb-edi-county", _wkb(-3.4, 55.85, -3.0, 56.0), GOOD, country="GB"),
+    fx.area("gb-edi-ward", _wkb(-3.2, 55.94, -3.18, 55.96), GOOD, country="GB"),
 ]
 
 
@@ -298,6 +335,52 @@ def test_a_crawled_stop_discovers_an_unseeded_city(tmp_path):
     # The country was already seeded and is not duplicated or replaced.
     assert places["Q33"] is not tampere
     assert manifest["places_added"] == 2  # the city and its region
+
+
+@pytest.mark.parametrize("kind", ["region", "city"], ids=["seeded", "conflicting"])
+def test_a_stop_in_a_council_area_discovers_its_city(tmp_path, kind):
+    from transitio_index import coverage, registry
+
+    # The council area was seeded, and is held by its own id — or its
+    # division is held by a row of another kind, which stands.
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text(HEADER)
+    with registry.session(path) as reg:
+        council_id = reg.identify(
+            {"overture": ["gb-edi-county"]},
+            kind=kind,
+            minted_from="t",
+            minted_in="t 1",
+        )
+        reg.save()
+    council = {
+        **SEED_PLACES[0],
+        "place_id": council_id,
+        "tp_id": council_id,
+        "kind": kind,
+        "source_subtype": "county",
+        "resolution_method": "overture_id",
+        "name": "City of Edinburgh",
+        "country_code": "GB",
+        "overture_id": "gb-edi-county",
+    }
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES + [council])
+    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    _write_crawl(cache, "f-edi", ["s1,55.95,-3.19\n"])
+    with registry.session(path) as reg:
+        _, places, _ = _expand(tmp_path, cache, registry=reg)
+    edinburgh = places["Q23436"]
+    # The city sits in its council area, not the ward its hierarchy passes
+    # through, and ships the area's boundary for want of its own.
+    assert edinburgh["kind"] == "city" and edinburgh["overture_id"] == "gb-edi"
+    assert edinburgh["parent_id"] == council_id
+    if kind == "city":
+        return
+    assert edinburgh["geometry_source"] == geometry.COUNCIL_AREA
+    assert places["Q999005"]["geometry_source"] == "overture"
+    index = coverage.place_index({p["place_id"]: p for p in places.values()})
+    assert sorted(index["gb-edi-county"]) == sorted([council_id, edinburgh["place_id"]])
 
 
 def test_an_already_seeded_place_is_not_re_added(tmp_path):
