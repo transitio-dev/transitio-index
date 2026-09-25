@@ -366,6 +366,63 @@ def test_a_metro_gets_the_union_of_its_members_shipped_polygons(tmp_path):
     assert manifest["member_union_geometry"] == 1
 
 
+def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    def named(place, name, **fields):
+        return {**place, "name": name, "country_code": "GB", **fields}
+
+    council = named(
+        _place("overture:gb-man", "region", overture_id="gb-man"),
+        "Manchester",
+        source_subtype="county",
+        resolution_method="overture_id",
+    )
+    county = named(
+        _place("Q_LEEDS", "region", overture_id="gb-leeds"),
+        "Leeds",
+        source_subtype="county",
+    )
+    records = [
+        council,
+        county,
+        named(_place("Q18125", "city", overture_id="no-area"), "Manchester"),
+        # A same-named city with an area of its own keeps it.
+        named(_place("Q_OWN", "city", overture_id="fi-helsinki"), "Manchester"),
+        # A county a QID names is a place of its own, not the city's area.
+        named(_place("Q39121", "city", overture_id="no-area-2"), "Leeds"),
+    ]
+    for record in records[2:]:
+        record["parent_id"] = council["place_id"]
+    records[-1]["parent_id"] = county["place_id"]
+    # A curated boundary for the council area is the city's too.
+    wkt = "POLYGON((-2.3 53.4, -2.2 53.4, -2.2 53.5, -2.3 53.5, -2.3 53.4))"
+    overrides_dir = write_overrides(
+        tmp_path, places=[{"place": "overture:gb-man", "set_boundary": wkt}]
+    )
+    cache = tmp_path / "cache"
+    _publish(cache, records, overrides_dir)
+    areas = AREAS + [fx.area(key, OTHER, [_osm()]) for key in ("gb-man", "gb-leeds")]
+    dataset = fx.write_area_dataset(tmp_path / "areas.parquet", areas)
+    manifest = geometry.attach_geometry(
+        cache, dataset=dataset, overrides_dir=overrides_dir
+    )
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    places = {p["place_id"]: p for p in places}
+    manchester = places["Q18125"]
+    assert places["overture:gb-man"]["geometry_source"] == "curated"
+    assert manchester["geometry_source"] == geometry.COUNCIL_AREA
+    assert manchester["geometry"] == places["overture:gb-man"]["geometry"]
+    assert places["Q_OWN"]["geometry_source"] == "overture"
+    assert places["Q39121"]["geometry"] is None
+    assert manifest["council_area_geometry"] == 1
+    # The metros stage reads the city's footprint from the same area.
+    read = geometry.place_areas(cache, dataset, records, {"no-area", "no-area-2"})
+    assert read["no-area"] is read["gb-man"] and "no-area-2" not in read
+
+
 def test_area_chunking_matches_a_single_pass(tmp_path):
     # Resolving the seeded areas in small chunks (a memory-tight host's setting)
     # must produce exactly the same attached geometry as one full-set pass.

@@ -3,7 +3,7 @@ import pytest
 import hashlib  # noqa: E402
 import json  # noqa: E402
 
-from transitio_index import coverage, crawl, overrides, store  # noqa: E402
+from transitio_index import coverage, crawl, geometry, overrides, store  # noqa: E402
 
 
 def _publish(cache, subdir, pointer, artifact, records, manifest=None, extra=None):
@@ -294,6 +294,23 @@ def test_a_single_stop_inside_a_place_admits_the_feed(tmp_path):
     assert set(tiny) == {"Q-city", "Q-other", "Q-reg", "Q-c", "Q-metro", "Q-csa"}
     assert tiny["Q-city"]["service"]["stops"] == 1
     assert tiny["Q-other"]["evidence"]["stop_share"] == pytest.approx(2 / 3)
+
+
+def test_a_stop_in_a_council_area_reaches_the_city_shipping_its_boundary(tmp_path):
+    council = {**_place("tp_council", "region"), "overture_id": "ov-council"}
+    city = {
+        **_place("tp_city", "city", parent_id="tp_council"),
+        "overture_id": "ov-city",
+        "geometry_source": geometry.COUNCIL_AREA,
+    }
+    lookup = StubLookup({30.0: [{"kind": "region", "overture_id": "ov-council"}]})
+    _, _, edges = _cover(
+        tmp_path,
+        places=PLACES + [council, city],
+        crawls={"f-city": _rows(3, 30.0)},
+        lookup=lookup,
+    )
+    assert set(edges["f-city"]) == {"tp_council", "tp_city"}
 
 
 def test_dropped_rows_stay_in_the_share_denominator(tmp_path):

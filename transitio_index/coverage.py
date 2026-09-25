@@ -270,17 +270,24 @@ def _stop_hull(points):
 
 
 def place_index(places):
-    """``{overture_id: place_id}``: how division hits map onto places.
+    """``{overture_id: [place_id, ...]}``: how division hits map onto places.
 
     Overture id first — a P402-resolved place has no wikidata on the division
     record — with the QID (see :func:`place_qids`) as the fallback in
-    :func:`stop_places`.
+    :func:`stop_places`. A council area's hits are its city's too, when the
+    city ships the area's boundary for want of its own.
     """
-    return {
-        place.get("overture_id"): place_id
-        for place_id, place in places.items()
-        if place.get("overture_id")
-    }
+    from transitio_index import geometry
+
+    index = collections.defaultdict(list)
+    for place_id, place in places.items():
+        if place.get("overture_id"):
+            index[place["overture_id"]].append(place_id)
+        if place.get("geometry_source") == geometry.COUNCIL_AREA:
+            area = places.get(place.get("parent_id")) or {}
+            if area.get("overture_id"):
+                index[area["overture_id"]].append(place_id)
+    return dict(index)
 
 
 def place_qids(places):
@@ -319,11 +326,11 @@ def stop_places(lookup, x, y, by_overture, by_qid):
     for record in lookup.divisions_at(x, y):
         if record.get("country"):
             countries.add(record["country"])
-        place_id = by_overture.get(record.get("overture_id"))
-        if place_id is None:
-            place_id = by_qid.get(record.get("wikidata"))
-        if place_id is not None:
-            hit.add(place_id)
+        place_ids = by_overture.get(record.get("overture_id"))
+        if place_ids is None and record.get("wikidata") in by_qid:
+            place_ids = [by_qid[record["wikidata"]]]
+        if place_ids is not None:
+            hit.update(place_ids)
             continue
         qid = record.get("wikidata")
         if record.get("kind") and qid and overture.QID_PATTERN.match(qid):
