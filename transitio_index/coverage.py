@@ -12,7 +12,9 @@ because minted metros carry no geometry yet (the merged metros stage's own
 convention); when metro polygons exist, PIP takes over with no schema change.
 Crawled evidence supersedes the declared placements feed by feed. Feeds whose
 crawls hold the same data — an operator's feed listed twice, often once in each
-catalogue — fold into one feed first, the others' ids kept as its aliases.
+catalogue — fold into one feed first, the others' ids kept as its aliases;
+feeds sharing their stops and routes but not their schedules are listed in
+``near_duplicates.jsonl`` and kept apart.
 
 For every other feed the answer comes from
 what the catalogues declare: the seed stage resolved each feed's declared
@@ -47,6 +49,7 @@ log = logging.getLogger(__name__)
 COVERAGE_POINTER = "coverage.json"
 FEEDS_ARTIFACT = "feeds_covered.jsonl"
 EDGES_ARTIFACT = "edges_candidate.jsonl"
+NEAR_DUPLICATES_ARTIFACT = "near_duplicates.jsonl"
 
 
 class CoverageError(RuntimeError):
@@ -183,6 +186,20 @@ def crawled_states(cache_dir, feeds):
     return states, unmatched
 
 
+def _enough_stops(states, members):
+    """Whether the stops ``members`` share (one stops digest) give at least two
+    readable coordinates, read through the first member whose ``stops.txt``
+    verifies: a header-only archive is never taken for another feed's twin,
+    and one member's damaged cache does not decide for the rest."""
+    from transitio_index import expand
+
+    for feed_id in members:
+        read = expand._stop_points(*states[feed_id])
+        if read is not None:
+            return len(read[0]) >= 2
+    return False
+
+
 # The tables two crawls must both carry, digest for digest, to be one feed.
 FOLD_MEMBERS = ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt")
 # Which feed of a folded group keeps its id: one both catalogues carry first.
@@ -200,8 +217,6 @@ def fold_duplicates(feeds, states):
     folded MDB feed's record as a feed both catalogues carry, matched by
     ``content``. ``feeds`` and ``states`` lose the folded feeds.
     """
-    from transitio_index import expand
-
     by_id = {feed["feed_id"]: feed for feed in feeds}
     groups = collections.defaultdict(list)
     for feed_id, (_, state) in states.items():
@@ -219,8 +234,7 @@ def fold_duplicates(feeds, states):
         members.sort(
             key=lambda f: (SOURCE_RANK.get(by_id[f].get("source"), len(SOURCE_RANK)), f)
         )
-        read = expand._stop_points(*states[members[0]])
-        if read is None or len(read[0]) < 2:
+        if not _enough_stops(states, members):
             continue
         keep = by_id[members[0]]
         for feed_id in members[1:]:
@@ -243,6 +257,30 @@ def fold_duplicates(feeds, states):
             del states[feed_id]
     feeds[:] = [feed for feed in feeds if feed["feed_id"] not in folded]
     return folded
+
+
+def near_duplicates(states):
+    """Crawled feeds sharing their stops and routes that were not folded —
+    versions of one network, or copies the fold withheld for want of
+    stop_times — as ``{"feed_ids", "differ"}`` rows naming the tables that
+    differ (none for such copies). Reported, never folded; a group whose
+    stops give fewer than two readable coordinates is left out."""
+    groups = collections.defaultdict(list)
+    for feed_id, (_, state) in states.items():
+        digests = state.get("member_sha256")
+        if isinstance(digests, dict) and all(
+            isinstance(digests.get(name), str) for name in ("stops.txt", "routes.txt")
+        ):
+            groups[(digests["stops.txt"], digests["routes.txt"])].append(feed_id)
+    report = []
+    for members in groups.values():
+        if len(members) < 2 or not _enough_stops(states, members):
+            continue
+        digests = [states[feed_id][1]["member_sha256"] for feed_id in members]
+        names = set().union(*digests)
+        differ = [n for n in sorted(names) if len({d.get(n) for d in digests}) > 1]
+        report.append({"feed_ids": sorted(members), "differ": differ})
+    return sorted(report, key=lambda row: row["feed_ids"])
 
 
 def link_static_feeds(feeds, canonical):
@@ -744,6 +782,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "crawl_fields": {},
             }
             folded = {}
+            near = []
             opened_lookup = None
             crawl_digest = None
             crawl_lock = crawl.reading(cache_dir)
@@ -768,6 +807,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                         lookup = opened_lookup
                     states, unmatched = crawled_states(cache_dir, feeds)
                     folded = fold_duplicates(feeds, states)
+                    near = near_duplicates(states)
                     try:
                         crawled_by_key, crawl_report = crawled_edges(
                             states, places, lookup, conflicts=conflicts
@@ -838,6 +878,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "feeds": len(feeds),
                 "feeds_covered": len(covered),
                 "folded_feeds": dict(sorted(folded.items())),
+                "near_duplicate_groups": len(near),
                 "feeds_overrides_sha256": feeds_digest,
                 "overrides_applied": coverage_overrides,
                 "stale_overrides": len(override_report),
@@ -874,6 +915,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     FEEDS_ARTIFACT: store.jsonl_chunks(feeds),
                     EDGES_ARTIFACT: store.jsonl_chunks(edges),
                     "override_report.jsonl": store.jsonl_chunks(override_report),
+                    NEAR_DUPLICATES_ARTIFACT: store.jsonl_chunks(near),
                 },
                 manifest,
                 held=directory,

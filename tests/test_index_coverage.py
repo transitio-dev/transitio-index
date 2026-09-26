@@ -433,23 +433,27 @@ TABLES = {
 NO_STOP_TIMES = {k: v for k, v in TABLES.items() if k != "stop_times.txt"}
 
 
+ALL = ["f-atlas", "f-mdb-1", "f-mdb-2"]
+
+
 @pytest.mark.parametrize(
-    "stops, tables, copy_tables, folded",
+    "stops, tables, copy_tables, folded, near",
     [
-        (3, TABLES, TABLES, {"f-mdb-1": "f-atlas", "f-mdb-2": "f-atlas"}),
+        (3, TABLES, TABLES, {"f-mdb-1": "f-atlas", "f-mdb-2": "f-atlas"}, []),
         (
             3,
             TABLES,
             {**TABLES, "stop_times.txt": b"trip_id\nt\n"},
             {"f-mdb-1": "f-atlas"},
+            [(["f-atlas", "f-mdb-2"], ["stop_times.txt"])],
         ),
-        (1, TABLES, TABLES, {}),
-        (3, NO_STOP_TIMES, NO_STOP_TIMES, {}),
+        (1, TABLES, TABLES, {}, []),
+        (3, NO_STOP_TIMES, NO_STOP_TIMES, {}, [(ALL, [])]),
     ],
     ids=["same-data", "other-schedule", "one-stop", "no-stop-times"],
 )
 def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
-    tmp_path, stops, tables, copy_tables, folded
+    tmp_path, stops, tables, copy_tables, folded, near
 ):
     feeds = [
         {**_feed("f-atlas"), "source": "atlas", "crosswalk_method": "none"},
@@ -465,7 +469,7 @@ def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
         lookup=LOOKUP,
     )
     assert manifest["folded_feeds"] == folded
-    assert set(covered) == {"f-atlas", "f-mdb-1", "f-mdb-2"} - set(folded)
+    assert set(covered) == set(ALL) - set(folded)
     assert set(edges) == set(covered)
     kept = covered["f-atlas"]
     assert kept["aliases"] == sorted(folded)
@@ -473,6 +477,33 @@ def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
     assert (kept["source"], kept.get("mdb_id"), kept["crosswalk_method"]) == (
         ("both", "1", "content") if folded else ("atlas", None, "none")
     )
+    # Feeds sharing stops and routes but not every table are reported apart.
+    rows, _ = store.read_jsonl(
+        tmp_path / "cache" / "coverage",
+        "coverage.json",
+        coverage.NEAR_DUPLICATES_ARTIFACT,
+    )
+    assert [(r["feed_ids"], r["differ"]) for r in rows] == near
+    assert manifest["near_duplicate_groups"] == len(near)
+
+
+def test_a_damaged_cache_does_not_keep_twins_apart(tmp_path):
+    # The kept feed's stops.txt no longer verifies; its copy's does, and the
+    # two share one stops digest, so the copy's file answers the stops guard.
+    feeds = [
+        {**_feed("f-atlas"), "source": "atlas", "crosswalk_method": "none"},
+        {**_feed("f-mdb-1"), "source": "mdb", "mdb_id": "1", "mdb": {"id": "1"}},
+    ]
+    manifest, _, _ = _cover(
+        tmp_path,
+        feeds=feeds,
+        placements=[],
+        crawls={feed["feed_id"]: _rows(3, 10.0) for feed in feeds},
+        members={"f-atlas": TABLES, "f-mdb-1": TABLES},
+        tamper="f-atlas",
+        lookup=LOOKUP,
+    )
+    assert manifest["folded_feeds"] == {"f-mdb-1": "f-atlas"}
 
 
 def test_a_crawl_that_changed_after_expansion_is_refused(tmp_path):
