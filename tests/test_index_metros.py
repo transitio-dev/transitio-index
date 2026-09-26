@@ -484,7 +484,12 @@ def test_set_place_members_replaces_a_metros_members_reciprocally(tmp_path):
 
     both = {"Q1297": [CHICAGO_METRO], "Q28515": [CHICAGO_METRO]}
     entries = [
-        {"place": "Q1754965", "set_place_members": ["Q1297"], "evidence_hash": "0" * 64}
+        {
+            "place": "Q1754965",
+            "set_place_members": ["Q1297"],
+            "evidence_hash": "0" * 64,
+        },
+        {"place": "Q404", "set_place_members": ["Q1297"]},  # another build's metro
     ]
     manifest, places = _run(
         tmp_path, both, overrides_dir=write_overrides(tmp_path, places=entries)
@@ -503,15 +508,18 @@ def test_set_place_members_replaces_a_metros_members_reciprocally(tmp_path):
     assert report[0]["current_evidence_hash"] == overrides.canonical_digest(
         ["Q1297", "Q28515"]
     )
-    with pytest.raises(overrides.OverrideError, match="needs a seeded metro"):
-        _run(
-            tmp_path / "bad",
-            both,
-            overrides_dir=write_overrides(
-                tmp_path / "bad",
-                places=[{"place": "Q1297", "set_place_members": ["Q28515"]}],
-            ),
-        )
+    # A city is no metro, and an own id among the members may be a place
+    # still held under its concordance key.
+    for place, members in (("Q1297", ["Q28515"]), ("Q404", ["tp_4"])):
+        with pytest.raises(overrides.OverrideError, match="needs a seeded metro"):
+            _run(
+                tmp_path / place,
+                both,
+                overrides_dir=write_overrides(
+                    tmp_path / place,
+                    places=[{"place": place, "set_place_members": members}],
+                ),
+            )
 
 
 def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
@@ -1185,6 +1193,17 @@ def test_a_fao_metro_auto_publishes_under_the_derived_gate(
         assert [r["reason"] for r in report if r.get("branch") == "fao"] == [
             "a derived input is not allowlisted"
         ]
+
+
+def test_members_for_a_fao_metro_this_build_mints_are_refused(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import overrides
+
+    # The FAO metro is minted after the members are set: not another build's.
+    entries = [{"place": "fao_city_region:50", "set_place_members": ["Q1297"]}]
+    with pytest.raises(overrides.OverrideError, match="needs a seeded metro"):
+        _fao_run(tmp_path, overrides_dir=write_overrides(tmp_path, places=entries))
 
 
 def test_a_registry_backed_fao_metro_carries_its_region_not_a_cbsa(tmp_path):

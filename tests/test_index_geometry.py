@@ -251,11 +251,46 @@ def test_set_boundary_attaches_a_curated_polygon(tmp_path):
     manifest, places, _ = _run(
         tmp_path,
         overrides_dir=write_overrides(
-            tmp_path, places=[{"place": "Q_METRO", "set_boundary": wkt}]
+            tmp_path,
+            places=[
+                {"place": "Q_METRO", "set_boundary": wkt},
+                {"place": "Q404", "set_boundary": wkt},  # another build's place
+            ],
         ),
     )
     metro = places["Q_METRO"]
     assert metro["geometry_source"] == "curated"
+    # A string that is no reference names nothing: refused.
+    with pytest.raises(overrides.OverrideError, match="needs a seeded place"):
+        _run(
+            tmp_path / "typo",
+            overrides_dir=write_overrides(
+                tmp_path / "typo", places=[{"place": "Q-typo", "set_boundary": wkt}]
+            ),
+        )
+    # With a registry the entry names the place by its own id, as this stage
+    # holds places: a registered place outside the build is another build's.
+    from transitio_index import registry
+
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        reg.identify(
+            {"wikidata": ["Q404"]}, kind="city", minted_from="t", minted_in="t 1"
+        )
+        reg.save()
+    elsewhere = write_overrides(
+        tmp_path / "registered", places=[{"place": "Q404", "set_boundary": wkt}]
+    )
+    _publish(tmp_path / "registered" / "cache", PLACES, elsewhere)
+    with registry.session(path, read_only=True) as reg:
+        registered = geometry.attach_geometry(
+            tmp_path / "registered" / "cache",
+            dataset=fx.write_area_dataset(tmp_path / "registered" / "a.parquet", AREAS),
+            overrides_dir=elsewhere,
+            registry=reg,
+        )
+    assert registered["curated_geometry"] == 0
     assert shapely.from_wkb(bytes.fromhex(metro["geometry"])).area > 0
     assert manifest["curated_geometry"] == 1 and manifest["stale_overrides"] == 0
     with pytest.raises(overrides.OverrideError, match="valid"):
@@ -383,7 +418,23 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
         "Leeds",
         source_subtype="county",
     )
+    # A Swiss county of the city's name is a district larger than the town.
+    district = named(
+        _place("overture:ch-bern", "region", overture_id="ch-bern"),
+        "Bern",
+        source_subtype="county",
+        resolution_method="overture_id",
+        country_code="CH",
+    )
+    bern = named(
+        _place("Q70", "city", overture_id="no-area-3"),
+        "Bern",
+        country_code="CH",
+        parent_id=district["place_id"],
+    )
     records = [
+        district,
+        bern,
         council,
         county,
         named(_place("Q18125", "city", overture_id="no-area"), "Manchester"),
@@ -392,7 +443,7 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
         # A county a QID names is a place of its own, not the city's area.
         named(_place("Q39121", "city", overture_id="no-area-2"), "Leeds"),
     ]
-    for record in records[2:]:
+    for record in records[4:]:
         record["parent_id"] = council["place_id"]
     records[-1]["parent_id"] = county["place_id"]
     # A curated boundary for the council area is the city's too.
@@ -402,7 +453,9 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
     )
     cache = tmp_path / "cache"
     _publish(cache, records, overrides_dir)
-    areas = AREAS + [fx.area(key, OTHER, [_osm()]) for key in ("gb-man", "gb-leeds")]
+    areas = AREAS + [
+        fx.area(key, OTHER, [_osm()]) for key in ("gb-man", "gb-leeds", "ch-bern")
+    ]
     dataset = fx.write_area_dataset(tmp_path / "areas.parquet", areas)
     manifest = geometry.attach_geometry(
         cache, dataset=dataset, overrides_dir=overrides_dir
@@ -417,6 +470,7 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
     assert manchester["geometry"] == places["overture:gb-man"]["geometry"]
     assert places["Q_OWN"]["geometry_source"] == "overture"
     assert places["Q39121"]["geometry"] is None
+    assert places["Q70"]["geometry"] is None
     assert manifest["council_area_geometry"] == 1
     # The metros stage reads the city's footprint from the same area.
     read = geometry.place_areas(cache, dataset, records, {"no-area", "no-area-2"})

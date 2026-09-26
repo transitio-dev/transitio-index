@@ -1262,6 +1262,39 @@ def test_a_metro_polygon_places_stops_alongside_its_members(tmp_path):
     assert stops == {"Q-city": 1, "Q-metro": 2}
 
 
+def test_a_curated_boundary_places_the_stops_inside_it(tmp_path):
+    import shapely
+
+    from transitio_index import geometry
+
+    # No division the lookup knows lies at longitude 50: the curated
+    # boundary alone places the stop.
+    cache = tmp_path / "cache"
+    drawn = {
+        **_place("Q-drawn", "city", parent_id="Q-reg"),
+        "geometry_source": geometry.CURATED,
+        "geometry": shapely.to_wkb(shapely.box(49.0, 0.0, 51.0, 2.0)).hex(),
+    }
+    feeds = [
+        {"feed_id": "f-d", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    _write_crawl(
+        cache,
+        "f-d",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\nd1,1.0,50.0\n",
+            "routes.txt": b"route_id,route_type\nbus,3\n",
+            "trips.txt": b"trip_id,route_id\nt,bus\n",
+            "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt,d1,1\n",
+        },
+        "complete",
+    )
+    _coverage(cache, feeds, [_candidate("Q-drawn", "f-d")], places=PLACES + [drawn])
+    classify.classify(cache, lookup=LOOKUP)
+    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    assert {e["place_id"]: e["service"]["stops"] for e in edges} == {"Q-drawn": 1}
+
+
 def test_departures_per_day_are_weighted_by_the_calendar(tmp_path):
     # Two weeks: a weekday service minus one removed day (9 dates) and a
     # Sunday service plus one added date (3 dates); each trip visits both

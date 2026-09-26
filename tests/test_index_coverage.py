@@ -313,6 +313,24 @@ def test_a_stop_in_a_council_area_reaches_the_city_shipping_its_boundary(tmp_pat
     assert set(edges["f-city"]) == {"tp_council", "tp_city"}
 
 
+def test_a_stop_inside_a_curated_boundary_reaches_its_place(tmp_path):
+    import shapely
+
+    # No Overture division stands for the curated place: its boundary does.
+    drawn = {
+        **_place("tp_drawn", "city"),
+        "geometry_source": geometry.CURATED,
+        "geometry": shapely.to_wkb(shapely.box(49.0, 0.0, 51.0, 2.0)).hex(),
+    }
+    _, _, edges = _cover(
+        tmp_path,
+        places=PLACES + [drawn],
+        crawls={"f-city": _rows(2, 50.0)},
+        lookup=StubLookup({}),
+    )
+    assert set(edges["f-city"]) == {"tp_drawn"}
+
+
 def test_dropped_rows_stay_in_the_share_denominator(tmp_path):
     # Five good stops among 245 unparsable rows must not read as 100% share:
     # the share is 5/250.

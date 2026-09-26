@@ -989,6 +989,7 @@ def _classify_feed(
     route_min_stops,
     conflicts=frozenset(),
     calendar=None,
+    curated=None,
 ):
     """The classified edges for one crawled feed; ``(edges, status, routes,
     dropped, join_gaps, country_stops, country_basis)`` — ``dropped`` counting
@@ -1035,7 +1036,7 @@ def _classify_feed(
     stale = set()
     for stop_id, (x, y) in coords.items():
         hit, countries, stale_here = coverage.stop_places(
-            lookup, x, y, by_overture, by_qid
+            lookup, x, y, by_overture, by_qid, curated
         )
         stop_places[stop_id] = hit
         stop_countries[stop_id] = countries
@@ -1603,6 +1604,7 @@ def classify(
             places = {place["place_id"]: place for place in place_rows}
             by_overture = coverage.place_index(places)
             by_qid = coverage.place_qids(places)
+            curated = coverage.curated_boundaries(places)
             canonical = coverage._canonical_ids(feeds)
             crawl_lock = crawl.reading(cache_dir)
             crawl_lock.__enter__()
@@ -1662,6 +1664,7 @@ def classify(
                             route_min_stops,
                             conflicts=conflicts,
                             calendar=calendar,
+                            curated=curated,
                         )
                     )
                     routes_classified += routes

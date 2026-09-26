@@ -219,10 +219,16 @@ def join(metro, city):
 def _set_members(by_id, entries, report):
     """A curator's member list for a metro, reciprocal on the cities: the
     old members lose the metro, the new ones gain it. Judged against the
-    metro's current member list."""
+    metro's current member list. ``(applied, absent)``: the count applied,
+    and the metros not in ``by_id`` — another build's."""
     applied = 0
+    absent = []
     for entry in entries:
         metro = by_id.get(entry["place"])
+        refs = [entry["place"], *entry["set_place_members"]]
+        if metro is None and all(map(overrides.elsewhere, refs)):
+            absent.append(entry["place"])
+            continue
         if metro is None or metro.get("kind") != "metro":
             raise overrides.OverrideError(
                 f"place {entry['place']!r}: set_place_members needs a seeded metro"
@@ -242,7 +248,7 @@ def _set_members(by_id, entries, report):
             if metro["place_id"] not in by_id[member]["metro_ids"]:
                 by_id[member]["metro_ids"].append(metro["place_id"])
         applied += 1
-    return applied
+    return applied, absent
 
 
 def _take_code(metro, code, scheme):
@@ -1054,11 +1060,12 @@ def attach_metros(
             # rows minted in this stage (US, Eurostat and FAO) are told apart.
             city_keys = set(by_id)
             by_id.update({m["place_id"]: m for m in metros.values()})
-            applied = crosswalked + _set_members(
+            members_applied, absent = _set_members(
                 by_id,
                 overrides.by_operation(place_overrides, "set_place_members"),
                 override_report,
             )
+            applied = crosswalked + members_applied
             # The official metros are partitioned before the FAO branch, whose
             # metros are minted partitioned.
             official = {
@@ -1122,6 +1129,13 @@ def attach_metros(
                     "published": len(fao_published),
                     "memberships": fao_memberships,
                 }
+            for place_id in absent:
+                # A metro the FAO branch minted after the members were set is
+                # this build's, not another's: refused, as before.
+                if place_id in metros:
+                    raise overrides.OverrideError(
+                        f"place {place_id!r}: set_place_members needs a seeded metro"
+                    )
             derived_inputs = {
                 "eurostat": _snapshot(euro, EUROSTAT_DERIVED),
                 "urau": _snapshot(urau_inputs, URAU_DERIVED),

@@ -427,7 +427,6 @@ def _rewritten_notice(archived, fi, de):
         (_a_malformed_classifier_everywhere, "no usable classifier"),
         (_a_negative_tolerance, "no usable simplify_tolerance_deg"),
         (_feeds_without_service_spans, "does not verify"),
-        (_with_an_override_digest, "carries no overrides"),
         (_tampered_table, "does not verify"),
         (_rewritten_notice, "does not verify"),
     ],
@@ -621,6 +620,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     from transitio.index import DISCOVERY_SEMANTICS_VERSION, MIN_READER_VERSIONS
 
     fi, de = _two_runs(fx, tmp_path)
+    _with_an_override_digest(tmp_path, fi, de)  # a source that applied overrides
     loaded, tables = _merged(tmp_path)
     manifest, files = merge.assemble(loaded, tables, b"NOTICE\n")
     snapshot_id = manifest["snapshot_id"]

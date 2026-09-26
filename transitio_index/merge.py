@@ -52,8 +52,8 @@ from .builds import (
 # Manifest fields every source must agree on: a disagreement means builds
 # of different code or data would be mixed into one index.
 AGREED_FIELDS = ("overture_release", "simplify_tolerance_deg", "classifier")
-# The override digests; a merged index carries none, so every source's
-# must be null.
+# The override digests: a merged index records none of its own; each
+# source's stays pinned by its manifest's digest in ``merged``.
 OVERRIDE_FIELDS = (
     "overrides_sha256",
     "feeds_overrides_sha256",
@@ -238,9 +238,8 @@ def merge_tables(sources, skipped=()):
 
 def _check_sources(snapshots):
     """Refuse a selection the merge cannot ship: a source below schema 9, an
-    unlicensed one, one carrying an override digest, one without a field of
-    ``AGREED_FIELDS``, or sources disagreeing on one. Returns the agreed
-    values."""
+    unlicensed one, one without a field of ``AGREED_FIELDS``, or sources
+    disagreeing on one. Returns the agreed values."""
     agreed = {}
     for build_id, snapshot in snapshots:
         version = snapshot.get("schema_version")
@@ -253,11 +252,6 @@ def _check_sources(snapshots):
             snapshot.get("notice_sha256"), str
         ):
             raise MergeError(f"{build_id}: not a licensed build")
-        for field in OVERRIDE_FIELDS:
-            if snapshot.get(field) is not None:
-                raise MergeError(
-                    f"{build_id}: {field} is set; a merged index carries no overrides"
-                )
         for field in AGREED_FIELDS:
             value = snapshot.get(field)
             if not _well_formed(field, value):
