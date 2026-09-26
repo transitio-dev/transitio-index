@@ -433,6 +433,7 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
     feeds = [
         _feed(
             "hsl",
+            aliases=["f-hsl-copy"],
             mdb_id="mdb-1",
             stops=100,
             files=["calendar.txt"],
@@ -475,6 +476,8 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
     ]
     crawl_log = [
         {"feed_id": "hsl", "method": "download", "route_count": 7},
+        # A folded copy's record, filed under an alias, never stands in.
+        {"feed_id": "f-hsl-copy", "method": "failed", "route_count": 1},
         {"feed_id": "f-old-rail", "method": "download", "route_count": 2},
         {
             "feed_id": "gone",

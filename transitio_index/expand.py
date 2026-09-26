@@ -145,19 +145,8 @@ def _attach_boundary(place, rows):
     """
     place.setdefault("geometry", None)
     place.setdefault("geometry_source", None)
-    if not rows:
-        return
-    if not all(geometry._is_shippable(row["sources"]) for row in rows):
-        return
-    geoms = [row["geom"] for row in rows]
-    if not all(geometry._valid_polygon(geom) for geom in geoms):
-        return
-    merged = geoms[0] if len(geoms) == 1 else shapely.unary_union(geoms)
-    simplified = geometry._simplify(merged)
-    if not geometry._valid_polygon(simplified):
-        return
-    place["geometry"] = shapely.to_wkb(simplified).hex()
-    place["geometry_source"] = "overture"
+    if rows:
+        geometry.ship_area(place, rows)
 
 
 def _attach_metros(places_by_id, codes, new_cities, wikidata, report, registry=None):
@@ -635,16 +624,16 @@ def _discover(
     # Boundaries come from a complete, id-filtered area read, so a multi-part
     # place ships whole even when its stops touched only one component.
     wanted = {discovered[qid]["overture_id"] for qid in new_ids}
-    lent = geometry.council_areas(discovered.values())
+    lent = geometry.lenders(discovered.values())
     areas = geometry.read_areas(
         area_dataset,
-        wanted | {lent[key] for key in wanted if key in lent},
+        wanted | {area for key in wanted for area, _ in lent.get(key, ())},
         simplify=geometry.SIMPLIFY_TOLERANCE_DEG,
         cache=(cache_dir, release),
         reopen=reopen,
         countries={discovered[qid].get("country_code") for qid in new_ids} - {None},
     )
-    given = geometry.lend_council_areas(areas, lent)
+    given = geometry.lend_areas(areas, lent)
     for qid in new_ids:
         place = discovered[qid]
         place.setdefault("aliases", [])
@@ -652,7 +641,7 @@ def _discover(
         place.setdefault("metro_ids", [])
         _attach_boundary(place, areas.get(place["overture_id"]))
         if place["geometry"] and place["overture_id"] in given:
-            place["geometry_source"] = geometry.COUNCIL_AREA
+            place["geometry_source"] = given[place["overture_id"]]
         places_by_id[qid] = place
     # A discovered place under a seeded one links to the key the seeded row
     # is held by — its own id, for a place no QID names.

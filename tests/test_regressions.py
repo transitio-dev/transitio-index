@@ -14,6 +14,7 @@ import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
 import test_index_boundaries as bt  # noqa: E402
+import test_index_coverage as ct  # noqa: E402
 from transitio_index import (  # noqa: E402
     boundaries,
     classify,
@@ -961,3 +962,15 @@ def test_one_stop_across_a_boundary_does_not_make_a_route_international(
         "stops_without_country": 1,
         "border_stops": abroad,
     }
+
+
+def test_a_feeds_own_crawl_outranks_one_filed_under_its_alias(tmp_path):
+    """A renamed feed's old crawl maps to the feed through its alias; it must
+    not stand in for the feed's own crawl however the log orders them."""
+    cache = tmp_path / "cache"
+    ct._write_crawl(cache, "f-new", ct._rows(2, 10.0))
+    ct._write_crawl(cache, "f-old", ct._rows(3, 20.0))
+    states, unmatched = coverage.crawled_states(
+        cache, [ct._feed("f-new", aliases=["f-old"])]
+    )
+    assert states["f-new"][1]["feed_id"] == "f-new" and not unmatched

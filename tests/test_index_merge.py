@@ -216,6 +216,51 @@ def test_feeds_edges_and_places_merge_by_source(tmp_path):
     assert snapshot["skipped"] == [{"id": "nl", "reason": "no feeds"}]
 
 
+def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
+    def feed(feed_id, *aliases):
+        return {**_feed7(feed_id, feed_id, "FI", "domestic"), "aliases": list(aliases)}
+
+    a = _run(
+        tmp_path,
+        "fi",
+        1,
+        feeds=[feed("c", "x"), feed("m", "n"), feed("p", "q")],
+        edges={"FI": [_edge7("hel", "c", "local", "primary", 0.5, False)]},
+        built_at=BUILT(14),
+    )
+    # The newer build did not fold x into c; n claims o (a chain m->n->o),
+    # and r claims q, which p claims too.
+    b = _run(
+        tmp_path,
+        "se",
+        2,
+        feeds=[feed("c", "y"), feed("x"), feed("n", "o"), feed("r", "q")],
+        edges={
+            "FI": [
+                _edge7("esp", "c", "local", "primary", 0.5, False),
+                _edge7("hel", "x", "local", "primary", 0.5, False),
+            ]
+        },
+        realtime={"FI": [_rt("x-rt", "x", {"realtime_alerts": "https://x"})]},
+        built_at=BUILT(15),
+    )
+    sources = []
+    for run in (a, b):
+        snapshot, _, tables = builds.load_tables(tmp_path / run / "index")
+        sources.append((run, snapshot, tables))
+    snapshot, tables = merge.merge_tables(sources)
+    feeds = _frame(tables, "feeds.parquet", "feed_id")
+    # x is c: its row and edges go, c keeps every source's aliases and
+    # x's companion follows c; contradicting claims leave their rows alone.
+    assert set(feeds.index) == {"c", "m", "n", "p", "r"}
+    assert list(feeds.loc["c", "aliases"]) == ["y", "x"]
+    edges = tables["edges.parquet"].to_pandas()
+    assert set(map(tuple, edges[["place_id", "feed_id"]].to_numpy())) == {("esp", "c")}
+    realtime = _frame(tables, "realtime.parquet", "feed_id")
+    assert realtime.loc["x-rt", "static_feed_id"] == "c"
+    assert snapshot["alias_conflicts"] == [["m", "n", "o"], ["p", "q", "r"]]
+
+
 # ---- loading a selection for a merge: the reader's schema-9 fixture ----
 
 # What a schema-9 build's manifest carries that a merge checks or copies.
@@ -667,6 +712,11 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert manifest["unknown_share"] == 0.0 and manifest["margin_share"] == 0.0
     assert all(manifest[field] is None for field in merge.OVERRIDE_FIELDS)
     assert manifest["stale_feed_overrides"] == 2 and manifest["stale_overrides"] == 2
+    assert manifest["alias_conflicts"] == []
+    conflicted, _ = merge.assemble(
+        loaded, tables, b"NOTICE\n", alias_conflicts=[("p", "q", "r")]
+    )
+    assert conflicted["alias_conflicts"] == [["p", "q", "r"]]
     # The sources by portable identities only, in label order.
     assert [(s["label"], s["build_id"]) for s in manifest["merged"]] == [
         ("de", de),
@@ -1113,8 +1163,8 @@ def test_a_snapshot_the_reader_rejects_leaves_the_live_index_untouched(
     before = _files_under(cache / "index")
     assemble = merge.assemble
 
-    def tampered(loaded, tables, notice):  # a table digest the reader will not accept
-        manifest, files = assemble(loaded, tables, notice)
+    def tampered(loaded, tables, notice, **options):  # a digest the reader refuses
+        manifest, files = assemble(loaded, tables, notice, **options)
         manifest["partitions"]["FI"]["feeds"]["sha256"] = "0" * 64
         manifest["snapshot_id"] = "feedcafefeedcafe"
         return manifest, files

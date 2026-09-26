@@ -401,7 +401,7 @@ def test_a_metro_gets_the_union_of_its_members_shipped_polygons(tmp_path):
     assert manifest["member_union_geometry"] == 1
 
 
-def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
+def test_a_city_without_an_area_ships_its_twins_or_council_areas_boundary(tmp_path):
     from test_index_place_overrides import write_overrides
 
     def named(place, name, **fields):
@@ -438,14 +438,27 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
         council,
         county,
         named(_place("Q18125", "city", overture_id="no-area"), "Manchester"),
-        # A same-named city with an area of its own keeps it.
-        named(_place("Q_OWN", "city", overture_id="fi-helsinki"), "Manchester"),
+        # A same-named city with an area of its own keeps it, twin or not.
+        named(
+            _place("Q_OWN", "city", overture_id="fi-helsinki"),
+            "Manchester",
+            twin_overture_ids=["de-berlin"],
+        ),
         # A county a QID names is a place of its own, not the city's area.
         named(_place("Q39121", "city", overture_id="no-area-2"), "Leeds"),
     ]
     for record in records[4:]:
         record["parent_id"] = council["place_id"]
     records[-1]["parent_id"] = county["place_id"]
+    # A city that is also its own region ships the area of the first division
+    # of its QID that has one.
+    berlin = _place("Q64", "city", overture_id="no-area-4", country="DE")
+    records.append({**berlin, "twin_overture_ids": ["de-none", "de-berlin"]})
+    # A twin whose area the audit refuses settles the city: no council area.
+    refused = named(_place("Q_REFUSED", "city", overture_id="no-area-5"), "Manchester")
+    records.append(
+        {**refused, "parent_id": council["place_id"], "twin_overture_ids": ["denied"]}
+    )
     # A curated boundary for the council area is the city's too.
     wkt = "POLYGON((-2.3 53.4, -2.2 53.4, -2.2 53.5, -2.3 53.5, -2.3 53.4))"
     overrides_dir = write_overrides(
@@ -454,7 +467,8 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
     cache = tmp_path / "cache"
     _publish(cache, records, overrides_dir)
     areas = AREAS + [
-        fx.area(key, OTHER, [_osm()]) for key in ("gb-man", "gb-leeds", "ch-bern")
+        fx.area(key, OTHER, [_osm()])
+        for key in ("gb-man", "gb-leeds", "ch-bern", "de-berlin")
     ]
     dataset = fx.write_area_dataset(tmp_path / "areas.parquet", areas)
     manifest = geometry.attach_geometry(
@@ -471,10 +485,15 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
     assert places["Q_OWN"]["geometry_source"] == "overture"
     assert places["Q39121"]["geometry"] is None
     assert places["Q70"]["geometry"] is None
+    assert places["Q64"]["geometry_source"] == geometry.QID_TWIN
+    assert places["Q64"]["geometry"]
+    assert places["Q_REFUSED"]["geometry"] is None
     assert manifest["council_area_geometry"] == 1
-    # The metros stage reads the city's footprint from the same area.
-    read = geometry.place_areas(cache, dataset, records, {"no-area", "no-area-2"})
+    # The metros stage reads the city's footprint from the same areas.
+    wanted = {"no-area", "no-area-2", "no-area-4"}
+    read = geometry.place_areas(cache, dataset, records, wanted)
     assert read["no-area"] is read["gb-man"] and "no-area-2" not in read
+    assert read["no-area-4"] is read["de-berlin"]
 
 
 def test_area_chunking_matches_a_single_pass(tmp_path):

@@ -668,7 +668,10 @@ def feed_rows(
     log = {}
     for record in crawl_log:
         feed_id = canonical.get(record.get("feed_id"))
-        if feed_id is not None:
+        # A feed's own record outranks one filed under an alias.
+        if feed_id is not None and (
+            feed_id not in log or record.get("feed_id") == feed_id
+        ):
             log[feed_id] = record
     placed = {}
     for placement in placements:

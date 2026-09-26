@@ -428,6 +428,20 @@ def _merge_place(places, place):
         places[place["place_id"]] = place
 
 
+def _add_twins(places, skeleton):
+    """Record on each place the other skeleton divisions its QID names
+    (``twin_overture_ids``) — a city that is also its own county or region —
+    whose area it ships when its own division has none."""
+    by_qid = {}
+    for record in skeleton.values():
+        if record.get("qid"):
+            by_qid.setdefault(record["qid"], set()).add(record["overture_id"])
+    for key, place in places.items():
+        twins = by_qid.get(key, set()) - {place.get("overture_id")}
+        if twins:
+            place["twin_overture_ids"] = sorted(twins)
+
+
 def _add_place(places, skeleton, division):
     """Add a resolved division and its ancestors to ``places`` by QID."""
     ancestors, parent_id = _ancestor_places(division, skeleton)
@@ -926,6 +940,7 @@ def resolve_seed(
         # A place this build holds names a candidate that is gone.
         if entry["place"] in places:
             _no_candidate(entry)
+    _add_twins(places, skeleton)
     before = set(places)
     identified = _identify_places(places, registry, places_digest)
     conflicts = before - set(places)
