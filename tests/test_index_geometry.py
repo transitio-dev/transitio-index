@@ -251,11 +251,25 @@ def test_set_boundary_attaches_a_curated_polygon(tmp_path):
     manifest, places, _ = _run(
         tmp_path,
         overrides_dir=write_overrides(
-            tmp_path, places=[{"place": "Q_METRO", "set_boundary": wkt}]
+            tmp_path,
+            places=[
+                {"place": "Q_METRO", "set_boundary": wkt},
+                {"place": "Q404", "set_boundary": wkt},  # another build's place
+            ],
         ),
     )
     metro = places["Q_METRO"]
     assert metro["geometry_source"] == "curated"
+    # An own id may be a place still held under its concordance key, and a
+    # string that is no reference names nothing: both refused.
+    for place in ("tp_4", "Q-typo"):
+        with pytest.raises(overrides.OverrideError, match="needs a seeded place"):
+            _run(
+                tmp_path / place,
+                overrides_dir=write_overrides(
+                    tmp_path / place, places=[{"place": place, "set_boundary": wkt}]
+                ),
+            )
     assert shapely.from_wkb(bytes.fromhex(metro["geometry"])).area > 0
     assert manifest["curated_geometry"] == 1 and manifest["stale_overrides"] == 0
     with pytest.raises(overrides.OverrideError, match="valid"):

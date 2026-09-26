@@ -439,7 +439,9 @@ def _add_place(places, skeleton, division):
 def _resolve_place_overrides(candidates, entries, report):
     """A curator's QID for an Overture candidate the skeleton could not
     resolve (keyed by its Overture id): assigned as ``curated``. Judged
-    against the candidate as it stands."""
+    against the candidate as it stands. ``(applied, unmatched)``: a missing
+    candidate is another build's when its place may be (see
+    ``overrides.elsewhere``) — the entries left unmatched — else refused."""
     by_ref = {e["source_ref"]: e for e in entries}
     applied = 0
     consumed = set()
@@ -470,14 +472,46 @@ def _resolve_place_overrides(candidates, entries, report):
         record["resolution_method"] = "curated"
         record["curated"] = True
         applied += 1
-    missing = sorted(set(by_ref) - consumed)
-    if missing:
-        # A candidate that vanished from the skeleton cannot take the QID:
-        # the override no longer names anything, which is a build error.
-        raise overrides.OverrideError(
-            f"resolve_place: no candidate with Overture id {missing[0]!r}"
-        )
-    return applied
+    unmatched = [by_ref[ref] for ref in sorted(set(by_ref) - consumed)]
+    for entry in unmatched:
+        if not overrides.elsewhere(entry["place"]):
+            _no_candidate(entry)
+    return applied, unmatched
+
+
+def _no_candidate(entry):
+    raise overrides.OverrideError(
+        f"resolve_place: no candidate with Overture id {entry['source_ref']!r}"
+    )
+
+
+def _held_add_places(entries, places):
+    """The add_place entries this build holds: its place, or a parent, or one
+    member, among its places or the places of other entries it holds. An
+    entry naming neither a parent nor members, or naming a place no other
+    build may hold (see ``overrides.elsewhere``), is held by every build."""
+    known = set(places)
+    held = set()
+    grew = True
+    while grew:
+        grew = False
+        for entry in entries:
+            spec = entry["add_place"]
+            if entry["place"] in held:
+                continue
+            parent, members = spec.get("parent_id"), spec.get("member_ids") or []
+            refs = [entry["place"], *([parent] if parent else []), *members]
+            if entry["place"] in places or not all(map(overrides.elsewhere, refs)):
+                inside = True
+            elif parent is None and not members:
+                inside = True
+            else:
+                inside = parent in known or any(m in known for m in members)
+            if inside:
+                held.add(entry["place"])
+                known.add(entry["place"])
+                grew = True
+    return [entry for entry in entries if entry["place"] in held]
 
 
 def _add_place_overrides(places, entries, report, statistical=frozenset()):
@@ -807,7 +841,7 @@ def resolve_seed(
         overrides_dir, registry=registry, internal=True
     )
     override_report = []
-    resolved_by_hand = _resolve_place_overrides(
+    resolved_by_hand, unmatched = _resolve_place_overrides(
         candidates,
         overrides.by_operation(place_overrides, "resolve_place"),
         override_report,
@@ -880,12 +914,18 @@ def resolve_seed(
             }
         )
         _add_place(places, skeleton, division)
-    added = overrides.by_operation(place_overrides, "add_place")
+    added = _held_add_places(
+        overrides.by_operation(place_overrides, "add_place"), places
+    )
     statistical = {
         e["place"]
         for e in overrides.by_operation(place_overrides, "set_statistical_area")
     }
     _add_place_overrides(places, added, override_report, statistical)
+    for entry in unmatched:
+        # A place this build holds names a candidate that is gone.
+        if entry["place"] in places:
+            _no_candidate(entry)
     before = set(places)
     identified = _identify_places(places, registry, places_digest)
     conflicts = before - set(places)

@@ -648,8 +648,6 @@ def test_a_locality_wins_over_a_localadmin_of_one_qid_in_either_order():
 def test_add_place_upserts_curated_places(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    from transitio_index import overrides
-
     entries = [
         {
             "place": "Q9000",
@@ -680,23 +678,24 @@ def test_add_place_upserts_curated_places(tmp_path):
     assert city["parent_id"] == "Q1508" and city["boundary_wkt"].startswith("POLYGON")
     assert city["resolution_method"] == "curated" and city["names"]["en"] == "Sipoo"
     assert manifest["overrides_applied"] == 2 and manifest["stale_overrides"] == 0
-    # A parent the seed never had is a build error, never a dangling id.
-    orphan = [
+    # A parent this build does not hold, nor a metro none of whose members
+    # it holds: another build's place, never a dangling id.
+    elsewhere = [
         {
             "place": "Q9002",
-            "add_place": {
-                "kind": "city",
-                "name": "X",
-                "parent_id": "Q404",
-                "boundary": "POINT(0 0)",
-            },
-        }
+            "add_place": {"kind": "city", "name": "X", "parent_id": "Q404"},
+        },
+        {
+            "place": "Q9003",
+            "add_place": {"kind": "metro", "name": "Y", "member_ids": ["Q404"]},
+        },
     ]
-    with pytest.raises(overrides.OverrideError, match="not a seeded place"):
-        _seed(
-            tmp_path / "orphan",
-            overrides_dir=write_overrides(tmp_path / "orphan", places=orphan),
-        )
+    manifest, places, _ = _seed(
+        tmp_path / "elsewhere",
+        overrides_dir=write_overrides(tmp_path / "elsewhere", places=elsewhere),
+    )
+    assert not {"Q9002", "Q9003"} & set(places)
+    assert manifest["overrides_applied"] == 0
 
 
 def test_resolve_place_assigns_a_qid_to_an_unresolved_candidate(tmp_path):
@@ -734,16 +733,33 @@ def test_add_place_on_an_existing_place_rewrites_its_provenance(tmp_path):
                 "parent_id": "Q1508",
             },
         },
+        # A candidate no feed of this build names is another build's.
         {"place": "Q77777", "source_ref": "no-such-candidate", "resolve_place": True},
     ]
-    with pytest.raises(overrides.OverrideError, match="no candidate"):
-        _seed(tmp_path, overrides_dir=write_overrides(tmp_path, places=entries))
     # A seeded place keeps its kind, boundary and members; a new one needs
     # a boundary or a member list.
     wkt = "POLYGON((24.9 60.1, 25.1 60.1, 25.1 60.3, 24.9 60.1))"
     refused = [
         ("Q1757", {**entries[0]["add_place"], "boundary": wkt}, "use set_boundary"),
         ("Q1757", {**entries[0]["add_place"], "kind": "metro"}, "cannot change"),
+        ("Q1757", {**entries[0]["add_place"], "parent_id": "Q404"}, "seeded place"),
+        # An own id may be a place still held under its concordance key.
+        (
+            "Q900004",
+            {"kind": "city", "name": "X", "parent_id": "tp_4", "boundary": wkt},
+            "tp_4",
+        ),
+        # A metro held by its member is checked for its parent too.
+        (
+            "Q900005",
+            {
+                "kind": "metro",
+                "name": "M",
+                "parent_id": "Q404",
+                "member_ids": ["Q1757"],
+            },
+            "Q404",
+        ),
         ("Q900002", {"kind": "country", "name": "Nowhere"}, "needs a boundary"),
     ]
     for place, spec, message in refused:
@@ -755,6 +771,17 @@ def test_add_place_on_an_existing_place_rewrites_its_provenance(tmp_path):
                     base, places=[{"place": place, "add_place": spec}]
                 ),
             )
+    # A missing candidate for an own id, or for a place this build holds, is
+    # this build's and refused.
+    for place in ("tp_5", "Q1757"):
+        stale = [
+            {"place": place, "source_ref": "no-such-candidate", "resolve_place": True}
+        ]
+        with pytest.raises(overrides.OverrideError, match="no candidate"):
+            _seed(
+                tmp_path / place,
+                overrides_dir=write_overrides(tmp_path / place, places=stale),
+            )
     loop = [
         {**entries[0], "add_place": {**entries[0]["add_place"], "parent_id": "Q1757"}}
     ]
@@ -765,8 +792,9 @@ def test_add_place_on_an_existing_place_rewrites_its_provenance(tmp_path):
         )
     manifest, places, _ = _seed(
         tmp_path / "ok",
-        overrides_dir=write_overrides(tmp_path / "ok", places=entries[:1]),
+        overrides_dir=write_overrides(tmp_path / "ok", places=entries),
     )
+    assert manifest["overrides_applied"] == 1
     helsinki = places["Q1757"]
     assert helsinki["curated"] is True and helsinki["resolution_method"] == "curated"
     assert helsinki["name"] == "Helsinki (curated)"

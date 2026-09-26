@@ -935,6 +935,8 @@ def attach_geometry(
                     curated += 1
             for entry in overrides.by_operation(place_overrides, "set_boundary"):
                 place = by_id.get(entry["place"])
+                if place is None and overrides.elsewhere(entry["place"]):
+                    continue  # another build's place
                 if place is None:
                     raise overrides.OverrideError(
                         f"place {entry['place']!r}: set_boundary needs a seeded place"

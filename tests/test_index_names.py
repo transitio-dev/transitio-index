@@ -134,7 +134,10 @@ def test_labels_and_aliases_parses_wbgetentities(monkeypatch):
 def test_set_aliases_adds_the_curators_names(tmp_path):
     from test_index_place_overrides import write_overrides
 
-    entries = [{"place": "Q2000", "set_aliases": ["Nowheresville", "Nowhere"]}]
+    entries = [
+        {"place": "Q2000", "set_aliases": ["Nowheresville", "Nowhere"]},
+        {"place": "Q404", "set_aliases": ["Elsewhere"]},  # another build's place
+    ]
     manifest, places = _run(
         tmp_path, overrides_dir=write_overrides(tmp_path, places=entries)
     )

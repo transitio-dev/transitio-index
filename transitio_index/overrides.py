@@ -473,6 +473,14 @@ def is_reference(value):
     return namespace in _registry.NAMESPACES and bool(rest)
 
 
+def elsewhere(reference):
+    """Whether a reference a build does not hold may name another build's
+    place: a QID or a concordance may; a registry own id never does, since a
+    stage holds a QID-less or derived place under its concordance key until
+    it is identified, nor does a string that is no reference at all."""
+    return is_reference(reference) and not _registry.ID_PATTERN.match(reference)
+
+
 def _reference_list(value):
     return isinstance(value, list) and bool(value) and all(map(is_reference, value))
 

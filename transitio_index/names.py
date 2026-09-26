@@ -27,10 +27,13 @@ def _merge(place, entry):
 
 def _set_aliases(places, entries, report):
     """A curator's aliases join the place's, minus its name. Judged against
-    the name and aliases the place has now."""
+    the name and aliases the place has now; the count applied is returned."""
     by_id = {p["place_id"]: p for p in places}
+    applied = 0
     for entry in entries:
         place = by_id.get(entry["place"])
+        if place is None and overrides.elsewhere(entry["place"]):
+            continue  # another build's place
         if place is None:
             raise overrides.OverrideError(
                 f"place {entry['place']!r}: set_aliases needs a seeded place"
@@ -43,7 +46,8 @@ def _set_aliases(places, entries, report):
         )
         merged = set(place.get("aliases") or []) | set(entry["set_aliases"])
         place["aliases"] = sorted(merged - {place.get("name")})
-    return len(entries)
+        applied += 1
+    return applied
 
 
 def merge_names(
