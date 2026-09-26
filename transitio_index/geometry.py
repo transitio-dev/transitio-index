@@ -937,7 +937,7 @@ def attach_geometry(
                     curated += 1
             for entry in overrides.by_operation(place_overrides, "set_boundary"):
                 place = by_id.get(entry["place"])
-                if place is None and overrides.elsewhere(entry["place"]):
+                if place is None and overrides.elsewhere(entry["place"], own_ids=True):
                     continue  # another build's place
                 if place is None:
                     raise overrides.OverrideError(

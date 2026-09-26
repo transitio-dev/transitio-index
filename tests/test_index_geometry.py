@@ -260,16 +260,37 @@ def test_set_boundary_attaches_a_curated_polygon(tmp_path):
     )
     metro = places["Q_METRO"]
     assert metro["geometry_source"] == "curated"
-    # An own id may be a place still held under its concordance key, and a
-    # string that is no reference names nothing: both refused.
-    for place in ("tp_4", "Q-typo"):
-        with pytest.raises(overrides.OverrideError, match="needs a seeded place"):
-            _run(
-                tmp_path / place,
-                overrides_dir=write_overrides(
-                    tmp_path / place, places=[{"place": place, "set_boundary": wkt}]
-                ),
-            )
+    # A string that is no reference names nothing: refused.
+    with pytest.raises(overrides.OverrideError, match="needs a seeded place"):
+        _run(
+            tmp_path / "typo",
+            overrides_dir=write_overrides(
+                tmp_path / "typo", places=[{"place": "Q-typo", "set_boundary": wkt}]
+            ),
+        )
+    # With a registry the entry names the place by its own id, as this stage
+    # holds places: a registered place outside the build is another build's.
+    from transitio_index import registry
+
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    with registry.session(path) as reg:
+        reg.identify(
+            {"wikidata": ["Q404"]}, kind="city", minted_from="t", minted_in="t 1"
+        )
+        reg.save()
+    elsewhere = write_overrides(
+        tmp_path / "registered", places=[{"place": "Q404", "set_boundary": wkt}]
+    )
+    _publish(tmp_path / "registered" / "cache", PLACES, elsewhere)
+    with registry.session(path, read_only=True) as reg:
+        registered = geometry.attach_geometry(
+            tmp_path / "registered" / "cache",
+            dataset=fx.write_area_dataset(tmp_path / "registered" / "a.parquet", AREAS),
+            overrides_dir=elsewhere,
+            registry=reg,
+        )
+    assert registered["curated_geometry"] == 0
     assert shapely.from_wkb(bytes.fromhex(metro["geometry"])).area > 0
     assert manifest["curated_geometry"] == 1 and manifest["stale_overrides"] == 0
     with pytest.raises(overrides.OverrideError, match="valid"):
