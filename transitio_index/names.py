@@ -32,7 +32,7 @@ def _set_aliases(places, entries, report):
     applied = 0
     for entry in entries:
         place = by_id.get(entry["place"])
-        if place is None and overrides.elsewhere(entry["place"]):
+        if place is None and overrides.elsewhere(entry["place"], own_ids=True):
             continue  # another build's place
         if place is None:
             raise overrides.OverrideError(

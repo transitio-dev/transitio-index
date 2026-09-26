@@ -473,12 +473,16 @@ def is_reference(value):
     return namespace in _registry.NAMESPACES and bool(rest)
 
 
-def elsewhere(reference):
+def elsewhere(reference, *, own_ids=False):
     """Whether a reference a build does not hold may name another build's
-    place: a QID or a concordance may; a registry own id never does, since a
-    stage holds a QID-less or derived place under its concordance key until
-    it is identified, nor does a string that is no reference at all."""
-    return is_reference(reference) and not _registry.ID_PATTERN.match(reference)
+    place: a QID or a concordance may, a string that is no reference never
+    does. A registry own id may only in a stage that holds its places under
+    their own ids (``own_ids``); the seed and metros stages hold a QID-less or
+    derived place under its concordance key until it is identified, so an own
+    id they lack may still name one of their places."""
+    if not is_reference(reference):
+        return False
+    return own_ids or not _registry.ID_PATTERN.match(reference)
 
 
 def _reference_list(value):
