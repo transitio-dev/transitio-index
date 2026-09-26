@@ -182,6 +182,8 @@ SIMPLIFY_TOLERANCE_DEG = 0.0005
 
 # The geometry source of a city that ships its council area's boundary.
 COUNCIL_AREA = "council_area"
+# The geometry source of a boundary a curator drew.
+CURATED = "curated"
 
 
 def division_area_dataset(release=overture.OVERTURE_RELEASE):
@@ -789,7 +791,7 @@ def _curated_geometry(place, wkt):
             f"place {place['place_id']!r}: boundary is not in WGS84 degrees"
         )
     place["geometry"] = shapely.to_wkb(simplified).hex()
-    place["geometry_source"] = "curated"
+    place["geometry_source"] = CURATED
 
 
 def attach_geometry(

@@ -310,17 +310,44 @@ def place_qids(places):
     return index
 
 
-def stop_places(lookup, x, y, by_overture, by_qid):
+def curated_boundaries(places):
+    """``(tree, place_ids)`` over the boundaries curators drew, or None: no
+    Overture division stands for such a place, so a stop reaches it by lying
+    inside its boundary."""
+    import shapely
+
+    from transitio_index import geometry
+
+    ids = [
+        place_id
+        for place_id, place in places.items()
+        if place.get("geometry_source") == geometry.CURATED and place.get("geometry")
+    ]
+    if not ids:
+        return None
+    geoms = [shapely.from_wkb(places[place_id]["geometry"]) for place_id in ids]
+    return shapely.STRtree(geoms), ids
+
+
+def stop_places(lookup, x, y, by_overture, by_qid, curated=None):
     """``(place_ids, countries, stale)`` for one stop coordinate.
 
     A division is known when its Overture id or its QID maps to a place;
     ``stale`` holds the QID-bearing divisions neither names — a discovery the
     expand stage reported as a conflict, or else a sign that
-    ``places_expanded`` predates the crawl; the caller tells them apart.
+    ``places_expanded`` predates the crawl; the caller tells them apart. A
+    stop inside a curated boundary (``curated``, from
+    :func:`curated_boundaries`) is in its place too.
     """
+    import shapely
+
     from transitio_index import overture
 
     hit = set()
+    if curated is not None:
+        tree, ids = curated
+        point = shapely.Point(x, y)
+        hit.update(ids[i] for i in tree.query(point, predicate="intersects"))
     countries = set()
     stale = set()
     for record in lookup.divisions_at(x, y):
@@ -389,6 +416,7 @@ def crawled_edges(cache_dir, feeds, places, lookup, conflicts=frozenset()):
 
     canonical = _canonical_ids(feeds)
     by_overture = place_index(places)
+    curated = curated_boundaries(places)
     by_qid = place_qids(places)
     # Minted metros have no geometry: a stop is inside a metro when it is
     # inside ANY member city — counted once however many members it hits.
@@ -437,7 +465,7 @@ def crawled_edges(cache_dir, feeds, places, lookup, conflicts=frozenset()):
         lookup.ensure(crawl.cluster_boxes(points))
         counts = collections.Counter()
         for x, y in points:
-            hit, _, stale_here = stop_places(lookup, x, y, by_overture, by_qid)
+            hit, _, stale_here = stop_places(lookup, x, y, by_overture, by_qid, curated)
             stale.update(stale_here)
             # A metro counts a stop once, whether its own polygon, a member
             # city, or both placed it there.
