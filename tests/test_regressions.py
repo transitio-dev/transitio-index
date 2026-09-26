@@ -974,3 +974,20 @@ def test_a_feeds_own_crawl_outranks_one_filed_under_its_alias(tmp_path):
         cache, [ct._feed("f-new", aliases=["f-old"])]
     )
     assert states["f-new"][1]["feed_id"] == "f-new" and not unmatched
+
+
+def test_a_flat_build_claiming_schema_10_needs_its_columns(tmp_path):
+    """The schema's required columns were checked on partitioned builds only,
+    so a flat manifest claiming schema 10 loaded without contained_in."""
+    import json
+
+    from builds_fixture import write_build
+
+    from transitio_index import builds
+
+    path = tmp_path / "index"
+    write_build(path)
+    assert builds.load_tables(path) is not None
+    snapshot = json.loads((path / "snapshot.json").read_text())
+    (path / "snapshot.json").write_text(json.dumps({**snapshot, "schema_version": 10}))
+    assert builds.load_tables(path) is None

@@ -506,6 +506,48 @@ def test_a_damaged_cache_does_not_keep_twins_apart(tmp_path):
     assert manifest["folded_feeds"] == {"f-mdb-1": "f-atlas"}
 
 
+def _stops(count, first=0):
+    return [f"s{i},1.{i:03d},10.0\n" for i in range(first, first + count)]
+
+
+ROUTES = b"route_id,route_type,route_short_name\nr1,3,1\nr2,3,2\n"
+
+
+@pytest.mark.parametrize(
+    "small, large, routes, contained",
+    [
+        (_stops(3), _stops(5), ROUTES, {"f-small": ["f-large"]}),
+        (_stops(3), _stops(5), b"route_id,route_type,route_short_name\nr1,3,9\n", {}),
+        (_stops(3), _stops(4), ROUTES, {}),
+        (_stops(3, first=3), _stops(5), ROUTES, {}),
+        # A route type int() cannot read is one row skipped, not every route.
+        (_stops(3), _stops(5), ROUTES + "r9,²,9\n".encode(), {"f-small": ["f-large"]}),
+    ],
+    ids=["contained", "other-routes", "similar-size", "stops-elsewhere", "odd-type"],
+)
+def test_a_feed_records_the_larger_feeds_containing_it(
+    tmp_path, small, large, routes, contained
+):
+    # The large feed runs the small one's routes (r1, r2) and more.
+    feeds = [_feed("f-small"), _feed("f-large")]
+    manifest, covered, _ = _cover(
+        tmp_path,
+        feeds=feeds,
+        placements=[],
+        crawls={"f-small": small, "f-large": large},
+        members={
+            "f-small": {"routes.txt": ROUTES},
+            "f-large": {"routes.txt": routes + b"r3,0,3\n"},
+        },
+        lookup=LOOKUP,
+    )
+    assert {f: covered[f]["contained_in"] for f in covered} == {
+        "f-small": contained.get("f-small", []),
+        "f-large": [],
+    }
+    assert manifest["feeds_contained"] == len(contained)
+
+
 def test_a_crawl_that_changed_after_expansion_is_refused(tmp_path):
     with pytest.raises(coverage.CoverageError, match="re-run the expand"):
         _cover(

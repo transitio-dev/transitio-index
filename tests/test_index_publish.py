@@ -41,6 +41,7 @@ _SCHEMA_7_FEED_COLUMNS = (
     "service_start",
     "service_end",
     "validity",
+    "contained_in",
 )
 
 
@@ -1491,9 +1492,9 @@ def test_the_index_ships_the_country_and_relevance_columns(tmp_path):
         "cross_border": True,
     }
     cache, manifest = _edges_index(tmp_path, [edge], feeds=[feed])
-    assert manifest["schema_version"] == 9 == publish.SCHEMA_VERSION
+    assert manifest["schema_version"] == 10 == publish.SCHEMA_VERSION
     assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
-        9, publish.MIN_READER_VERSION
+        10, publish.MIN_READER_VERSION
     )
     # Without a home country the feed sits in the international partition and
     # its edge in the links, naming that partition.
