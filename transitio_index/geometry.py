@@ -184,6 +184,9 @@ SIMPLIFY_TOLERANCE_DEG = 0.0005
 COUNCIL_AREA = "council_area"
 # The geometry source of a boundary a curator drew.
 CURATED = "curated"
+# The geometry source of a place that ships the area of another division its
+# QID names (a city whose county twin carries the boundary).
+QID_TWIN = "qid_twin"
 
 
 def division_area_dataset(release=overture.OVERTURE_RELEASE):
@@ -267,12 +270,12 @@ def place_areas(cache_dir, dataset, places, wanted):
     cache = (cache_dir, overture.OVERTURE_RELEASE)
     reopen = division_area_dataset if dataset is None else None
     countries = {p.get("country_code") for p in places} - {None}
-    lent = council_areas(places)
-    wanted = set(wanted) | {lent[key] for key in wanted if key in lent}
+    lent = lenders(places)
+    wanted = set(wanted) | {area for key in wanted for area, _ in lent.get(key, ())}
     every = ({p.get("overture_id") for p in places} - {None}) | wanted
     prefetch_areas(dataset, every, cache=cache, reopen=reopen, countries=countries)
     areas = read_areas(dataset, wanted, cache=cache, reopen=reopen, countries=countries)
-    lend_council_areas(areas, lent)
+    lend_areas(areas, lent)
     return areas
 
 
@@ -296,16 +299,65 @@ def council_areas(places):
     return lent
 
 
-def lend_council_areas(areas, lent):
-    """Give each city in ``lent`` (from ``council_areas``) that read no area
-    of its own its council area's rows, in place; the cities given one are
-    returned."""
-    given = set()
-    for city, area in lent.items():
-        if city not in areas and area in areas:
-            areas[city] = areas[area]
-            given.add(city)
+def lenders(places):
+    """``{overture_id: [(overture_id, geometry_source), ...]}``: the divisions
+    whose area a place with none of its own stands on, in order — the other
+    divisions its QID names (``twin_overture_ids``), then its council area —
+    each with the geometry source a place borrowing it ships."""
+    places = list(places)
+    council = council_areas(places)
+    lent = {}
+    for place in places:
+        own = place.get("overture_id")
+        areas = [(twin, QID_TWIN) for twin in place.get("twin_overture_ids") or []]
+        if own in council:
+            areas.append((council[own], COUNCIL_AREA))
+        if own and areas:
+            lent[own] = areas
+    return lent
+
+
+def lend_areas(areas, lent):
+    """Give each place in ``lent`` (from :func:`lenders`) that read no area of
+    its own the rows of its first lender that read some, in place;
+    ``{place overture_id: geometry_source}`` for the places given one."""
+    given = {}
+    for own, candidates in lent.items():
+        found = [(area, source) for area, source in candidates if area in areas]
+        if own not in areas and found:
+            areas[own] = areas[found[0][0]]
+            given[own] = found[0][1]
     return given
+
+
+def ship_area(place, rows, inventory=None, shipped=None, source="overture"):
+    """Ship a division's land-area ``rows`` as ``place``'s simplified geometry,
+    labelled ``source``, when every area's every source is allowlisted and
+    every polygon valid; ``"shipped"``, ``"omitted"`` (a source not
+    allowlisted) or ``"invalid"``. ``inventory`` counts every row's sources
+    and ``shipped`` gathers those of an area that ships."""
+    if inventory is not None:
+        for row in rows:
+            # A land area with no sources still records one row, keyed to the
+            # null source, so its omission is auditable, not silent.
+            for row_source in row["sources"] or [None]:
+                key = _source_key(row_source)
+                inventory[(*key, key in SOURCE_ALLOWLIST)] += 1
+    if not all(_is_shippable(row["sources"]) for row in rows):
+        return "omitted"
+    geoms = [row["geom"] for row in rows]
+    if not all(_valid_polygon(geom) for geom in geoms):
+        return "invalid"
+    merged = geoms[0] if len(geoms) == 1 else shapely.unary_union(geoms)
+    simplified = _simplify(merged)
+    if not _valid_polygon(simplified):
+        return "invalid"
+    place["geometry"] = shapely.to_wkb(simplified).hex()
+    place["geometry_source"] = source
+    if shipped is not None:
+        for row in rows:
+            shipped.update(_source_key(row_source) for row_source in row["sources"])
+    return "shipped"
 
 
 def _area_predicate(ids):
@@ -839,9 +891,7 @@ def attach_geometry(
             shipped = set()
             inventory = collections.Counter()
             absent = set()
-            with_geometry = 0
-            omitted = 0
-            invalid = 0
+            outcomes = collections.Counter()
             # Resolve the seeded places' areas in bounded chunks so the whole
             # set's polygons are never held at once (that peak OOMs a feed-dense
             # country's build on a memory-tight host). The accumulators below are
@@ -866,34 +916,37 @@ def attach_geometry(
                         absent.add(overture_id)
                         continue
                     for place in by_overture[overture_id]:
-                        for row in rows:
-                            # A land area with no sources still records one row,
-                            # keyed to the null source, so its omission is
-                            # auditable, not silent.
-                            for source in row["sources"] or [None]:
-                                key = _source_key(source)
-                                inventory[(*key, key in SOURCE_ALLOWLIST)] += 1
-                        if not all(_is_shippable(row["sources"]) for row in rows):
-                            omitted += 1
-                            continue
-                        geoms = [row["geom"] for row in rows]
-                        if not all(_valid_polygon(geom) for geom in geoms):
-                            invalid += 1
-                            continue
-                        merged = (
-                            geoms[0] if len(geoms) == 1 else shapely.unary_union(geoms)
-                        )
-                        simplified = _simplify(merged)
-                        if not _valid_polygon(simplified):
-                            invalid += 1
-                            continue
-                        place["geometry"] = shapely.to_wkb(simplified).hex()
-                        place["geometry_source"] = "overture"
-                        with_geometry += 1
-                        for row in rows:
-                            for source in row["sources"]:
-                                shipped.add(_source_key(source))
+                        outcomes[ship_area(place, rows, inventory, shipped)] += 1
                 del areas
+            # A place whose own division has no area ships the area of another
+            # division its QID names.
+            twins = {
+                own: [
+                    (area, source) for area, source in candidates if source == QID_TWIN
+                ]
+                for own, candidates in lenders(places).items()
+                if own in absent
+            }
+            if twins:
+                areas = read_areas(
+                    dataset,
+                    {area for candidates in twins.values() for area, _ in candidates},
+                    simplify=SIMPLIFY_TOLERANCE_DEG,
+                    cache=(cache_dir, overture.OVERTURE_RELEASE),
+                    reopen=reopen,
+                    countries=countries,
+                )
+                for own, source in lend_areas(areas, twins).items():
+                    # A twin that read an area settles the place, shipped or
+                    # not: the council area comes after it, as in lend_areas.
+                    absent.discard(own)
+                    for place in by_overture[own]:
+                        rows = areas[own]
+                        outcomes[
+                            ship_area(place, rows, inventory, shipped, source)
+                        ] += 1
+            with_geometry = outcomes["shipped"]
+            invalid = outcomes["invalid"]
 
             by_id = {p["place_id"]: p for p in places}
             lent = council_areas(places)
@@ -970,7 +1023,7 @@ def attach_geometry(
                 "overture_release": overture.OVERTURE_RELEASE,
                 "simplify_tolerance_deg": SIMPLIFY_TOLERANCE_DEG,
                 "with_geometry": with_geometry,
-                "omitted_by_licence": omitted,
+                "omitted_by_licence": outcomes["omitted"],
                 "invalid_geometry": invalid,
                 "curated_geometry": curated,
                 "member_union_geometry": member_union,

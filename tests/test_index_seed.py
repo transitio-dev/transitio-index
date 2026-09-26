@@ -607,8 +607,12 @@ def test_a_feed_with_no_declared_place_is_skipped(tmp_path):
 def test_a_locality_is_preferred_over_a_localadmin_of_the_same_qid(tmp_path):
     _, places, _ = _seed(tmp_path)
     # Both fi-helsinki (locality) and fi-helsinki-la (localadmin) carry Q1757;
-    # the locality's overture id must be the one recorded.
+    # the locality's overture id must be the one recorded, the skeleton's
+    # other divisions of the QID as its twins.
     assert places["Q1757"]["overture_id"] == "fi-helsinki"
+    helsinki = places["Q1757"]["twin_overture_ids"]
+    assert helsinki == ["fi-helsinki-county", "fi-helsinki-la"]
+    assert "twin_overture_ids" not in places["Q13291"]  # Espoo has none
 
 
 def test_declared_locations_prefers_mdb_and_skips_the_placeless():
