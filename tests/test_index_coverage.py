@@ -100,6 +100,7 @@ def _cover(
     tamper=None,
     late_crawl=None,
     report=None,
+    members=None,
     **cover_args,
 ):
     cache = tmp_path / "cache"
@@ -142,7 +143,7 @@ def _cover(
         },
     )
     for feed_id, stops_rows in (crawls or {}).items():
-        _write_crawl(cache, feed_id, stops_rows)
+        _write_crawl(cache, feed_id, stops_rows, (members or {}).get(feed_id))
     if tamper:
         stops = cache / "crawl" / crawl._dir_name(tamper) / "stops.txt"
         stops.write_bytes(stops.read_bytes() + b"sx,1.0,10.0\n")
@@ -180,17 +181,22 @@ def _cover(
     return manifest, {f["feed_id"]: f for f in covered}, grouped
 
 
-def _write_crawl(cache, feed_id, stops_rows):
+def _write_crawl(cache, feed_id, stops_rows, members=None):
     feed_dir = cache / "crawl" / crawl._dir_name(feed_id)
     feed_dir.mkdir(parents=True, exist_ok=True)
     stops = ("stop_id,stop_lat,stop_lon\n" + "".join(stops_rows)).encode()
-    (feed_dir / "stops.txt").write_bytes(stops)
+    files = {"stops.txt": stops, **(members or {})}
+    for name, data in files.items():
+        (feed_dir / name).write_bytes(data)
     (feed_dir / "state.json").write_text(
         json.dumps(
             {
                 "feed_id": feed_id,
-                "members": ["stops.txt"],
-                "member_sha256": {"stops.txt": hashlib.sha256(stops).hexdigest()},
+                "members": sorted(files),
+                "member_sha256": {
+                    name: hashlib.sha256(data).hexdigest()
+                    for name, data in files.items()
+                },
             }
         )
     )
@@ -417,6 +423,56 @@ def test_a_stop_placed_by_the_metro_polygon_and_a_member_counts_once(tmp_path):
         tmp_path, places=places, crawls={"f-none": _rows(3, 45.0)}, lookup=LOOKUP
     )
     assert edges["f-none"]["Q-metro"]["service"]["stops"] == 3
+
+
+TABLES = {
+    "routes.txt": b"route_id,route_type\nr,3\n",
+    "trips.txt": b"trip_id,route_id\nt,r\n",
+    "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt,s10.0-0,1\n",
+}
+NO_STOP_TIMES = {k: v for k, v in TABLES.items() if k != "stop_times.txt"}
+
+
+@pytest.mark.parametrize(
+    "stops, tables, copy_tables, folded",
+    [
+        (3, TABLES, TABLES, {"f-mdb-1": "f-atlas", "f-mdb-2": "f-atlas"}),
+        (
+            3,
+            TABLES,
+            {**TABLES, "stop_times.txt": b"trip_id\nt\n"},
+            {"f-mdb-1": "f-atlas"},
+        ),
+        (1, TABLES, TABLES, {}),
+        (3, NO_STOP_TIMES, NO_STOP_TIMES, {}),
+    ],
+    ids=["same-data", "other-schedule", "one-stop", "no-stop-times"],
+)
+def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
+    tmp_path, stops, tables, copy_tables, folded
+):
+    feeds = [
+        {**_feed("f-atlas"), "source": "atlas", "crosswalk_method": "none"},
+        {**_feed("f-mdb-2"), "source": "mdb", "mdb_id": "2", "mdb": {"id": "2"}},
+        {**_feed("f-mdb-1"), "source": "mdb", "mdb_id": "1", "mdb": {"id": "1"}},
+    ]
+    manifest, covered, edges = _cover(
+        tmp_path,
+        feeds=feeds,
+        placements=[],
+        crawls={feed["feed_id"]: _rows(stops, 10.0) for feed in feeds},
+        members={"f-atlas": tables, "f-mdb-1": tables, "f-mdb-2": copy_tables},
+        lookup=LOOKUP,
+    )
+    assert manifest["folded_feeds"] == folded
+    assert set(covered) == {"f-atlas", "f-mdb-1", "f-mdb-2"} - set(folded)
+    assert set(edges) == set(covered)
+    kept = covered["f-atlas"]
+    assert kept["aliases"] == sorted(folded)
+    # The Atlas feed takes the first MDB copy's record: both catalogues carry it.
+    assert (kept["source"], kept.get("mdb_id"), kept["crosswalk_method"]) == (
+        ("both", "1", "content") if folded else ("atlas", None, "none")
+    )
 
 
 def test_a_crawl_that_changed_after_expansion_is_refused(tmp_path):

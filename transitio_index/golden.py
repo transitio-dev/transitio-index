@@ -19,7 +19,7 @@ import json
 import math
 import os
 
-from transitio_index import overrides, store
+from transitio_index import coverage, overrides, store
 from transitio_index import registry as _registry
 
 REQUIRED_KEYS = ("feed_id", "name", "why", "membership", "tiers", "review_state")
@@ -112,15 +112,15 @@ def check_catalogue_evidence(golden_path, evidence_path):
 
 
 def _actual(cache_dir, overrides_dir=None):
-    """``{feed_id: [edges]}`` from the latest edge stage — curated edges
-    when a fresh curate generation exists, classified edges when a fresh
-    classify generation does, candidate edges otherwise; a stale generation
+    """``({feed_id: [edges]}, manifest, feeds)`` from the latest edge stage —
+    curated edges when a fresh curate generation exists, classified edges when
+    a fresh classify generation does, candidate edges otherwise; a stale generation
     fails the gate rather than being checked, and so do curated edges whose
     ``edges.yaml`` has moved on (or an ``edges.yaml`` nobody applied)."""
     from transitio_index import classify, overrides
 
     try:
-        _, edges, manifest = classify.read_edges(cache_dir)
+        feeds, edges, manifest = classify.read_edges(cache_dir)
         overrides.applied_digest(manifest, overrides_dir)
     except (classify.ClassifyError, overrides.OverrideError) as error:
         raise GoldenError(str(error)) from error
@@ -129,7 +129,7 @@ def _actual(cache_dir, overrides_dir=None):
     actual = {}
     for edge in edges:
         actual.setdefault(edge["feed_id"], []).append(edge)
-    return actual, manifest
+    return actual, manifest, feeds
 
 
 def _unknown_drift(cache_dir, manifest):
@@ -172,6 +172,7 @@ def check(
     assert_tiers=None,
     edges=None,
     manifest=None,
+    feeds=None,
     overrides_dir=None,
     registry=None,
 ):
@@ -185,12 +186,13 @@ def check(
     any of its edges needs review — so a rule change that moves a golden
     feed across the cutoff fails the diff without anyone remembering a
     flag. ``edges``/``manifest`` let a caller check the edges it already
-    read instead of resolving the latest generation again; ``registry``
+    read instead of resolving the latest generation again, with the ``feeds``
+    that resolve an entry filed under a feed's alias; ``registry``
     resolves the entries' place references to the index's keys.
     """
     entries = load_golden(golden_path, registry=registry)
     if edges is None:
-        actual, manifest = _actual(cache_dir, overrides_dir)
+        actual, manifest, feeds = _actual(cache_dir, overrides_dir)
     else:
         # The caller's own read: publish passes the very edges it ships, so
         # a concurrent republish cannot make the gate judge another set.
@@ -200,10 +202,11 @@ def check(
         manifest = manifest or {}
     if assert_tiers is None:
         assert_tiers = manifest.get("source") in ("classify", "curate", "rank")
+    canonical = coverage._canonical_ids(feeds or [])
     violations = []
     for entry in entries:
         feed_id = entry["feed_id"]
-        edges = actual.get(feed_id) or []
+        edges = actual.get(canonical.get(feed_id, feed_id)) or []
         places = {edge["place_id"] for edge in edges}
         if not places:
             violations.append({"feed_id": feed_id, "problem": "feed has no edges"})

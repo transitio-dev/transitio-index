@@ -1605,7 +1605,6 @@ def classify(
             by_overture = coverage.place_index(places)
             by_qid = coverage.place_qids(places)
             curated = coverage.curated_boundaries(places)
-            canonical = coverage._canonical_ids(feeds)
             crawl_lock = crawl.reading(cache_dir)
             crawl_lock.__enter__()
             if coverage_manifest.get("crawl_digest") != crawl.states_digest(cache_dir):
@@ -1615,12 +1614,7 @@ def classify(
                     "the crawl changed since the coverage stage read it; "
                     "re-run the coverage stage"
                 )
-            crawled = {}
-            for feed_dir, state in crawl.crawled_feeds(cache_dir):
-                state_id = state.get("feed_id")
-                feed_id = canonical.get(state_id) if isinstance(state_id, str) else None
-                if feed_id is not None:
-                    crawled[feed_id] = (feed_dir, state)
+            crawled, _ = coverage.crawled_states(cache_dir, feeds)
             by_feed = collections.defaultdict(dict)
             for candidate in candidates:
                 by_feed[candidate["feed_id"]][candidate["place_id"]] = candidate

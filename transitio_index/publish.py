@@ -1347,7 +1347,7 @@ def _read_coverage(cache_dir, *, locked=False, overrides_dir=None):
     return feeds, edges, manifest, current
 
 
-def _golden_gate(cache_dir, golden_path, edges, manifest, registry=None):
+def _golden_gate(cache_dir, golden_path, edges, manifest, feeds=None, registry=None):
     """The golden diff over the very edges about to ship, run before
     anything is written: a violation fails the publish loudly rather than
     shipping a regression."""
@@ -1355,7 +1355,12 @@ def _golden_gate(cache_dir, golden_path, edges, manifest, registry=None):
 
     try:
         report = golden.check(
-            cache_dir, golden_path, edges=edges, manifest=manifest, registry=registry
+            cache_dir,
+            golden_path,
+            edges=edges,
+            manifest=manifest,
+            feeds=feeds,
+            registry=registry,
         )
     except golden.GoldenError as error:
         raise PublishError(f"golden diff could not run: {error}") from error
@@ -1426,7 +1431,12 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
                     "snapshot with --no-golden"
                 )
             golden_report = _golden_gate(
-                cache_dir, golden_path, edges, coverage, registry=registry
+                cache_dir,
+                golden_path,
+                edges,
+                coverage,
+                feeds=records,
+                registry=registry,
             )
         digests = []
         identities = None

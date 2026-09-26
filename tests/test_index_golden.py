@@ -231,6 +231,15 @@ def test_the_gate_checks_the_edges_it_is_handed(tmp_path):
         tmp_path / "empty", path, edges=[], manifest={"source": "classify"}
     )
     assert report["violations"][0]["problem"] == "feed has no edges"
+    # An entry filed under an alias is judged on the feed that carries it.
+    report = golden.check(
+        tmp_path / "empty",
+        path,
+        edges=[_edge("f-kept", "Q1", "local", False)],
+        manifest={"source": "classify"},
+        feeds=[{"feed_id": "f-kept", "aliases": ["f-ok"]}],
+    )
+    assert report["passed"] is True
 
 
 def test_a_clean_build_passes(tmp_path):
