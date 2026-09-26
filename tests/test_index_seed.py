@@ -249,6 +249,37 @@ ROWS = [
             ("fi-uusimaa-x", "locality", "Uusimaa"),
         ),
     ),
+    # Manchester: a city whose district is its council area, a county no QID
+    # names.
+    fx.division("gb", "GB", "country", wikidata="Q145", name="United Kingdom"),
+    fx.division(
+        "gb-man-county",
+        "GB",
+        "county",
+        wikidata=None,
+        name="Manchester",
+        admin_level=2,
+        sources=[
+            {"dataset": "geoBoundaries", "license": "CC-BY-4.0", "record_id": "M"}
+        ],
+        hierarchies=fx.chain(
+            ("gb", "country", "United Kingdom"),
+            ("gb-man-county", "county", "Manchester"),
+        ),
+    ),
+    fx.division(
+        "gb-man",
+        "GB",
+        "locality",
+        wikidata="Q18125",
+        name="Manchester",
+        admin_level=3,
+        hierarchies=fx.chain(
+            ("gb", "country", "United Kingdom"),
+            ("gb-man-county", "county", "Manchester"),
+            ("gb-man", "locality", "Manchester"),
+        ),
+    ),
     # Turku, reachable only through its Swedish name Åbo.
     fx.division(
         "fi-turku",
@@ -300,6 +331,7 @@ FEEDS = [
     {"feed_id": "f-district-wrongsub", "mdb": _mdb("FI", "Lapland", "Keski-Uusimaa")},
     {"feed_id": "f-atlantis", "mdb": _mdb("FI", None, "Atlantis")},
     {"feed_id": "f-lahti", "mdb": _mdb("FI", None, "Lahti")},
+    {"feed_id": "f-manchester", "mdb": _mdb("GB", None, "Manchester")},
     {"feed_id": "f-uusimaa-muni", "mdb": _mdb("FI", "Uusimaa", "Uusimaa")},
 ]
 
@@ -522,6 +554,12 @@ def test_a_name_shared_by_a_city_and_its_own_district_is_the_city(tmp_path):
     assert "Q999002" not in places
     reasons = {r["feed_id"]: r["reason"] for r in report}
     assert "f-lahti" not in reasons
+    # So is Manchester, whose district is its QID-less council area: the city
+    # places, and sits in the area.
+    manchester = places["Q18125"]
+    assert manchester["overture_id"] == "gb-man"
+    assert manchester["parent_id"] == "overture:gb-man-county"
+    assert "f-manchester" not in reasons
     # A municipality field naming the region, beside a QID-less hamlet of that
     # name, is reported rather than placed at the hamlet; the declared
     # subdivision corroborates the region by its own name.

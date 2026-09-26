@@ -26,7 +26,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import shapely
 
-from transitio_index import overrides, overture, store
+from transitio_index import overrides, overture, seed, store
 from transitio_index.progress import progress
 
 log = logging.getLogger(__name__)
@@ -180,6 +180,9 @@ URAU_DERIVED = ("GISCO Urban Audit 2024", "EuroGeographics-NC")
 # both countries or in neither; classify counts those artefacts.
 SIMPLIFY_TOLERANCE_DEG = 0.0005
 
+# The geometry source of a city that ships its council area's boundary.
+COUNCIL_AREA = "council_area"
+
 
 def division_area_dataset(release=overture.OVERTURE_RELEASE):
     """The pinned Overture ``division_area`` theme as a dataset over S3."""
@@ -262,9 +265,45 @@ def place_areas(cache_dir, dataset, places, wanted):
     cache = (cache_dir, overture.OVERTURE_RELEASE)
     reopen = division_area_dataset if dataset is None else None
     countries = {p.get("country_code") for p in places} - {None}
-    every = ({p.get("overture_id") for p in places} - {None}) | set(wanted)
+    lent = council_areas(places)
+    wanted = set(wanted) | {lent[key] for key in wanted if key in lent}
+    every = ({p.get("overture_id") for p in places} - {None}) | wanted
     prefetch_areas(dataset, every, cache=cache, reopen=reopen, countries=countries)
-    return read_areas(dataset, wanted, cache=cache, reopen=reopen, countries=countries)
+    areas = read_areas(dataset, wanted, cache=cache, reopen=reopen, countries=countries)
+    lend_council_areas(areas, lent)
+    return areas
+
+
+def council_areas(places):
+    """``{city overture_id: area overture_id}`` for the cities whose parent is
+    their council area (``seed.council_area``) — the area a city with none of
+    its own stands on."""
+    places = list(places)
+    by_id = {place["place_id"]: place for place in places if place.get("place_id")}
+    lent = {}
+    for place in places:
+        parent = by_id.get(place.get("parent_id"))
+        if (
+            place.get("kind") == "city"
+            and place.get("overture_id")
+            and parent is not None
+            and parent.get("overture_id")
+            and seed.council_area(place, parent)
+        ):
+            lent[place["overture_id"]] = parent["overture_id"]
+    return lent
+
+
+def lend_council_areas(areas, lent):
+    """Give each city in ``lent`` (from ``council_areas``) that read no area
+    of its own its council area's rows, in place; the cities given one are
+    returned."""
+    given = set()
+    for city, area in lent.items():
+        if city not in areas and area in areas:
+            areas[city] = areas[area]
+            given.add(city)
+    return given
 
 
 def _area_predicate(ids):
@@ -713,6 +752,21 @@ def _inventory_rows(inventory, shipped_count, derived=()):
     return rows + list(derived)
 
 
+def _lend_council_boundaries(places, by_id, lent, absent):
+    """Give each city in ``lent`` that read no area of its own (``absent``),
+    and has no curated boundary, its council area's shipped boundary."""
+    for place in places:
+        own = place.get("overture_id")
+        if own not in absent or own not in lent:
+            continue
+        if place.get("geometry_source") not in (None, COUNCIL_AREA):
+            continue
+        parent = by_id[place["parent_id"]]
+        if parent.get("geometry"):
+            place["geometry"] = parent["geometry"]
+            place["geometry_source"] = COUNCIL_AREA
+
+
 def _curated_geometry(place, wkt):
     """A curator-supplied boundary: WKT parsed, validated and simplified like
     any other, shipped with ``geometry_source = "curated"`` — the curator, not
@@ -782,6 +836,7 @@ def attach_geometry(
 
             shipped = set()
             inventory = collections.Counter()
+            absent = set()
             with_geometry = 0
             omitted = 0
             invalid = 0
@@ -806,6 +861,7 @@ def attach_geometry(
                 for overture_id in batch_ids:
                     rows = areas.get(overture_id)
                     if not rows:
+                        absent.add(overture_id)
                         continue
                     for place in by_overture[overture_id]:
                         for row in rows:
@@ -838,6 +894,8 @@ def attach_geometry(
                 del areas
 
             by_id = {p["place_id"]: p for p in places}
+            lent = council_areas(places)
+            _lend_council_boundaries(places, by_id, lent, absent)
             member_union = 0
             for place in places:
                 if place.get("kind") != "metro" or place.get("geometry"):
@@ -893,6 +951,8 @@ def attach_geometry(
                 )
                 _curated_geometry(place, entry["set_boundary"])
                 curated += 1
+            # A council area's curated boundary is its cities' too.
+            _lend_council_boundaries(places, by_id, lent, absent)
             derived = metros_manifest.get("derived_inventory") or []
             inventory_rows = _inventory_rows(inventory, with_geometry, derived)
             notice = _notice(shipped, overture.OVERTURE_RELEASE, derived)
@@ -910,6 +970,9 @@ def attach_geometry(
                 "invalid_geometry": invalid,
                 "curated_geometry": curated,
                 "member_union_geometry": member_union,
+                "council_area_geometry": sum(
+                    p.get("geometry_source") == COUNCIL_AREA for p in places
+                ),
                 "places_overrides_sha256": places_digest,
                 "stale_overrides": len(override_report),
                 "stale_place_overrides": (

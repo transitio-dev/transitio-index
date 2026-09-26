@@ -58,6 +58,31 @@ def _name_variants(record):
     return variants
 
 
+def _area_names(record):
+    """The folded names a division carries as a city's council area: each
+    label, and each without a ``City`` affix — "City of Edinburgh" and
+    "Glasgow City" carry Edinburgh's and Glasgow's names."""
+    names = set()
+    for name in _name_variants(record):
+        names.add(name)
+        if name.startswith("city of "):
+            names.add(name[len("city of ") :])
+        if name.endswith(" city"):
+            names.add(name[: -len(" city")])
+    return names
+
+
+def council_area(city, area):
+    """Whether ``area`` is ``city``'s own council area: a county no QID names
+    that carries the city's name (Manchester's Manchester, Edinburgh's City of
+    Edinburgh). A candidate record and a place row answer alike."""
+    return (
+        area.get("source_subtype") == "county"
+        and area.get("resolution_method") == "overture_id"
+        and bool(_name_variants(city) & _area_names(area))
+    )
+
+
 def declared_locations(feeds):
     """One declared location per placeable feed, finest declared level first.
 
@@ -160,6 +185,27 @@ def city_qids(dataset, qids):
     return found & wanted
 
 
+def council_area_cities(dataset, areas):
+    """``{area overture_id: locality record}``: the one QID-bearing locality
+    each of ``areas`` is the council area of (see ``council_area``), its
+    ancestry cut at the area so the city sits in it. One locality scan over
+    the areas' countries."""
+    by_id = {area["overture_id"]: area for area in areas}
+    countries = {area["country"] for area in areas}
+    wanted = {(area["country"], name) for area in areas for name in _area_names(area)}
+    found = {}
+    for record in read_city_candidates(dataset, countries, wanted):
+        if record["subtype"] != "locality" or not record["wikidata"]:
+            continue
+        for depth, ancestor in enumerate(record["ancestors"]):
+            area = by_id.get(ancestor.get("overture_id"))
+            if area is not None and council_area(record, area):
+                record["ancestors"] = record["ancestors"][: depth + 1]
+                found.setdefault(area["overture_id"], []).append(record)
+                break
+    return {key: cities[0] for key, cities in found.items() if len(cities) == 1}
+
+
 def _resolve_candidates(candidates, wikidata):
     """Attach a resolved ``qid``/``resolution_method`` to each candidate."""
     pending = {
@@ -190,17 +236,25 @@ def _index(records):
 
 
 def _principal_qid(candidates):
-    """The one QID carried by both a city-level and a district-level candidate
-    — a city that is its own district (Augsburg, Karlsruhe, Ulm) appears at
-    both levels under its QID, while the other same-name divisions are hamlets
-    — or ``None`` when no QID is, or more than one."""
+    """The one QID of a city that is its own district, while the other
+    same-name divisions are hamlets — or ``None`` when no QID is, or more than
+    one. Such a city appears at both levels under its QID (Augsburg, Karlsruhe,
+    Ulm), or its district is its council area, a county no QID names
+    (Manchester, Cardiff)."""
     levels = {}
     for candidate in candidates:
         if candidate["qid"]:
             city_level = candidate["subtype"] in CITY_SUBTYPES
             levels.setdefault(candidate["qid"], set()).add(city_level)
-    shared = [qid for qid, seen in levels.items() if seen == {True, False}]
-    return shared[0] if len(shared) == 1 else None
+    shared = {qid for qid, seen in levels.items() if seen == {True, False}}
+    by_id = {c["overture_id"]: c for c in candidates}
+    for candidate in candidates:
+        if candidate["qid"] and candidate["subtype"] in CITY_SUBTYPES:
+            ancestors = candidate.get("ancestors", [])
+            areas = (by_id.get(a.get("overture_id")) for a in ancestors)
+            if any(area and council_area(candidate, area) for area in areas):
+                shared.add(candidate["qid"])
+    return shared.pop() if len(shared) == 1 else None
 
 
 def _unique_identity(candidates):
@@ -209,9 +263,9 @@ def _unique_identity(candidates):
     Candidates that share one QID are the same place (a locality and its
     localadmin, say); the locality is preferred. Two distinct QIDs conflict, and
     a QID-less same-name division leaves the identity unprovable — either way the
-    match is reported rather than minted — unless one QID is shared by a
-    city-level and a district-level candidate: that is the principal place, and
-    the other same-name divisions are set aside.
+    match is reported rather than minted — unless one QID is a city that is
+    its own district (``_principal_qid``): that is the principal place, and the
+    other same-name divisions are set aside.
     """
     qids = {c["qid"] for c in candidates if c["qid"]}
     if len(qids) > 1 or (qids and any(not c["qid"] for c in candidates)):
