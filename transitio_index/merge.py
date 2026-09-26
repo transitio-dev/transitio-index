@@ -65,8 +65,9 @@ OVERRIDE_FIELDS = (
 # composition or the serialisation, so a new implementation never reuses
 # an old snapshot id. 2: the NOTICE parser accepts the geometry credit's
 # source list as an indented continuation block. 3: an id another build
-# folded into a feed is that feed.
-MERGE_FORMAT = 3
+# folded into a feed is that feed. 4: a feed's containers are named by the
+# merged ids.
+MERGE_FORMAT = 4
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -210,6 +211,22 @@ def _union_aliases(table, stacked, mapping):
     )
 
 
+def _merged_containers(table, mapping):
+    """``table`` with each feed's ``contained_in`` named by the merged ids:
+    re-keyed through ``mapping``, without the feed itself, repeats, or an id
+    no merged feed carries."""
+    ids = table["feed_id"].to_pylist()
+    kept = set(ids)
+    rows = [
+        sorted({mapping.get(c, c) for c in containers or ()} & kept - {feed_id})
+        for feed_id, containers in zip(ids, table["contained_in"].to_pylist())
+    ]
+    index = table.schema.get_field_index("contained_in")
+    return table.set_column(
+        index, table.field(index), pa.array(rows, table.field(index).type)
+    )
+
+
 def merge_tables(sources, skipped=()):
     """The catalogue's ``(snapshot, tables)`` over loaded ``sources``, each a
     ``(build_id, snapshot, tables)`` as ``load_tables`` returns them.
@@ -290,6 +307,8 @@ def merge_tables(sources, skipped=()):
                 companions.field(index),
                 pa.array(linked, companions.field(index).type),
             )
+    if "contained_in" in tables["feeds.parquet"].column_names:
+        tables["feeds.parquet"] = _merged_containers(tables["feeds.parquet"], mapping)
     counts = {
         "places": len(tables["places.parquet"]),
         "places_by_kind": _value_counts(tables["places.parquet"]["kind"]),

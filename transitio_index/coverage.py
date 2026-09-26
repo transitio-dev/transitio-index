@@ -14,7 +14,8 @@ Crawled evidence supersedes the declared placements feed by feed. Feeds whose
 crawls hold the same data — an operator's feed listed twice, often once in each
 catalogue — fold into one feed first, the others' ids kept as its aliases;
 feeds sharing their stops and routes but not their schedules are listed in
-``near_duplicates.jsonl`` and kept apart.
+``near_duplicates.jsonl`` and kept apart, and each feed records the larger
+feeds whose stops and routes contain its own (``contained_in``).
 
 For every other feed the answer comes from
 what the catalogues declare: the seed stage resolved each feed's declared
@@ -281,6 +282,75 @@ def near_duplicates(states):
         differ = [n for n in sorted(names) if len({d.get(n) for d in digests}) > 1]
         report.append({"feed_ids": sorted(members), "differ": differ})
     return sorted(report, key=lambda row: row["feed_ids"])
+
+
+# A feed lies within another when this share of its stops (rounded to about
+# 10 m) and of its routes are the other's, and the other has this many times
+# its stops.
+CONTAINED_SHARE = 0.9
+CONTAINER_SCALE = 1.5
+
+
+def _route_keys(feed_dir, state):
+    """A crawl's routes as ``(route_type, name)`` — the short name, else the
+    long name, casefolded — from its digest-verified routes.txt; empty when
+    it cannot be read."""
+    from transitio_index import classify, crawl
+
+    keys = set()
+    try:
+        with crawl.verified_member(feed_dir, state, "routes.txt") as opened:
+            for row in classify._reader(opened) if opened is not None else ():
+                value = (row.get("route_type") or "").strip()
+                name = (row.get("route_short_name") or "").strip() or (
+                    row.get("route_long_name") or ""
+                ).strip()
+                # ASCII digits only: "²" is a digit to str.isdigit, not to int.
+                if value.isascii() and value.isdigit() and len(value) <= 4 and name:
+                    keys.add((int(value), name.casefold()))
+    except crawl.MEMBER_ERRORS:
+        return set()
+    return keys
+
+
+def contained_feeds(states):
+    """``{feed_id: [container ids]}``: for each crawl, the larger crawls that
+    contain it — at least :data:`CONTAINED_SHARE` of its distinct stop
+    coordinates (rounded to 1e-4 degrees) and of its routes among the other's,
+    the other with at least :data:`CONTAINER_SCALE` times its stops. A feed
+    needs two readable stops and a named, typed route to take part; two feeds
+    sharing their stops (near-duplicates) never qualify."""
+    import pandas as pd
+
+    from transitio_index import expand
+
+    points, routes = {}, {}
+    for feed_id, (feed_dir, state) in states.items():
+        read = expand._stop_points(feed_dir, state)
+        keys = _route_keys(feed_dir, state)
+        rounded = {(round(x, 4), round(y, 4)) for x, y in read[0]} if read else set()
+        if len(rounded) >= 2 and keys:
+            points[feed_id], routes[feed_id] = rounded, keys
+    frame = pd.DataFrame(
+        [(feed_id, x, y) for feed_id, pts in points.items() for x, y in pts],
+        columns=["feed", "x", "y"],
+    )
+    pairs = frame.merge(frame, on=["x", "y"], suffixes=("", "_other"))
+    shared = (
+        pairs[pairs["feed"] != pairs["feed_other"]]
+        .groupby(["feed", "feed_other"])
+        .size()
+    )
+    contained = {}
+    for (feed_id, other), count in shared.items():
+        size, keys = len(points[feed_id]), routes[feed_id]
+        if (
+            count >= CONTAINED_SHARE * size
+            and len(points[other]) >= CONTAINER_SCALE * size
+            and len(keys & routes[other]) >= CONTAINED_SHARE * len(keys)
+        ):
+            contained.setdefault(feed_id, []).append(other)
+    return {feed_id: sorted(ids) for feed_id, ids in contained.items()}
 
 
 def link_static_feeds(feeds, canonical):
@@ -783,6 +853,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             }
             folded = {}
             near = []
+            contained = {}
             opened_lookup = None
             crawl_digest = None
             crawl_lock = crawl.reading(cache_dir)
@@ -808,6 +879,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     states, unmatched = crawled_states(cache_dir, feeds)
                     folded = fold_duplicates(feeds, states)
                     near = near_duplicates(states)
+                    contained = contained_feeds(states)
                     try:
                         crawled_by_key, crawl_report = crawled_edges(
                             states, places, lookup, conflicts=conflicts
@@ -851,6 +923,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 edge["feed_id"] for edge in edges if edge["feed_id"] not in superseded
             }
             for feed in feeds:
+                feed["contained_in"] = contained.get(feed["feed_id"], [])
                 if feed["feed_id"] in superseded:
                     # The schema's crawl fields: measured hull and stop count
                     # replace whatever the catalogues declared.
@@ -879,6 +952,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "feeds_covered": len(covered),
                 "folded_feeds": dict(sorted(folded.items())),
                 "near_duplicate_groups": len(near),
+                "feeds_contained": len(contained),
                 "feeds_overrides_sha256": feeds_digest,
                 "overrides_applied": coverage_overrides,
                 "stale_overrides": len(override_report),

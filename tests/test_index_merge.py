@@ -217,14 +217,19 @@ def test_feeds_edges_and_places_merge_by_source(tmp_path):
 
 
 def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
-    def feed(feed_id, *aliases):
-        return {**_feed7(feed_id, feed_id, "FI", "domestic"), "aliases": list(aliases)}
+    def feed(feed_id, *aliases, contained_in=()):
+        row = _feed7(feed_id, feed_id, "FI", "domestic")
+        return {**row, "aliases": list(aliases), "contained_in": list(contained_in)}
 
     a = _run(
         tmp_path,
         "fi",
         1,
-        feeds=[feed("c", "x"), feed("m", "n"), feed("p", "q")],
+        feeds=[
+            feed("c", "x"),
+            feed("m", "n", contained_in=["x"]),
+            feed("p", "q", contained_in=["p", "gone"]),
+        ],
         edges={"FI": [_edge7("hel", "c", "local", "primary", 0.5, False)]},
         built_at=BUILT(14),
     )
@@ -254,6 +259,9 @@ def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
     # x's companion follows c; contradicting claims leave their rows alone.
     assert set(feeds.index) == {"c", "m", "n", "p", "r"}
     assert list(feeds.loc["c", "aliases"]) == ["y", "x"]
+    # A container is named by its merged id; itself and absent ids go.
+    assert list(feeds.loc["m", "contained_in"]) == ["c"]
+    assert list(feeds.loc["p", "contained_in"]) == []
     edges = tables["edges.parquet"].to_pandas()
     assert set(map(tuple, edges[["place_id", "feed_id"]].to_numpy())) == {("esp", "c")}
     realtime = _frame(tables, "realtime.parquet", "feed_id")
@@ -280,7 +288,7 @@ MANIFEST_9 = {
 
 
 def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fields):
-    """A schema-9 run archived as ``<label>-<16 hex>``: the reader fixture's
+    """A schema-10 run archived as ``<label>-<16 hex>``: the reader fixture's
     partitioned index with the manifest fields a merge checks."""
     path = archived / f"{label}-{digit:016x}" / "index"
     fx.write_partitioned_index(
@@ -289,7 +297,7 @@ def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fiel
         places=fields.pop("places"),
         edges=fields.pop("edges"),
         realtime=fields.pop("realtime", []),
-        validity={},
+        contained=fields.pop("contained", {}),
         snapshot_id=f"{digit:016x}",
         notice=notice,
     )
@@ -405,8 +413,8 @@ def _mixed_overture(archived, fi, de):
     )
 
 
-def _below_schema_9(archived, fi, de):
-    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(schema_version=8))
+def _below_schema_10(archived, fi, de):
+    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(schema_version=9))
 
 
 def _without_a_release(archived, fi, de):
@@ -434,9 +442,17 @@ def _a_negative_tolerance(archived, fi, de):
 
 
 def _feeds_without_service_spans(archived, fi, de):
-    # Schema-8-shaped feeds under a schema-9 manifest, digests intact.
+    _drop_feed_columns(archived, fi, ["service_start", "service_end"])
+
+
+def _feeds_without_containers(archived, fi, de):
+    _drop_feed_columns(archived, fi, ["contained_in"])
+
+
+def _drop_feed_columns(archived, fi, columns):
+    # Feeds lacking columns their manifest's schema requires, digests intact.
     file = archived / fi / "index" / "FI" / "feeds.parquet"
-    table = pq.read_table(file).drop_columns(["service_start", "service_end"])
+    table = pq.read_table(file).drop_columns(columns)
     sink = io.BytesIO()
     pq.write_table(table, sink)
     file.write_bytes(sink.getvalue())
@@ -466,12 +482,13 @@ def _rewritten_notice(archived, fi, de):
     [
         (_unlicensed, "not a licensed build"),
         (_mixed_overture, "overture_release differs"),
-        (_below_schema_9, "schema_version 8"),
+        (_below_schema_10, "schema_version 9"),
         (_without_a_release, "no usable overture_release"),
         (_another_classifier, "classifier differs"),
         (_a_malformed_classifier_everywhere, "no usable classifier"),
         (_a_negative_tolerance, "no usable simplify_tolerance_deg"),
         (_feeds_without_service_spans, "does not verify"),
+        (_feeds_without_containers, "does not verify"),
         (_tampered_table, "does not verify"),
         (_rewritten_notice, "does not verify"),
     ],
@@ -672,9 +689,9 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
     read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
     assert set(read["snapshot"].to_pylist()) == {snapshot_id}
-    assert manifest["schema_version"] == 9
+    assert manifest["schema_version"] == 10
     assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
-    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[9]
+    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[10]
     assert manifest["built_with"] == transitio.__version__
     assert manifest["built_at"] == BUILT(15)  # the newest source's, not the clock
     assert manifest["counts"] == {

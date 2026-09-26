@@ -86,6 +86,8 @@ SCHEMA_9_COLUMNS = {
     "feeds.parquet": {"service_start", "service_end"},
     "places.parquet": {"validity"},
 }
+# What schema 10 adds: the feeds containing each feed.
+SCHEMA_10_COLUMNS = {"feeds.parquet": {"contained_in"}}
 
 
 LATEST = "latest"  # the id of the build at cache/index
@@ -313,6 +315,7 @@ def load_tables(path, read_bytes=_read_file, expected=None):
             return None
         version = snapshot.get("schema_version")
         dated = isinstance(version, int) and version >= 9
+        nested = isinstance(version, int) and version >= 10
         digests, tables = {}, {}
         for name, (digest, rows) in files.items():
             partition = name.rpartition("/")[0]
@@ -333,6 +336,7 @@ def load_tables(path, read_bytes=_read_file, expected=None):
                     _has_columns(table, base, REQUIRED_COLUMNS)
                     and _has_columns(table, base, SCHEMA_7_COLUMNS)
                     and (not dated or _has_columns(table, base, SCHEMA_9_COLUMNS))
+                    and (not nested or _has_columns(table, base, SCHEMA_10_COLUMNS))
                 ):
                     return None
                 tables[name] = table
@@ -343,6 +347,14 @@ def load_tables(path, read_bytes=_read_file, expected=None):
         for name in REQUIRED_COLUMNS:
             if not _has_columns(tables[name], name, REQUIRED_COLUMNS):
                 return None
+        # The schema's columns whatever the layout: a flat build claiming
+        # schema 9 or 10 must carry them too.
+        claimed = [SCHEMA_9_COLUMNS] if dated else []
+        claimed += [SCHEMA_10_COLUMNS] if nested else []
+        for required in claimed:
+            for name in required:
+                if name in tables and not _has_columns(tables[name], name, required):
+                    return None
         return snapshot, digests, tables
     except _BUILD_ERRORS:
         return None

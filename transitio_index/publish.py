@@ -1,6 +1,6 @@
 """Publish stage: the feeds, places and membership edges as a shippable index.
 
-Writes ``<cache>/index/`` as a directory of partitions (schema 9): under each
+Writes ``<cache>/index/`` as a directory of partitions (schema 10): under each
 country code ``feeds.parquet`` (one row per GTFS feed whose home country it
 is), ``realtime.parquet`` (the GTFS-RT companions of those feeds),
 ``places.parquet`` (one row per place there, a GeoParquet with the simplified
@@ -47,10 +47,10 @@ from transitio_index import overture
 from transitio_index import registry as _registry
 from transitio_index import store
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 # The reader release that first reads this schema; the installed reader's own
 # floor table wins once it knows the version.
-MIN_READER_VERSION = "0.12.0"
+MIN_READER_VERSION = "0.15.0"
 # The edge generations that carry curation (curate, and rank on top of it).
 FINAL_SOURCES = ("curate", "rank")
 FEEDS_FILE = "feeds.parquet"
@@ -127,6 +127,9 @@ _SCHEMA = pa.schema(
         # crawled calendar (schema_version 9); null without one.
         ("service_start", pa.string()),
         ("service_end", pa.string()),
+        # The larger feeds whose stops and routes contain this feed's
+        # (schema_version 10). Set by the coverage stage.
+        ("contained_in", pa.list_(pa.string())),
         ("snapshot", pa.string()),
     ]
 )
@@ -203,6 +206,7 @@ def _row(record, snapshot_id):
         "realtime_feed_ids": record.get("realtime_feed_ids") or [],
         "service_start": span[0].isoformat() if span else None,
         "service_end": span[1].isoformat() if span else None,
+        "contained_in": record.get("contained_in") or [],
         "snapshot": snapshot_id,
     }
 

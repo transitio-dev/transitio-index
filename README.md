@@ -221,7 +221,7 @@ the newest complete run of every label and writes one snapshot from them:
 python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache-dir cache/merged
 ```
 
-Every source must be a licensed schema-9 build, and the sources must agree on
+Every source must be a licensed schema-10 build, and the sources must agree on
 the Overture release, the simplification tolerance and the classifier. A feed
 comes from the newest build carrying it and its edges from that same build; a
 place comes from the build serving it most. The merged NOTICE credits every
