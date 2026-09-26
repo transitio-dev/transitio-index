@@ -64,8 +64,9 @@ OVERRIDE_FIELDS = (
 # Bumped by every change to the merge rules, the routing, the NOTICE
 # composition or the serialisation, so a new implementation never reuses
 # an old snapshot id. 2: the NOTICE parser accepts the geometry credit's
-# source list as an indented continuation block.
-MERGE_FORMAT = 2
+# source list as an indented continuation block. 3: an id another build
+# folded into a feed is that feed.
+MERGE_FORMAT = 3
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -141,6 +142,74 @@ def _value_counts(column):
     return {k: int(v) for k, v in column.to_pandas().value_counts().items()}
 
 
+def _alias_map(feeds):
+    """``(mapping, conflicts)`` over stacked feed rows: ``{alias: feed_id}``
+    for the ids another build lists as a feed's alias, and the id groups
+    whose claims contradict each other.
+
+    The claims (alias to the feed listing it) form a graph judged one
+    connected component at a time, never followed transitively: a component
+    maps only when it is a star — one feed claiming every other id and
+    claimed by none. Two claimants, a chain or a cycle leave the whole
+    component unmapped and listed in ``conflicts``.
+    """
+    if "aliases" not in feeds.column_names:
+        return {}, []
+    claims = {}
+    for feed_id, aliases in zip(
+        feeds["feed_id"].to_pylist(), feeds["aliases"].to_pylist()
+    ):
+        for alias in aliases or ():
+            if alias != feed_id:
+                claims.setdefault(alias, set()).add(feed_id)
+    parent = {}
+
+    def root(node):
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for alias, claimants in claims.items():
+        for feed_id in claimants:
+            parent[root(alias)] = root(feed_id)
+    components = {}
+    for node in parent:
+        components.setdefault(root(node), set()).add(node)
+    mapping, conflicts = {}, []
+    for component in components.values():
+        claimants = {f for alias in component & claims.keys() for f in claims[alias]}
+        (canonical,) = claimants if len(claimants) == 1 else (None,)
+        if canonical is None or canonical in claims:
+            conflicts.append(sorted(component))
+            continue
+        mapping.update((alias, canonical) for alias in component - {canonical})
+    return mapping, sorted(conflicts)
+
+
+def _union_aliases(table, stacked, mapping):
+    """``table`` with each re-keyed feed's aliases the union of every source
+    row's for it, the winning row's own first."""
+    canonicals = set(mapping.values())
+    union = {}
+    for feed_id, aliases in zip(
+        stacked["feed_id"].to_pylist(), stacked["aliases"].to_pylist()
+    ):
+        if feed_id in canonicals:
+            union.setdefault(feed_id, []).extend(aliases or ())
+    rows = [
+        list(dict.fromkeys([*(aliases or ()), *union.get(feed_id, ())]))
+        for feed_id, aliases in zip(
+            table["feed_id"].to_pylist(), table["aliases"].to_pylist()
+        )
+    ]
+    index = table.schema.get_field_index("aliases")
+    return table.set_column(
+        index, table.field(index), pa.array(rows, table.field(index).type)
+    )
+
+
 def merge_tables(sources, skipped=()):
     """The catalogue's ``(snapshot, tables)`` over loaded ``sources``, each a
     ``(build_id, snapshot, tables)`` as ``load_tables`` returns them.
@@ -150,8 +219,11 @@ def merge_tables(sources, skipped=()):
     build's classification is never mixed with another's; a place from the
     source contributing the most kept edges to it, from the newest when none
     does. A realtime companion follows its static feed, an unlinked one the
-    newest source. Every table gains ``build_id``. The snapshot recounts the
-    merged tables and lists the ``sources`` and the ``skipped`` runs.
+    newest source. An id another build folded into a feed (see
+    :func:`_alias_map`) is that feed: its own rows are dropped, and the
+    feed's aliases gather every source's. Every table gains ``build_id``.
+    The snapshot recounts the merged tables and lists the ``sources``, the
+    ``skipped`` runs and the ``alias_conflicts``.
     """
     ranked = sorted(sources, key=lambda source: source[0])
     ranked.sort(key=lambda source: _built_at(source[1]) or _EPOCH, reverse=True)
@@ -165,7 +237,9 @@ def merge_tables(sources, skipped=()):
         name: pa.concat_tables(parts, promote_options="default")
         for name, parts in stacked.items()
     }
+    mapping, conflicts = _alias_map(merged["feeds.parquet"])
     feeds = _keys(merged["feeds.parquet"], ["feed_id"], order)
+    feeds = feeds[~feeds["feed_id"].isin(mapping.keys())]
     winners = feeds.sort_values("order", kind="stable").drop_duplicates("feed_id")
     won = winners[["feed_id", "build_id"]]
     edges = _keys(merged["edges.parquet"], ["place_id", "feed_id"], order)
@@ -186,6 +260,7 @@ def merge_tables(sources, skipped=()):
         realtime = _keys(
             merged["realtime.parquet"], ["feed_id", "static_feed_id"], order
         )
+        realtime["static_feed_id"] = realtime["static_feed_id"].replace(mapping)
         # A companion of a won feed comes with that feed's source or not at
         # all; one linked to no won feed comes from the newest source.
         static = won.rename(columns={"feed_id": "static_feed_id"})
@@ -200,6 +275,21 @@ def merge_tables(sources, skipped=()):
         name: merged[name].take(pa.array(np.sort(rows.to_numpy())))
         for name, rows in taken.items()
     }
+    if mapping:
+        tables["feeds.parquet"] = _union_aliases(
+            tables["feeds.parquet"], merged["feeds.parquet"], mapping
+        )
+        if "realtime.parquet" in tables:
+            # A companion taken from a build that did not fold its static
+            # feed still names the folded id.
+            companions = tables["realtime.parquet"]
+            index = companions.schema.get_field_index("static_feed_id")
+            linked = [mapping.get(f, f) for f in companions[index].to_pylist()]
+            tables["realtime.parquet"] = companions.set_column(
+                index,
+                companions.field(index),
+                pa.array(linked, companions.field(index).type),
+            )
     counts = {
         "places": len(tables["places.parquet"]),
         "places_by_kind": _value_counts(tables["places.parquet"]["kind"]),
@@ -232,6 +322,7 @@ def merge_tables(sources, skipped=()):
             for build_id, snapshot, _ in sorted(ranked, key=lambda s: label_of(s[0]))
         ],
         "skipped": list(skipped),
+        "alias_conflicts": conflicts,
     }
     return snapshot, tables
 
@@ -567,7 +658,7 @@ def _recount(tables):
     }
 
 
-def assemble(loaded, tables, notice):
+def assemble(loaded, tables, notice, alias_conflicts=()):
     """``(manifest, files)`` of the merged snapshot: the partition tables as
     Parquet bytes keyed ``(partition, table)`` and the manifest that lists
     them, over the sources ``load_sources`` returned and the ``tables``
@@ -581,7 +672,8 @@ def assemble(loaded, tables, notice):
     stage generations, a ``merged`` block naming each source by portable
     identities only: its label, build id, snapshot id, build date, coverage
     mode, catalogue pins, partition digests and the digests of its manifest
-    and NOTICE.
+    and NOTICE; ``alias_conflicts`` are the id groups ``merge_tables`` left
+    unfolded.
     """
     from transitio import __version__ as built_with
     from transitio.index import DISCOVERY_SEMANTICS_VERSION, MIN_READER_VERSIONS
@@ -620,6 +712,7 @@ def assemble(loaded, tables, notice):
         **{field: None for field in OVERRIDE_FIELDS},
         **stale,
         "stale_overrides": sum(stale.values()),
+        "alias_conflicts": [list(group) for group in alias_conflicts],
         "merged": [
             {
                 "label": s["label"],
@@ -908,11 +1001,15 @@ def merge_builds(builds, cache_dir, read_bytes=_read_file, log=print):
     if not sources:
         raise MergeError(f"no build to merge under {builds}")
     loaded = load_sources(sources, read_bytes)
-    _, tables = merge_tables(
+    catalogue, tables = merge_tables(
         [(s["build_id"], s["snapshot"], s["tables"]) for s in loaded]
     )
+    for group in catalogue["alias_conflicts"]:
+        log(f"not folded, contradicting alias claims: {', '.join(group)}")
     notice = compose_notice(loaded, tables["feeds.parquet"])
-    manifest, files = assemble(loaded, tables, notice)
+    manifest, files = assemble(
+        loaded, tables, notice, alias_conflicts=catalogue["alias_conflicts"]
+    )
     write_snapshot(cache_dir, manifest, files, notice)
     return manifest
 
