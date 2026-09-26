@@ -58,6 +58,12 @@ def _name_variants(record):
     return variants
 
 
+# The countries whose same-named county is a city's own council area; in
+# others it is a district larger than the town (a Swiss Bezirk, a Kenyan
+# sub-county).
+COUNCIL_AREA_COUNTRIES = frozenset({"CA", "CO", "GB"})
+
+
 def _area_names(record):
     """The folded names a division carries as a city's council area: each
     label, and each without a ``City`` affix — "City of Edinburgh" and
@@ -75,9 +81,12 @@ def _area_names(record):
 def council_area(city, area):
     """Whether ``area`` is ``city``'s own council area: a county no QID names
     that carries the city's name (Manchester's Manchester, Edinburgh's City of
-    Edinburgh). A candidate record and a place row answer alike."""
+    Edinburgh), in a country where such a county is the city's own unit. A
+    candidate record and a place row answer alike."""
+    country = area.get("country") or area.get("country_code")
     return (
-        area.get("source_subtype") == "county"
+        country in COUNCIL_AREA_COUNTRIES
+        and area.get("source_subtype") == "county"
         and area.get("resolution_method") == "overture_id"
         and bool(_name_variants(city) & _area_names(area))
     )

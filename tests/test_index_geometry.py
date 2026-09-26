@@ -383,7 +383,23 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
         "Leeds",
         source_subtype="county",
     )
+    # A Swiss county of the city's name is a district larger than the town.
+    district = named(
+        _place("overture:ch-bern", "region", overture_id="ch-bern"),
+        "Bern",
+        source_subtype="county",
+        resolution_method="overture_id",
+        country_code="CH",
+    )
+    bern = named(
+        _place("Q70", "city", overture_id="no-area-3"),
+        "Bern",
+        country_code="CH",
+        parent_id=district["place_id"],
+    )
     records = [
+        district,
+        bern,
         council,
         county,
         named(_place("Q18125", "city", overture_id="no-area"), "Manchester"),
@@ -392,7 +408,7 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
         # A county a QID names is a place of its own, not the city's area.
         named(_place("Q39121", "city", overture_id="no-area-2"), "Leeds"),
     ]
-    for record in records[2:]:
+    for record in records[4:]:
         record["parent_id"] = council["place_id"]
     records[-1]["parent_id"] = county["place_id"]
     # A curated boundary for the council area is the city's too.
@@ -402,7 +418,9 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
     )
     cache = tmp_path / "cache"
     _publish(cache, records, overrides_dir)
-    areas = AREAS + [fx.area(key, OTHER, [_osm()]) for key in ("gb-man", "gb-leeds")]
+    areas = AREAS + [
+        fx.area(key, OTHER, [_osm()]) for key in ("gb-man", "gb-leeds", "ch-bern")
+    ]
     dataset = fx.write_area_dataset(tmp_path / "areas.parquet", areas)
     manifest = geometry.attach_geometry(
         cache, dataset=dataset, overrides_dir=overrides_dir
@@ -417,6 +435,7 @@ def test_a_city_without_an_area_ships_its_council_areas_boundary(tmp_path):
     assert manchester["geometry"] == places["overture:gb-man"]["geometry"]
     assert places["Q_OWN"]["geometry_source"] == "overture"
     assert places["Q39121"]["geometry"] is None
+    assert places["Q70"]["geometry"] is None
     assert manifest["council_area_geometry"] == 1
     # The metros stage reads the city's footprint from the same area.
     read = geometry.place_areas(cache, dataset, records, {"no-area", "no-area-2"})
