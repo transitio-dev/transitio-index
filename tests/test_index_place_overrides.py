@@ -351,3 +351,20 @@ def test_a_file_may_reference_the_places_its_add_place_entries_create(tmp_path):
     )
     with pytest.raises(overrides.OverrideError, match="no place carries it"):
         overrides.load_edge_overrides(directory, registry=reg)
+
+
+def test_the_committed_place_overrides_load_with_valid_boundaries():
+    from pathlib import Path
+
+    pytest.importorskip("pyarrow")
+    from transitio_index import geometry
+
+    entries, _ = overrides.load_place_overrides(
+        Path(__file__).resolve().parent.parent / "overrides"
+    )
+    boundaries = overrides.by_operation(entries, "set_boundary")
+    assert entries and boundaries
+    for entry in boundaries:
+        place = {"place_id": entry["place"]}
+        geometry._curated_geometry(place, entry["set_boundary"])
+        assert place["geometry_source"] == geometry.CURATED
