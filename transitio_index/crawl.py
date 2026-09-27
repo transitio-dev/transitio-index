@@ -749,6 +749,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
         return record
 
     feed_dir = None
+    state = None
     fetched_before = fetcher.bytes_fetched
 
     def decide(directory, digests):
@@ -939,6 +940,11 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
     ) as error:
         record["method"] = "failed"
         record["fallback_reason"] = str(error)
+        # The previous crawl still stands in for the feed: give it the
+        # identity it predates when its members still verify.
+        if feed_dir is not None and state and _members_intact(feed_dir, state):
+            with contextlib.suppress(OSError, RuntimeError):
+                _backfill_identity(feed_dir, state)
         return record
     finally:
         record["bytes_fetched"] = fetcher.bytes_fetched - fetched_before

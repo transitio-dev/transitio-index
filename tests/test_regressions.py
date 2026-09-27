@@ -5,6 +5,7 @@ Fixtures are imported from the stage test modules rather than duplicated.
 
 import hashlib
 import http.client
+import json
 import logging
 import os
 
@@ -17,6 +18,7 @@ import shapely  # noqa: E402
 import overture_fixture as fx  # noqa: E402
 import test_index_boundaries as bt  # noqa: E402
 import test_index_coverage as ct  # noqa: E402
+import test_index_crawl as crt  # noqa: E402
 import test_index_fetch as ft  # noqa: E402
 from transitio_index import (  # noqa: E402
     boundaries,
@@ -1028,3 +1030,20 @@ def test_a_dropped_download_resumes_from_the_bytes_that_arrived(tmp_path):
     assert len(ranges) > fetch.DOWNLOAD_ATTEMPTS
     assert result["sha256"] == hashlib.sha256(body).hexdigest()
     assert (tmp_path / "crawl" / "feed.zip").read_bytes() == body
+
+
+def test_a_failed_refetch_keeping_its_crawl_gets_that_crawl_identity(tmp_path):
+    """A feed whose re-fetch fails keeps its previous crawl for coverage; a
+    crawl from before identities were recorded must get one then too, or the
+    feed can never fold with its copies."""
+    cache = tmp_path / "cache"
+    crt._publish_resolved(cache, [crt._feed("f-a", "https://feeds.example/a.zip")])
+    crt._crawl(cache, crt._server({"/a.zip": (crt._zip_bytes(), '"v1"')}))
+    path = crt._feed_dir(cache, "f-a") / "state.json"
+    state = json.loads(path.read_text())
+    identity = state.pop("identity")
+    del state["identity_version"]
+    path.write_text(json.dumps(state))
+    _, log = crt._crawl(cache, crt._server({}))
+    assert log["f-a"]["method"] == "failed"
+    assert json.loads(path.read_text())["identity"] == identity
