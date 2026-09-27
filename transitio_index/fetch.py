@@ -50,6 +50,10 @@ RANGE_THRESHOLD = 20 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
 DOWNLOAD_ATTEMPTS = 3
+# An attempt that ends with new, resumable bytes is not a failed attempt; this
+# caps all attempts of one download (each may follow redirects), however many
+# of those there are.
+DOWNLOAD_TRIES = 10
 REDIRECT_LIMIT = 5
 TIMEOUT = 60.0
 # A connect still pending after this long is a dead host (TCP's SYN retries
@@ -91,6 +95,16 @@ class FetchError(RuntimeError):
 
 class RangeUnsupported(FetchError):
     """The server did not honour a range request; download the file whole."""
+
+
+class _Dropped(FetchError):
+    """An identity body cut off by the transport after ``written`` bytes, all
+    of them whole chunks already written and hashed."""
+
+    def __init__(self, error, written, validators):
+        super().__init__(str(error))
+        self.written = written
+        self.validators = validators
 
 
 def check_url(url):
@@ -482,11 +496,12 @@ class Fetcher:
         the body is streamed to an exclusively created temporary file — hashed
         as it arrives, bounded by ``max_bytes``, checked against the declared
         Content-Length — and replaced into place only when complete. A
-        connection dropping mid-body is resumed with a range request from the
-        bytes already written (what the failed attempt appended, and its
-        digest, are discarded first), pinned by ``If-Range`` to the
-        representation the first bytes came from; a refused or unpinnable
-        resume restarts from zero, as does an encoded body. Returns
+        connection dropping mid-body, or a body ending short, is resumed with
+        a range request from the bytes already written, pinned by ``If-Range``
+        to the representation the first bytes came from; a refused or
+        unpinnable resume restarts from zero, as does an encoded body. An
+        attempt that adds resumable bytes does not count against
+        ``DOWNLOAD_ATTEMPTS``; ``DOWNLOAD_TRIES`` bounds them all. Returns
         ``status``, ``sha256``, ``bytes`` and the response
         validators (kept from the responses that supplied them, so a resumed
         download still records the validators for the next crawl's
@@ -512,7 +527,10 @@ class Fetcher:
         try:
             with os.fdopen(handle, "wb") as opened_file:
                 handle = None
-                for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+                attempt = tries = 0
+                while attempt < DOWNLOAD_ATTEMPTS and tries < DOWNLOAD_TRIES:
+                    attempt += 1
+                    tries += 1
                     resume_pin = validators.get("etag") or validators.get(
                         "last_modified"
                     )
@@ -533,8 +551,10 @@ class Fetcher:
                         headers["Accept-Encoding"] = "gzip"
                     # The attempt hashes into its own copy and appends past
                     # ``written``: a failure drops both, so the next attempt
-                    # continues from bytes that were fully accounted for.
+                    # continues from bytes that were fully accounted for. A
+                    # dropped connection keeps what arrived, like a short body.
                     attempt_digest = digest.copy()
+                    last = "body ended early"
                     try:
                         outcome = self._stream_once(
                             url,
@@ -546,12 +566,20 @@ class Fetcher:
                             gzip_ok=encoded,
                         )
                     except (httpx.HTTPError, FetchError) as error:
-                        opened_file.seek(written)
-                        opened_file.truncate()
                         first_error = first_error or error
-                        if attempt == DOWNLOAD_ATTEMPTS:
-                            raise _attempt_error(url, first_error, error)
-                        continue
+                        if not isinstance(error, _Dropped) or error.written <= written:
+                            opened_file.seek(written)
+                            opened_file.truncate()
+                            if attempt == DOWNLOAD_ATTEMPTS:
+                                raise _attempt_error(url, first_error, error)
+                            continue
+                        last = error
+                        outcome = {
+                            "status": "streamed",
+                            "written": error.written,
+                            "complete": False,
+                            "validators": error.validators,
+                        }
                     if outcome["status"] == "not_acceptable":
                         if encoded or attempt == DOWNLOAD_ATTEMPTS:
                             raise _attempt_error(url, first_error, "HTTP 406")
@@ -581,7 +609,7 @@ class Fetcher:
                         written = 0
                         validators = {}
                         continue
-                    written = outcome["written"]
+                    before, written = written, outcome["written"]
                     digest = attempt_digest
                     for key, value in outcome["validators"].items():
                         # A later 206 that omits a validator must not erase the
@@ -592,9 +620,13 @@ class Fetcher:
                         opened_file.flush()
                         os.fsync(opened_file.fileno())
                         break
-                    first_error = first_error or FetchError("body ended early")
-                    if attempt == DOWNLOAD_ATTEMPTS:
-                        raise _attempt_error(url, first_error, "body ended early")
+                    first_error = first_error or FetchError(str(last))
+                    if written > before and not encoded and validators:
+                        # New bytes the next request can resume from: progress,
+                        # not a failed attempt (DOWNLOAD_TRIES still bounds it).
+                        attempt -= 1
+                    elif attempt == DOWNLOAD_ATTEMPTS:
+                        raise _attempt_error(url, first_error, last)
                 else:
                     raise _attempt_error(
                         url, first_error, "could not complete the download"
@@ -663,6 +695,11 @@ class Fetcher:
                 # resume, never publish a truncated file.
                 expected = total
 
+            validators = {
+                "etag": response.headers.get("ETag"),
+                "last_modified": response.headers.get("Last-Modified"),
+            }
+
             def take(chunk):
                 nonlocal written
                 written += len(chunk)
@@ -705,21 +742,23 @@ class Fetcher:
                         # chunker's output or the connection dropped first.
                         self.bytes_fetched += response.num_bytes_downloaded
                 else:
-                    for chunk in response.iter_bytes(1024 * 1024):
+                    # Unchunked, so a dropped connection loses nothing that
+                    # arrived before it.
+                    for chunk in response.iter_bytes():
                         self.bytes_fetched += len(chunk)
                         take(chunk)
             except zlib.error as error:
                 raise FetchError(f"gzip body could not be decoded: {error}")
-            except httpx.TransportError:
-                # Counted against the host; the caller's retry sees it unchanged.
+            except httpx.TransportError as error:
+                # Counted against the host. An identity body's bytes so far
+                # are whole chunks the caller can resume from; a decoded one's
+                # are not.
                 self._note(host, url, failed=True)
-                raise
+                if gzipped:
+                    raise
+                raise _Dropped(error, written, validators) from error
             else:
                 self._note(host, url, failed=False)
-            validators = {
-                "etag": response.headers.get("ETag"),
-                "last_modified": response.headers.get("Last-Modified"),
-            }
         finally:
             response.close()
         complete = expected is None or written == expected
