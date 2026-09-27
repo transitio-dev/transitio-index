@@ -217,9 +217,14 @@ def test_feeds_edges_and_places_merge_by_source(tmp_path):
 
 
 def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
-    def feed(feed_id, *aliases, contained_in=()):
+    def feed(feed_id, *aliases, contained_in=(), companions=()):
         row = _feed7(feed_id, feed_id, "FI", "domestic")
-        return {**row, "aliases": list(aliases), "contained_in": list(contained_in)}
+        return {
+            **row,
+            "aliases": list(aliases),
+            "contained_in": list(contained_in),
+            "realtime_feed_ids": list(companions),
+        }
 
     a = _run(
         tmp_path,
@@ -229,17 +234,25 @@ def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
             feed("c", "x"),
             feed("m", "n", contained_in=["x"]),
             feed("p", "q", contained_in=["p", "gone"]),
+            feed("z", companions=["z-rt"]),
         ],
         edges={"FI": [_edge7("hel", "c", "local", "primary", 0.5, False)]},
+        realtime={"FI": [_rt("z-rt", "z", {"realtime_alerts": "https://z"})]},
         built_at=BUILT(14),
     )
-    # The newer build did not fold x into c; n claims o (a chain m->n->o),
-    # and r claims q, which p claims too.
+    # The newer build did not fold x into c but folded z, whose companion is
+    # in the older build; n claims o (a chain m->n->o), and r claims q, which
+    # p claims too.
     b = _run(
         tmp_path,
         "se",
         2,
-        feeds=[feed("c", "y"), feed("x"), feed("n", "o"), feed("r", "q")],
+        feeds=[
+            feed("c", "y", "z"),
+            feed("x", companions=["x-rt"]),
+            feed("n", "o"),
+            feed("r", "q"),
+        ],
         edges={
             "FI": [
                 _edge7("esp", "c", "local", "primary", 0.5, False),
@@ -258,7 +271,7 @@ def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
     # x is c: its row and edges go, c keeps every source's aliases and
     # x's companion follows c; contradicting claims leave their rows alone.
     assert set(feeds.index) == {"c", "m", "n", "p", "r"}
-    assert list(feeds.loc["c", "aliases"]) == ["y", "x"]
+    assert list(feeds.loc["c", "aliases"]) == ["y", "z", "x"]
     # A container is named by its merged id; itself and absent ids go.
     assert list(feeds.loc["m", "contained_in"]) == ["c"]
     assert list(feeds.loc["p", "contained_in"]) == []
@@ -266,6 +279,10 @@ def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
     assert set(map(tuple, edges[["place_id", "feed_id"]].to_numpy())) == {("esp", "c")}
     realtime = _frame(tables, "realtime.parquet", "feed_id")
     assert realtime.loc["x-rt", "static_feed_id"] == "c"
+    # A companion follows its re-keyed feed from any build carrying the id,
+    # and the feed lists every companion now linked to it.
+    assert realtime.loc["z-rt", "static_feed_id"] == "c"
+    assert list(feeds.loc["c", "realtime_feed_ids"]) == ["x-rt", "z-rt"]
     assert snapshot["alias_conflicts"] == [["m", "n", "o"], ["p", "q", "r"]]
 
 

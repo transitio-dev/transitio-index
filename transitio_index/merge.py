@@ -66,8 +66,9 @@ OVERRIDE_FIELDS = (
 # an old snapshot id. 2: the NOTICE parser accepts the geometry credit's
 # source list as an indented continuation block. 3: an id another build
 # folded into a feed is that feed. 4: a feed's containers are named by the
-# merged ids.
-MERGE_FORMAT = 4
+# merged ids. 5: a re-keyed id keeps its companions, and a feed lists the
+# companions linked to it.
+MERGE_FORMAT = 5
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -211,6 +212,22 @@ def _union_aliases(table, stacked, mapping):
     )
 
 
+def _companion_lists(feeds, realtime):
+    """``feeds`` with each feed's ``realtime_feed_ids`` the companions the
+    merged realtime table links to it, as the publish stage derives them."""
+    linked = {}
+    for feed_id, static in zip(
+        realtime["feed_id"].to_pylist(), realtime["static_feed_id"].to_pylist()
+    ):
+        if static is not None:
+            linked.setdefault(static, set()).add(feed_id)
+    rows = [sorted(linked.get(feed_id, ())) for feed_id in feeds["feed_id"].to_pylist()]
+    index = feeds.schema.get_field_index("realtime_feed_ids")
+    return feeds.set_column(
+        index, feeds.field(index), pa.array(rows, feeds.field(index).type)
+    )
+
+
 def _merged_containers(table, mapping):
     """``table`` with each feed's ``contained_in`` named by the merged ids:
     re-keyed through ``mapping``, without the feed itself, repeats, or an id
@@ -237,8 +254,10 @@ def merge_tables(sources, skipped=()):
     source contributing the most kept edges to it, from the newest when none
     does. A realtime companion follows its static feed, an unlinked one the
     newest source. An id another build folded into a feed (see
-    :func:`_alias_map`) is that feed: its own rows are dropped, and the
-    feed's aliases gather every source's. Every table gains ``build_id``.
+    :func:`_alias_map`) is that feed: its own rows are dropped, the feed's
+    aliases gather every source's, and its companions follow the feed from
+    the newest build carrying the id. A feed lists the companions linked to
+    it. Every table gains ``build_id``.
     The snapshot recounts the merged tables and lists the ``sources``, the
     ``skipped`` runs and the ``alias_conflicts``.
     """
@@ -256,6 +275,12 @@ def merge_tables(sources, skipped=()):
     }
     mapping, conflicts = _alias_map(merged["feeds.parquet"])
     feeds = _keys(merged["feeds.parquet"], ["feed_id"], order)
+    # Each re-keyed id's newest build, whose companions follow its feed.
+    rekeyed = (
+        feeds[feeds["feed_id"].isin(mapping.keys())]
+        .sort_values("order", kind="stable")
+        .drop_duplicates("feed_id")
+    )
     feeds = feeds[~feeds["feed_id"].isin(mapping.keys())]
     winners = feeds.sort_values("order", kind="stable").drop_duplicates("feed_id")
     won = winners[["feed_id", "build_id"]]
@@ -281,6 +306,20 @@ def merge_tables(sources, skipped=()):
         # A companion of a won feed comes with that feed's source or not at
         # all; one linked to no won feed comes from the newest source.
         static = won.rename(columns={"feed_id": "static_feed_id"})
+        # A re-keyed id keeps its companions: they follow its feed from the
+        # newest build carrying the id.
+        static = pd.concat(
+            [
+                static,
+                pd.DataFrame(
+                    {
+                        "static_feed_id": rekeyed["feed_id"].map(mapping),
+                        "build_id": rekeyed["build_id"],
+                    }
+                ),
+            ],
+            ignore_index=True,
+        )
         follows = realtime.merge(static, on=["static_feed_id", "build_id"])
         loose = realtime[~realtime["static_feed_id"].isin(static["static_feed_id"])]
         loose = loose.sort_values("order", kind="stable")
@@ -309,6 +348,13 @@ def merge_tables(sources, skipped=()):
             )
     if "contained_in" in tables["feeds.parquet"].column_names:
         tables["feeds.parquet"] = _merged_containers(tables["feeds.parquet"], mapping)
+    if (
+        "realtime.parquet" in tables
+        and "realtime_feed_ids" in tables["feeds.parquet"].column_names
+    ):
+        tables["feeds.parquet"] = _companion_lists(
+            tables["feeds.parquet"], tables["realtime.parquet"]
+        )
     counts = {
         "places": len(tables["places.parquet"]),
         "places_by_kind": _value_counts(tables["places.parquet"]["kind"]),
