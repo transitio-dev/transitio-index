@@ -33,8 +33,9 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from transitio.index import fingerprint
 
-from . import classify, licensing, publish, store
+from . import classify, coverage, licensing, publish, store
 from .builds import (
     _EPOCH,
     _SNAPSHOT_ERRORS,
@@ -67,8 +68,9 @@ OVERRIDE_FIELDS = (
 # source list as an indented continuation block. 3: an id another build
 # folded into a feed is that feed. 4: a feed's containers are named by the
 # merged ids. 5: a re-keyed id keeps its companions, and a feed lists the
-# companions linked to it.
-MERGE_FORMAT = 5
+# companions linked to it. 6: feeds of different builds with one content
+# identity fold.
+MERGE_FORMAT = 6
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -190,16 +192,119 @@ def _alias_map(feeds):
     return mapping, sorted(conflicts)
 
 
+def _recorded_identities(snapshot):
+    """The content identities a build recorded, when made by this identity
+    version and well formed; otherwise none."""
+    recorded = snapshot.get("feed_identities")
+    version = snapshot.get("identity_version")
+    current = type(version) is int and version == fingerprint.IDENTITY_VERSION
+    if not current or not isinstance(recorded, dict):
+        return {}
+    return {
+        feed_id: found
+        for feed_id, found in recorded.items()
+        if isinstance(found, dict)
+        and all(isinstance(k, str) and isinstance(v, str) for k, v in found.items())
+    }
+
+
+def _content_folds(ranked, feeds, mapping, order):
+    """``({folded id: canonical id}, best)`` for merged feeds whose content
+    identities match (:func:`fingerprint.identical_groups`), each judged by
+    the row and identity of the newest build carrying it and folded only with
+    at least two stops; ``best`` is each id's ``(build_id, source)``. The
+    canonical feed is the first by :data:`coverage.SOURCE_RANK`, then id, as
+    in a build's own fold. Ids already re-keyed by ``mapping`` take no part.
+    """
+    columns = feeds.column_names
+    if "source" not in columns or "stop_count" not in columns:
+        return {}, {}
+    recorded = {build_id: _recorded_identities(snap) for build_id, snap, _ in ranked}
+    best = {}
+    for feed_id, build_id, source, stops in zip(
+        feeds["feed_id"].to_pylist(),
+        feeds["build_id"].to_pylist(),
+        feeds["source"].to_pylist(),
+        feeds["stop_count"].to_pylist(),
+    ):
+        if feed_id in mapping:
+            continue
+        if feed_id not in best or order[build_id] < order[best[feed_id][0]]:
+            best[feed_id] = (build_id, source, stops)
+    identities = {
+        feed_id: recorded[build_id].get(feed_id)
+        for feed_id, (build_id, _, stops) in best.items()
+        if stops is not None and stops >= 2
+    }
+    rank = coverage.SOURCE_RANK
+    folds = {}
+    for group in fingerprint.identical_groups(identities):
+        group.sort(key=lambda f: (rank.get(best[f][1], len(rank)), f))
+        folds.update((feed_id, group[0]) for feed_id in group[1:])
+    return folds, {f: (build_id, source) for f, (build_id, source, _) in best.items()}
+
+
+def _take_mdb_records(table, stacked, folds, best):
+    """``table`` with each Atlas-only canonical taking the record of the
+    first MDB feed folded into it, as a feed both catalogues carry matched by
+    ``content`` — what a build's own fold does."""
+    takes = {}
+    for folded, canonical in sorted(folds.items()):
+        if best[canonical][1] == "atlas" and best[folded][1] == "mdb":
+            takes.setdefault(canonical, folded)
+    if not takes:
+        return table
+    wanted = {(f, best[f][0]): canonical for canonical, f in takes.items()}
+    fields = [c for c in ("mdb_id", "mdb", "name") if c in stacked.column_names]
+    records = {}
+    for row in stacked.select(["feed_id", "build_id", *fields]).to_pylist():
+        canonical = wanted.get((row["feed_id"], row["build_id"]))
+        if canonical is not None:
+            records[canonical] = row
+    ids = table["feed_id"].to_pylist()
+    for column in (
+        "source",
+        "mdb_id",
+        "mdb",
+        "name",
+        "crosswalk_method",
+        "crosswalk_confidence",
+    ):
+        if column not in table.column_names:
+            continue
+        values = table[column].to_pylist()
+        for i, feed_id in enumerate(ids):
+            if feed_id not in records:
+                continue
+            record = records[feed_id]
+            values[i] = {
+                "source": "both",
+                "mdb_id": record.get("mdb_id"),
+                "mdb": record.get("mdb"),
+                "name": values[i] or record.get("name"),
+                "crosswalk_method": "content",
+                "crosswalk_confidence": 1.0,
+            }[column]
+        index = table.schema.get_field_index(column)
+        table = table.set_column(
+            index, table.field(index), pa.array(values, table.field(index).type)
+        )
+    return table
+
+
 def _union_aliases(table, stacked, mapping):
     """``table`` with each re-keyed feed's aliases the union of every source
-    row's for it, the winning row's own first."""
+    row's for it, the winning row's own first; a row of an id re-keyed into
+    it adds that id and its aliases."""
     canonicals = set(mapping.values())
     union = {}
     for feed_id, aliases in zip(
         stacked["feed_id"].to_pylist(), stacked["aliases"].to_pylist()
     ):
-        if feed_id in canonicals:
-            union.setdefault(feed_id, []).extend(aliases or ())
+        target = mapping.get(feed_id, feed_id)
+        if target in canonicals:
+            own = [] if target == feed_id else [feed_id]
+            union.setdefault(target, []).extend([*own, *(aliases or ())])
     rows = [
         list(dict.fromkeys([*(aliases or ()), *union.get(feed_id, ())]))
         for feed_id, aliases in zip(
@@ -254,12 +359,13 @@ def merge_tables(sources, skipped=()):
     source contributing the most kept edges to it, from the newest when none
     does. A realtime companion follows its static feed, an unlinked one the
     newest source. An id another build folded into a feed (see
-    :func:`_alias_map`) is that feed: its own rows are dropped, the feed's
-    aliases gather every source's, and its companions follow the feed from
-    the newest build carrying the id. A feed lists the companions linked to
-    it. Every table gains ``build_id``.
-    The snapshot recounts the merged tables and lists the ``sources``, the
-    ``skipped`` runs and the ``alias_conflicts``.
+    :func:`_alias_map`) is that feed, and so is a feed another build kept
+    with the same content identity (see :func:`_content_folds`): its own
+    rows are dropped, the feed's aliases gather every source's, and its
+    companions follow the feed from the newest build carrying the id. A feed
+    lists the companions linked to it. Every table gains ``build_id``. The
+    snapshot recounts the merged tables and lists the ``sources``, the
+    ``skipped`` runs, the ``alias_conflicts`` and the ``content_folds``.
     """
     ranked = sorted(sources, key=lambda source: source[0])
     ranked.sort(key=lambda source: _built_at(source[1]) or _EPOCH, reverse=True)
@@ -274,6 +380,8 @@ def merge_tables(sources, skipped=()):
         for name, parts in stacked.items()
     }
     mapping, conflicts = _alias_map(merged["feeds.parquet"])
+    folds, best = _content_folds(ranked, merged["feeds.parquet"], mapping, order)
+    mapping = {alias: folds.get(f, f) for alias, f in mapping.items()} | folds
     feeds = _keys(merged["feeds.parquet"], ["feed_id"], order)
     # Each re-keyed id's newest build, whose companions follow its feed.
     rekeyed = (
@@ -335,6 +443,9 @@ def merge_tables(sources, skipped=()):
         tables["feeds.parquet"] = _union_aliases(
             tables["feeds.parquet"], merged["feeds.parquet"], mapping
         )
+        tables["feeds.parquet"] = _take_mdb_records(
+            tables["feeds.parquet"], merged["feeds.parquet"], folds, best
+        )
         if "realtime.parquet" in tables:
             # A companion taken from a build that did not fold its static
             # feed still names the folded id.
@@ -388,6 +499,7 @@ def merge_tables(sources, skipped=()):
         ],
         "skipped": list(skipped),
         "alias_conflicts": conflicts,
+        "content_folds": dict(sorted(folds.items())),
     }
     return snapshot, tables
 
@@ -1071,6 +1183,8 @@ def merge_builds(builds, cache_dir, read_bytes=_read_file, log=print):
     )
     for group in catalogue["alias_conflicts"]:
         log(f"not folded, contradicting alias claims: {', '.join(group)}")
+    if catalogue["content_folds"]:
+        log(f"folded {len(catalogue['content_folds'])} feeds with the same content")
     notice = compose_notice(loaded, tables["feeds.parquet"])
     manifest, files = assemble(
         loaded, tables, notice, alias_conflicts=catalogue["alias_conflicts"]
