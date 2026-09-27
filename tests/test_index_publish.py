@@ -25,6 +25,7 @@ from transitio_index import overrides  # noqa: E402
 # Import the read layer directly too, so an old installed transitio shadowing
 # the source (which would lack it) fails loudly rather than skipping the module.
 from transitio import index as transitio_index  # noqa: E402
+from transitio.index import fingerprint  # noqa: E402
 from transitio.exceptions import IncompatibleIndexError  # noqa: E402
 from transitio.exceptions import PlaceNotFoundError  # noqa: E402
 
@@ -987,8 +988,17 @@ def test_crawl_evidence_and_provenance_round_trip(tmp_path):
         "crawl_status": "ok",
         "last_crawled": "2026-09-01T00:00:00+00:00",
         "files": manifest_files,
+        "content_identity": {"stops.txt": "s", "routes.txt": "r"},
+        "content_identity_version": fingerprint.IDENTITY_VERSION,
     }
     cache, manifest = _edges_index(tmp_path, [_edge("Q1757", "f-a")], feeds=[crawled])
+    # The identity is recorded for the merge, never shipped as a column.
+    assert manifest["feed_identities"] == {"f-a": crawled["content_identity"]}
+    assert manifest["identity_version"] == fingerprint.IDENTITY_VERSION
+    # An identity another version computed is left out, never relabelled.
+    for version in (0, True, None):
+        stale = {**crawled, "content_identity_version": version}
+        assert publish._feed_identities([stale]) == {}
     assert manifest["schema_version"] == publish.SCHEMA_VERSION
     assert (
         manifest["discovery_semantics_version"]

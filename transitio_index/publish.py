@@ -43,6 +43,8 @@ import stat
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from transitio.index import fingerprint
+
 from transitio_index import overture
 from transitio_index import registry as _registry
 from transitio_index import store
@@ -401,6 +403,19 @@ def _content_digest(records):
     """A stable digest of raw records whose content no source version pins."""
     canonical = json.dumps(records, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _feed_identities(records):
+    """``{feed_id: identity}`` for the records whose identity the installed
+    identity version computed; one from another version (coverage run before
+    an upgrade) is left out rather than labelled current."""
+    found = {}
+    for feed in records:
+        version = feed.get("content_identity_version")
+        current = type(version) is int and version == fingerprint.IDENTITY_VERSION
+        if current and isinstance(feed.get("content_identity"), dict):
+            found[feed["feed_id"]] = feed["content_identity"]
+    return found
 
 
 def _snapshot_id(sources, overture_release=None, digests=()):
@@ -1502,6 +1517,10 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             ),
             # The crawl the edges and expanded places were measured against.
             "crawl_digest": crawl.states_digest(cache_dir),
+            # Each crawled feed's content identity, for the merge's fold of
+            # copies kept by different builds.
+            "feed_identities": _feed_identities(records),
+            "identity_version": fingerprint.IDENTITY_VERSION,
             # Whether the license stage's artifacts are what ships, and the
             # NOTICE that ships with them.
             "licensed": licensed is not None,

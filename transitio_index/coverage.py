@@ -212,7 +212,8 @@ def _identity(state):
     """The crawl's content identity, or None when it has none, a malformed
     one, or one computed under another identity version."""
     found = state.get("identity")
-    if state.get("identity_version") != fingerprint.IDENTITY_VERSION:
+    version = state.get("identity_version")
+    if type(version) is not int or version != fingerprint.IDENTITY_VERSION:
         return None
     if isinstance(found, dict) and all(isinstance(v, str) for v in found.values()):
         return found
@@ -857,6 +858,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             folded = {}
             near = []
             contained = {}
+            content = {}
             opened_lookup = None
             crawl_digest = None
             crawl_lock = crawl.reading(cache_dir)
@@ -883,6 +885,13 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     folded = fold_duplicates(feeds, states)
                     near = near_duplicates(states)
                     contained = contained_feeds(states)
+                    # Each kept feed's identity, which the snapshot records
+                    # so the merge can fold copies another build kept.
+                    content = {
+                        feed_id: found
+                        for feed_id, (_, state) in states.items()
+                        if (found := _identity(state)) is not None
+                    }
                     try:
                         crawled_by_key, crawl_report = crawled_edges(
                             states, places, lookup, conflicts=conflicts
@@ -927,6 +936,9 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             }
             for feed in feeds:
                 feed["contained_in"] = contained.get(feed["feed_id"], [])
+                if feed["feed_id"] in content:
+                    feed["content_identity"] = content[feed["feed_id"]]
+                    feed["content_identity_version"] = fingerprint.IDENTITY_VERSION
                 if feed["feed_id"] in superseded:
                     # The schema's crawl fields: measured hull and stop count
                     # replace whatever the catalogues declared.

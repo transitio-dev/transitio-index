@@ -511,7 +511,8 @@ def test_only_a_current_identity_counts():
     found = {"stops.txt": "s", "routes.txt": "r"}
     current = {"identity": found, "identity_version": fingerprint.IDENTITY_VERSION}
     assert coverage._identity(current) == found
-    assert coverage._identity({**current, "identity_version": 0}) is None
+    for version in (0, True, float(fingerprint.IDENTITY_VERSION)):
+        assert coverage._identity({**current, "identity_version": version}) is None
     assert coverage._identity({**current, "identity": ["s"]}) is None
 
 

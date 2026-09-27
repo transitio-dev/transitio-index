@@ -25,6 +25,8 @@ from builds_fixture import (
     _run,
     write_build,
 )
+from transitio.index import fingerprint
+
 from transitio_index import builds, classify, merge, store
 
 BUILT = "2026-09-{:02d}T00:00:00+00:00".format
@@ -284,6 +286,107 @@ def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
     assert realtime.loc["z-rt", "static_feed_id"] == "c"
     assert list(feeds.loc["c", "realtime_feed_ids"]) == ["x-rt", "z-rt"]
     assert snapshot["alias_conflicts"] == [["m", "n", "o"], ["p", "q", "r"]]
+
+
+IDENTITY = {"stops.txt": "s", "routes.txt": "r", "trips.txt": "t", "calendar.txt": "c"}
+
+
+@pytest.mark.parametrize(
+    "other, stops, version, folded",
+    [
+        (IDENTITY, 5, None, True),
+        ({**IDENTITY, "trips.txt": "t2"}, 5, None, False),
+        (IDENTITY, 1, None, False),
+        (IDENTITY, 5, 0, False),
+        (IDENTITY, 5, True, False),
+    ],
+    ids=["same-content", "other-trips", "one-stop", "stale-version", "bool-version"],
+)
+def test_feeds_another_build_kept_with_the_same_content_fold(
+    tmp_path, other, stops, version, folded
+):
+    def feed(feed_id, source, **kw):
+        row = _feed7(feed_id, kw.pop("name", feed_id), "AT", "domestic")
+        return {
+            **row,
+            "source": source,
+            "stop_count": stops,
+            "aliases": kw.pop("aliases", []),
+            "contained_in": [],
+            "mdb_id": None,
+            "mdb": None,
+            "crosswalk_method": "none",
+            "crosswalk_confidence": 0.0,
+            "realtime_feed_ids": [],
+            **kw,
+        }
+
+    runs = [
+        _run(
+            tmp_path,
+            "at",
+            1,
+            feeds=[
+                feed(
+                    "f-mdb-648",
+                    "mdb",
+                    mdb_id="648",
+                    mdb='{"id": "648"}',
+                    aliases=["f-old"],
+                    realtime_feed_ids=["wl-rt"],
+                )
+            ],
+            edges={"AT": [_edge7("wien", "f-mdb-648", "local", "primary", 0.5, False)]},
+            realtime={
+                "AT": [_rt("wl-rt", "f-mdb-648", {"realtime_alerts": "https://x"})]
+            },
+            built_at=BUILT(14),
+        ),
+        _run(
+            tmp_path,
+            "atlas6",
+            2,
+            feeds=[feed("f-wl", "atlas", name="")],
+            edges={"AT": [_edge7("wien", "f-wl", "local", "primary", 0.5, False)]},
+            built_at=BUILT(15),
+        ),
+    ]
+    recorded = {"f-mdb-648": other, "f-wl": IDENTITY}
+    sources = []
+    for run in runs:
+        snapshot, _, tables = builds.load_tables(tmp_path / run / "index")
+        feed_id = tables["feeds.parquet"]["feed_id"][0].as_py()
+        snapshot = {
+            **snapshot,
+            "feed_identities": {feed_id: recorded[feed_id]},
+            "identity_version": (
+                fingerprint.IDENTITY_VERSION if version is None else version
+            ),
+        }
+        sources.append((run, snapshot, tables))
+    snapshot, tables = merge.merge_tables(sources)
+    feeds = _frame(tables, "feeds.parquet", "feed_id")
+    realtime = _frame(tables, "realtime.parquet", "feed_id")
+    if not folded:
+        assert set(feeds.index) == {"f-mdb-648", "f-wl"}
+        assert snapshot["content_folds"] == {}
+        return
+    # The Atlas feed ranks first and takes the MDB copy's record, its id and
+    # aliases; the copy's edges go and its companion follows the kept feed.
+    assert set(feeds.index) == {"f-wl"}
+    kept = feeds.loc["f-wl"]
+    assert list(kept["aliases"]) == ["f-mdb-648", "f-old"]
+    assert (kept["source"], kept["mdb_id"], kept["crosswalk_method"]) == (
+        "both",
+        "648",
+        "content",
+    )
+    assert kept["name"] == "f-mdb-648"
+    edges = tables["edges.parquet"].to_pandas()
+    assert set(edges["feed_id"]) == {"f-wl"}
+    assert realtime.loc["wl-rt", "static_feed_id"] == "f-wl"
+    assert list(kept["realtime_feed_ids"]) == ["wl-rt"]
+    assert snapshot["content_folds"] == {"f-mdb-648": "f-wl"}
 
 
 # ---- loading a selection for a merge: the reader's schema-9 fixture ----
