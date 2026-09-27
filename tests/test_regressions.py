@@ -3,10 +3,12 @@
 Fixtures are imported from the stage test modules rather than duplicated.
 """
 
+import hashlib
 import http.client
 import logging
 import os
 
+import httpx
 import pytest
 
 pytest.importorskip("pyarrow")
@@ -15,6 +17,7 @@ import shapely  # noqa: E402
 import overture_fixture as fx  # noqa: E402
 import test_index_boundaries as bt  # noqa: E402
 import test_index_coverage as ct  # noqa: E402
+import test_index_fetch as ft  # noqa: E402
 from transitio_index import (  # noqa: E402
     boundaries,
     classify,
@@ -991,3 +994,37 @@ def test_a_flat_build_claiming_schema_10_needs_its_columns(tmp_path):
     snapshot = json.loads((path / "snapshot.json").read_text())
     (path / "snapshot.json").write_text(json.dumps({**snapshot, "schema_version": 10}))
     assert builds.load_tables(path) is None
+
+
+def test_a_dropped_download_resumes_from_the_bytes_that_arrived(tmp_path):
+    """A connection cut mid-body keeps what arrived and resumes from it, and a
+    cut that added bytes is not a failed attempt: a server that drops every
+    connection after a slice still delivers the whole file, each byte once."""
+    body, cut = ft.BODY, 4096
+    ranges = []
+
+    def handler(request):
+        ranges.append(request.headers.get("Range"))
+        start = int(ranges[-1][6:-1]) if ranges[-1] else 0
+        rest = body[start:]
+        headers = {"Content-Length": str(len(rest)), "ETag": '"v1"'}
+        if start:
+            headers["Content-Range"] = f"bytes {start}-{len(body) - 1}/{len(body)}"
+        stream = (
+            ft._FailingStream(rest, cut) if len(rest) > cut else ft._RawStream(rest)
+        )
+        return httpx.Response(206 if start else 200, headers=headers, stream=stream)
+
+    directory = store.open_subdir(tmp_path, "crawl")
+    try:
+        with ft._fetcher(httpx.MockTransport(handler)) as fetcher:
+            result = fetcher.download(
+                "https://feeds.example/gtfs.zip", directory, "feed.zip"
+            )
+            assert fetcher.bytes_fetched == len(body)
+    finally:
+        directory.close()
+    assert ranges == [None] + [f"bytes={n}-" for n in range(cut, len(body), cut)]
+    assert len(ranges) > fetch.DOWNLOAD_ATTEMPTS
+    assert result["sha256"] == hashlib.sha256(body).hexdigest()
+    assert (tmp_path / "crawl" / "feed.zip").read_bytes() == body
