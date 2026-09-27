@@ -102,9 +102,12 @@ class _Dropped(FetchError):
     of them whole chunks already written and hashed."""
 
     def __init__(self, error, written, validators):
-        super().__init__(str(error))
+        super().__init__(error, written, validators)
         self.written = written
         self.validators = validators
+
+    def __str__(self):
+        return str(self.args[0])
 
 
 def check_url(url):
