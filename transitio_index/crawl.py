@@ -47,10 +47,13 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import urllib.parse
 import zipfile
 import zlib
+
+from transitio.index import fingerprint
 
 from transitio_index import fetch, store, ziprange
 from transitio_index.progress import progress
@@ -431,6 +434,24 @@ def _write_state(directory, state):
     )
 
 
+def _identity_fields(feed_dir, members):
+    """The feed's content identity over its recorded ``members``, for its
+    state. Member files the state does not record are removed first, so only
+    recorded members are read; a symlink or non-regular member makes it None,
+    and the crawl lock keeps other writers out meanwhile."""
+    _prune_members(feed_dir, members)
+    found = fingerprint.identity(feed_dir.path, max_member_bytes=DOWNLOAD_MEMBER_BYTES)
+    return {"identity": found, "identity_version": fingerprint.IDENTITY_VERSION}
+
+
+def _backfill_identity(feed_dir, state):
+    """Give a reused state the content identity it predates; its members
+    were verified against it just before."""
+    if state.get("identity_version") != fingerprint.IDENTITY_VERSION:
+        members = state.get("members") or []
+        _write_state(feed_dir, {**state, **_identity_fields(feed_dir, members)})
+
+
 def _members_intact(feed_dir, state):
     """Whether every member state records is on disk, regular, and unchanged.
 
@@ -495,14 +516,22 @@ def _range_validator(probe):
 
 
 def _prune_members(feed_dir, kept):
-    """Remove member files a newer archive no longer carries.
+    """Remove member entries a newer archive no longer carries.
 
     ``state.json`` is written after the member writes and is the commit point:
     a run that dies mid-write leaves state recording the previous members, and
     the next run's intact-check refetches rather than trusts a mixed directory.
+    A symlink (broken or not) or special file under a member name goes too;
+    a directory is left for the intact-check to refuse.
     """
     for name in MEMBERS:
-        if name not in kept and (feed_dir.path / name).is_file():
+        if name in kept:
+            continue
+        try:
+            entry = os.lstat(feed_dir.path / name)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(entry.st_mode):
             store.unlink(feed_dir, name)
 
 
@@ -757,6 +786,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 and manifest is not None
                 and _cache_reusable(feed_dir, state, url, force, lookup)
             ):
+                _backfill_identity(feed_dir, state)
                 record["method"] = "not_modified"
                 record["members"] = sorted(state.get("members") or [])
                 record["files"] = manifest
@@ -825,6 +855,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 last_modified=conditional.get("last_modified"),
             )
             if outcome["status"] == "not_modified":
+                _backfill_identity(feed_dir, state)
                 record["method"] = "not_modified"
                 record["members"] = sorted(state.get("members") or [])
                 record["files"] = manifest
@@ -883,6 +914,8 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),
+                # The normalized per-table digests the fold compares.
+                **_identity_fields(feed_dir, digests),
             },
         )
         return record

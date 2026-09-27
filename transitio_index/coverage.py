@@ -11,9 +11,10 @@ country polygons too. Metro edges are propagated from member-city edges,
 because minted metros carry no geometry yet (the merged metros stage's own
 convention); when metro polygons exist, PIP takes over with no schema change.
 Crawled evidence supersedes the declared placements feed by feed. Feeds whose
-crawls hold the same data — an operator's feed listed twice, often once in each
-catalogue — fold into one feed first, the others' ids kept as its aliases;
-feeds sharing their stops and routes but not their schedules are listed in
+crawls hold the same data by their content identity — an operator's feed listed
+twice, often once in each catalogue — fold into one feed first, the others' ids
+kept as its aliases; feeds sharing their stops and routes but not their
+schedules are listed in
 ``near_duplicates.jsonl`` and kept apart, and each feed records the larger
 feeds whose stops and routes contain its own (``contained_in``).
 
@@ -41,6 +42,8 @@ this feed by feed once the crawl exists.
 import collections
 import datetime
 import logging
+
+from transitio.index import fingerprint
 
 from transitio_index import overrides, store
 from transitio_index.progress import progress
@@ -201,37 +204,38 @@ def _enough_stops(states, members):
     return False
 
 
-# The tables two crawls must both carry, digest for digest, to be one feed.
-FOLD_MEMBERS = ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt")
 # Which feed of a folded group keeps its id: one both catalogues carry first.
 SOURCE_RANK = {"both": 0, "atlas": 1, "mdb": 2}
+
+
+def _identity(state):
+    """The crawl's content identity, or None when it has none, a malformed
+    one, or one computed under another identity version."""
+    found = state.get("identity")
+    if state.get("identity_version") != fingerprint.IDENTITY_VERSION:
+        return None
+    if isinstance(found, dict) and all(isinstance(v, str) for v in found.values()):
+        return found
+    return None
 
 
 def fold_duplicates(feeds, states):
     """Fold feeds whose crawls hold the same data; ``{folded id: canonical id}``.
 
-    Two crawls hold the same data when their member digests match one for one
-    and include every table in :data:`FOLD_MEMBERS`; a group whose stops give
-    fewer than two readable coordinates (a header-only archive) never folds.
+    Two crawls hold the same data when their content identities match
+    (:func:`transitio.index.fingerprint.identical_groups`: the same stops,
+    routes, trips and calendars, and stop_times where both crawls read it,
+    however the files were packaged); a group whose stops give fewer than two
+    readable coordinates (a header-only archive) never folds.
     The canonical feed is the first by :data:`SOURCE_RANK`, then id: it keeps
     the others' ids and aliases as aliases, and an Atlas-only canonical takes a
     folded MDB feed's record as a feed both catalogues carry, matched by
     ``content``. ``feeds`` and ``states`` lose the folded feeds.
     """
     by_id = {feed["feed_id"]: feed for feed in feeds}
-    groups = collections.defaultdict(list)
-    for feed_id, (_, state) in states.items():
-        digests = state.get("member_sha256")
-        if (
-            isinstance(digests, dict)
-            and all(isinstance(value, str) for value in digests.values())
-            and all(digests.get(name) for name in FOLD_MEMBERS)
-        ):
-            groups[tuple(sorted(digests.items()))].append(feed_id)
+    identities = {feed_id: _identity(state) for feed_id, (_, state) in states.items()}
     folded = {}
-    for members in groups.values():
-        if len(members) < 2:
-            continue
+    for members in fingerprint.identical_groups(identities):
         members.sort(
             key=lambda f: (SOURCE_RANK.get(by_id[f].get("source"), len(SOURCE_RANK)), f)
         )
@@ -262,22 +266,21 @@ def fold_duplicates(feeds, states):
 
 def near_duplicates(states):
     """Crawled feeds sharing their stops and routes that were not folded —
-    versions of one network, or copies the fold withheld for want of
-    stop_times — as ``{"feed_ids", "differ"}`` rows naming the tables that
-    differ (none for such copies). Reported, never folded; a group whose
-    stops give fewer than two readable coordinates is left out."""
+    versions of one network, or a crawl without stop_times beside several
+    stop_times versions — as ``{"feed_ids", "differ"}`` rows naming the
+    identity tables whose digests differ (a table one crawl lacks counts).
+    Reported, never folded; a group whose stops give fewer than two readable
+    coordinates is left out."""
     groups = collections.defaultdict(list)
     for feed_id, (_, state) in states.items():
-        digests = state.get("member_sha256")
-        if isinstance(digests, dict) and all(
-            isinstance(digests.get(name), str) for name in ("stops.txt", "routes.txt")
-        ):
-            groups[(digests["stops.txt"], digests["routes.txt"])].append(feed_id)
+        found = _identity(state)
+        if found and found.get("stops.txt") and found.get("routes.txt"):
+            groups[(found["stops.txt"], found["routes.txt"])].append(feed_id)
     report = []
     for members in groups.values():
         if len(members) < 2 or not _enough_stops(states, members):
             continue
-        digests = [states[feed_id][1]["member_sha256"] for feed_id in members]
+        digests = [_identity(states[feed_id][1]) for feed_id in members]
         names = set().union(*digests)
         differ = [n for n in sorted(names) if len({d.get(n) for d in digests}) > 1]
         report.append({"feed_ids": sorted(members), "differ": differ})
