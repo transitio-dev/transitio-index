@@ -3,6 +3,8 @@ import pytest
 import hashlib  # noqa: E402
 import json  # noqa: E402
 
+from transitio.index import fingerprint  # noqa: E402
+
 from transitio_index import coverage, crawl, geometry, overrides, store  # noqa: E402
 
 
@@ -197,6 +199,8 @@ def _write_crawl(cache, feed_id, stops_rows, members=None):
                     name: hashlib.sha256(data).hexdigest()
                     for name, data in files.items()
                 },
+                "identity": fingerprint.identity(feed_dir),
+                "identity_version": fingerprint.IDENTITY_VERSION,
             }
         )
     )
@@ -427,8 +431,17 @@ def test_a_stop_placed_by_the_metro_polygon_and_a_member_counts_once(tmp_path):
 
 TABLES = {
     "routes.txt": b"route_id,route_type\nr,3\n",
-    "trips.txt": b"trip_id,route_id\nt,r\n",
+    "trips.txt": b"trip_id,route_id,service_id\nt,r,wk\n",
+    "calendar.txt": b"service_id,monday,start_date,end_date\nwk,1,20260101,20261231\n",
     "stop_times.txt": b"trip_id,stop_id,stop_sequence\nt,s10.0-0,1\n",
+}
+# The same tables written by another tool: columns reordered, CRLF line ends.
+REPACKAGED = {
+    name: b"\r\n".join(
+        b",".join(row.split(b",")[::-1]) for row in data.strip().split(b"\n")
+    )
+    + b"\r\n"
+    for name, data in TABLES.items()
 }
 NO_STOP_TIMES = {k: v for k, v in TABLES.items() if k != "stop_times.txt"}
 
@@ -447,10 +460,17 @@ ALL = ["f-atlas", "f-mdb-1", "f-mdb-2"]
             {"f-mdb-1": "f-atlas"},
             [(["f-atlas", "f-mdb-2"], ["stop_times.txt"])],
         ),
+        (3, TABLES, REPACKAGED, {"f-mdb-1": "f-atlas", "f-mdb-2": "f-atlas"}, []),
         (1, TABLES, TABLES, {}, []),
-        (3, NO_STOP_TIMES, NO_STOP_TIMES, {}, [(ALL, [])]),
+        (
+            3,
+            NO_STOP_TIMES,
+            NO_STOP_TIMES,
+            {"f-mdb-1": "f-atlas", "f-mdb-2": "f-atlas"},
+            [],
+        ),
     ],
-    ids=["same-data", "other-schedule", "one-stop", "no-stop-times"],
+    ids=["same-data", "other-schedule", "repackaged", "one-stop", "no-stop-times"],
 )
 def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
     tmp_path, stops, tables, copy_tables, folded, near
@@ -485,6 +505,14 @@ def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
     )
     assert [(r["feed_ids"], r["differ"]) for r in rows] == near
     assert manifest["near_duplicate_groups"] == len(near)
+
+
+def test_only_a_current_identity_counts():
+    found = {"stops.txt": "s", "routes.txt": "r"}
+    current = {"identity": found, "identity_version": fingerprint.IDENTITY_VERSION}
+    assert coverage._identity(current) == found
+    assert coverage._identity({**current, "identity_version": 0}) is None
+    assert coverage._identity({**current, "identity": ["s"]}) is None
 
 
 def test_a_damaged_cache_does_not_keep_twins_apart(tmp_path):

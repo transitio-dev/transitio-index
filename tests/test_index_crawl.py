@@ -6,6 +6,7 @@ import zipfile
 
 import httpx
 import pytest
+from transitio.index import fingerprint
 
 from transitio_index import crawl, fetch, store  # noqa: E402
 
@@ -624,6 +625,8 @@ def test_state_records_per_member_digests_on_both_paths(tmp_path):
         assert log["f-a"]["method"] == expected_method
         state = json.loads((_feed_dir(cache, "f-a") / "state.json").read_text())
         assert state["member_sha256"]["stops.txt"] == hashlib.sha256(STOPS).hexdigest()
+        assert state["identity"] == fingerprint.identity(io.BytesIO(data))
+        assert state["identity_version"] == fingerprint.IDENTITY_VERSION
 
 
 def test_a_range_hostile_server_falls_back_to_download(tmp_path):
@@ -646,7 +649,21 @@ def test_an_unchanged_feed_is_skipped_on_rerun(tmp_path):
     server = _server({"/a.zip": (data, '"v1"')})
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
     _crawl(cache, server)
+    # A state written before identities were recorded gets one on the rerun,
+    # over its recorded members only: an unreadable leftover table is removed
+    # rather than read.
+    path = _feed_dir(cache, "f-a") / "state.json"
+    state = json.loads(path.read_text())
+    identity = state.pop("identity")
+    del state["identity_version"]
+    path.write_text(json.dumps(state))
+    (_feed_dir(cache, "f-a") / "calendar.txt").write_bytes(b"service_id\n\xff\n")
+    try:  # and a broken symlink under a member name, where links can be made
+        (_feed_dir(cache, "f-a") / "calendar_dates.txt").symlink_to(tmp_path / "gone")
+    except OSError:
+        pass
     summary, log = _crawl(cache, server)
+    assert json.loads(path.read_text())["identity"] == identity
     assert log["f-a"]["method"] == "not_modified"
     assert log["f-a"]["bytes_fetched"] == 0
     assert (_feed_dir(cache, "f-a") / "stops.txt").read_bytes() == STOPS
