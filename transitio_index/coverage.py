@@ -293,6 +293,12 @@ def near_duplicates(states):
 # its stops.
 CONTAINED_SHARE = 0.9
 CONTAINER_SCALE = 1.5
+# Or when all its routes, at least this many, and this share of its stops are
+# the other's, and the other has this many times its stops: two feeds may
+# place one platform a few metres apart.
+CARRIED_ROUTES = 5
+CARRIED_SHARE = 0.8
+CARRIER_SCALE = 3
 
 
 def _route_keys(feed_dir, state):
@@ -318,11 +324,14 @@ def _route_keys(feed_dir, state):
 
 
 def contained_feeds(states):
-    """``{feed_id: [container ids]}``: for each crawl, the larger crawls that
-    contain it — at least :data:`CONTAINED_SHARE` of its distinct stop
-    coordinates (rounded to 1e-4 degrees) and of its routes among the other's,
-    the other with at least :data:`CONTAINER_SCALE` times its stops. A feed
-    needs two readable stops and a named, typed route to take part; two feeds
+    """``{feed_id: {container id: rule}}``: for each crawl, the larger crawls
+    that contain it and the rule that matched. By ``"share"``, at least
+    :data:`CONTAINED_SHARE` of its distinct stop coordinates (rounded to 1e-4
+    degrees) and of its routes are among the other's, the other with at least
+    :data:`CONTAINER_SCALE` times its stops; by ``"routes"``, all its routes,
+    at least :data:`CARRIED_ROUTES`, and :data:`CARRIED_SHARE` of its stops
+    are, the other with :data:`CARRIER_SCALE` times its stops. A feed needs
+    two readable stops and a named, typed route to take part; two feeds
     sharing their stops (near-duplicates) never qualify."""
     import pandas as pd
 
@@ -348,13 +357,22 @@ def contained_feeds(states):
     contained = {}
     for (feed_id, other), count in shared.items():
         size, keys = len(points[feed_id]), routes[feed_id]
+        carried = len(keys & routes[other])
         if (
             count >= CONTAINED_SHARE * size
             and len(points[other]) >= CONTAINER_SCALE * size
-            and len(keys & routes[other]) >= CONTAINED_SHARE * len(keys)
+            and carried >= CONTAINED_SHARE * len(keys)
         ):
-            contained.setdefault(feed_id, []).append(other)
-    return {feed_id: sorted(ids) for feed_id, ids in contained.items()}
+            contained.setdefault(feed_id, {})[other] = "share"
+        elif (
+            count >= CARRIED_SHARE * size
+            and len(points[other]) >= CARRIER_SCALE * size
+            and carried == len(keys) >= CARRIED_ROUTES
+        ):
+            contained.setdefault(feed_id, {})[other] = "routes"
+    return {
+        feed_id: dict(sorted(rules.items())) for feed_id, rules in contained.items()
+    }
 
 
 def link_static_feeds(feeds, canonical):
@@ -935,7 +953,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 edge["feed_id"] for edge in edges if edge["feed_id"] not in superseded
             }
             for feed in feeds:
-                feed["contained_in"] = contained.get(feed["feed_id"], [])
+                feed["contained_in"] = sorted(contained.get(feed["feed_id"], {}))
                 if feed["feed_id"] in content:
                     feed["content_identity"] = content[feed["feed_id"]]
                     feed["content_identity_version"] = fingerprint.IDENTITY_VERSION
@@ -968,6 +986,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "folded_feeds": dict(sorted(folded.items())),
                 "near_duplicate_groups": len(near),
                 "feeds_contained": len(contained),
+                "containment_rules": dict(sorted(contained.items())),
                 "feeds_overrides_sha256": feeds_digest,
                 "overrides_applied": coverage_overrides,
                 "stale_overrides": len(override_report),
