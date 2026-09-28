@@ -34,13 +34,18 @@ def _zip_bytes(members=FULL_MEMBERS):
 
 
 def _server(feeds, *, honour_ranges=True):
-    """A MockTransport serving ``{path: (data, etag)}`` with Range support."""
+    """A MockTransport serving ``{path: (data, etag)}`` with Range support;
+    ``data`` may instead be a status to answer or a transport error to raise."""
 
     def handler(request):
         entry = feeds.get(request.url.path)
         if entry is None:
             return httpx.Response(404)
         data, etag = entry
+        if isinstance(data, int):
+            return httpx.Response(data)
+        if isinstance(data, type):
+            raise data("stub failure", request=request)
         headers = {"Content-Length": str(len(data))}
         if honour_ranges:
             headers["Accept-Ranges"] = "bytes"
@@ -651,11 +656,13 @@ def test_an_unchanged_feed_is_skipped_on_rerun(tmp_path):
     _crawl(cache, server)
     # A state written before identities were recorded gets one on the rerun,
     # over its recorded members only: an unreadable leftover table is removed
-    # rather than read.
+    # rather than read. One from before the hosted copy was read is the
+    # producer's.
     path = _feed_dir(cache, "f-a") / "state.json"
     state = json.loads(path.read_text())
     identity = state.pop("identity")
-    del state["identity_version"]
+    for key in ("identity_version", "fetched_from", "producer_failure"):
+        del state[key]
     path.write_text(json.dumps(state))
     (_feed_dir(cache, "f-a") / "calendar.txt").write_bytes(b"service_id\n\xff\n")
     try:  # and a broken symlink under a member name, where links can be made
@@ -663,7 +670,9 @@ def test_an_unchanged_feed_is_skipped_on_rerun(tmp_path):
     except OSError:
         pass
     summary, log = _crawl(cache, server)
-    assert json.loads(path.read_text())["identity"] == identity
+    state = json.loads(path.read_text())
+    assert state["identity"] == identity
+    assert (state["fetched_from"], state["producer_failure"]) == ("producer", None)
     assert log["f-a"]["method"] == "not_modified"
     assert log["f-a"]["bytes_fetched"] == 0
     assert (_feed_dir(cache, "f-a") / "stops.txt").read_bytes() == STOPS
@@ -842,6 +851,85 @@ def test_the_mdb_url_is_the_fallback(tmp_path):
     _publish_resolved(cache, [feed])
     _, log = _crawl(cache, _server({"/a.zip": (data, None)}))
     assert log["f-m"]["method"] == "download"
+
+
+HTML = b"\n<!DOCTYPE html>\n<html><body>This file has moved.</body></html>\n"
+PRODUCER_URL = "https://producer.example/a.zip"
+HOSTED = "https://files.example/mdb-1/latest.zip"
+
+
+@pytest.mark.parametrize(
+    ("producer", "hosted", "method", "fetched_from", "failure"),
+    [
+        (httpx.ConnectTimeout, HOSTED, "download", "mdb_latest", "stub failure"),
+        (None, None, "failed", None, None),  # a 404 with no hosted copy
+        (410, HOSTED, "download", "mdb_latest", "HTTP 410"),
+        (HTML, HOSTED, "download", "mdb_latest", "an HTML page"),
+        (503, HOSTED, "failed", None, None),  # the server's failure, not the link's
+        (_zip_bytes(), HOSTED, "download", "producer", None),
+    ],
+    ids=["timeout", "404-no-hosted-copy", "410", "html", "5xx", "producer-ok"],
+)
+def test_a_dead_producer_link_falls_back_to_the_hosted_copy(
+    tmp_path, producer, hosted, method, fetched_from, failure
+):
+    cache = tmp_path / "cache"
+    feed = _feed("f-a", PRODUCER_URL)
+    feed["mdb"] = {"urls": {"latest": hosted}}
+    _publish_resolved(cache, [feed])
+    served = {"/mdb-1/latest.zip": (_zip_bytes(), '"h1"')}
+    if producer is not None:
+        served["/a.zip"] = (producer, '"p1"')
+    _, log = _crawl(cache, _server(served))
+    record = log["f-a"]
+    assert (record["method"], record["fetched_from"]) == (method, fetched_from)
+    assert record["url"] == PRODUCER_URL
+    assert (record["producer_failure"] is None) == (failure is None)
+    assert failure is None or failure in record["producer_failure"]
+    # Both attempts' bytes count.
+    producer_bytes = len(producer) if isinstance(producer, bytes) else 0
+    hosted_bytes = len(_zip_bytes()) if fetched_from == "mdb_latest" else 0
+    assert record["bytes_fetched"] == producer_bytes + hosted_bytes
+    # The committed state is what coverage reads, whichever copy was read.
+    states = {state["feed_id"]: state for _, state in crawl.crawled_feeds(cache)}
+    if method == "failed":
+        assert states == {}
+    else:
+        state = states["f-a"]
+        assert state["fetched_from"] == fetched_from
+        assert state["producer_failure"] == record["producer_failure"]
+        assert state["url"] == (
+            HOSTED if fetched_from == "mdb_latest" else PRODUCER_URL
+        )
+    # A rerun reads the same copy, and its validators spare the download.
+    _, rerun = _crawl(cache, _server(served))
+    expected = "failed" if method == "failed" else "not_modified"
+    assert (rerun["f-a"]["method"], rerun["f-a"]["fetched_from"]) == (
+        expected,
+        fetched_from,
+    )
+
+
+@pytest.mark.parametrize(
+    ("content_type", "body", "html"),
+    [
+        (None, HTML, True),
+        ("text/html; charset=utf-8", b"This file has moved.", True),
+        (None, b"\xef\xbb\xbf <!-- portal -->\n<head><title>Moved</title>", True),
+        ("application/octet-stream", b"\x08\x01\x12\x04html", False),
+        (None, b"<?xml version='1.0'?><Error><Code>NoSuchKey</Code></Error>", False),
+    ],
+    ids=["doctype", "served-as-html", "no-root-tag", "binary", "xml"],
+)
+def test_an_html_page_is_told_from_other_non_archives(
+    tmp_path, content_type, body, html
+):
+    feed_dir = store.open_subdir(tmp_path, "crawl")
+    try:
+        store.write_bytes(feed_dir, crawl.ARCHIVE_FILE, body)
+        assert crawl._html_page(feed_dir, content_type) is html
+    finally:
+        feed_dir.close()
 
 
 # --- Parallel crawl (workers) -------------------------------------------------

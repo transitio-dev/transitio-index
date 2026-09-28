@@ -195,19 +195,29 @@ def test_a_refused_resume_restarts_from_zero(tmp_path):
     assert (tmp_path / "crawl" / "feed.zip").read_bytes() == BODY
 
 
-def test_a_persistently_short_body_fails_after_the_attempts(tmp_path):
+@pytest.mark.parametrize("resumable", [False, True], ids=["attempts", "tries"])
+def test_a_persistently_short_body_fails_after_the_attempts(tmp_path, resumable):
+    # Unpinned short bodies use up the attempts; pinned ones resume ten bytes
+    # at a time until the tries run out. Either way the connection failed.
     def handler(request):
-        return httpx.Response(
-            200, headers={"Content-Length": str(len(BODY))}, content=BODY[:10]
-        )
+        start = int(request.headers.get("Range", "bytes=0-")[6:-1])
+        headers = {"Content-Length": str(len(BODY) - start)}
+        if resumable:
+            headers["ETag"] = '"v1"'
+        if not start:
+            return httpx.Response(200, headers=headers, content=BODY[:10])
+        headers["Content-Range"] = f"bytes {start}-{len(BODY) - 1}/{len(BODY)}"
+        return httpx.Response(206, headers=headers, content=BODY[start : start + 10])
 
     directory = store.open_subdir(tmp_path, "crawl")
     try:
         with _fetcher(httpx.MockTransport(handler)) as fetcher:
-            with pytest.raises(fetch.FetchError):
+            with pytest.raises(fetch.FetchError) as failed:
                 fetcher.download(
                     "https://feeds.example/gtfs.zip", directory, "feed.zip"
                 )
+        assert failed.value.transport
+        assert ("could not complete" in str(failed.value)) is resumable
         assert not (tmp_path / "crawl" / "feed.zip").exists()
     finally:
         directory.close()

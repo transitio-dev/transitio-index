@@ -475,7 +475,14 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
         _edge("lost", "hel", "local", 0.3),  # declared a place the index lost
     ]
     crawl_log = [
-        {"feed_id": "hsl", "method": "download", "route_count": 7},
+        # Read from the MDB-hosted copy after its producer link failed.
+        {
+            "feed_id": "hsl",
+            "method": "download",
+            "route_count": 7,
+            "url": "https://hsl.fi/g.zip",
+            "fetched_from": "mdb_latest",
+        },
         # A folded copy's record, filed under an alias, never stands in.
         {"feed_id": "f-hsl-copy", "method": "failed", "route_count": 1},
         {"feed_id": "f-old-rail", "method": "download", "route_count": 2},
@@ -484,7 +491,12 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
             "method": "failed",
             "fallback_reason": "GET https://x: HTTP 404",
         },
-        {"feed_id": "far", "method": "not_modified"},
+        {
+            "feed_id": "far",
+            "method": "not_modified",
+            "url": "https://far.example/g.zip",
+            "fetched_from": "producer",
+        },
         {"feed_id": "lost", "method": "range"},
         {"feed_id": "bikes", "method": "skipped", "fallback_reason": "boom"},
     ]
@@ -501,6 +513,7 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
     by_id = {row["feed_id"]: row for row in rows}
     hsl = by_id["hsl"]
     assert hsl["crawl_outcome"] == "ok" and hsl["failure_class"] is None
+    assert hsl["hosted_copy_host"] == "hsl.fi"
     assert hsl["route_count"] == 7 and hsl["has_calendar"] is True
     assert hsl["country_agreement"] == "agree"
     assert hsl["municipality_outcome"] == "in_place"
@@ -544,6 +557,7 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
         "skipped": 1,
     }
     assert sections["availability"]["failures_by_class"] == {"404": 1}
+    assert sections["availability"]["hosted_copy_by_host"] == {"hsl.fi": 1}
     assert sections["availability"]["outcome_by_catalogue_status"] == {
         "active": {"ok": 1},
         "deprecated": {"failed": 1},
