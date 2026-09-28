@@ -95,12 +95,19 @@ class FetchError(RuntimeError):
     ``status`` is the HTTP status that ended it, if one did; ``transport`` is
     true when a transport failure did (a timeout, a failed or dropped
     connection), or the breaker's refusal of a host that keeps failing so.
+    :func:`_failure` sets both.
     """
 
-    def __init__(self, *args, status=None, transport=False):
-        super().__init__(*args)
-        self.status = status
-        self.transport = transport
+    status = None
+    transport = False
+
+
+def _failure(message, *, status=None, transport=False):
+    """A :class:`FetchError` with its ``status`` and ``transport``."""
+    error = FetchError(message)
+    error.status = status
+    error.transport = transport
+    return error
 
 
 class RangeUnsupported(FetchError):
@@ -112,7 +119,8 @@ class _Dropped(FetchError):
     of them whole chunks already written and hashed."""
 
     def __init__(self, error, written, validators):
-        super().__init__(error, written, validators, transport=True)
+        super().__init__(error, written, validators)
+        self.transport = True
         self.written = written
         self.validators = validators
 
@@ -237,8 +245,8 @@ def _attempt_error(url, first, last):
         or getattr(last, "transport", False),
     }
     if first is None or str(first) == str(last):
-        return FetchError(f"GET {url}: {last}", **kind)
-    return FetchError(f"GET {url}: {first}; last attempt: {last}", **kind)
+        return _failure(f"GET {url}: {last}", **kind)
+    return _failure(f"GET {url}: {first}; last attempt: {last}", **kind)
 
 
 def _refuse_encoding(response, url, *, gzip_ok=False):
@@ -334,7 +342,7 @@ class Fetcher:
         with self._failures_lock:
             failures = len(self._failures.get(host, ()))
         if failures >= self._host_failures:
-            raise FetchError(
+            raise _failure(
                 f"{method} {url}: host {host} unreachable this run "
                 f"({failures} URLs failed consecutively); not tried",
                 transport=True,
@@ -372,7 +380,7 @@ class Fetcher:
                 response = self._client.send(request, stream=stream)
             except httpx.TransportError as error:
                 self._note(host, origin, failed=True)
-                raise FetchError(f"{method} {url}: {error}", transport=True)
+                raise _failure(f"{method} {url}: {error}", transport=True)
             except (httpx.HTTPError, httpx.InvalidURL, ValueError) as error:
                 # ValueError covers malformed third-party URLs (a bad port,
                 # say) that httpx surfaces outside its own error tree.
@@ -402,7 +410,7 @@ class Fetcher:
         """Size, range support and validators, from a ``HEAD`` probe."""
         _, response = self._hops("HEAD", url, {})
         if response.status_code != 200:
-            raise FetchError(
+            raise _failure(
                 f"HEAD {url}: HTTP {response.status_code}",
                 status=response.status_code,
             )
@@ -449,7 +457,7 @@ class Fetcher:
             if response.status_code == 200:
                 raise RangeUnsupported(f"{url}: server ignored the range request")
             if response.status_code != 206:
-                raise FetchError(
+                raise _failure(
                     f"GET {url}: HTTP {response.status_code} for a range",
                     status=response.status_code,
                 )
@@ -481,7 +489,7 @@ class Fetcher:
                 # A host that answers but stalls mid-body counts like one that
                 # never answered.
                 self._note(host, url, failed=True)
-                raise FetchError(f"GET {url}: {error}", transport=True)
+                raise _failure(f"GET {url}: {error}", transport=True)
             except httpx.HTTPError as error:
                 raise FetchError(f"GET {url}: {error}")
             else:
@@ -581,7 +589,7 @@ class Fetcher:
                     # continues from bytes that were fully accounted for. A
                     # dropped connection keeps what arrived, like a short body.
                     attempt_digest = digest.copy()
-                    last = FetchError("body ended early", transport=True)
+                    last = _failure("body ended early", transport=True)
                     try:
                         outcome = self._stream_once(
                             url,
@@ -661,7 +669,7 @@ class Fetcher:
                     raise _attempt_error(
                         url,
                         first_error,
-                        FetchError("could not complete the download", transport=True),
+                        _failure("could not complete the download", transport=True),
                     )
             directory.replace(partial, name)
             return {
@@ -707,7 +715,7 @@ class Fetcher:
             if written and response.status_code != 206:
                 return {"status": "restart"}
             if response.status_code not in (200, 206):
-                raise FetchError(
+                raise _failure(
                     f"HTTP {response.status_code}", status=response.status_code
                 )
             if response.status_code == 206 and not written:
