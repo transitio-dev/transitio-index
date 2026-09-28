@@ -52,7 +52,15 @@ def operator(name, *feed_ids):
 
 
 def mdb_feed(
-    mdb_id, *, spec="gtfs", url=None, name=None, provider=None, bounding_box=None
+    mdb_id,
+    *,
+    spec="gtfs",
+    url=None,
+    name=None,
+    provider=None,
+    bounding_box=None,
+    status="active",
+    redirect_ids=(),
 ):
     urls = {"direct_download": url} if url is not None else {}
     return {
@@ -63,6 +71,8 @@ def mdb_feed(
         "name": name,
         "provider": provider,
         "bounding_box": bounding_box,
+        "status": status,
+        "redirect_ids": list(redirect_ids),
     }
 
 
@@ -829,6 +839,60 @@ def test_provisional_drops_when_its_mdb_endpoint_is_geohash_resolved(tmp_path):
     )
     assert by_feed_id(records)[f"f-{geohash}z-a"]["crosswalk_method"] == "geohash"
     assert summary["provisional_links"] == []
+
+
+# --- superseded MDB rows -------------------------------------------------
+
+
+def test_deprecated_rows_fold_into_their_live_successor(tmp_path):
+    from transitio_index import resolve
+
+    url = "https://live.example/gtfs.zip"
+
+    def deprecated(mdb_id, *redirects, spec="gtfs"):
+        return mdb_feed(mdb_id, spec=spec, status="deprecated", redirect_ids=redirects)
+
+    records, summary = crosswalk.build_records(
+        [atlas_feed("f-a", url=url)],
+        [
+            deprecated("mdb-1", "mdb-2"),  # a live redirect, matched to Atlas
+            mdb_feed("mdb-2", url=url),
+            deprecated("mdb-3", "mdb-4"),  # a chain of two
+            deprecated("mdb-4", "mdb-5"),
+            mdb_feed("mdb-5"),
+            deprecated("5", "mdb-5"),  # minting its successor's own id
+            deprecated("mdb-6", "mdb-7"),  # a cycle
+            deprecated("mdb-7", "mdb-6"),
+            deprecated("mdb-8", "mdb-9", "mdb-10"),  # two live targets
+            mdb_feed("mdb-9"),
+            mdb_feed("mdb-10"),
+            deprecated("mdb-11", "mdb-12"),  # a chain leaving the ingest
+            deprecated("mdb-12", "mdb-99"),
+            deprecated("mdb-13", "mdb-98"),  # a redirect outside the ingest
+            deprecated("mdb-14", "mdb-15"),  # a live target of another spec
+            mdb_feed("mdb-15", spec="gtfs-rt"),
+        ],
+    )
+    # The folded rows are no feeds of their own; only their successors alias them.
+    assert summary["mdb_folded"] == 4 and summary["feeds"] == 12
+    assert {r["feed_id"]: r["aliases"] for r in records if r["aliases"]} == {
+        "f-a": ["f-mdb-2", "f-mdb-1"],
+        "f-mdb-5": ["f-mdb-3", "f-mdb-4"],
+    }
+    # An override filed against a folded row lands on its successor; one against
+    # a kept row on that row alone.
+    for ref, feed_id in [
+        ("f-mdb-1", "f-a"),
+        ("f-mdb-3", "f-mdb-5"),
+        ("f-mdb-4", "f-mdb-5"),
+        ("f-mdb-6", "f-mdb-6"),
+        ("f-mdb-8", "f-mdb-8"),
+        ("f-mdb-11", "f-mdb-11"),
+        ("f-mdb-13", "f-mdb-13"),
+        ("f-mdb-14", "f-mdb-14"),
+    ]:
+        hits = [r["feed_id"] for r in records if resolve._matching_refs({ref: {}}, r)]
+        assert hits == [feed_id], ref
 
 
 # --- the whole cascade ----------------------------------------------------

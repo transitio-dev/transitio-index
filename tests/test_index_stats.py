@@ -179,6 +179,12 @@ def test_catalogue_rows_name_the_feed_or_the_reason_they_were_dropped():
     assert dropped["feed_id"] is None and dropped["drop_reason"] == "ambiguous_id"
     assert all(row["snapshot_id"] == "snap" for row in rows)
     assert set(rows[0]) == set(stats.CATALOGUE_SCHEMA.names)
+    # A deprecated row folded into its successor's feed, which aliases it.
+    folded = [{**FEEDS[0], "aliases": ["f-mdb-1", "f-mdb-3"]}, FEEDS[1], FEEDS[3]]
+    by_source_id = {row["source_id"]: row for row in stats.catalogue_rows(RAW, folded)}
+    assert by_source_id["mdb-3"]["feed_id"] is None
+    assert by_source_id["mdb-3"]["drop_reason"] == "folded"
+    assert by_source_id["mdb-1"]["drop_reason"] is None
     # A box across the antimeridian is narrow, not global.
     wrapped = {"min_lat": 0.0, "max_lat": 1.0, "min_lon": 179.0, "max_lon": -179.0}
     assert stats._lon_span(wrapped) == pytest.approx(2.0)
