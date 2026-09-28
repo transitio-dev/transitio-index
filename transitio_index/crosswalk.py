@@ -3,8 +3,8 @@
 Reads the raw Atlas, Mobility Database and GBFS generations and writes
 ``feeds.jsonl`` of unified transit feed records (GTFS and GTFS-RT), each with
 a stable ``feed_id`` and the crosswalk method that produced it. Identity is
-resolved in a cascade of narrowing confidence: url-exact (a GTFS download URL
-byte-identical in both catalogues), then a gated same-host match (feeds
+resolved in a cascade of narrowing confidence: url-exact (one GTFS download URL
+in both catalogues, http and https alike), then a gated same-host match (feeds
 sharing a download host whose names agree), then geohash-confirm (a same-host
 candidate whose Onestop-ID geohash meets the MDB centroid geohash). GBFS
 ``systems.csv`` systems are linked to their Atlas feed by auto-discovery URL,
@@ -61,12 +61,12 @@ def _clean_url(value):
     """A URL usable as an identity key, or None.
 
     Only a real URL — one that parses with both a scheme and a host — counts, so
-    a sentinel like ``N/A`` cannot be asserted as an identity. The match is on
-    the exact bytes: surrounding whitespace is *not* trimmed away and then
-    matched, since a value differing only by whitespace is a different string
-    and must not be asserted the same feed (a wrong merge adopts identity and
-    would corrupt a licence block and dataset history). Such a pair can still
-    resolve through the later same-host step.
+    a sentinel like ``N/A`` cannot be asserted as an identity. Surrounding
+    whitespace is *not* trimmed away and then matched, since a value differing
+    only by whitespace is a different string and must not be asserted the same
+    feed (a wrong merge adopts identity and would corrupt a licence block and
+    dataset history). Such a pair can still resolve through the later same-host
+    step.
     """
     if not isinstance(value, str):
         return None
@@ -77,6 +77,42 @@ def _clean_url(value):
     if not parts.scheme or not parts.hostname:
         return None
     return value
+
+
+# A URL as scheme, authority, path and the query-and-fragment tail.
+_URL_SHAPE = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)([^?#]*)(.*)", re.DOTALL)
+_DEFAULT_PORTS = {"http": "80", "https": "443"}
+
+
+def _match_url(value):
+    """A download URL in the form the url-exact match compares, or None.
+
+    The scheme and host are lower-cased, ``http`` counts as ``https``, and a
+    default port and a trailing slash on the path are dropped; the userinfo,
+    path and query are kept as they are. A value that does not split that way
+    (one with surrounding whitespace, say) is compared as it is. Only the
+    comparison uses this form; a record keeps its URL.
+    """
+    url = _clean_url(value)
+    if url is None:
+        return None
+    shape = _URL_SHAPE.fullmatch(url)
+    if shape is None:
+        return url
+    scheme, authority, path, tail = shape.groups()
+    scheme = scheme.lower()
+    userinfo, at, host = authority.rpartition("@")
+    host = host.lower()
+    # The text after the last colon is a port unless it closes an IPv6 literal.
+    bare, colon, port = host.rpartition(":")
+    if colon and port.isascii() and port.isdigit():
+        if port.lstrip("0") == _DEFAULT_PORTS.get(scheme):
+            host = bare
+    if scheme == "http":
+        scheme = "https"
+    if path.endswith("/"):
+        path = path[:-1]
+    return f"{scheme}://{userinfo}{at}{host}{path}{tail}"
 
 
 def _read_atlas(cache_dir):
@@ -157,8 +193,8 @@ def _url_exact_pairs(atlas_feeds, mdb_feeds):
         atlas_feeds,
         mdb_feeds,
         "gtfs",
-        lambda feed: (feed.get("urls") or {}).get(ATLAS_STATIC_URL),
-        lambda feed: (feed.get("urls") or {}).get(MDB_DOWNLOAD_URL),
+        lambda feed: _match_url((feed.get("urls") or {}).get(ATLAS_STATIC_URL)),
+        lambda feed: _match_url((feed.get("urls") or {}).get(MDB_DOWNLOAD_URL)),
     )
 
 

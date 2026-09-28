@@ -17,7 +17,7 @@ MDB and GBFS rows carry a country field — usually an ISO ``country_code``,
 sometimes a full country name — so a requested country is matched on either
 form; a missing or renamed column stops the cut rather than silently matching
 nothing. Atlas feed records carry no country — the crosswalk places an Atlas
-feed by matching its GTFS download URL (exactly, then by host) against MDB — so
+feed by matching its GTFS download URL (http or https, then by host) against MDB — so
 the archive is trimmed to the Atlas feeds that share a download URL with a kept
 MDB feed, plus the other feeds of a host when at least half of that host's
 Atlas feeds match by exact URL (a platform host serving many agencies fails
@@ -54,7 +54,7 @@ import tempfile
 from pathlib import Path
 
 from transitio_index import atlas, csv_source, gbfs, mdb, store
-from transitio_index.crosswalk import ATLAS_STATIC_URL, _clean_url, _host
+from transitio_index.crosswalk import ATLAS_STATIC_URL, _host, _match_url
 
 DEFAULT_COUNTRIES = ("FI", "EE")
 
@@ -383,10 +383,11 @@ def _check_includes(includes, mdb_rows, atlas_files):
 
 
 def _mdb_targets(rows):
-    """The exact download URLs and the non-shared hosts of the kept MDB feeds."""
+    """The download URLs, in the crosswalk's match form, and the non-shared hosts
+    of the kept MDB feeds."""
     urls, hosts = set(), set()
     for row in rows:
-        url = _clean_url(row.get(MDB_DOWNLOAD))
+        url = _match_url(row.get(MDB_DOWNLOAD))
         if url is None:
             continue
         urls.add(url)
@@ -397,9 +398,10 @@ def _mdb_targets(rows):
 
 
 def _feed_url(feed):
-    """The cleaned static download URL of an Atlas feed record — the field the
-    crosswalk matches on; realtime endpoints carry no identity — or None."""
-    return _clean_url((feed.get("urls") or {}).get(ATLAS_STATIC_URL))
+    """The static download URL of an Atlas feed record in the crosswalk's match
+    form — the field the crosswalk matches on; realtime endpoints carry no
+    identity — or None."""
+    return _match_url((feed.get("urls") or {}).get(ATLAS_STATIC_URL))
 
 
 def _select_atlas(archive, urls, hosts, includes=frozenset()):
@@ -567,7 +569,7 @@ def _emit(
 
 
 def _mdb_url_countries(mdb_src):
-    """``{cleaned MDB download URL: set of country codes that declare it}`` over
+    """``{MDB download URL in match form: set of country codes declaring it}`` over
     every GTFS row — the evidence for whether some ``--country`` cut could pull
     an Atlas feed on that URL. Only GTFS rows count (a realtime endpoint is never
     a static feed a country cut keeps), and the country is canonicalised to its
@@ -581,7 +583,7 @@ def _mdb_url_countries(mdb_src):
         for row in reader:
             if (row.get("data_type") or "").strip().lower() != "gtfs":
                 continue
-            url = _clean_url(row.get(MDB_DOWNLOAD))
+            url = _match_url(row.get(MDB_DOWNLOAD))
             token = (row.get(MDB_COUNTRY) or "").strip()
             if url is None or not token:
                 continue

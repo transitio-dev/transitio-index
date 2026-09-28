@@ -21,9 +21,11 @@ import test_index_coverage as ct  # noqa: E402
 import test_index_crawl as crt  # noqa: E402
 import test_index_fetch as ft  # noqa: E402
 from transitio_index import (  # noqa: E402
+    atlas,
     boundaries,
     classify,
     coverage,
+    crosswalk,
     fetch,
     geometry,
     overture,
@@ -776,6 +778,47 @@ def test_sampler_keeps_matching_atlas_feeds_not_files_or_platform_hosts(tmp_path
         "local.dmfr.json": ["f-a", "f-b", "f-c"],
         "hsl.dmfr.json": ["f-hsl"],
     }
+
+
+def test_an_http_atlas_url_is_sampled_and_paired_with_its_https_mdb_twin(tmp_path):
+    """STM's Atlas feed lists its download as ``http://`` and its MDB row as
+    ``https://``. The sampler kept an Atlas feed only on a byte-identical URL,
+    so the twins were cut into different samples (ca-full and atlas3), and the
+    crosswalk's url-exact match compared full strings and would not pair them.
+    """
+    import test_index_crosswalk as cwt
+    import test_sample_catalogues as sct
+
+    sc = sct.sc
+    path = "stm.example/gtfs/gtfs_stm.zip"
+    src = tmp_path / "feeds_v2.csv"
+    src.write_text(
+        "id,data_type,location.country_code,urls.direct_download\n"
+        f"mdb-1,gtfs,CA,https://{path}\n",
+        encoding="utf-8",
+    )
+    archive = tmp_path / "atlas.tar.gz"
+    sct._archive(
+        archive, [("r/feeds/stm.dmfr.json", sct._dmfr("f-stm", f"http://{path}"))]
+    )
+
+    _, mdb_rows = sc._select_csv(
+        src, sc.MDB_COUNTRY, (sc.MDB_COUNTRY, sc.MDB_DOWNLOAD), {"CA"}
+    )
+    kept = sc._select_atlas(archive, *sc._mdb_targets(mdb_rows))
+    # The CA cut keeps the Atlas feed, so the unmatched cut leaves it out.
+    assert [feed["id"] for _, payload in kept for feed in payload["feeds"]] == ["f-stm"]
+    assert sc._select_atlas_unmatched(archive, sc._mdb_url_countries(src)) == []
+
+    sample = tmp_path / "atlas_sample.tar.gz"
+    sc._write_atlas(sample, kept)
+    records, _ = crosswalk.build_records(
+        atlas.parse(sample)["feeds"],
+        [cwt.mdb_feed("mdb-1", url=mdb_rows[0][sc.MDB_DOWNLOAD])],
+    )
+    assert [(r["source"], r["feed_id"], r["mdb_id"]) for r in records] == [
+        ("both", "f-stm", "mdb-1")
+    ]
 
 
 def test_stats_keys_gbfs_systems_sharing_id_and_country_by_ordinal():
