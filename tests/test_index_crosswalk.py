@@ -174,10 +174,17 @@ def test_a_url_shared_by_two_mdb_feeds_is_not_an_identity(tmp_path):
     assert found["f-a"]["crosswalk_method"] == "none"
 
 
-def test_a_url_shared_by_two_atlas_feeds_is_not_an_identity(tmp_path):
+@pytest.mark.parametrize(
+    "other",
+    ["https://vendor.example/gtfs.zip", "http://vendor.example/gtfs.zip"],
+    ids=["same", "scheme-variant"],
+)
+def test_a_url_shared_by_two_atlas_feeds_is_not_an_identity(tmp_path, other):
+    # A scheme-only variant shares the match form, so even the byte-identical
+    # feed is not paired.
     url = "https://vendor.example/gtfs.zip"
     records, _ = crosswalk.build_records(
-        [atlas_feed("f-a", url=url), atlas_feed("f-b", url=url)],
+        [atlas_feed("f-a", url=url), atlas_feed("f-b", url=other)],
         [mdb_feed("mdb-1", url=url)],
     )
     found = by_feed_id(records)
@@ -201,16 +208,35 @@ def test_rt_feeds_are_never_url_matched(tmp_path):
 # --- exactness of the URL match ------------------------------------------
 
 
-def test_match_is_exact_scheme_and_slash_sensitive(tmp_path):
-    records, _ = crosswalk.build_records(
-        [
-            atlas_feed("f-http", url="http://example.org/gtfs.zip"),
-            atlas_feed("f-slash", url="https://example.org/gtfs.zip/"),
-        ],
-        [mdb_feed("mdb-1", url="https://example.org/gtfs.zip")],
-    )
-    # http != https, and a trailing slash is a different path: neither matches.
-    assert all(record["source"] != "both" for record in records)
+@pytest.mark.parametrize(
+    "left, right, same",
+    [
+        ("http://example.org/gtfs.zip", "https://example.org/gtfs.zip", True),
+        ("HTTPS://Example.ORG/gtfs.zip", "https://example.org/gtfs.zip", True),
+        ("http://example.org:080/g.zip", "https://example.org:443/g.zip", True),
+        ("http://[::1]:80/g.zip", "https://[::1]/g.zip", True),
+        ("https://example.org/gtfs/?k=1", "https://example.org/gtfs?k=1", True),
+        ("https://example.org/g?k=a", "https://example.org/g?k=b", False),
+        ("https://example.org/GTFS.zip", "https://example.org/gtfs.zip", False),
+        ("https://example.org:8443/g", "https://example.org/g", False),
+        ("http://example.org:443/g", "https://example.org/g", False),
+    ],
+    ids=[
+        "scheme",
+        "case",
+        "default-port",
+        "ipv6-default-port",
+        "trailing-slash",
+        "query",
+        "path-case",
+        "other-port",
+        "port-of-other-scheme",
+    ],
+)
+def test_match_url_compares_urls_up_to_scheme_host_case_port_and_slash(
+    left, right, same
+):
+    assert (crosswalk._match_url(left) == crosswalk._match_url(right)) is same
 
 
 def test_whitespace_differing_urls_do_not_match(tmp_path):
@@ -218,7 +244,7 @@ def test_whitespace_differing_urls_do_not_match(tmp_path):
         [atlas_feed("f-a", url="  https://example.org/gtfs.zip  ")],
         [mdb_feed("mdb-1", url="https://example.org/gtfs.zip")],
     )
-    # url_exact is byte-identical; a whitespace difference is not a match.
+    # A whitespace difference is not a match.
     assert all(record["source"] != "both" for record in records)
 
 
