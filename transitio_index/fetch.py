@@ -90,7 +90,24 @@ def _looks_numeric(host):
 
 
 class FetchError(RuntimeError):
-    """The fetch failed in a way retrying this call cannot fix."""
+    """The fetch failed in a way retrying this call cannot fix.
+
+    ``status`` is the HTTP status that ended it, if one did; ``transport`` is
+    true when a transport failure did (a timeout, a failed or dropped
+    connection), or the breaker's refusal of a host that keeps failing so.
+    :func:`_failure` sets both.
+    """
+
+    status = None
+    transport = False
+
+
+def _failure(message, *, status=None, transport=False):
+    """A :class:`FetchError` with its ``status`` and ``transport``."""
+    error = FetchError(message)
+    error.status = status
+    error.transport = transport
+    return error
 
 
 class RangeUnsupported(FetchError):
@@ -103,6 +120,7 @@ class _Dropped(FetchError):
 
     def __init__(self, error, written, validators):
         super().__init__(error, written, validators)
+        self.transport = True
         self.written = written
         self.validators = validators
 
@@ -219,10 +237,16 @@ def _attempt_error(url, first, last):
     """The error a download ends with: the last attempt's, with the first
     attempt's failure kept in front when it said something different — the
     breaker's refusal or a short body would otherwise hide the transport error
-    that started it."""
+    that started it. The last attempt's status and transport failure carry
+    over."""
+    kind = {
+        "status": getattr(last, "status", None),
+        "transport": isinstance(last, httpx.TransportError)
+        or getattr(last, "transport", False),
+    }
     if first is None or str(first) == str(last):
-        return FetchError(f"GET {url}: {last}")
-    return FetchError(f"GET {url}: {first}; last attempt: {last}")
+        return _failure(f"GET {url}: {last}", **kind)
+    return _failure(f"GET {url}: {first}; last attempt: {last}", **kind)
 
 
 def _refuse_encoding(response, url, *, gzip_ok=False):
@@ -318,9 +342,10 @@ class Fetcher:
         with self._failures_lock:
             failures = len(self._failures.get(host, ()))
         if failures >= self._host_failures:
-            raise FetchError(
+            raise _failure(
                 f"{method} {url}: host {host} unreachable this run "
-                f"({failures} URLs failed consecutively); not tried"
+                f"({failures} URLs failed consecutively); not tried",
+                transport=True,
             )
 
     def _note(self, host, url, *, failed):
@@ -355,7 +380,7 @@ class Fetcher:
                 response = self._client.send(request, stream=stream)
             except httpx.TransportError as error:
                 self._note(host, origin, failed=True)
-                raise FetchError(f"{method} {url}: {error}")
+                raise _failure(f"{method} {url}: {error}", transport=True)
             except (httpx.HTTPError, httpx.InvalidURL, ValueError) as error:
                 # ValueError covers malformed third-party URLs (a bad port,
                 # say) that httpx surfaces outside its own error tree.
@@ -385,7 +410,10 @@ class Fetcher:
         """Size, range support and validators, from a ``HEAD`` probe."""
         _, response = self._hops("HEAD", url, {})
         if response.status_code != 200:
-            raise FetchError(f"HEAD {url}: HTTP {response.status_code}")
+            raise _failure(
+                f"HEAD {url}: HTTP {response.status_code}",
+                status=response.status_code,
+            )
         # An encoded HEAD would describe a different byte representation than
         # the ranges later read.
         _refuse_encoding(response, url)
@@ -429,7 +457,10 @@ class Fetcher:
             if response.status_code == 200:
                 raise RangeUnsupported(f"{url}: server ignored the range request")
             if response.status_code != 206:
-                raise FetchError(f"GET {url}: HTTP {response.status_code} for a range")
+                raise _failure(
+                    f"GET {url}: HTTP {response.status_code} for a range",
+                    status=response.status_code,
+                )
             _refuse_encoding(response, url)
             claimed = _content_range(response)
             if claimed is not None:
@@ -458,7 +489,7 @@ class Fetcher:
                 # A host that answers but stalls mid-body counts like one that
                 # never answered.
                 self._note(host, url, failed=True)
-                raise FetchError(f"GET {url}: {error}")
+                raise _failure(f"GET {url}: {error}", transport=True)
             except httpx.HTTPError as error:
                 raise FetchError(f"GET {url}: {error}")
             else:
@@ -505,7 +536,7 @@ class Fetcher:
         unpinnable resume restarts from zero, as does an encoded body. An
         attempt that adds resumable bytes does not count against
         ``DOWNLOAD_ATTEMPTS``; ``DOWNLOAD_TRIES`` bounds them all. Returns
-        ``status``, ``sha256``, ``bytes`` and the response
+        ``status``, ``sha256``, ``bytes``, the ``content_type`` and the response
         validators (kept from the responses that supplied them, so a resumed
         download still records the validators for the next crawl's
         conditional request).
@@ -520,6 +551,7 @@ class Fetcher:
         digest = hashlib.sha256()
         written = 0
         validators = {}
+        content_type = None
         # A host that answers 406 to identity encoding gets one more chance
         # with gzip; its body is decoded as it streams and never resumed by
         # range (offsets into the encoded body mean nothing to the file).
@@ -557,7 +589,7 @@ class Fetcher:
                     # continues from bytes that were fully accounted for. A
                     # dropped connection keeps what arrived, like a short body.
                     attempt_digest = digest.copy()
-                    last = "body ended early"
+                    last = _failure("body ended early", transport=True)
                     try:
                         outcome = self._stream_once(
                             url,
@@ -614,6 +646,7 @@ class Fetcher:
                         continue
                     before, written = written, outcome["written"]
                     digest = attempt_digest
+                    content_type = outcome.get("content_type") or content_type
                     for key, value in outcome["validators"].items():
                         # A later 206 that omits a validator must not erase the
                         # one the representation was pinned by.
@@ -631,8 +664,12 @@ class Fetcher:
                     elif attempt == DOWNLOAD_ATTEMPTS:
                         raise _attempt_error(url, first_error, last)
                 else:
+                    # Only a dropped or short body leaves bytes to resume, so
+                    # running out of tries is a connection failure too.
                     raise _attempt_error(
-                        url, first_error, "could not complete the download"
+                        url,
+                        first_error,
+                        _failure("could not complete the download", transport=True),
                     )
             directory.replace(partial, name)
             return {
@@ -641,6 +678,7 @@ class Fetcher:
                 "bytes": written,
                 "etag": validators.get("etag"),
                 "last_modified": validators.get("last_modified"),
+                "content_type": content_type,
             }
         finally:
             if handle is not None:
@@ -677,7 +715,9 @@ class Fetcher:
             if written and response.status_code != 206:
                 return {"status": "restart"}
             if response.status_code not in (200, 206):
-                raise FetchError(f"HTTP {response.status_code}")
+                raise _failure(
+                    f"HTTP {response.status_code}", status=response.status_code
+                )
             if response.status_code == 206 and not written:
                 raise FetchError("206 answer to a request without a range")
             gzipped = _refuse_encoding(response, url, gzip_ok=gzip_ok)
@@ -770,4 +810,5 @@ class Fetcher:
             "written": written,
             "complete": complete,
             "validators": validators,
+            "content_type": response.headers.get("Content-Type"),
         }

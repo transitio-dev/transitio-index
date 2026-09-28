@@ -21,7 +21,11 @@ cheap: a feed whose validators match the stored state — and whose cached
 members verify against their recorded digests — is skipped, except when
 ``cache/recrawl_requests.jsonl`` names it, which bypasses the skip so a
 requested complete read cannot be starved by an unchanged ETag. One feed's
-failure of any kind is logged, never fatal to the run.
+failure of any kind is logged, never fatal to the run. A producer link that
+times out, cannot connect, answers 404 or 410, or serves an HTML page is
+retried once from the feed's MDB-hosted copy (``urls.latest``); the state and
+the log record say which was read (``fetched_from``) and keep the producer's
+failure.
 
 ``crawl_log.jsonl`` records, per feed, its catalogue source (mdb, atlas, both
 or systems_csv), the method taken, the bytes fetched, the bytes a range read
@@ -93,6 +97,21 @@ ARCHIVE_FILE = "feed.zip"
 # national aggregate's stop_times.txt runs to several GiB.
 DOWNLOAD_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 
+# Where a crawl read the feed from: its producer URL, or the MDB-hosted copy.
+PRODUCER = "producer"
+HOSTED_COPY = "mdb_latest"
+# The producer answers that say the link is gone, not the feed.
+GONE_STATUSES = (404, 410)
+# A body that is not a zip archive is an HTML page when served as one, or when
+# it opens with markup carrying one of these tags in its first 4 KiB.
+HTML_TYPES = ("text/html", "application/xhtml+xml")
+HTML_TAGS = (b"<!doctype html", b"<html", b"<head", b"<body", b"<title", b"<meta")
+
+
+class HtmlPage(fetch.FetchError):
+    """An HTML page where a zip archive was expected: what a portal serves in
+    place of a file it moved or removed."""
+
 
 def feed_url(feed):
     """The URL to crawl: the Atlas static feed, else the MDB direct download."""
@@ -100,6 +119,19 @@ def feed_url(feed):
     mdb = feed.get("mdb") or {}
     return ((atlas.get("urls") or {}).get("static_current")) or (
         (mdb.get("urls") or {}).get("direct_download")
+    )
+
+
+def _hosted_url(feed):
+    """The feed's MDB-hosted copy (``urls.latest``), or None."""
+    return ((feed.get("mdb") or {}).get("urls") or {}).get("latest")
+
+
+def _link_failed(error):
+    """Whether a producer failure is the link's rather than the feed's: a
+    timeout or failed connection, an HTTP 404 or 410, or an HTML page."""
+    return isinstance(error, fetch.FetchError) and (
+        error.transport or error.status in GONE_STATUSES or isinstance(error, HtmlPage)
     )
 
 
@@ -444,12 +476,18 @@ def _identity_fields(feed_dir, members):
     return {"identity": found, "identity_version": fingerprint.IDENTITY_VERSION}
 
 
-def _backfill_identity(feed_dir, state):
-    """Give a reused state the content identity it predates; its members
-    were verified against it just before."""
+def _backfill_state(feed_dir, state):
+    """Give a reused state the content identity and source record it
+    predates; its members were verified against it just before. A state
+    without ``fetched_from`` was read from the producer, the only URL crawled
+    before the hosted copy was."""
+    missing = {}
+    if "fetched_from" not in state:
+        missing.update(fetched_from=PRODUCER, producer_failure=None)
     if state.get("identity_version") != fingerprint.IDENTITY_VERSION:
-        members = state.get("members") or []
-        _write_state(feed_dir, {**state, **_identity_fields(feed_dir, members)})
+        missing.update(_identity_fields(feed_dir, state.get("members") or []))
+    if missing:
+        _write_state(feed_dir, {**state, **missing})
 
 
 def _members_intact(feed_dir, state):
@@ -673,6 +711,22 @@ def _open_archive(stack, feed_dir, name):
     return zipfile.ZipFile(opened)
 
 
+def _html_page(feed_dir, content_type):
+    """Whether the downloaded file, which is not a zip archive, is an HTML
+    page: served as one, or opening like one (:data:`HTML_TAGS`)."""
+    if (content_type or "").partition(";")[0].strip().lower() in HTML_TYPES:
+        return True
+    try:
+        with os.fdopen(
+            store.open_nofollow(feed_dir.path / ARCHIVE_FILE), "rb"
+        ) as opened:
+            head = opened.read(4096)
+    except OSError:
+        return False
+    head = head.lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return head.startswith(b"<") and any(tag in head for tag in HTML_TAGS)
+
+
 def _extract_members(feed_dir, decide, fragment=None):
     """Extract the members from the downloaded archive, streamed and bounded.
 
@@ -726,15 +780,56 @@ def _extract_members(feed_dir, decide, fragment=None):
 
 
 def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
-    """Crawl one feed; returns its log record (never raises)."""
+    """Crawl one feed; returns its log record (never raises).
+
+    The producer URL is read first. When it fails the way a dead, moved or
+    unreachable link does (:func:`_link_failed`), the MDB-hosted copy is read
+    once in its place; the record keeps the producer URL and its failure.
+    """
+    options = {"force": force, "range_threshold": range_threshold, "lookup": lookup}
+    record, error = _crawl_from(fetcher, cache_dir, feed, feed_url(feed), **options)
+    hosted = _hosted_url(feed)
+    if not _link_failed(error) or not hosted or hosted == record["url"]:
+        return record
+    retry, _ = _crawl_from(
+        fetcher,
+        cache_dir,
+        feed,
+        hosted,
+        fetched_from=HOSTED_COPY,
+        producer_failure=record["fallback_reason"],
+        **options,
+    )
+    retry["url"] = record["url"]
+    retry["bytes_fetched"] += record["bytes_fetched"]
+    return retry
+
+
+def _crawl_from(
+    fetcher,
+    cache_dir,
+    feed,
+    url,
+    *,
+    fetched_from=PRODUCER,
+    producer_failure=None,
+    force,
+    range_threshold,
+    lookup,
+):
+    """Crawl one feed from ``url``; returns ``(log record, the error that
+    failed it or None)``, never raises. ``fetched_from`` and
+    ``producer_failure`` are recorded in the state it writes."""
     feed_id = feed["feed_id"]
-    url = feed_url(feed)
     record = {
         "feed_id": feed_id,
         "source": feed.get("source"),
         "url": url,
         "directory": _dir_name(feed_id),
         "method": None,
+        # Where this crawl read the feed from; None when it read nothing.
+        "fetched_from": None,
+        "producer_failure": producer_failure,
         "bytes_fetched": 0,
         "bytes_saved": 0,
         "fallback_reason": None,
@@ -746,7 +841,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
     if not url:
         record["method"] = "skipped"
         record["fallback_reason"] = "no download URL"
-        return record
+        return record, None
 
     feed_dir = None
     state = None
@@ -787,12 +882,13 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 and manifest is not None
                 and _cache_reusable(feed_dir, state, url, force, lookup)
             ):
-                _backfill_identity(feed_dir, state)
+                _backfill_state(feed_dir, state)
                 record["method"] = "not_modified"
+                record["fetched_from"] = fetched_from
                 record["members"] = sorted(state.get("members") or [])
                 record["files"] = manifest
                 record["stop_times"] = (state.get("stop_times") or {}).get("state")
-                return record
+                return record, None
 
         digests = None
         files = []
@@ -856,16 +952,21 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 last_modified=conditional.get("last_modified"),
             )
             if outcome["status"] == "not_modified":
-                _backfill_identity(feed_dir, state)
+                _backfill_state(feed_dir, state)
                 record["method"] = "not_modified"
+                record["fetched_from"] = fetched_from
                 record["members"] = sorted(state.get("members") or [])
                 record["files"] = manifest
                 record["stop_times"] = (state.get("stop_times") or {}).get("state")
-                return record
+                return record, None
             try:
                 digests, files, skipped, skip_reason = _extract_members(
                     feed_dir, decide, fragment
                 )
+            except zipfile.BadZipFile:
+                if _html_page(feed_dir, outcome.get("content_type")):
+                    raise HtmlPage(f"GET {url}: an HTML page, not a zip archive")
+                raise
             finally:
                 # Never leave the archive behind, extraction failures included.
                 store.unlink(feed_dir, ARCHIVE_FILE)
@@ -877,6 +978,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
             }
 
         _prune_members(feed_dir, digests)
+        record["fetched_from"] = fetched_from
         record["members"] = sorted(digests)
         record["files"] = files
         record["fallback_reason"] = fallback_reason
@@ -890,7 +992,11 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
             feed_dir,
             {
                 "feed_id": feed_id,
+                # The URL the validators belong to: the producer's, or the
+                # hosted copy's when that was read.
                 "url": url,
+                "fetched_from": fetched_from,
+                "producer_failure": producer_failure,
                 "etag": validators.get("etag"),
                 "last_modified": validators.get("last_modified"),
                 # Whole downloads digest the archive bytes that arrived; a
@@ -919,7 +1025,7 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
                 **_identity_fields(feed_dir, digests),
             },
         )
-        return record
+        return record, None
     except (
         fetch.FetchError,
         ziprange.RangeReadError,
@@ -941,11 +1047,11 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
         record["method"] = "failed"
         record["fallback_reason"] = str(error)
         # The previous crawl still stands in for the feed: give it the
-        # identity it predates when its members still verify.
+        # identity and source record it predates when its members verify.
         if feed_dir is not None and state and _members_intact(feed_dir, state):
             with contextlib.suppress(OSError, RuntimeError):
-                _backfill_identity(feed_dir, state)
-        return record
+                _backfill_state(feed_dir, state)
+        return record, error
     finally:
         record["bytes_fetched"] = fetcher.bytes_fetched - fetched_before
         if feed_dir is not None:
@@ -973,6 +1079,8 @@ def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup)
             "url": feed_url(feed),
             "directory": _dir_name(feed["feed_id"]),
             "method": "skipped",
+            "fetched_from": None,
+            "producer_failure": None,
             "bytes_fetched": 0,
             "bytes_saved": 0,
             "fallback_reason": f"unexpected error: {error}",

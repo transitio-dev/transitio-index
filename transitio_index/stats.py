@@ -30,7 +30,7 @@ from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host
 
 STATS_POINTER = "stats.json"
 # The shape of the stats artifacts; the aggregation script refuses a mismatch.
-STATS_SCHEMA_VERSION = 3  # 2: the realtime section; 3: validity
+STATS_SCHEMA_VERSION = 4  # 2: the realtime section; 3: validity; 4: hosted copies
 # A partition of the published index: a country code, international or links.
 PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 # The tables a partition kind may carry; a country partition any of them.
@@ -524,6 +524,8 @@ FEED_SCHEMA = pa.schema(
         ("catalogue_status", pa.string()),
         ("crawl_outcome", pa.string()),
         ("failure_class", pa.string()),
+        # The producer link's host when the crawl read the MDB-hosted copy.
+        ("hosted_copy_host", pa.string()),
         ("stop_count", pa.int64()),
         ("route_count", pa.int64()),
         ("has_calendar", pa.bool_()),
@@ -662,7 +664,7 @@ def feed_rows(
     """One row per index feed from the published tables, the crawl log
     (keyed by the crawl-time id or an alias), the seed placements and the
     catalogue statuses."""
-    from transitio_index import classify, coverage
+    from transitio_index import classify, coverage, crawl
 
     canonical = coverage._canonical_ids(feeds)
     log = {}
@@ -705,6 +707,11 @@ def feed_rows(
                 "failure_class": (
                     failure_class(record.get("fallback_reason"))
                     if record and record.get("method") == "failed"
+                    else None
+                ),
+                "hosted_copy_host": (
+                    _host(record.get("url"))
+                    if record and record.get("fetched_from") == crawl.HOSTED_COPY
                     else None
                 ),
                 "stop_count": feed.get("stop_count"),
@@ -848,9 +855,12 @@ def feed_sections(rows):
     observed country agreement; the declared-municipality outcomes."""
 
     def counts(key, subset=None):
+        # An archived row written before a column existed counts nothing.
         return dict(
             collections.Counter(
-                r[key] for r in (subset if subset is not None else rows) if r[key]
+                r.get(key)
+                for r in (subset if subset is not None else rows)
+                if r.get(key)
             )
         )
 
@@ -864,6 +874,7 @@ def feed_sections(rows):
             "crawled": len(crawled),
             "by_outcome": counts("crawl_outcome"),
             "failures_by_class": counts("failure_class"),
+            "hosted_copy_by_host": counts("hosted_copy_host"),
             "outcome_by_catalogue_status": {
                 status: dict(c) for status, c in sorted(by_status.items())
             },
@@ -1032,7 +1043,9 @@ DEFINITIONS = {
     ),
     "availability": (
         "Crawl outcomes per feed, the failure classes from the fetcher's "
-        "recorded reason, and outcomes by the row's catalogue status."
+        "recorded reason, the feeds read from the MDB-hosted copy by the host "
+        "of the producer link that failed, and outcomes by the row's "
+        "catalogue status."
     ),
     "licensing": "Licence declarations and the redistribution judgement per feed.",
     "validity": (
