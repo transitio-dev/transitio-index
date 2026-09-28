@@ -106,7 +106,8 @@ matching registry together.
 10. `rank` — give every edge its relevance: a category from its tier (local
     is primary, regional secondary, national tertiary, international stays
     international), a score within that category, and whether it crosses a
-    border.
+    border. A feed whose service ended more than 30 days before it was
+    crawled scores 0, so it lists last in its category.
 11. `prune` — drop the places that no kept edge needs.
 12. `license` — record each shipped feed's licence and lineage, and write the
     NOTICE.
