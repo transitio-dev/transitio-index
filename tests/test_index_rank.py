@@ -110,6 +110,47 @@ def test_relevance_is_scored_per_pair_and_category_follows_the_tier():
     assert set(report["relevance_by_kind"]) == {"city", "region", "country"}
 
 
+def test_a_feed_stale_when_indexed_sorts_last_and_keeps_its_tiers():
+    # Crawled 2026-09-13: an end 30 days before is still ranked, 31 is stale.
+    feeds = [
+        {
+            "feed_id": feed_id,
+            "home_country": "FI",
+            "country_stops": {"FI": 10},
+            "service_start": "2021-01-01",
+            "service_end": end,
+            "last_crawled": "2026-09-13T08:00:00+00:00",
+        }
+        for feed_id, end in (
+            ("current", "2026-12-31"),
+            ("boundary", "2026-08-14"),
+            ("stale", "2026-08-13"),
+        )
+    ]
+    edges = [
+        _edge("current", "c1", "local", 10, 50.0),
+        _edge("boundary", "c1", "local", 10, 50.0),
+        _edge("stale", "c1", "local", 10, 50.0),
+        _edge("stale", "c1", "regional", 10, 50.0),
+    ]
+    ranked, _ = rank.rank_edges(edges, feeds, PLACES)
+    primary = sorted(
+        (e for e in ranked if e["relevance_category"] == "primary"),
+        key=lambda e: -e["relevance"],
+    )
+    assert [e["feed_id"] for e in primary][-1] == "stale"
+    assert primary[0]["relevance"] == primary[1]["relevance"] > 0.0
+    assert all("stale_when_indexed" not in e["evidence"] for e in primary[:2])
+    stale = {e["tier"]: e for e in ranked if e["feed_id"] == "stale"}
+    assert {t: e["relevance_category"] for t, e in stale.items()} == {
+        "local": "primary",
+        "regional": "secondary",
+    }
+    for edge in stale.values():
+        assert edge["relevance"] == 0.0
+        assert edge["evidence"]["stale_when_indexed"] == "2026-08-13"
+
+
 def test_inconsistent_inputs_are_refused():
     edges = [
         _edge("bus", "c1", "local", 5, 1.0),

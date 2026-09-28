@@ -17,8 +17,12 @@ of the place lacks a crawled calendar — one basis per place, recorded as
 ``share_basis``) over the place total; ``share_of_feed`` is the pair's stops
 over the feed's stops in its home country (all its countries when it has no
 home). For country places ``share_of_feed`` is replaced by breadth: the
-cities the feed serves in the country over all served cities there. The
-weights live here and nothing else in the pipeline reads them.
+cities the feed serves in the country over all served cities there. A feed
+stale when indexed — its ``service_end`` more than ``STALE_DAYS`` before its
+``last_crawled`` — scores 0 on every edge, so it sorts last in its category
+with its tier and category unchanged; the edge's evidence records that
+``service_end`` as ``stale_when_indexed``. The weights live here and nothing
+else in the pipeline reads them.
 """
 
 import collections
@@ -26,7 +30,7 @@ import contextlib
 import datetime
 import statistics
 
-from transitio_index import classify, store
+from transitio_index import classify, publish, store
 
 RANK_POINTER = classify.RANK_POINTER
 EDGES_ARTIFACT = classify.RANKED_EDGES_ARTIFACT
@@ -34,6 +38,7 @@ FEEDS_ARTIFACT = classify.RANKED_FEEDS_ARTIFACT
 
 W_PLACE = 0.7
 W_FEED = 0.3
+STALE_DAYS = 30
 CATEGORY_BY_TIER = {
     "local": "primary",
     "regional": "secondary",
@@ -54,18 +59,34 @@ def _pair_value(service, basis):
     return float(value or 0.0)
 
 
+def _stale_when_indexed(feed):
+    """The feed's ``service_end`` as an ISO date when it is more than
+    ``STALE_DAYS`` before its ``last_crawled``, else None."""
+    span = publish.service_span(feed)
+    crawled = feed.get("last_crawled")
+    if span is None or not isinstance(crawled, str):
+        return None
+    try:
+        day = datetime.datetime.fromisoformat(crawled).date()
+    except ValueError:
+        return None
+    return span[1].isoformat() if (day - span[1]).days > STALE_DAYS else None
+
+
 def rank_edges(edges, feeds, places):
     """The edges with their relevance fields, and the stage report.
 
     ``places`` maps place ids to expanded place rows (``kind``,
     ``country_code``); ``feeds`` are the curated feed rows with classify's
-    ``home_country`` and ``country_stops``.
+    ``home_country``, ``country_stops`` and service span, and coverage's
+    ``last_crawled``.
     """
     feed_by_id = {}
     for feed in feeds:
         if feed["feed_id"] in feed_by_id:
             raise RankError(f"duplicate feed {feed['feed_id']!r}")
         feed_by_id[feed["feed_id"]] = feed
+    stale = {feed_id: _stale_when_indexed(f) for feed_id, f in feed_by_id.items()}
     pairs = {}
     for edge in edges:
         key = (edge["feed_id"], edge["place_id"])
@@ -134,8 +155,13 @@ def rank_edges(edges, feeds, places):
                 else 0.0
             )
             evidence["breadth"] = second
+        ended = stale[edge["feed_id"]]
+        if ended is not None:
+            evidence["stale_when_indexed"] = ended
         relevance = (
-            0.0 if category == "unknown" else W_PLACE * share_of_place + W_FEED * second
+            0.0
+            if category == "unknown" or ended is not None
+            else W_PLACE * share_of_place + W_FEED * second
         )
         crossing = home is None or country != home
         cross_border += crossing
