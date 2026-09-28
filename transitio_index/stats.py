@@ -26,7 +26,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from transitio_index import store
-from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host
+from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host, _mint_mdb
 
 STATS_POINTER = "stats.json"
 # The shape of the stats artifacts; the aggregation script refuses a mismatch.
@@ -196,8 +196,13 @@ def catalogue_rows(raw, feeds, snapshot_id=None, systems=()):
     """One row per catalogue row of ``raw`` (``{source: records}``), with the
     index feed it became, or the reason it did not. ``systems`` are the GBFS
     records the crosswalk kept apart: a system it resolved is ``not_transit``,
-    one it could not tell apart ``ambiguous_id``; neither is a feed."""
+    one it could not tell apart ``ambiguous_id``; neither is a feed. A
+    deprecated MDB row the crosswalk folded into its successor, whose feed
+    keeps the row's minted id as an alias, is ``folded``."""
     lookup = _feed_lookup(feeds, systems)
+    # Every id a feed answers to: a folded row's mint is among them.
+    names = {feed["feed_id"] for feed in feeds}
+    names.update(alias for feed in feeds for alias in feed.get("aliases") or ())
     mdb = raw.get("mdb") or []
     status_by_id = {record["mdb_id"]: record.get("status") for record in mdb}
     gbfs = raw.get("gbfs") or []
@@ -207,6 +212,8 @@ def catalogue_rows(raw, feeds, snapshot_id=None, systems=()):
     for record in mdb:
         row = _mdb_row(record, status_by_id)
         row["feed_id"] = lookup.get(("mdb", record["mdb_id"]))
+        if row["feed_id"] is None and _mint_mdb(record["mdb_id"]) in names:
+            row["drop_reason"] = "folded"
         rows.append(row)
     for record in raw.get("atlas") or []:
         row = _atlas_row(record)

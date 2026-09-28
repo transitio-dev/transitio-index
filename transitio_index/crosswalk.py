@@ -19,7 +19,9 @@ stage uses to propagate that feed's places.
 
 Identity follows decision L: ``feed_id`` is the Onestop ID where one exists,
 else a minted ``f-mdb-<mdb_id>``. A record keeps the contributing source rows
-verbatim under ``atlas`` / ``mdb`` so nothing downstream must re-read raw.
+verbatim under ``atlas`` / ``mdb`` so nothing downstream must re-read raw. A
+deprecated MDB row that redirects to a live row of the ingest is no feed of its
+own: it is folded into that row's record, which keeps its minted id as an alias.
 """
 
 import collections
@@ -586,6 +588,53 @@ def _mdb_record(feed):
     }
 
 
+def _live_successor(feed, by_id):
+    """The first row that is not deprecated along ``feed``'s redirects, or None.
+
+    Only a single redirect is followed: a row naming several has no one
+    successor. A cycle, a redirect outside the ingest or one to a row of
+    another spec reaches no live row.
+    """
+    seen = set()
+    while feed.get("status") == "deprecated":
+        targets = set(feed.get("redirect_ids") or ())
+        if len(targets) != 1:
+            return None
+        seen.add(feed["mdb_id"])
+        (target,) = targets
+        if target in seen or by_id.get(target, {}).get("spec") != feed["spec"]:
+            return None
+        feed = by_id[target]
+    return feed
+
+
+def _successors(mdb_feeds):
+    """``{mdb_id: live mdb_id}`` for every deprecated row with a live
+    successor, in ingest order. Every deprecated row on a chain folds into the
+    live row that ends it."""
+    by_id = {feed["mdb_id"]: feed for feed in mdb_feeds}
+    successors = {}
+    for feed in mdb_feeds:
+        if feed.get("status") != "deprecated":
+            continue
+        live = _live_successor(feed, by_id)
+        if live is not None:
+            successors[feed["mdb_id"]] = live["mdb_id"]
+    return successors
+
+
+def _fold_aliases(records, successors):
+    """Each folded row's minted id, as an alias of its successor's record, so
+    an override filed against the old id still finds the feed. A mint the
+    record already carries is not repeated."""
+    by_mdb_id = {record["mdb_id"]: record for record in records if record["mdb_id"]}
+    for mdb_id, live in successors.items():
+        record = by_mdb_id[live]
+        minted = _mint_mdb(mdb_id)
+        if minted != record["feed_id"] and minted not in record["aliases"]:
+            record["aliases"].append(minted)
+
+
 # GBFS: a systems.csv system is the same feed as the Atlas GBFS feed advertising
 # the same auto-discovery URL; a system no Atlas feed carries is minted f-gbfs-*.
 GBFS_DISCOVERY_URL = "gbfs_auto_discovery"
@@ -825,11 +874,14 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
     GBFS systems are linked to their Atlas feed by auto-discovery URL and minted
     ``f-gbfs-*`` where no Atlas feed carries them. Returns ``(records,
     summary)``; every feed appears exactly once, a matched pair as one ``both``
-    record. ``summary`` also carries ``provisional_links`` — the ambiguous
-    same-host candidates a human must adjudicate.
+    record, and a deprecated MDB row with a live successor only as an alias of
+    that row's record. ``summary`` also carries ``provisional_links`` — the
+    ambiguous same-host candidates a human must adjudicate.
     """
     _require_unique_ids(atlas_feeds, "onestop_id", "atlas feed")
     _require_unique_ids(mdb_feeds, "mdb_id", "mdb feed")
+    successors = _successors(mdb_feeds)
+    mdb_feeds = [feed for feed in mdb_feeds if feed["mdb_id"] not in successors]
 
     url_pairs = _url_exact_pairs(atlas_feeds, mdb_feeds)
     matched_onestop = {atlas_feed["onestop_id"] for atlas_feed, _ in url_pairs}
@@ -913,6 +965,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
             skipped_orphans.append(system["system_id"])
             continue
         records.append(_gbfs_system_record(system, minted))
+    _fold_aliases(records, successors)
     _require_unique_namespace(records)
     rt_static_links = _apply_static_links(records, atlas_feeds, operators)
 
@@ -935,6 +988,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         "same_host_candidates": same_host_candidates,
         "same_host_pairs": len(name_pairs),
         "geohash_pairs": len(geohash_pairs),
+        "mdb_folded": len(successors),
         "gbfs_linked": len(gbfs_pairs),
         "gbfs_minted": len(orphan_systems) - len(skipped_orphans),
         "gbfs_skipped": len(skipped_orphans),

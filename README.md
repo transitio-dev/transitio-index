@@ -86,8 +86,10 @@ matching registry together.
    Atlas archive, the Mobility Database `feeds_v2.csv` and the GBFS
    `systems.csv`.
 2. `crosswalk` — match the same feed across the Transitland Atlas and the
-   Mobility Database into one de-duplicated table. The GBFS systems go to a
-   table of their own, which the index does not publish.
+   Mobility Database into one de-duplicated table. A deprecated Mobility
+   Database row that redirects to a live row becomes an alias of that feed.
+   The GBFS systems go to a table of their own, which the index does not
+   publish.
 3. `gazetteer` — resolve Overture administrative divisions to Wikidata QIDs,
    seed the cities the feeds declare, attach metros, boundary geometry and
    names, and mint the place registry.
