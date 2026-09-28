@@ -539,25 +539,50 @@ def _stops(count, first=0):
     return [f"s{i},1.{i:03d},10.0\n" for i in range(first, first + count)]
 
 
-ROUTES = b"route_id,route_type,route_short_name\nr1,3,1\nr2,3,2\n"
+def _routes(count):
+    return b"route_id,route_type,route_short_name\n" + b"".join(
+        f"r{i},3,{i}\n".encode() for i in range(1, count + 1)
+    )
+
+
+ROUTES = _routes(2)
+LINES = _routes(24)
+# 50 stops, 41 (82%) of them among the large feed's.
+PLATFORMS = _stops(41) + _stops(9, first=900)
+BY_SHARE = {"f-small": {"f-large": "share"}}
 
 
 @pytest.mark.parametrize(
-    "small, large, routes, contained",
+    "small, small_routes, large, routes, contained",
     [
-        (_stops(3), _stops(5), ROUTES, {"f-small": ["f-large"]}),
-        (_stops(3), _stops(5), b"route_id,route_type,route_short_name\nr1,3,9\n", {}),
-        (_stops(3), _stops(4), ROUTES, {}),
-        (_stops(3, first=3), _stops(5), ROUTES, {}),
+        (_stops(3), ROUTES, _stops(5), ROUTES, BY_SHARE),
+        (_stops(3), ROUTES, _stops(5), _routes(0) + b"r1,3,9\n", {}),
+        (_stops(3), ROUTES, _stops(4), ROUTES, {}),
+        (_stops(3, first=3), ROUTES, _stops(5), ROUTES, {}),
         # A route type int() cannot read is one row skipped, not every route.
-        (_stops(3), _stops(5), ROUTES + "r9,²,9\n".encode(), {"f-small": ["f-large"]}),
+        (_stops(3), ROUTES, _stops(5), ROUTES + "r9,²,9\n".encode(), BY_SHARE),
+        # Every route carried by a feed eight times the size.
+        (PLATFORMS, LINES, _stops(400), LINES, {"f-small": {"f-large": "routes"}}),
+        (PLATFORMS, LINES, _stops(400), _routes(23), {}),
+        (PLATFORMS, LINES, _stops(100), LINES, {}),
+        (PLATFORMS, _routes(4), _stops(400), LINES, {}),
     ],
-    ids=["contained", "other-routes", "similar-size", "stops-elsewhere", "odd-type"],
+    ids=[
+        "contained",
+        "other-routes",
+        "similar-size",
+        "stops-elsewhere",
+        "odd-type",
+        "routes-carried",
+        "route-missing",
+        "twice-the-size",
+        "four-routes",
+    ],
 )
 def test_a_feed_records_the_larger_feeds_containing_it(
-    tmp_path, small, large, routes, contained
+    tmp_path, small, small_routes, large, routes, contained
 ):
-    # The large feed runs the small one's routes (r1, r2) and more.
+    # The large feed runs the small one's routes and more.
     feeds = [_feed("f-small"), _feed("f-large")]
     manifest, covered, _ = _cover(
         tmp_path,
@@ -565,16 +590,17 @@ def test_a_feed_records_the_larger_feeds_containing_it(
         placements=[],
         crawls={"f-small": small, "f-large": large},
         members={
-            "f-small": {"routes.txt": ROUTES},
-            "f-large": {"routes.txt": routes + b"r3,0,3\n"},
+            "f-small": {"routes.txt": small_routes},
+            "f-large": {"routes.txt": routes + b"r0,0,0\n"},
         },
         lookup=LOOKUP,
     )
     assert {f: covered[f]["contained_in"] for f in covered} == {
-        "f-small": contained.get("f-small", []),
+        "f-small": sorted(contained.get("f-small", {})),
         "f-large": [],
     }
     assert manifest["feeds_contained"] == len(contained)
+    assert manifest["containment_rules"] == contained
 
 
 def test_a_crawl_that_changed_after_expansion_is_refused(tmp_path):
