@@ -1164,3 +1164,27 @@ def test_the_crawl_log_records_source_even_when_a_feed_errors(tmp_path, monkeypa
     _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_members()), '"v1"')}))
     assert log["f-a"]["method"] == "skipped"
     assert log["f-a"]["source"] == "atlas"
+
+
+@pytest.mark.parametrize(
+    "data, rows",
+    [
+        pytest.param(
+            b"id,end_date   \nr1,20261011   \n",
+            [{"id": "r1", "end_date": "20261011   "}],
+            id="trailing",
+        ),
+        pytest.param(
+            b"id, name, type\nr1,a,3\n",
+            [{"id": "r1", "name": "a", "type": "3"}],
+            id="leading",
+        ),
+        pytest.param(b"\xef\xbb\xbf id ,x\n1,2\n", [{"id": "1", "x": "2"}], id="bom"),
+        pytest.param(b"a, a\n1,2\n", [{"a": "1", "": "2"}], id="repeated"),
+        pytest.param(b"id,name\n", [], id="header-only"),
+    ],
+)
+def test_member_rows_trims_header_names_and_keeps_values(data, rows):
+    opened = io.BytesIO(data)
+    assert list(crawl.member_rows(opened)) == rows
+    opened.seek(0)

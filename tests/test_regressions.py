@@ -25,6 +25,7 @@ from transitio_index import (  # noqa: E402
     boundaries,
     classify,
     coverage,
+    crawl,
     crosswalk,
     fetch,
     geometry,
@@ -1190,3 +1191,77 @@ def test_the_merge_rescores_relevance_over_the_merged_edges(tmp_path):
         "share_basis_by_place": {"departures": 4, "stops": 1},
         "no_share_of_feed": 1,
     }
+
+
+def _padded(text, width=150):
+    """Every line of ``text`` padded with trailing spaces, as Renfe writes."""
+    return "".join(line + " " * width + "\n" for line in text.splitlines()).encode()
+
+
+_CALENDAR = (
+    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+    "start_date,end_date\ns1,1,1,1,1,1,1,1,20260929,20261011\n"
+)
+_CALENDAR_DATES = "service_id,date,exception_type\ns1,20261001,2\n"
+_ROUTES = "route_id,agency_id,route_type\nr1,a,3\nr2,a,0\n"
+_STOPS = "stop_id,stop_lat,stop_lon\ns1,40.4,-3.7\ns2,40.5,-3.6\n"
+
+
+@pytest.mark.parametrize(
+    "read, members",
+    [
+        pytest.param(
+            lambda calendar, dates: classify._read_calendar(calendar, dates),
+            (_CALENDAR, _CALENDAR_DATES),
+            id="calendar",
+        ),
+        pytest.param(classify._read_routes, (_ROUTES,), id="routes"),
+        pytest.param(crawl.stop_rows, (_STOPS,), id="stops"),
+    ],
+)
+def test_a_padded_member_reads_as_the_clean_one(read, members):
+    """Renfe pads every line, headers included, so the last column's
+    name carried the padding and every calendar row lost its end_date."""
+    import io
+
+    clean = read(*(io.BytesIO(m.encode()) for m in members))
+    assert read(*(io.BytesIO(_padded(m)) for m in members)) == clean
+    if members[0] == _CALENDAR:
+        active, _, span = clean
+        assert active == {"s1": 12}
+        assert [d.isoformat() for d in span] == ["2026-09-29", "2026-10-11"]
+
+
+def test_a_feed_with_spaced_header_names_keeps_its_fingerprint():
+    """Metra writes a space after each comma of its header rows, so no
+    stop coordinate parsed and the feed had no edge."""
+    import io
+
+    from transitio.index import fingerprint
+
+    trips = "route_id,service_id,trip_id\nr1,s1,t1\nr2,s1,t2\n"
+    stop_times = (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:00:00,08:00:00,s1,1\nt1,08:10:00,08:10:00,s2,2\n"
+        "t2,09:00:00,09:00:00,s2,1\nt2,09:05:00,09:05:00,s1,2\n"
+    )
+
+    def digest(spaced):
+        def member(text):
+            header, _, rest = text.partition("\n")
+            return io.BytesIO(
+                (
+                    (header.replace(",", ", ") if spaced else header) + "\n" + rest
+                ).encode()
+            )
+
+        routes, _ = classify._read_routes(member(_ROUTES))
+        rows, _ = crawl.stop_rows(member(_STOPS))
+        coords = {stop_id: (x, y) for stop_id, x, y in rows}
+        trip_routes, trip_services, _ = classify._read_trips(member(trips), routes)
+        stops = classify._read_stop_times(
+            member(stop_times), trip_routes, trip_services
+        )[0]
+        return fingerprint.compute("route_stops", routes, coords, stops)
+
+    assert digest(spaced=True) == digest(spaced=False)
