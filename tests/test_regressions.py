@@ -1090,3 +1090,103 @@ def test_a_failed_refetch_keeping_its_crawl_gets_that_crawl_identity(tmp_path):
     _, log = crt._crawl(cache, crt._server({}))
     assert log["f-a"]["method"] == "failed"
     assert json.loads(path.read_text())["identity"] == identity
+
+
+def test_the_merge_rescores_relevance_over_the_merged_edges(tmp_path):
+    """CT-21: the merge kept each edge's relevance from the build that won its
+    feed, so a feed alone at Paris in one build kept 0.7 for its place share
+    and outranked Paris's main feed from another build."""
+    import json
+
+    from builds_fixture import BOX, _feed7, _place, _run
+
+    from transitio_index import builds, merge, rank
+
+    def edge(place, feed, tier, stops, departures, evidence, relevance, category=None):
+        service = {"stops": stops}
+        if departures is not None:
+            service["departures_per_day"] = departures
+        return {
+            "place_id": place,
+            "feed_id": feed,
+            "tier": tier,
+            "service": json.dumps(service),
+            "evidence": json.dumps(evidence),
+            "needs_review": False,
+            "relevance_category": category or rank.CATEGORY_BY_TIER[tier],
+            "relevance": relevance,
+            "cross_border": False,
+        }
+
+    places = [
+        _place(*row, country="FR")
+        for row in (
+            ("fr", "country", "France", None, BOX(-5, 42, 8, 51)),
+            ("ara", "region", "Rhône", "fr", BOX(4, 44, 7, 46.5)),
+            ("par", "city", "Paris", "fr", BOX(2.2, 48.8, 2.5, 48.9)),
+            ("mrs", "city", "Marseille", "fr", BOX(5.3, 43.2, 5.5, 43.4)),
+            ("lyo", "city", "Lyon", "ara", BOX(4.8, 45.7, 4.9, 45.8)),
+        )
+    ]
+    older = [
+        ("par", "x", "local", 4, 4.5, {"share_of_feed": 0.0002}, 0.7 + 0.3 * 0.0002),
+        # A place filed under another kind in this build.
+        ("mrs", "x", "local", 5, None, {"breadth": 1.0}, 1.0),
+        ("fr", "x", "national", 9, 4.5, {"breadth": 1.0}, 1.0),
+    ]
+    stale = {"share_of_feed": 0.9, "stale_when_indexed": "2026-01-31"}
+    newer = [
+        ("par", "y", "local", 400, 15614, {"share_of_feed": 0.5}, 0.85),
+        ("mrs", "y", "local", 20, 100, {"share_of_feed": 0.05}, 0.715),
+        ("lyo", "z", "local", 30, 50, {"share_of_feed": 0.4}, 0.82),
+        ("ara", "s", "regional", 3, 2, stale, 0.0),
+        ("ara", "z", "unknown", 1, 1, {"share_of_feed": 0.1}, 0.3, "primary"),
+    ]
+    sources = []
+    for label, digit, feeds, rows, day in (
+        ("atlas1", 1, ["x"], older, 10),
+        ("mdb", 2, ["y", "z", "s"], newer, 15),
+    ):
+        run = _run(
+            tmp_path,
+            label,
+            digit,
+            places=places,
+            feeds=[_feed7(f, f, "FR", "domestic") for f in feeds],
+            edges={"FR": [edge(*row) for row in rows]},
+            built_at=f"2026-09-{day}T00:00:00+00:00",
+        )
+        snapshot, _, tables = builds.load_tables(tmp_path / run / "index")
+        sources.append((run, snapshot, tables))
+    snapshot, tables = merge.merge_tables(sources)
+    edges = {
+        (e["place_id"], e["feed_id"]): {**e, "evidence": json.loads(e["evidence"])}
+        for e in tables["edges.parquet"].to_pylist()
+    }
+    paris = 4.5 + 15614
+    assert edges["par", "x"]["relevance"] == pytest.approx(
+        0.7 * 4.5 / paris + 0.3 * 0.0002
+    )
+    assert edges["par", "y"]["relevance"] == pytest.approx(
+        0.7 * 15614 / paris + 0.3 * 0.5
+    )
+    # One pair without departures puts the whole place on stops.
+    for feed, share in (("x", 5 / 25), ("y", 20 / 25)):
+        assert edges["mrs", feed]["evidence"]["share_basis"] == "stops"
+        assert edges["mrs", feed]["evidence"]["share_of_place"] == pytest.approx(share)
+    assert edges["mrs", "x"]["relevance"] == pytest.approx(0.7 * 5 / 25)
+    assert edges["mrs", "x"]["evidence"]["relevance_note"] == "no_share_of_feed"
+    assert edges["lyo", "z"]["relevance"] == pytest.approx(0.82)
+    assert edges["fr", "x"]["evidence"]["breadth"] == pytest.approx(2 / 3)
+    assert edges["fr", "x"]["relevance"] == pytest.approx(0.7 + 0.3 * 2 / 3)
+    assert edges["ara", "s"]["relevance"] == 0.0
+    assert edges["ara", "s"]["evidence"]["stale_when_indexed"] == "2026-01-31"
+    unknown = edges["ara", "z"]
+    assert (unknown["relevance_category"], unknown["relevance"]) == ("unknown", 0.0)
+    assert unknown["needs_review"] is True
+    assert snapshot["relevance"] == {
+        "edges": 8,
+        "changed": 6,
+        "share_basis_by_place": {"departures": 4, "stops": 1},
+        "no_share_of_feed": 1,
+    }

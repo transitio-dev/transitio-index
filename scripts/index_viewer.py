@@ -62,7 +62,7 @@ from transitio_index.builds import (  # noqa: F401  (two names for the tests)
     DIGEST_KEYS,
     LATEST,
 )
-from transitio_index.merge import merge_tables, select_sources
+from transitio_index.merge import MergeError, merge_tables, select_sources
 
 REALTIME_COLUMNS = (
     "feed_id",
@@ -461,7 +461,7 @@ def _merged_build(cache, loaded, skipped):
         sources = [(build_id, s, t) for build_id, _, s, t, _ in loaded]
         snapshot, tables = merge_tables(sources, skipped)
         return Build(CATALOGUE, Path(cache), snapshot, {}, tables)
-    except _BUILD_ERRORS:
+    except _BUILD_ERRORS + (MergeError,):
         return None
 
 

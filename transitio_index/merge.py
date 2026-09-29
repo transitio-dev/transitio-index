@@ -19,6 +19,7 @@ snapshot back through the reader before committing it into the cache's
 """
 
 import argparse
+import collections
 import hashlib
 import io
 import json
@@ -35,7 +36,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from transitio.index import fingerprint
 
-from . import classify, coverage, licensing, publish, store
+from . import classify, coverage, licensing, publish, rank, store
 from .builds import (
     _EPOCH,
     _SNAPSHOT_ERRORS,
@@ -69,8 +70,8 @@ OVERRIDE_FIELDS = (
 # folded into a feed is that feed. 4: a feed's containers are named by the
 # merged ids. 5: a re-keyed id keeps its companions, and a feed lists the
 # companions linked to it. 6: feeds of different builds with one content
-# identity fold.
-MERGE_FORMAT = 6
+# identity fold. 7: relevance is rescored over the merged edges.
+MERGE_FORMAT = 7
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -364,8 +365,10 @@ def merge_tables(sources, skipped=()):
     rows are dropped, the feed's aliases gather every source's, and its
     companions follow the feed from the newest build carrying the id. A feed
     lists the companions linked to it. Every table gains ``build_id``. The
-    snapshot recounts the merged tables and lists the ``sources``, the
-    ``skipped`` runs, the ``alias_conflicts`` and the ``content_folds``.
+    edges' relevance is scored again over the merged edges (see
+    :func:`_rescored`). The snapshot recounts the merged tables and lists the
+    ``sources``, the ``skipped`` runs, the ``alias_conflicts``, the
+    ``content_folds`` and the ``relevance`` rescore.
     """
     ranked = sorted(sources, key=lambda source: source[0])
     ranked.sort(key=lambda source: _built_at(source[1]) or _EPOCH, reverse=True)
@@ -466,6 +469,9 @@ def merge_tables(sources, skipped=()):
         tables["feeds.parquet"] = _companion_lists(
             tables["feeds.parquet"], tables["realtime.parquet"]
         )
+    tables["edges.parquet"], relevance = _rescored(
+        tables["edges.parquet"], tables["places.parquet"]
+    )
     counts = {
         "places": len(tables["places.parquet"]),
         "places_by_kind": _value_counts(tables["places.parquet"]["kind"]),
@@ -500,6 +506,7 @@ def merge_tables(sources, skipped=()):
         "skipped": list(skipped),
         "alias_conflicts": conflicts,
         "content_folds": dict(sorted(folds.items())),
+        "relevance": relevance,
     }
     return snapshot, tables
 
@@ -742,6 +749,82 @@ def _merged_id(loaded):
     return hashlib.sha256(_canonical(parts).encode("utf-8")).hexdigest()[:16]
 
 
+def _json_records(edges, column):
+    """The edges' ``column`` decoded, one dict per row. Null is what publish
+    writes for an absent block and reads as ``{}``; anything else must be a
+    JSON object."""
+    try:
+        values = [{} if v is None else json.loads(v) for v in edges[column].to_pylist()]
+    except (TypeError, ValueError, RecursionError) as error:
+        raise MergeError(f"edge {column} is not JSON: {error}") from error
+    if not all(isinstance(v, dict) for v in values):
+        raise MergeError(f"edge {column} is not a record")
+    return values
+
+
+def _replaced(table, name, values):
+    """``table`` with column ``name`` set to ``values``, typed as publish
+    writes it."""
+    field = publish._EDGES_SCHEMA.field(name)
+    column = pa.array(values, field.type)
+    index = table.schema.get_field_index(name)
+    if index < 0:
+        return table.append_column(field, column)
+    return table.set_column(index, field, column)
+
+
+def _rescored(edges, places):
+    """``(edges, block)``: the merged edges with their relevance scored again
+    over the merged edge set by :func:`rank.score_edges`, and the snapshot's
+    ``relevance`` block. Tier and ``cross_border`` stay: a feed's row and its
+    edges come from one build, and a place's country is fixed by its id. An
+    edges table without ``service`` or ``evidence`` stays as taken, with no
+    block."""
+    if not {"service", "evidence"} <= set(edges.column_names):
+        return edges, None
+    by_id = {
+        place["place_id"]: place
+        for place in places.select(["place_id", "kind", "country_code"]).to_pylist()
+    }
+    rows = edges.select(["place_id", "feed_id", "tier"]).to_pylist()
+    for row in rows:
+        if row["place_id"] not in by_id:
+            raise MergeError(f"edge to a place the index lacks: {row['place_id']}")
+        if row["tier"] not in rank.CATEGORY_BY_TIER:
+            raise MergeError(f"edge with an unknown tier {row['tier']!r}")
+    for column in ("service", "evidence"):
+        for row, value in zip(rows, _json_records(edges, column)):
+            row[column] = value
+    if "needs_review" in edges.column_names:
+        for row, flag in zip(rows, edges["needs_review"].to_pylist()):
+            row["needs_review"] = flag
+    scored, basis, unscored = rank.score_edges(rows, by_id)
+    before = (
+        edges["relevance"].to_pylist()
+        if "relevance" in edges.column_names
+        else [None] * len(scored)
+    )
+    changed = sum(
+        1
+        for old, edge in zip(before, scored)
+        if old is None or abs(old - edge["relevance"]) > 1e-9
+    )
+    for name in ("relevance_category", "relevance", "needs_review"):
+        edges = _replaced(edges, name, [edge[name] for edge in scored])
+    edges = _replaced(
+        edges, "evidence", [publish._json_block(edge["evidence"]) for edge in scored]
+    )
+    block = {
+        "edges": len(scored),
+        "changed": changed,
+        "share_basis_by_place": dict(
+            sorted(collections.Counter(basis.values()).items())
+        ),
+        "no_share_of_feed": unscored,
+    }
+    return edges, block
+
+
 def _shares(edges):
     """``(unknown_share, margin_share)`` over the merged edges: the share
     whose tier is unknown, and the share the classifier decided within its
@@ -751,16 +834,7 @@ def _shares(edges):
         return 0.0, 0.0
     if "evidence" not in edges.column_names:
         raise MergeError("edges without evidence; not a published index")
-    # Null is what publish writes for an edge without evidence; anything
-    # else must be a JSON object.
-    try:
-        evidence = [
-            json.loads(e) for e in edges["evidence"].to_pylist() if e is not None
-        ]
-    except (TypeError, ValueError, RecursionError) as error:
-        raise MergeError(f"edge evidence is not JSON: {error}") from error
-    if not all(isinstance(e, dict) for e in evidence):
-        raise MergeError("edge evidence is not a record")
+    evidence = _json_records(edges, "evidence")
     flagged = classify.near_threshold_count({"evidence": e} for e in evidence)
     unknown = pc.sum(pc.equal(edges["tier"], "unknown")).as_py() or 0
     return unknown / len(edges), flagged / len(edges)
@@ -1185,6 +1259,15 @@ def merge_builds(builds, cache_dir, read_bytes=_read_file, log=print):
         log(f"not folded, contradicting alias claims: {', '.join(group)}")
     if catalogue["content_folds"]:
         log(f"folded {len(catalogue['content_folds'])} feeds with the same content")
+    relevance = catalogue["relevance"]
+    if relevance is not None:
+        places = sum(relevance["share_basis_by_place"].values())
+        log(
+            f"rescored relevance at {places} places: {relevance['changed']} of "
+            f"{relevance['edges']} edges changed"
+        )
+        if relevance["no_share_of_feed"]:
+            log(f"{relevance['no_share_of_feed']} edges lack share_of_feed")
     notice = compose_notice(loaded, tables["feeds.parquet"])
     manifest, files = assemble(
         loaded, tables, notice, alias_conflicts=catalogue["alias_conflicts"]
