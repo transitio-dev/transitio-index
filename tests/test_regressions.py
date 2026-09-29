@@ -20,6 +20,7 @@ import test_index_boundaries as bt  # noqa: E402
 import test_index_coverage as ct  # noqa: E402
 import test_index_crawl as crt  # noqa: E402
 import test_index_fetch as ft  # noqa: E402
+import test_index_ziprange as zt  # noqa: E402
 from transitio_index import (  # noqa: E402
     atlas,
     boundaries,
@@ -1265,3 +1266,20 @@ def test_a_feed_with_spaced_header_names_keeps_its_fingerprint():
         return fingerprint.compute("route_stops", routes, coords, stops)
 
     assert digest(spaced=True) == digest(spaced=False)
+
+
+def test_a_streamed_archive_is_read_through_ranges(tmp_path):
+    """A zip written to a stream flags every member with a data descriptor and
+    leaves each local CRC and size zero, as a Mobility Database hosted copy
+    does; the range reader refused such an archive, so the crawl downloaded
+    it whole."""
+    cache = tmp_path / "cache"
+    data = zt._zip_bytes(crt.FULL_MEMBERS, streamed=True)
+    crt._publish_resolved(cache, [crt._feed("f-a", "https://feeds.example/a.zip")])
+    _, log = crt._crawl(
+        cache, crt._server({"/a.zip": (data, '"v1"')}), range_threshold=1
+    )
+    assert log["f-a"]["method"] == "range"
+    assert log["f-a"]["fallback_reason"] is None
+    stop_times = crt._feed_dir(cache, "f-a") / "stop_times.txt"
+    assert stop_times.read_bytes() == crt.STOP_TIMES

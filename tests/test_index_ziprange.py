@@ -11,14 +11,30 @@ STOPS = b"stop_id,stop_name\n1,Central\n2,Harbour\n"
 ROUTES = b"route_id,route_type\nr1,3\n"
 
 
-def _zip_bytes(members, *, compression=zipfile.ZIP_DEFLATED, comment=b""):
-    sink = io.BytesIO()
+class _Unseekable:
+    """A write-only sink: ``zipfile`` streams to it, setting the data-descriptor
+    flag and leaving each local header's CRC and sizes zero."""
+
+    def __init__(self):
+        self.buffer = io.BytesIO()
+
+    def write(self, data):
+        return self.buffer.write(data)
+
+    def flush(self):
+        pass
+
+
+def _zip_bytes(
+    members, *, compression=zipfile.ZIP_DEFLATED, comment=b"", streamed=False
+):
+    sink = _Unseekable() if streamed else io.BytesIO()
     with zipfile.ZipFile(sink, "w", compression=compression) as archive:
         for name, data in members.items():
             archive.writestr(name, data)
         if comment:
             archive.comment = comment
-    return sink.getvalue()
+    return (sink.buffer if streamed else sink).getvalue()
 
 
 def _directory(data):
@@ -100,10 +116,43 @@ def test_an_encrypted_member_falls_back():
         _directory(data)
 
 
-def test_a_data_descriptor_member_falls_back():
-    data = _flip_central_flag(_zip_bytes({"stops.txt": STOPS}), 0x0008)
-    with pytest.raises(ziprange.RangeReadError, match="data-descriptor"):
-        _directory(data)
+@pytest.mark.parametrize(
+    "streamed, compression, field, value, reads",
+    [
+        (True, zipfile.ZIP_DEFLATED, None, None, True),
+        (True, zipfile.ZIP_STORED, None, None, True),
+        (True, zipfile.ZIP_STORED, "uncompressed_size", "directory", True),
+        (True, zipfile.ZIP_DEFLATED, "compressed_size", "other", False),
+        (True, zipfile.ZIP_STORED, "crc32", "other", False),
+        (False, zipfile.ZIP_DEFLATED, "crc32", 0, False),
+    ],
+)
+def test_a_data_descriptor_local_header_must_be_zero_or_agree(
+    streamed, compression, field, value, reads
+):
+    # Zero stands in for a local CRC or size only under the data-descriptor
+    # flag; a nonzero value must still equal the directory's.
+    data = bytearray(
+        _zip_bytes({"stops.txt": STOPS}, compression=compression, streamed=streamed)
+    )
+    entry = _directory(bytes(data))["stops.txt"]
+    local = entry["header_offset"]
+    assert bool(entry["flags"] & 0x0008) == streamed
+    if streamed:
+        assert struct.unpack_from("<III", data, local + 14) == (0, 0, 0)
+    if field is not None:
+        offset = {"crc32": 14, "compressed_size": 18, "uncompressed_size": 22}[field]
+        if value == "directory":
+            value = entry[field]
+        elif value == "other":
+            value = entry[field] + 1
+        struct.pack_into("<I", data, local + offset, value)
+    read = ziprange.bytes_reader(bytes(data))
+    if reads:
+        assert ziprange.read_member(read, entry) == STOPS
+    else:
+        with pytest.raises(ziprange.RangeReadError, match="disagrees"):
+            ziprange.read_member(read, entry)
 
 
 def test_an_unsupported_compression_method_falls_back():

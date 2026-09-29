@@ -749,8 +749,8 @@ def _html_page(feed_dir, content_type):
 def _extract_members(feed_dir, decide, fragment=None):
     """Extract the members from the downloaded archive, streamed and bounded.
 
-    ``zipfile`` handles what ziprange deliberately refuses (ZIP64, data
-    descriptors); each member is capped and streamed straight to its file, so
+    ``zipfile`` handles what ziprange deliberately refuses (ZIP64, bzip2 or
+    LZMA members); each member is capped and streamed straight to its file, so
     members never accumulate in memory. An archive fragment names a nested zip,
     extracted first and read in the outer one's place. The cheap members land
     first; ``decide`` then rules on extracting ``stop_times.txt``. Returns the

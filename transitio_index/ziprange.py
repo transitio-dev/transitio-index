@@ -8,9 +8,11 @@ the crawler never fetched in full. The functions here are pure: they take a
 same code runs over HTTP ranges or local bytes in tests.
 
 Anything odd falls back rather than being handled: ZIP64 markers, encryption,
-data descriptors, an unknown compression method or a CRC mismatch raise
-:class:`RangeReadError` with the reason, and the crawler downloads the whole
-feed instead — the plan's contract, keeping this parser small enough to trust.
+an unknown compression method or a CRC mismatch raise :class:`RangeReadError`
+with the reason, and the crawler downloads the whole feed instead — the plan's
+contract, keeping this parser small enough to trust. A member written with a
+data descriptor, as a streaming writer leaves it, is read by the central
+directory's CRC and sizes; the descriptor itself is never read.
 """
 
 import struct
@@ -27,8 +29,9 @@ _CENTRAL_SIZE = 46
 _LOCAL_SIGNATURE = b"PK\x03\x04"
 _LOCAL_SIZE = 30
 
-# General-purpose flag bits that route to the fallback: encryption and the
-# streaming data descriptor.
+# General-purpose flag bits. Encryption routes to the fallback; a member with
+# a data descriptor may leave its local header's CRC and sizes zero, and is
+# read by the central directory's.
 _FLAG_ENCRYPTED = 0x0001
 _FLAG_DATA_DESCRIPTOR = 0x0008
 _FLAG_UTF8 = 0x0800
@@ -102,8 +105,8 @@ def central_directory(read, size, *, max_directory_bytes=MAX_DIRECTORY_BYTES):
     """The member entries, keyed by name.
 
     Each entry carries what a member read needs: the compression method, the
-    sizes, the CRC and the local-header offset. Encrypted or data-descriptor
-    members, ZIP64 fields, duplicate names and malformed records raise
+    sizes, the CRC and the local-header offset. Encrypted members, ZIP64
+    fields, duplicate names and malformed records raise
     :class:`RangeReadError`.
     """
     entries, cd_offset, cd_size = end_of_central_directory(read, size)
@@ -145,8 +148,6 @@ def central_directory(read, size, *, max_directory_bytes=MAX_DIRECTORY_BYTES):
             raise RangeReadError("truncated central-directory name")
         if flags & _FLAG_ENCRYPTED:
             raise RangeReadError(f"encrypted member {raw_name!r}")
-        if flags & _FLAG_DATA_DESCRIPTOR:
-            raise RangeReadError(f"data-descriptor member {raw_name!r}")
         if _ZIP64_32 in (compressed_size, uncompressed_size, header_offset):
             raise RangeReadError(f"zip64 member {raw_name!r}")
         if method not in (_STORED, _DEFLATED):
@@ -188,7 +189,8 @@ def read_member(read, entry, *, max_member_bytes=MAX_MEMBER_BYTES):
 
     The local header must agree with the central-directory entry (flags, method,
     CRC, sizes, name): the directory is what was validated, so a header that
-    disagrees is a malformed or hostile archive. Decompression is bounded by the
+    disagrees is a malformed or hostile archive. A data-descriptor member's
+    local CRC and sizes may instead be zero. Decompression is bounded by the
     declared size, so a stream claiming to be small cannot expand past it, and
     declared sizes over ``max_member_bytes`` fall back before anything is read.
     """
@@ -215,12 +217,13 @@ def read_member(read, entry, *, max_member_bytes=MAX_MEMBER_BYTES):
     local_name = _read_exact(
         read, entry["header_offset"] + _LOCAL_SIZE, name_size, "local header name"
     )
+    blank = 0 if entry["flags"] & _FLAG_DATA_DESCRIPTOR else None
     if (
         flags != entry["flags"]
         or method != entry["method"]
-        or crc32 != entry["crc32"]
-        or compressed_size != entry["compressed_size"]
-        or uncompressed_size != entry["uncompressed_size"]
+        or crc32 not in (entry["crc32"], blank)
+        or compressed_size not in (entry["compressed_size"], blank)
+        or uncompressed_size not in (entry["uncompressed_size"], blank)
         or local_name != entry["raw_name"]
     ):
         raise RangeReadError(
