@@ -1093,7 +1093,7 @@ def test_a_failed_refetch_keeping_its_crawl_gets_that_crawl_identity(tmp_path):
 
 
 def test_the_merge_rescores_relevance_over_the_merged_edges(tmp_path):
-    """CT-21: the merge kept each edge's relevance from the build that won its
+    """The merge kept each edge's relevance from the build that won its
     feed, so a feed alone at Paris in one build kept 0.7 for its place share
     and outranked Paris's main feed from another build."""
     import json
