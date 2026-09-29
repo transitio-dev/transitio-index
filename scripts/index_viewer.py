@@ -64,6 +64,9 @@ from transitio_index.builds import (  # noqa: F401  (two names for the tests)
 )
 from transitio_index.merge import MergeError, merge_tables, select_sources
 
+# A catalogue whose sources cannot be merged is left out like a malformed one.
+_CATALOGUE_ERRORS = _BUILD_ERRORS + (MergeError,)
+
 REALTIME_COLUMNS = (
     "feed_id",
     "name",
@@ -461,7 +464,7 @@ def _merged_build(cache, loaded, skipped):
         sources = [(build_id, s, t) for build_id, _, s, t, _ in loaded]
         snapshot, tables = merge_tables(sources, skipped)
         return Build(CATALOGUE, Path(cache), snapshot, {}, tables)
-    except _BUILD_ERRORS + (MergeError,):
+    except _CATALOGUE_ERRORS:
         return None
 
 
