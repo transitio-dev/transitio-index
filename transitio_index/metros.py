@@ -12,8 +12,10 @@ curator ``set_statistical_area`` crosswalk may instead merge it onto a chosen
 QID. Everywhere: the FAO city-region a
 city's Overture land area falls in is published as a ``metro`` keyed by its
 region id and named from its GHS-UCDB centre, one more definition of the
-city's area beside the others. The Eurostat and FAO branches publish only
-while their derived inputs are allowlisted. Every member city carries its
+city's area beside the others; one whose cities cover under ``CORE_SLIVER``
+of its region also takes the region-kind place holding the region's centre
+as a core member. The Eurostat and FAO branches publish only
+while their derived inputs are allowlisted. Every member carries its
 metros in ``metro_ids`` — one per definition it falls in. This stage adds
 membership only; the geometry stage draws a metro from its members' shipped
 polygons.
@@ -24,6 +26,8 @@ import datetime
 import functools
 import json
 import hashlib
+
+import shapely
 
 from transitio_index import (
     csv_source,
@@ -51,6 +55,13 @@ EUROSTAT_DERIVED = (
 # regions, so both are derived inputs of the published membership.
 FAO_DERIVED = (OVERTURE_DERIVED, geometry.FAO_DERIVED)
 FAO_SUBTYPE = "city-region (FAO)"
+# A FAO metro whose cities cover under CORE_SLIVER of its region admits a
+# core: the region-kind place holding the region's centre, no larger than
+# CORE_MAX_RATIO of the region and with at least CORE_MIN_INSIDE of its own
+# area inside it.
+CORE_SLIVER = 0.05
+CORE_MAX_RATIO = 1.0
+CORE_MIN_INSIDE = 0.5
 # The Urban Audit functional urban areas as derived inputs, like the NUTS
 # boundaries: a membership is placed by Overture land areas in an area.
 URAU_DERIVED = (OVERTURE_DERIVED, geometry.URAU_DERIVED)
@@ -203,17 +214,28 @@ def _join_member(by_id, metros, codes, qid, make_row, city, code):
     return metro
 
 
-def join(metro, city):
-    """Join ``city`` to ``metro`` as a member, reciprocally — unless the
+def join(metro, place):
+    """Join ``place`` to ``metro`` as a member, reciprocally — unless the
     metro's members are curated: a curator's list is never added to."""
     if metro.get("members_curated"):
         return
     members = metro.setdefault("member_ids", [])
-    if city["place_id"] not in members:
-        members.append(city["place_id"])
-    metro_ids = city.setdefault("metro_ids", [])
+    if place["place_id"] not in members:
+        members.append(place["place_id"])
+    metro_ids = place.setdefault("metro_ids", [])
     if metro["place_id"] not in metro_ids:
         metro_ids.append(metro["place_id"])
+
+
+def leave(metro, place):
+    """Take ``place`` off ``metro``'s members, reciprocally — the reverse of
+    :func:`join`, and like it never touching a curator's list."""
+    if metro.get("members_curated"):
+        return
+    if place["place_id"] in (metro.get("member_ids") or []):
+        metro["member_ids"].remove(place["place_id"])
+    if metro["place_id"] in (place.get("metro_ids") or []):
+        place["metro_ids"].remove(metro["place_id"])
 
 
 def _set_members(by_id, entries, report):
@@ -308,11 +330,11 @@ def _available(load):
 
 
 def _unjoin(metro, by_id):
-    """Take ``metro`` off every member city's ``metro_ids``."""
+    """Take ``metro`` off every member's ``metro_ids``."""
     for member in metro.get("member_ids") or []:
-        city = by_id.get(member)
-        if city is not None and metro["place_id"] in (city.get("metro_ids") or []):
-            city["metro_ids"].remove(metro["place_id"])
+        place = by_id.get(member)
+        if place is not None and metro["place_id"] in (place.get("metro_ids") or []):
+            place["metro_ids"].remove(metro["place_id"])
 
 
 def _partition(metro, by_id):
@@ -574,19 +596,21 @@ def _consumed(definition, inputs_manifest, memberships):
     }
 
 
-def _fao_version(inputs_manifest):
+def _fao_version(inputs_manifest, centres=None):
     """The version the FAO derived row records: both pinned inputs and the
-    cutoff, since a membership depends on all three."""
+    cutoff, since a membership depends on all three, and the digest of the
+    pinned ``centres`` file when the cores were placed by it."""
     from transitio_index import fao
 
     digests = inputs_manifest["digests"]
-    return overrides.canonical_digest(
-        {
-            "patches": digests[fao.PATCHES_FILE],
-            "regions": digests[fao.REGIONS_FILE],
-            "cutoff_hours": fao.CUTOFF_HOURS,
-        }
-    )
+    version = {
+        "patches": digests[fao.PATCHES_FILE],
+        "regions": digests[fao.REGIONS_FILE],
+        "cutoff_hours": fao.CUTOFF_HOURS,
+    }
+    if centres is not None:
+        version["centres"] = centres
+    return overrides.canonical_digest(version)
 
 
 def _majority_country(city_ids, by_id):
@@ -633,6 +657,115 @@ def _fao_name(names, region_id, members, by_id, footprint):
     return by_id[max(members, key=lambda c: (extent(c), c))].get("name")
 
 
+def fao_core(cities, candidates, footprint, region, centre, country):
+    """The region-kind place a FAO metro takes as its core member, or None.
+
+    None without a ``centre``, when a city has no footprint (a metro is
+    drawn only when every member ships one), or when the union of the
+    ``cities``' footprints covers at least ``CORE_SLIVER`` of ``region``
+    (the union of its patches). Otherwise the largest of ``candidates`` that
+    is in ``country``, covers ``centre``, is no larger than
+    ``CORE_MAX_RATIO`` of the region and has at least ``CORE_MIN_INSIDE`` of
+    its own area inside it; ties by place id. ``footprint(place)`` is a
+    place's polygon, None for none. Areas are planar degrees: each
+    comparison is between shapes at one place.
+    """
+    if centre is None or not candidates:
+        return None
+    shapes = [footprint(city) for city in cities]
+    if any(shape is None for shape in shapes):
+        return None
+    area = region.area
+    if shapes and (
+        shapely.union_all(shapes).intersection(region).area >= CORE_SLIVER * area
+    ):
+        return None
+    best = None
+    for place in candidates:
+        shape = footprint(place)
+        if (
+            place.get("country_code") != country
+            or shape is None
+            or not shape.covers(centre)
+            or shape.area > CORE_MAX_RATIO * area
+            or shape.intersection(region).area < CORE_MIN_INSIDE * shape.area
+        ):
+            continue
+        rank = (-shape.area, place["place_id"])
+        if best is None or rank < best[0]:
+            best = (rank, place)
+    return best[1] if best is not None else None
+
+
+def settle_fao_cores(rows, by_id, footprint, regions, patches, centres):
+    """Settle the core of each FAO metro in ``rows`` (``{key: row}``): the
+    region-kind member :func:`fao_core` names over its city members and the
+    country most of them are in joins, and one it no longer names leaves. A
+    metro whose members are curated is left as it is. The candidates are
+    ``by_id``'s region-kind places with a ``footprint``; ``regions`` and
+    ``patches`` are the loaded FAO inputs and ``centres`` the centre points
+    by id. Returns the keys changed."""
+    settled = {
+        key: metro
+        for key, metro in rows.items()
+        if metro.get("source_subtype") == FAO_SUBTYPE
+        and not metro.get("members_curated")
+        and metro.get("statistical_area_id") in regions
+    }
+    if not settled:
+        return set()
+    shapes = {}
+
+    def shape(place):
+        if place["place_id"] not in shapes:
+            shapes[place["place_id"]] = footprint(place)
+        return shapes[place["place_id"]]
+
+    candidates = [
+        place
+        for place in by_id.values()
+        if place.get("kind") == "region" and shape(place) is not None
+    ]
+    tree = shapely.STRtree([shape(place) for place in candidates])
+    changed = set()
+    for key, metro in settled.items():
+        region_id = metro["statistical_area_id"]
+        members = [by_id[m] for m in metro.get("member_ids") or [] if m in by_id]
+        cities = [m for m in members if m.get("kind") == "city"]
+        centre = centres.get(region_id)
+        near = [] if centre is None else [candidates[i] for i in tree.query(centre)]
+        core = fao_core(
+            cities,
+            near,
+            shape,
+            shapely.union_all(
+                [patches[p]["geom"] for p in regions[region_id]["patches"]]
+            ),
+            centre,
+            _majority_country([city["place_id"] for city in cities], by_id),
+        )
+        for member in members:
+            if member.get("kind") == "region" and member is not core:
+                leave(metro, member)
+                changed.add(key)
+        if core is not None and core["place_id"] not in (metro.get("member_ids") or []):
+            join(metro, core)
+            changed.add(key)
+    return changed
+
+
+def _shipped_area(areas, boundaries, place):
+    """The polygon ``place`` ships: its curated boundary — a ``set_boundary``
+    WKT in ``boundaries`` by place key, or its own — else the one its
+    Overture ``areas`` (``geometry.read_areas`` output keyed by Overture id)
+    ship, or None when it ships none."""
+    wkt = boundaries.get(place["place_id"]) or place.get("boundary_wkt")
+    if wkt:
+        return geometry.curated_polygon(place["place_id"], wkt)
+    rows = areas.get(place.get("overture_id"))
+    return geometry.shipped_geometry(rows)[1] if rows else None
+
+
 def _snapshot(inputs, keys):
     """The digests a branch published metros from — its loaded ``inputs``' —
     or None when it read none, or published none for want of its ``keys``
@@ -651,6 +784,9 @@ def _apply_fao(
     *,
     inputs,
     names,
+    centres,
+    centre_pin,
+    boundaries,
     cache_dir,
     dataset,
 ):
@@ -659,11 +795,15 @@ def _apply_fao(
     to. Each metro is keyed by its FAO region id, named from the
     region's GHS-UCDB centre match in ``names`` (empty unless the UCDB derived
     input was read), its country the one most of its cities are in, and the
-    cities joined as members. It publishes only while every FAO
-    derived input is allowlisted; otherwise the regions are reported, not
-    published. Returns ``(versions, touched)`` — the derived inputs read, at
-    their pinned versions, as ``{(dataset, licence): version}``, and every
-    region's metro joined as ``{key: members joined}``."""
+    cities joined as members, with the core :func:`settle_fao_cores` names
+    by the region ``centres`` (None when unread, else read from the file
+    pinned at ``centre_pin``) over the polygons the places ship, curated
+    ``boundaries`` included. It publishes only while
+    every FAO derived input is allowlisted; otherwise the regions are
+    reported, not published. Returns ``(versions, touched, cores)`` — the
+    derived inputs read, at their pinned versions, as ``{(dataset, licence):
+    version}``, every region's metro joined as ``{key: members joined}``,
+    and the keys of those that took a core."""
     from transitio_index import fao
 
     regions, patches, inputs_manifest = inputs
@@ -709,11 +849,38 @@ def _apply_fao(
         # US row takes its MSA's; a different code already on it conflicts.
         _take_fao(row, region_id)
         touched[row["place_id"]] = len(derived)
+    cores = set()
+    if centres is not None and touched:
+        # A metro is drawn only when every member ships, so a core is chosen
+        # by the polygons the places ship, read at the shipping tolerance.
+        held = {
+            p["overture_id"]
+            for p in places
+            if p["kind"] in ("city", "region") and p.get("overture_id")
+        }
+        shipped = geometry.place_areas(
+            cache_dir, dataset, places, held, simplify=geometry.SIMPLIFY_TOLERANCE_DEG
+        )
+        settle_fao_cores(
+            {key: metros[key] for key in touched},
+            by_id,
+            functools.partial(_shipped_area, shipped, boundaries),
+            regions,
+            patches,
+            centres,
+        )
+        for key in touched:
+            members = (by_id.get(m) for m in metros[key]["member_ids"])
+            if any(m is not None and m.get("kind") == "region" for m in members):
+                touched[key] += 1
+                cores.add(key)
     versions = {
         OVERTURE_DERIVED: overture.OVERTURE_RELEASE,
-        geometry.FAO_DERIVED: _fao_version(inputs_manifest),
+        geometry.FAO_DERIVED: _fao_version(
+            inputs_manifest, centre_pin if centres is not None else None
+        ),
     }
-    return versions, touched
+    return versions, touched, cores
 
 
 def _attach_definition(
@@ -999,6 +1166,13 @@ def attach_metros(
                 names, names_manifest = _available(
                     lambda: ucdb.load_names(cache_dir, expected=ucdb_pins)
                 ) or ({}, None)
+            # The FAO centres a sliver metro's core is placed by: FAO data,
+            # credited by the FAO derived row.
+            centres = None
+            if _snapshot(fao_inputs, FAO_DERIVED) is not None:
+                centres = _available(
+                    lambda: ucdb.centre_points(cache_dir, expected=ucdb_pins)
+                )
 
             metros = {}
             codes = _code_index(by_id.values())
@@ -1087,9 +1261,9 @@ def attach_metros(
                     us_summary["metros_published"] -= 1
             # A Eurostat metro the pass dropped published nothing after all.
             reconcile(assignments, codes)
-            fao_summary = {"published": 0, "memberships": 0}
+            fao_summary = {"published": 0, "memberships": 0, "cores": 0}
             if fao_inputs is not None:
-                fao_versions, fao_touched = _apply_fao(
+                fao_versions, fao_touched, fao_cores = _apply_fao(
                     places,
                     by_id,
                     metros,
@@ -1097,6 +1271,14 @@ def attach_metros(
                     report,
                     inputs=fao_inputs,
                     names=names,
+                    centres=centres,
+                    centre_pin=ucdb_pins.get(ucdb.CENTRES_FILE),
+                    boundaries={
+                        entry["place"]: entry["set_boundary"]
+                        for entry in overrides.by_operation(
+                            place_overrides, "set_boundary"
+                        )
+                    },
                     cache_dir=cache_dir,
                     dataset=dataset,
                 )
@@ -1128,6 +1310,7 @@ def attach_metros(
                 fao_summary = {
                     "published": len(fao_published),
                     "memberships": fao_memberships,
+                    "cores": len(fao_cores - fao_dropped),
                 }
             for place_id in absent:
                 # A metro the FAO branch minted after the members were set is
@@ -1143,6 +1326,7 @@ def attach_metros(
                 "ucdb": (
                     names_manifest["sources"] if names_manifest is not None else None
                 ),
+                "fao_centres": dict(ucdb_pins) if centres is not None else None,
             }
             for metro in metros.values():
                 metro["member_ids"].sort()

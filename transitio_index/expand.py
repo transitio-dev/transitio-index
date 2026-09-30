@@ -267,15 +267,15 @@ def _draw_member_geometry(places_by_id, keys):
 
 
 def _derived_inputs(cache_dir, recorded):
-    """The Eurostat, Urban Audit and FAO inputs, and the UCDB names, the
-    metros stage published metros from: ``(eurostat, urau, fao, names)``,
-    loaded under the digests the run's ``derived_inputs`` recorded — so
-    expansion derives metros from the run's snapshot, never from the modules'
-    current pins — each None (the names empty) where the run records none,
-    that definition or branch having published none. A recorded input the
-    raw store no longer holds, or one no longer allowlisted, refuses the
-    expansion: the seeded metros were derived from it, so only a gazetteer
-    rerun keeps the output consistent."""
+    """The Eurostat, Urban Audit and FAO inputs, the UCDB names and the FAO
+    centres the metros stage published metros from: ``(eurostat, urau, fao,
+    names, centres)``, loaded under the digests the run's ``derived_inputs``
+    recorded — so expansion derives metros from the run's snapshot, never
+    from the modules' current pins — each None (the names empty) where the
+    run records none, that definition or branch having published none. A
+    recorded input the raw store no longer holds, or one no longer
+    allowlisted, refuses the expansion: the seeded metros were derived from
+    it, so only a gazetteer rerun keeps the output consistent."""
     from transitio_index import eurostat, fao, ucdb, urau
 
     def load(branch, keys, read):
@@ -310,14 +310,20 @@ def _derived_inputs(cache_dir, recorded):
         metros.FAO_DERIVED,
         lambda pins: fao.load_inputs(cache_dir, expected=pins),
     )
-    names = None
+    names = centres = None
     if fao_inputs is not None:
         names = load(
             "ucdb",
             (ucdb.DERIVED,),
             lambda pins: ucdb.load_names(cache_dir, expected=pins),
         )
-    return euro, urau_inputs, fao_inputs, names[0] if names is not None else {}
+        centres = load(
+            "fao_centres",
+            metros.FAO_DERIVED,
+            lambda pins: ucdb.centre_points(cache_dir, expected=pins),
+        )
+    names = names[0] if names is not None else {}
+    return euro, urau_inputs, fao_inputs, names, centres
 
 
 class _SeededPlacement:
@@ -415,13 +421,14 @@ def _attach_fao_metros(
     report,
     fao_inputs,
     names,
+    centres,
 ):
     """FAO city-region membership for the discovered cities, mirroring the
-    metros stage over the inputs it read (``fao_inputs``, None for none, and
-    the UCDB ``names``): each city joins its region's metro, found by its
-    code (``codes``) or minted — over every city in the region, the seeded
-    ones included, when the seed left it unpublished. Returns ``(added,
-    touched)``."""
+    metros stage over the inputs it read (``fao_inputs``, None for none, the
+    UCDB ``names`` and the FAO ``centres``): each city joins its region's
+    metro, found by its code (``codes``) or minted — over every city in the
+    region, the seeded ones included, when the seed left it unpublished —
+    and every FAO metro's core is settled. Returns ``(added, touched)``."""
     from transitio_index import fao
 
     added = []
@@ -460,6 +467,17 @@ def _attach_fao_metros(
         touched.add(metro["place_id"])
         for city_id in sorted(members):
             metros.join(metro, places_by_id[city_id])
+    if centres is not None:
+        # A discovered region may hold the centre of a metro no discovered
+        # city joined.
+        changed = metros.settle_fao_cores(
+            places_by_id, places_by_id, _shipped_footprint, regions, patches, centres
+        )
+        for key in changed:
+            # Redrawn from the members it now has, never kept around a core
+            # that left.
+            places_by_id[key]["geometry"] = places_by_id[key]["geometry_source"] = None
+        touched |= changed
     return added, touched
 
 
@@ -680,10 +698,13 @@ def _discover(
     new_metros, metro_pairs = _attach_metros(
         places_by_id, codes, new_cities, wikidata, report, registry
     )
-    euro = urau_inputs = fao_inputs = None
+    euro = urau_inputs = fao_inputs = centres = None
     names = {}
-    if city_rows:
-        euro, urau_inputs, fao_inputs, names = _derived_inputs(cache_dir, derived)
+    # A discovered region may hold a FAO metro's centre.
+    if city_rows or any(places_by_id[q].get("kind") == "region" for q in new_ids):
+        euro, urau_inputs, fao_inputs, names, centres = _derived_inputs(
+            cache_dir, derived
+        )
     # One join per Eurostat definition the run derived, over the same cities.
     eurostat_metros, eurostat_touched, assignments = [], set(), []
     for definition, inputs in (
@@ -713,6 +734,7 @@ def _discover(
         report,
         fao_inputs,
         names,
+        centres,
     )
     dropped |= metros.partition(
         {key: places_by_id[key] for key in fao_touched}, places_by_id, codes, report

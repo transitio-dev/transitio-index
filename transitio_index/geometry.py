@@ -6,7 +6,7 @@ an allowlist of audited ``(dataset, licence)`` pairs: geometry ships (as
 hex-encoded WKB) only when every source that built it is on the allowlist, and
 its attribution goes into ``NOTICE``; geometry with any unaudited or unlicensed
 source is omitted and recorded in the licence inventory. A metro's geometry is
-the union of its member cities' shipped polygons, so it never carries what a
+the union of its members' shipped polygons, so it never carries what a
 member may not. The shipped geometry is simplified to a tolerance; the boundary
 lookup used for point-in-polygon (the expand and coverage stages) memoizes
 geometry at that same tolerance.
@@ -260,9 +260,10 @@ def read_areas(
     return areas
 
 
-def place_areas(cache_dir, dataset, places, wanted):
-    """The raw land areas of the ``wanted`` division ids among ``places`` — the
-    metros and fao stages' read: served from the release-keyed cache, the scan
+def place_areas(cache_dir, dataset, places, wanted, *, simplify=None):
+    """The land areas of the ``wanted`` division ids among ``places`` — the
+    metros and fao stages' read, raw unless ``simplify`` is given (as in
+    :func:`read_areas`): served from the release-keyed cache, the scan
     narrowed to the places' countries, and the S3 dataset opened (under the
     read's deadline) only when ``dataset`` is None and an id is missing. ``{}``
     when nothing is wanted.
@@ -280,7 +281,14 @@ def place_areas(cache_dir, dataset, places, wanted):
     wanted = set(wanted) | {area for key in wanted for area, _ in lent.get(key, ())}
     every = ({p.get("overture_id") for p in places} - {None}) | wanted
     prefetch_areas(dataset, every, cache=cache, reopen=reopen, countries=countries)
-    areas = read_areas(dataset, wanted, cache=cache, reopen=reopen, countries=countries)
+    areas = read_areas(
+        dataset,
+        wanted,
+        simplify=simplify,
+        cache=cache,
+        reopen=reopen,
+        countries=countries,
+    )
     lend_areas(areas, lent)
     return areas
 
@@ -349,21 +357,32 @@ def ship_area(place, rows, inventory=None, shipped=None, source="overture"):
             for row_source in row["sources"] or [None]:
                 key = _source_key(row_source)
                 inventory[(*key, key in SOURCE_ALLOWLIST)] += 1
-    if not all(_is_shippable(row["sources"]) for row in rows):
-        return "omitted"
-    geoms = [row["geom"] for row in rows]
-    if not all(_valid_polygon(geom) for geom in geoms):
-        return "invalid"
-    merged = geoms[0] if len(geoms) == 1 else shapely.unary_union(geoms)
-    simplified = _simplify(merged)
-    if not _valid_polygon(simplified):
-        return "invalid"
+    outcome, simplified = shipped_geometry(rows)
+    if simplified is None:
+        return outcome
     place["geometry"] = shapely.to_wkb(simplified).hex()
     place["geometry_source"] = source
     if shipped is not None:
         for row in rows:
             shipped.update(_source_key(row_source) for row_source in row["sources"])
     return "shipped"
+
+
+def shipped_geometry(rows):
+    """``(outcome, geometry)`` for a division's land-area ``rows``:
+    ``"shipped"`` and the simplified union it ships when every area's every
+    source is allowlisted and every polygon valid, else ``"omitted"`` (a
+    source not allowlisted) or ``"invalid"``, and None."""
+    if not all(_is_shippable(row["sources"]) for row in rows):
+        return "omitted", None
+    geoms = [row["geom"] for row in rows]
+    if not all(_valid_polygon(geom) for geom in geoms):
+        return "invalid", None
+    merged = geoms[0] if len(geoms) == 1 else shapely.unary_union(geoms)
+    simplified = _simplify(merged)
+    if not _valid_polygon(simplified):
+        return "invalid", None
+    return "shipped", simplified
 
 
 def _area_predicate(ids):
@@ -827,27 +846,33 @@ def _lend_council_boundaries(places, by_id, lent, absent):
             place["geometry_source"] = COUNCIL_AREA
 
 
-def _curated_geometry(place, wkt):
-    """A curator-supplied boundary: WKT parsed, validated and simplified like
-    any other, shipped with ``geometry_source = "curated"`` — the curator, not
-    a licence audit, vouches for it."""
+def curated_polygon(place_id, wkt):
+    """A curator-supplied boundary for ``place_id``: WKT parsed, validated and
+    simplified like any other."""
     try:
         geom = shapely.from_wkt(wkt)
     except Exception as error:  # noqa: B902 - shapely raises its own hierarchy
         raise overrides.OverrideError(
-            f"place {place['place_id']!r}: boundary is not valid WKT: {error}"
+            f"place {place_id!r}: boundary is not valid WKT: {error}"
         ) from None
     geom = shapely.force_2d(geom)
     simplified = _simplify(geom)
     if not _valid_polygon(geom) or not _valid_polygon(simplified):
         raise overrides.OverrideError(
-            f"place {place['place_id']!r}: boundary is not a valid polygon"
+            f"place {place_id!r}: boundary is not a valid polygon"
         )
     minx, miny, maxx, maxy = geom.bounds
     if not (-180 <= minx <= maxx <= 180 and -90 <= miny <= maxy <= 90):
         raise overrides.OverrideError(
-            f"place {place['place_id']!r}: boundary is not in WGS84 degrees"
+            f"place {place_id!r}: boundary is not in WGS84 degrees"
         )
+    return simplified
+
+
+def _curated_geometry(place, wkt):
+    """A curator-supplied boundary shipped with ``geometry_source =
+    "curated"`` — the curator, not a licence audit, vouches for it."""
+    simplified = curated_polygon(place["place_id"], wkt)
     place["geometry"] = shapely.to_wkb(simplified).hex()
     place["geometry_source"] = CURATED
 

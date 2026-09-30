@@ -263,10 +263,11 @@ def _run(
     fao=None,
     ucdb=None,
     urau=None,
+    areas=AREAS,
 ):
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
-    areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
+    areas = fx.write_area_dataset(tmp_path / "areas.parquet", areas)
     _publish(cache, "crosswalk", "feeds.json", "feeds.jsonl", FEEDS)
     overture.resolve(cache, dataset=dataset, wikidata=fx.StubWikidata())
     seed.resolve_seed(
@@ -720,6 +721,7 @@ def test_an_unavailable_eurostat_input_degrades_to_no_eu_metros(tmp_path, monkey
         "urau": None,
         "fao": None,
         "ucdb": None,
+        "fao_centres": None,
     }
     assert manifest["derived_inventory"] == []
 
@@ -1094,17 +1096,16 @@ def _fao_inputs(tmp_path, patch=CHICAGO_PATCH):
     return files, expected
 
 
-def _ucdb_inputs(tmp_path):
-    """A UCDB fixture that names FAO region 50's centre 'Chicago'."""
+def _ucdb_inputs(tmp_path, centre=CHICAGO_PATCH):
+    """A UCDB fixture that names FAO region 50's centre, drawn as ``centre``,
+    'Chicago' where the two overlap."""
     import hashlib
 
     import fao_fixture as ffx
     from transitio_index import ucdb
 
     payloads = {
-        ucdb.CENTRES_FILE: ffx.centres_zip(
-            [(50, 1, shapely.box(-89.0, 41.0, -86.0, 43.0))]
-        ),
+        ucdb.CENTRES_FILE: ffx.centres_zip([(50, 1, centre)]),
         ucdb.UCDB_FILE: ffx.ucdb_zip(
             [
                 (
@@ -1168,7 +1169,7 @@ def test_a_fao_metro_auto_publishes_under_the_derived_gate(
         assert metro["source_subtype"] == metros.FAO_SUBTYPE
         assert metro["resolution_method"] == "derived_from_fao"
         assert metro["country_code"] == "US" and metro["name"] == "Chicago"
-        assert manifest["fao"] == {"published": 1, "memberships": 1}
+        assert manifest["fao"] == {"published": 1, "memberships": 1, "cores": 0}
         assert all(r["allowed"] for r in fao_rows)
         assert not any(r.get("branch") == "fao" for r in report)
         # Downstream, the derived rows and the FAO credit reach the licence
@@ -1189,7 +1190,7 @@ def test_a_fao_metro_auto_publishes_under_the_derived_gate(
     else:
         # A closed gate ships nothing FAO-derived: the region is reported.
         assert "fao_city_region:50" not in places
-        assert manifest["fao"] == {"published": 0, "memberships": 0}
+        assert manifest["fao"] == {"published": 0, "memberships": 0, "cores": 0}
         assert [r["reason"] for r in report if r.get("branch") == "fao"] == [
             "a derived input is not allowlisted"
         ]
@@ -1215,7 +1216,7 @@ def test_a_registry_backed_fao_metro_carries_its_region_not_a_cbsa(tmp_path):
         manifest, places = _fao_run(tmp_path, registry=reg)
         reg.save()
     metro = next(p for p in places.values() if p.get("statistical_area_id") == "50")
-    assert manifest["fao"] == {"published": 1, "memberships": 1}
+    assert manifest["fao"] == {"published": 1, "memberships": 1, "cores": 0}
     identity = registry.load(path).effective(metro["place_id"])
     assert identity.get("fao_city_region") == ["50"] and "cbsa" not in identity
     with registry.session(path) as again:
@@ -1223,9 +1224,147 @@ def test_a_registry_backed_fao_metro_carries_its_region_not_a_cbsa(tmp_path):
         assert again.minted == 0
 
 
-def test_the_fao_derived_version_covers_both_inputs():
+@pytest.mark.parametrize(
+    "patches, centres",
+    [("c" * 64, "d" * 64), ("a" * 64, "e" * 64), ("a" * 64, None)],
+    ids=["patches", "centres", "no centres"],
+)
+def test_the_fao_derived_version_covers_every_input(patches, centres):
     from transitio_index import fao
 
-    base = {"digests": {fao.PATCHES_FILE: "a" * 64, fao.REGIONS_FILE: "b" * 64}}
-    other = {"digests": {fao.PATCHES_FILE: "c" * 64, fao.REGIONS_FILE: "b" * 64}}
-    assert metros._fao_version(base) != metros._fao_version(other)
+    def version(patches, centres):
+        digests = {fao.PATCHES_FILE: patches, fao.REGIONS_FILE: "b" * 64}
+        return metros._fao_version({"digests": digests}, centres)
+
+    assert version("a" * 64, "d" * 64) != version(patches, centres)
+
+
+# A FAO region of 100 square degrees whose centre is at (5, 5), and one city
+# covering 1% of it.
+REGION = shapely.box(0, 0, 10, 10)
+CENTRE = shapely.Point(5, 5)
+SLIVER = {"place_id": "c", "kind": "city", "geom": shapely.box(0, 0, 1, 1)}
+
+
+def _division(place_id, geom, country="XX"):
+    return {
+        "place_id": place_id,
+        "kind": "region",
+        "country_code": country,
+        "geom": geom,
+    }
+
+
+@pytest.mark.parametrize(
+    "cities, candidates, centre, expected",
+    [
+        ([SLIVER], [_division("r", shapely.box(3, 3, 7, 7))], CENTRE, "r"),
+        (
+            [{**SLIVER, "geom": shapely.box(0, 0, 5, 1)}],
+            [_division("r", shapely.box(3, 3, 7, 7))],
+            CENTRE,
+            None,
+        ),
+        ([SLIVER], [_division("r", shapely.box(-1, -1, 11, 11))], CENTRE, None),
+        ([SLIVER], [_division("r", shapely.box(4, 4, 20, 8))], CENTRE, None),
+        ([SLIVER], [_division("r", shapely.box(3, 3, 7, 7), "YY")], CENTRE, None),
+        ([SLIVER], [_division("r", shapely.box(6, 6, 9, 9))], CENTRE, None),
+        ([SLIVER], [_division("r", shapely.box(3, 3, 7, 7))], None, None),
+        (
+            [SLIVER, {**SLIVER, "place_id": "d", "geom": None}],
+            [_division("r", shapely.box(3, 3, 7, 7))],
+            CENTRE,
+            None,
+        ),
+        (
+            [SLIVER],
+            [_division("county", shapely.box(4, 4, 6, 6)), _division("r", REGION)],
+            CENTRE,
+            "r",
+        ),
+        (
+            [SLIVER],
+            [
+                _division("b", shapely.box(3, 3, 7, 7)),
+                _division("a", shapely.box(3, 3, 7, 7)),
+            ],
+            CENTRE,
+            "a",
+        ),
+    ],
+    ids=[
+        "sliver",
+        "cities at 5%",
+        "larger than the region",
+        "mostly outside",
+        "another country",
+        "centre elsewhere",
+        "no centre",
+        "a city shipping no polygon",
+        "region over county",
+        "tie by id",
+    ],
+)
+def test_a_sliver_fao_metro_takes_the_division_holding_its_centre(
+    cities, candidates, centre, expected
+):
+    core = metros.fao_core(
+        cities, candidates, lambda place: place["geom"], REGION, centre, "XX"
+    )
+    assert (core["place_id"] if core else None) == expected
+
+
+def test_a_core_that_no_longer_qualifies_leaves_its_metro():
+    key = "fao_city_region:50"
+    city = {**SLIVER, "geom": shapely.box(0, 0, 5, 2), "country_code": "XX"}
+    old = {**_division("r", shapely.box(3, 3, 7, 7)), "metro_ids": [key]}
+    metro = {
+        "place_id": key,
+        "kind": "metro",
+        "source_subtype": metros.FAO_SUBTYPE,
+        "statistical_area_id": "50",
+        "member_ids": ["c", "r"],
+    }
+    by_id = {"c": city, "r": old, key: metro}
+    changed = metros.settle_fao_cores(
+        {key: metro},
+        by_id,
+        lambda place: place.get("geom"),
+        {"50": {"patches": ["7"]}},
+        {"7": {"geom": REGION}},
+        {"50": CENTRE},
+    )
+    # The city now covers 10% of the region: the core leaves, reciprocally.
+    assert changed == {key}
+    assert metro["member_ids"] == ["c"] and old["metro_ids"] == []
+
+
+@pytest.mark.parametrize("curated", [False, True], ids=["overture", "curated"])
+def test_a_sliver_fao_metro_takes_its_region_as_a_core(tmp_path, curated):
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import ucdb
+
+    # Illinois's land area holds region 50's centre and ships; Chicago covers
+    # under 5% of the region, so Illinois joins as the core — unless a
+    # curated boundary, the one Illinois ships, lies off the centre.
+    illinois = fx.area(
+        "us-il", shapely.to_wkb(shapely.box(-88.5, 41.5, -87.0, 42.5)), [OSM]
+    )
+    boundary = shapely.to_wkt(shapely.box(-88.9, 41.1, -88.6, 41.4))
+    entries = [{"place": "Q1204", "set_boundary": boundary}]
+    manifest, places = _fao_run(
+        tmp_path,
+        areas=AREAS + [illinois],
+        overrides_dir=write_overrides(tmp_path, places=entries) if curated else None,
+    )
+    metro = places["fao_city_region:50"]
+    assert metro["name"] == "Chicago"
+    assert set(manifest["derived_inputs"]["fao_centres"]) == set(ucdb.PINS)
+    if curated:
+        assert metro["member_ids"] == ["Q1297"] and places["Q1204"]["metro_ids"] == []
+        assert manifest["fao"] == {"published": 1, "memberships": 1, "cores": 0}
+    else:
+        assert metro["member_ids"] == ["Q1204", "Q1297"]
+        assert places["Q1204"]["metro_ids"] == ["fao_city_region:50"]
+        assert manifest["fao"] == {"published": 1, "memberships": 2, "cores": 1}
