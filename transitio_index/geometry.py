@@ -852,6 +852,21 @@ def _curated_geometry(place, wkt):
     place["geometry_source"] = CURATED
 
 
+def set_boundary(place, entry, report):
+    """Apply a ``set_boundary`` entry to ``place``, judged against the
+    geometry the place has now; a stale entry is reported and applied."""
+    overrides.judge(
+        entry,
+        {
+            "geometry_source": place.get("geometry_source"),
+            "geometry": place.get("geometry"),
+        },
+        report,
+        "geometry",
+    )
+    _curated_geometry(place, entry["set_boundary"])
+
+
 def attach_geometry(
     cache_dir,
     *,
@@ -1002,17 +1017,7 @@ def attach_geometry(
                     raise overrides.OverrideError(
                         f"place {entry['place']!r}: set_boundary needs a seeded place"
                     )
-                # Judged against the geometry the place has now.
-                overrides.judge(
-                    entry,
-                    {
-                        "geometry_source": place.get("geometry_source"),
-                        "geometry": place.get("geometry"),
-                    },
-                    override_report,
-                    "geometry",
-                )
-                _curated_geometry(place, entry["set_boundary"])
+                set_boundary(place, entry, override_report)
                 curated += 1
             # A council area's curated boundary is its cities' too.
             _lend_council_boundaries(places, by_id, lent, absent)

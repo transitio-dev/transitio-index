@@ -258,7 +258,7 @@ def _write_crawl(cache, feed_id, stops_rows):
     log_path.write_text(existing + json.dumps(log) + "\n")
 
 
-def _expand(tmp_path, cache, registry=None, labels=None):
+def _expand(tmp_path, cache, registry=None, labels=None, overrides_dir=None):
     divisions = fx.write_dataset(tmp_path / "divisions.parquet", DIVISIONS)
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
     lookup = boundaries.BoundaryLookup(
@@ -286,6 +286,7 @@ def _expand(tmp_path, cache, registry=None, labels=None):
             wikidata=wikidata,
             area_dataset=areas,
             registry=registry,
+            overrides_dir=overrides_dir,
         )
     finally:
         lookup.close()

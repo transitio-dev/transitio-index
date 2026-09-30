@@ -475,12 +475,14 @@ def _discover(
     release,
     derived,
     reopen=None,
+    curated=(),
 ):
     """Resolve crawled stops and fold the missing places in; returns counts.
     With ``registry``, every discovered place is identified through it;
     ``derived`` is the run's ``derived_inputs`` — the digests the metros stage
-    derived metros from — and ``reopen`` reopens ``area_dataset`` when its S3
-    scan stalls."""
+    derived metros from — ``reopen`` reopens ``area_dataset`` when its S3
+    scan stalls, and ``curated`` holds the ``set_boundary`` entries a
+    discovered place takes."""
     # Two passes, one feed's stops in memory at a time — never every crawled
     # feed's stops at once: first the lookup boxes, then, with the boxes
     # ensured, the per-point division resolution.
@@ -636,6 +638,9 @@ def _discover(
         countries={discovered[qid].get("country_code") for qid in new_ids} - {None},
     )
     given = geometry.lend_areas(areas, lent)
+    # The geometry stage applied the entries naming a seeded key; the rest
+    # name a place discovery added, or a seeded row it gave their QID.
+    pending = [entry for entry in curated if entry["place"] not in places_by_id]
     inventory = collections.Counter()
     shipped = set()
     for qid in new_ids:
@@ -647,6 +652,19 @@ def _discover(
         if place["geometry"] and place["overture_id"] in given:
             place["geometry_source"] = given[place["overture_id"]]
         places_by_id[qid] = place
+    # A curated boundary replaces the Overture one before any metro is drawn
+    # from it.
+    fresh = set(new_ids)
+    targets = {}
+    for qid, key in canonical.items():
+        row = places_by_id.get(qid if qid in fresh else key)
+        if row is not None:
+            targets[qid] = targets[key] = row
+    stale = []
+    for entry in pending:
+        if entry["place"] in targets:
+            geometry.set_boundary(targets[entry["place"]], entry, stale)
+    report.extend({"kind": "stale_override", **row} for row in stale)
     # A discovered place under a seeded one links to the key the seeded row
     # is held by — its own id, for a place no QID names.
     held = {**survivors, **canonical}
@@ -775,6 +793,7 @@ def _expanded(
     registry,
     digest,
     derived,
+    curated,
 ):
     """Discovery under the crawl lock; ``(crawl_digest, counts, mode)``.
 
@@ -817,6 +836,7 @@ def _expanded(
                 release,
                 derived,
                 reopen,
+                curated,
             )
     finally:
         if opened_lookup is not None:
@@ -863,9 +883,13 @@ def expand(
                     f"{geometry.SIMPLIFY_TOLERANCE_DEG}°; re-run the geometry "
                     "stage before expanding"
                 )
+            # Keyed by QID, as discovery joins.
+            place_overrides, places_digest = overrides.load_place_overrides(
+                overrides_dir, registry=registry, internal=True
+            )
             overrides.expect_digest(
                 names_manifest.get("places_overrides_sha256"),
-                overrides.places_digest(overrides_dir),
+                places_digest,
                 "places.yaml",
                 "gazetteer",
             )
@@ -920,6 +944,7 @@ def expand(
                     registry,
                     digest,
                     derived,
+                    overrides.by_operation(place_overrides, "set_boundary"),
                 )
             # Saved before the generation is visible, as the gazetteer run
             # does: a crash between the two leaves rows a rerun reproduces.
@@ -941,7 +966,10 @@ def expand(
                 "places_overrides_sha256": names_manifest.get(
                     "places_overrides_sha256"
                 ),
-                "stale_place_overrides": names_manifest.get("stale_place_overrides"),
+                "stale_place_overrides": (
+                    names_manifest.get("stale_place_overrides") or 0
+                )
+                + sum(row.get("kind") == "stale_override" for row in report),
                 "crawl_digest": crawl_digest,
                 "mode": mode,
                 "places": len(places_by_id),

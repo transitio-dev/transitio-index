@@ -1381,3 +1381,63 @@ def test_an_expand_audit_the_licence_stage_cannot_credit_is_refused(expanded, er
 
     with pytest.raises(licensing.LicenseError, match=error):
         licensing._geometry_notice("", [], {}, expanded, "2026-08-19.0")
+
+
+@pytest.mark.parametrize(
+    ("stale", "joined"),
+    [(False, False), (True, False), (False, True)],
+    ids=["discovered", "stale", "joined"],
+)
+def test_set_boundary_applies_to_a_place_expand_discovers(tmp_path, stale, joined):
+    """The geometry stage applies ``set_boundary`` to the seeded places it
+    can key, and expand applied none: a place first found by expand — every
+    place of a build that seeds none — or a seeded row that gained the
+    entry's QID only in expand shipped its Overture boundary instead of the
+    curated one. Expand now applies it, judged like the geometry stage's."""
+    import test_index_expand as ex
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import overrides
+
+    curated = shapely.box(23.7, 61.45, 23.9, 61.55)
+    entry = {"place": "Q40840", "set_boundary": shapely.to_wkt(curated)}
+    if stale:
+        entry["evidence_hash"] = "0" * 64
+    directory = write_overrides(tmp_path, places=[entry])
+    cache = tmp_path / "cache"
+    seeded, known = list(ex.SEED_PLACES), []
+    if joined:
+        # Tampere seeded without a QID, known by its Overture division.
+        known.append({"overture": ["fi-tre"]})
+        seeded.append(
+            {
+                "place_id": "tp_2",
+                "tp_id": "tp_2",
+                "kind": "city",
+                "name": "Tampere",
+                "country_code": "FI",
+                "overture_id": "fi-tre",
+                "metro_ids": [],
+                "member_ids": [],
+            }
+        )
+    ex._publish_names(
+        cache, seeded, places_overrides_sha256=overrides.places_digest(directory)
+    )
+    ex._write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    path = tmp_path / "places_registry.jsonl"
+    ex._publish_run(cache, ex._seeded_registry(path, *known))
+    with registry.session(path) as reg:
+        manifest, places, report = ex._expand(
+            tmp_path, cache, registry=reg, overrides_dir=directory
+        )
+    # Joined, Tampere is the seeded row and only Pirkanmaa is added.
+    assert manifest["places_added"] == (1 if joined else 2)
+    tampere = places["Q40840"]
+    assert tampere["geometry_source"] == geometry.CURATED
+    assert shapely.from_wkb(bytes.fromhex(tampere["geometry"])).equals(curated)
+    rows = [row for row in report if row.get("kind") == "stale_override"]
+    assert [(row["place"], row["operation"]) for row in rows] == [
+        ("Q40840", "set_boundary")
+    ] * stale
+    assert manifest["stale_place_overrides"] == stale
