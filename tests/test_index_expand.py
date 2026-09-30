@@ -305,6 +305,7 @@ def test_no_crawl_artifacts_pass_the_seed_through(tmp_path):
     assert manifest["mode"] == "declared"
     assert manifest["simplify_tolerance_deg"] == geometry.SIMPLIFY_TOLERANCE_DEG
     assert manifest["places_added"] == 0
+    assert manifest["licence_sources"] == manifest["licence_inventory"] == []
     assert set(places) == {"Q33"}
     assert report == []
 
@@ -329,6 +330,13 @@ def test_a_crawled_stop_discovers_an_unseeded_city(tmp_path):
     assert tampere["geometry_source"] == "overture"
     boundary = shapely.from_wkb(bytes.fromhex(tampere["geometry"]))
     assert boundary.covers(shapely.Point(22.0, 61.0))
+    # The audit is recorded for the licence stage: Tampere's two areas and
+    # Pirkanmaa's one.
+    assert manifest["licence_sources"] == ["OpenStreetMap|ODbL-1.0"]
+    assert [
+        (row["dataset"], row["allowed"], row["geometries"])
+        for row in manifest["licence_inventory"]
+    ] == [("OpenStreetMap", True, 3)]
     # Wikidata names merged.
     assert tampere["names"]["fi"] == "Tampere"
     assert tampere["aliases"] == ["Manse"]
@@ -618,10 +626,14 @@ def test_an_unauditable_boundary_ships_without_geometry(tmp_path):
     cache = tmp_path / "cache"
     _publish_names(cache, SEED_PLACES)
     _write_crawl(cache, "f-badgeo", ["s1,62.1,28.2\n"])
-    _, places, _ = _expand(tmp_path, cache)
+    manifest, places, _ = _expand(tmp_path, cache)
     badgeo = places["Q999"]
     assert badgeo["geometry"] is None
     assert badgeo["geometry_source"] is None
+    assert manifest["licence_sources"] == []
+    assert [
+        (row["dataset"], row["allowed"]) for row in manifest["licence_inventory"]
+    ] == [("Mystery Maps", False)]
 
 
 def test_a_stops_file_that_fails_its_state_digest_is_skipped(tmp_path):

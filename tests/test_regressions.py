@@ -1283,3 +1283,101 @@ def test_a_streamed_archive_is_read_through_ranges(tmp_path):
     assert log["f-a"]["fallback_reason"] is None
     stop_times = crt._feed_dir(cache, "f-a") / "stop_times.txt"
     assert stop_times.read_bytes() == crt.STOP_TIMES
+
+
+LINZ_CREDIT = (
+    "  - Land Information New Zealand (LINZ) — CC BY 4.0 "
+    "(https://creativecommons.org/licenses/by/4.0/)"
+)
+
+
+def test_a_linz_area_ships_and_is_credited(tmp_path):
+    """Overture's New Zealand localities carry the LINZ source under CC BY
+    4.0, which was not allowlisted: their boundaries were omitted and the
+    licence stage drew each from its feeds' hulls."""
+    import test_index_geometry as gt
+
+    cache = tmp_path / "cache"
+    gt._publish(
+        cache, [gt._place("Q37100", "city", overture_id="nz-akl", country="NZ")]
+    )
+    linz = [{"dataset": "Linz", "license": "CC-BY-4.0", "record_id": "L"}]
+    dataset = fx.write_area_dataset(
+        tmp_path / "areas.parquet", [fx.area("nz-akl", gt.BOX, linz)]
+    )
+    geometry.attach_geometry(cache, dataset=dataset)
+    (place,), _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    assert place["geometry_source"] == "overture"
+    assert LINZ_CREDIT + "\n" in gt._read_text(cache, "NOTICE")
+    inventory, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    assert [
+        (row["dataset"], row["license"], row["allowed"])
+        for row in inventory
+        if row["role"] == "component"
+    ] == [("Linz", "CC-BY-4.0", True)]
+
+
+def test_a_source_only_expand_shipped_is_credited(tmp_path):
+    """The expand stage shipped boundaries without recording their sources,
+    and the NOTICE was the geometry stage's, written over the seeded places
+    only: a source that shipped only through expand went uncredited."""
+    import test_index_license as lt
+
+    from transitio_index import licensing, merge
+
+    component = {
+        "role": "component",
+        "use": "geometry",
+        "dataset": "Linz",
+        "license": "CC-BY-4.0",
+        "url": "https://creativecommons.org/licenses/by/4.0/",
+        "version": "2026-08-19.0",
+        "allowed": True,
+        "geometries": 1,
+    }
+    cache = lt._cache(
+        tmp_path,
+        expanded={
+            "licence_sources": ["Linz|CC-BY-4.0"],
+            "licence_inventory": [component],
+        },
+    )
+    licensing.license_index(cache)
+    generation, _ = store.resolve(cache / "license", "licensed.json")
+    with generation:
+        notice = generation.read_bytes("NOTICE")
+    assert LINZ_CREDIT in merge._notice_sections(notice, "b")["geometry"]
+    inventory, _ = store.read_jsonl(
+        cache / "license", "licensed.json", "licence_inventory.jsonl"
+    )
+    assert {**component, "stage": "expand"} in inventory
+
+
+@pytest.mark.parametrize(
+    ("expanded", "error"),
+    [
+        # Expanded before the stage recorded what its boundaries shipped.
+        ({"mode": "expanded"}, "rerun the expand stage"),
+        # A shipped source the allowlist has since dropped.
+        (
+            {
+                "mode": "expanded",
+                "licence_sources": ["Retired|X-1.0"],
+                "licence_inventory": [],
+            },
+            "no longer allowlisted",
+        ),
+    ],
+    ids=["unaudited", "dropped"],
+)
+def test_an_expand_audit_the_licence_stage_cannot_credit_is_refused(expanded, error):
+    """Expanded places whose shipped sources cannot be credited are refused,
+    not licensed with the geometry stage's credit alone."""
+    from transitio_index import licensing
+
+    with pytest.raises(licensing.LicenseError, match=error):
+        licensing._geometry_notice("", [], {}, expanded, "2026-08-19.0")

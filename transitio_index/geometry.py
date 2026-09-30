@@ -73,6 +73,12 @@ SOURCE_ALLOWLIST = {
         "url": "https://creativecommons.org/licenses/by/4.0/",
         "share_alike": False,
     },
+    ("Linz", "CC-BY-4.0"): {
+        "credit": "Land Information New Zealand (LINZ)",
+        "licence": "CC BY 4.0",
+        "url": "https://creativecommons.org/licenses/by/4.0/",
+        "share_alike": False,
+    },
     ("Maps Entity Variant Names", "CC0-1.0"): {
         "credit": "Maps Entity Variant Names",
         "licence": "CC0 1.0",

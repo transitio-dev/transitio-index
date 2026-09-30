@@ -16,6 +16,7 @@ unchanged as ``places_expanded.jsonl``, so the declared path keeps running end
 to end.
 """
 
+import collections
 import datetime
 import functools
 
@@ -133,7 +134,7 @@ def _stop_points(feed_dir, state):
         return None
 
 
-def _attach_boundary(place, rows):
+def _attach_boundary(place, rows, inventory, shipped):
     """The division's licence-audited, simplified boundary onto the place.
 
     ``rows`` are the division's COMPLETE land areas from an id-filtered
@@ -141,12 +142,13 @@ def _attach_boundary(place, rows):
     which would ship a multi-part city truncated to wherever its stops were.
     The contract mirrors the geometry stage's exactly: every area's every
     source allowlisted and every polygon valid, else the place ships without
-    geometry rather than with unaudited or partial geometry.
+    geometry rather than with unaudited or partial geometry. The audit is
+    recorded in ``inventory`` and ``shipped`` as the geometry stage records it.
     """
     place.setdefault("geometry", None)
     place.setdefault("geometry_source", None)
     if rows:
-        geometry.ship_area(place, rows)
+        geometry.ship_area(place, rows, inventory, shipped)
 
 
 def _attach_metros(places_by_id, codes, new_cities, wikidata, report, registry=None):
@@ -634,12 +636,14 @@ def _discover(
         countries={discovered[qid].get("country_code") for qid in new_ids} - {None},
     )
     given = geometry.lend_areas(areas, lent)
+    inventory = collections.Counter()
+    shipped = set()
     for qid in new_ids:
         place = discovered[qid]
         place.setdefault("aliases", [])
         place.setdefault("statistical_area_id", None)
         place.setdefault("metro_ids", [])
-        _attach_boundary(place, areas.get(place["overture_id"]))
+        _attach_boundary(place, areas.get(place["overture_id"]), inventory, shipped)
         if place["geometry"] and place["overture_id"] in given:
             place["geometry_source"] = given[place["overture_id"]]
         places_by_id[qid] = place
@@ -748,6 +752,14 @@ def _discover(
         "places_added": len(new_ids) + len(new_metros),
         "metros_added": len(new_metros),
         "identified": identified,
+        # The audit of the boundaries shipped here, in the geometry stage's
+        # form: the licence stage credits what that stage's NOTICE does not.
+        "licence_sources": sorted("|".join(pair) for pair in shipped),
+        "licence_inventory": [
+            row
+            for row in geometry._inventory_rows(inventory, 0)
+            if row["role"] == "component"
+        ],
     }
 
 
@@ -892,6 +904,8 @@ def expand(
                 "places_added": 0,
                 "metros_added": 0,
                 "identified": 0,
+                "licence_sources": [],
+                "licence_inventory": [],
             }
             with crawl.reading(cache_dir):
                 crawl_digest, counts, mode = _expanded(

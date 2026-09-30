@@ -3,10 +3,11 @@ the licensed artifacts publication reads.
 
 Reads exactly what publication would read — the feeds, edges and places of
 the current build, through the same lineage-checked readers — records every
-contributing source in ``licence_inventory.jsonl`` (the geometry audit's rows
-and the feeds' own licence blocks), writes the ``NOTICE`` that ships with the
-index, and publishes the three tables as ``feeds_licensed.jsonl``,
-``places_licensed.jsonl`` and ``edges_licensed.jsonl``.
+contributing source in ``licence_inventory.jsonl`` (the geometry and expand
+stages' audit rows and the feeds' own licence blocks), writes the ``NOTICE``
+that ships with the index, and publishes the three tables as
+``feeds_licensed.jsonl``, ``places_licensed.jsonl`` and
+``edges_licensed.jsonl``.
 
 The feeds are sanitised on the way: a feed's coverage hull is derived from
 its contents, so it ships only where the feed's licence permits
@@ -63,9 +64,10 @@ KNOWN_PERMISSIVE = frozenset(
     )
 )
 
-# The sanitisation rules a licensed generation was built under; publication
-# refuses a generation from an older policy rather than shipping it.
-POLICY_VERSION = 3
+# The sanitisation and attribution rules a licensed generation was built
+# under; publication refuses a generation from an older policy rather than
+# shipping it.
+POLICY_VERSION = 4
 
 # How an edge was derived, strongest provenance first; a merge keeps the
 # stronger.
@@ -327,7 +329,7 @@ def _assert_integrity(places, edges, records):
 
 
 def _geometry_audit(cache_dir):
-    """The geometry stage's inventory rows, NOTICE and generation, or none
+    """The geometry stage's inventory rows, NOTICE and manifest, or none
     without it."""
     try:
         if store.current_generation(cache_dir / "gazetteer", "geometry.json") is None:
@@ -340,7 +342,37 @@ def _geometry_audit(cache_dir):
             notice = generation.read_bytes(NOTICE_ARTIFACT).decode("utf-8")
     except (store.StoreError, ValueError) as error:
         raise LicenseError(f"the geometry audit is unreadable: {error}") from error
-    return rows, notice, manifest.get("generation")
+    return rows, notice, manifest
+
+
+def _pairs(values):
+    """``"dataset|licence"`` strings as ``(dataset, licence)`` pairs."""
+    return {tuple(value.split("|", 1)) for value in values or ()}
+
+
+def _geometry_notice(notice, audit_rows, audit, places_manifest, release):
+    """The NOTICE's geometry credit: the geometry stage's text, recomposed
+    over both stages' sources when the expand stage shipped a boundary from
+    a source the geometry stage did not."""
+    from transitio_index import geometry
+
+    audited = {"licence_sources", "licence_inventory"} <= places_manifest.keys()
+    if places_manifest.get("mode") == "expanded" and not audited:
+        raise LicenseError(
+            "the expanded places record no licence audit of their boundaries; "
+            "rerun the expand stage"
+        )
+    staged = _pairs(audit.get("licence_sources"))
+    shipped = staged | _pairs(places_manifest.get("licence_sources"))
+    stale = sorted("|".join(pair) for pair in shipped - set(geometry.SOURCE_ALLOWLIST))
+    if stale:
+        raise LicenseError(
+            f"{', '.join(stale)} is no longer allowlisted; rerun the gazetteer"
+        )
+    if shipped == staged:
+        return notice
+    derived = [row for row in audit_rows if row.get("role") == "derived_input"]
+    return geometry._notice(shipped, release, derived)
 
 
 def _feed_rows(records):
@@ -484,12 +516,25 @@ def license_index(cache_dir, *, overrides_dir=None):
             inputs = publish.read_inputs(cache_dir, overrides_dir)
         except publish.PublishError as error:
             raise LicenseError(str(error)) from error
-        audit_rows, geometry_notice, _ = _geometry_audit(cache_dir)
+        audit_rows, geometry_notice, audit = _geometry_audit(cache_dir)
         if inputs["places"] is not None and geometry_notice is None:
             raise LicenseError(
                 "a places build has no geometry audit to license; run the gazetteer "
                 "stage"
             )
+        places_manifest = inputs["places_manifest"] or {}
+        if geometry_notice is not None:
+            geometry_notice = _geometry_notice(
+                geometry_notice,
+                audit_rows,
+                audit,
+                places_manifest,
+                inputs["overture_release"],
+            )
+        expand_rows = [
+            {**row, "stage": "expand"}
+            for row in places_manifest.get("licence_inventory") or ()
+        ]
         records = inputs["records"]
         hulls_nulled = _sanitise_feeds(records)
         _assert_sanitised(records)
@@ -509,7 +554,9 @@ def license_index(cache_dir, *, overrides_dir=None):
             records,
         )
         feed_rows = _feed_rows(records)
-        inventory = audit_rows + _catalogue_rows(inputs["sources"]) + feed_rows
+        inventory = (
+            audit_rows + expand_rows + _catalogue_rows(inputs["sources"]) + feed_rows
+        )
         notice = _notice(geometry_notice, inputs["sources"], feed_rows)
         artifacts = {
             FEEDS_ARTIFACT: store.jsonl_chunks(inputs["records"]),
