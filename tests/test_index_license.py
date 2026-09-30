@@ -23,9 +23,10 @@ LICENSED = {
 }
 
 
-def _cache(tmp_path, feeds=None, edges=None, places=None):
+def _cache(tmp_path, feeds=None, edges=None, places=None, expanded=None):
     """A crosswalk, an expanded generation with a geometry audit behind it,
-    classified coverage edges: what the license stage reads."""
+    classified coverage edges: what the license stage reads. ``expanded``
+    adds to the expanded generation's manifest."""
     pytest.importorskip("geopandas")
     cache, _ = _build_index(tmp_path)
     audit = _publish_audit(cache)
@@ -39,6 +40,7 @@ def _cache(tmp_path, feeds=None, edges=None, places=None):
             "overture_release": "2026-08-19.0",
             "places_overrides_sha256": None,
             "geometry_generation": audit["generation"],
+            **(expanded or {}),
         },
     )
     _publish_coverage(

@@ -258,7 +258,7 @@ def _write_crawl(cache, feed_id, stops_rows):
     log_path.write_text(existing + json.dumps(log) + "\n")
 
 
-def _expand(tmp_path, cache, registry=None, labels=None):
+def _expand(tmp_path, cache, registry=None, labels=None, overrides_dir=None):
     divisions = fx.write_dataset(tmp_path / "divisions.parquet", DIVISIONS)
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
     lookup = boundaries.BoundaryLookup(
@@ -286,6 +286,7 @@ def _expand(tmp_path, cache, registry=None, labels=None):
             wikidata=wikidata,
             area_dataset=areas,
             registry=registry,
+            overrides_dir=overrides_dir,
         )
     finally:
         lookup.close()
@@ -305,6 +306,7 @@ def test_no_crawl_artifacts_pass_the_seed_through(tmp_path):
     assert manifest["mode"] == "declared"
     assert manifest["simplify_tolerance_deg"] == geometry.SIMPLIFY_TOLERANCE_DEG
     assert manifest["places_added"] == 0
+    assert manifest["licence_sources"] == manifest["licence_inventory"] == []
     assert set(places) == {"Q33"}
     assert report == []
 
@@ -329,6 +331,13 @@ def test_a_crawled_stop_discovers_an_unseeded_city(tmp_path):
     assert tampere["geometry_source"] == "overture"
     boundary = shapely.from_wkb(bytes.fromhex(tampere["geometry"]))
     assert boundary.covers(shapely.Point(22.0, 61.0))
+    # The audit is recorded for the licence stage: Tampere's two areas and
+    # Pirkanmaa's one.
+    assert manifest["licence_sources"] == ["OpenStreetMap|ODbL-1.0"]
+    assert [
+        (row["dataset"], row["allowed"], row["geometries"])
+        for row in manifest["licence_inventory"]
+    ] == [("OpenStreetMap", True, 3)]
     # Wikidata names merged.
     assert tampere["names"]["fi"] == "Tampere"
     assert tampere["aliases"] == ["Manse"]
@@ -614,14 +623,91 @@ def test_a_fao_region_the_seed_left_unpublished_is_minted_over_every_city(tmp_pa
     assert manifest["metros_added"] == 1
 
 
+@pytest.mark.parametrize("seeded_core", [False, True], ids=["joins", "leaves"])
+def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core):
+    from test_index_metros import _fao_inputs, _ucdb_inputs
+    from transitio_index import fao, ucdb
+
+    cache = tmp_path / "cache"
+    # The seed published FAO region 50 over Ikaalinen, under 1% of the region,
+    # whose centre lies in Pirkanmaa. A stop off every city discovers
+    # Pirkanmaa, which joins as the core; or the seed gave the metro a core
+    # and a stop discovers Badgeo, a city shipping no polygon, so it leaves.
+    files, pins = _fao_inputs(tmp_path, patch=shapely.box(21.0, 60.5, 29.0, 62.5))
+    fao.prepare_inputs(cache, files=files, expected=pins)
+    centres, centre_pins = _ucdb_inputs(
+        tmp_path, centre=shapely.box(23, 61.2, 24, 61.8)
+    )
+    ucdb.prepare_inputs(cache, files=centres, expected=centre_pins)
+    key = "fao_city_region:50"
+    ikaalinen = shapely.box(22.9, 61.7, 23.0, 61.8)
+    core = {
+        "place_id": "Q2",
+        "kind": "region",
+        "name": "Core",
+        "country_code": "FI",
+        "geometry": _wkb(23.2, 61.3, 23.8, 61.7).hex(),
+        "metro_ids": [key],
+        "member_ids": [],
+    }
+    drawn = ikaalinen
+    if seeded_core:
+        drawn = shapely.union(
+            ikaalinen, shapely.from_wkb(bytes.fromhex(core["geometry"]))
+        )
+    region = {
+        "place_id": key,
+        "kind": "metro",
+        "source_subtype": metros.FAO_SUBTYPE,
+        "name": "Ikaalinen",
+        "country_code": "FI",
+        "statistical_area_id": "50",
+        "geometry": shapely.to_wkb(drawn).hex(),
+        "metro_ids": [],
+        "member_ids": ["Q1", "Q2"] if seeded_core else ["Q1"],
+    }
+    city = {
+        "place_id": "Q1",
+        "kind": "city",
+        "name": "Ikaalinen",
+        "country_code": "FI",
+        "overture_id": "fi-ika",
+        "geometry": shapely.to_wkb(ikaalinen).hex(),
+        "metro_ids": [key],
+        "member_ids": [],
+    }
+    seeded = [region, city, core] if seeded_core else [region, city]
+    derived = {"eurostat": None, "fao": pins, "ucdb": None, "fao_centres": centre_pins}
+    _publish_names(cache, SEED_PLACES + seeded, derived_inputs=derived)
+    _write_crawl(cache, "f", ["s1,62.1,28.2\n" if seeded_core else "s1,61.9,23.0\n"])
+    manifest, places, _ = _expand(tmp_path, cache)
+    metro = places[key]
+    boundary = shapely.from_wkb(bytes.fromhex(metro["geometry"]))
+    assert manifest["places_added"] == 1
+    if seeded_core:
+        # Redrawn over the members it keeps, without the core.
+        assert metro["member_ids"] == ["Q1", "Q999"]
+        assert places["Q2"]["metro_ids"] == []
+        assert not boundary.covers(shapely.Point(23.5, 61.5))
+    else:
+        # Redrawn over its members, the metro now takes Pirkanmaa's shape.
+        assert metro["member_ids"] == ["Q1", "Q5697"]
+        assert places["Q5697"]["metro_ids"] == [key]
+        assert boundary.covers(shapely.Point(24.4, 61.1))
+
+
 def test_an_unauditable_boundary_ships_without_geometry(tmp_path):
     cache = tmp_path / "cache"
     _publish_names(cache, SEED_PLACES)
     _write_crawl(cache, "f-badgeo", ["s1,62.1,28.2\n"])
-    _, places, _ = _expand(tmp_path, cache)
+    manifest, places, _ = _expand(tmp_path, cache)
     badgeo = places["Q999"]
     assert badgeo["geometry"] is None
     assert badgeo["geometry_source"] is None
+    assert manifest["licence_sources"] == []
+    assert [
+        (row["dataset"], row["allowed"]) for row in manifest["licence_inventory"]
+    ] == [("Mystery Maps", False)]
 
 
 def test_a_stops_file_that_fails_its_state_digest_is_skipped(tmp_path):

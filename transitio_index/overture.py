@@ -19,6 +19,7 @@ import datetime
 import http.client
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -289,8 +290,8 @@ class WikidataClient:
     """Batched lookups against the Wikidata SPARQL endpoint.
 
     Resolves OSM relations to QIDs (``p402``), a city's US metropolitan area
-    (``statistical_metros``), its metro-like candidates (``metro_candidates``)
-    and a place's labels and aliases
+    (``statistical_metros``), its metro-like candidates (``metro_candidates``),
+    an entity's area (``areas``) and a place's labels and aliases
     (``labels_and_aliases``), each in id-keyed batches. Only the Overture release
     is pinned; these endpoints are live, so results track Wikidata at build time.
     Tests substitute a stub exposing the same methods rather than reaching the
@@ -358,15 +359,50 @@ class WikidataClient:
             for city, found in sorted(raw.items())
         }
 
+    def areas(self, qids):
+        """``{qid: [km², ...]}`` — each QID's area (P2046) values.
+
+        Only best-ranked statements, normalised to square metres, so a
+        deprecated or outranked area is never read as the entity's. A QID
+        without one is absent.
+        """
+        ids = self._checked_qids(qids)
+        found = {}
+        for start in progress(range(0, len(ids), self.batch_size), "wikidata areas"):
+            batch = " ".join(
+                f"wd:{qid}" for qid in ids[start : start + self.batch_size]
+            )
+            query = (
+                f"SELECT ?item ?m2 WHERE {{ VALUES ?item {{ {batch} }} "
+                "?item p:P2046 ?st . ?st a wikibase:BestRank ; "
+                "psn:P2046/wikibase:quantityAmount ?m2 . }"
+            )
+            for binding in self._get(query):
+                qid = binding.get("item", {}).get("value", "").rsplit("/", 1)[-1]
+                try:
+                    m2 = float(binding.get("m2", {}).get("value"))
+                except (TypeError, ValueError):
+                    continue
+                if QID_PATTERN.match(qid) and math.isfinite(m2) and m2 > 0:
+                    found.setdefault(qid, set()).add(m2 / 1e6)
+        return {qid: sorted(values) for qid, values in sorted(found.items())}
+
+    @staticmethod
+    def _checked_qids(ids):
+        """The distinct ``ids`` sorted, refusing any that is not a QID: only
+        QIDs reach a query's text, where an arbitrary string could alter it."""
+        ids = sorted({str(qid) for qid in ids if qid})
+        invalid = [qid for qid in ids if not QID_PATTERN.match(qid)]
+        if invalid:
+            raise GazetteerError(f"not Wikidata QIDs: {invalid[:5]}")
+        return ids
+
     def _p8138(self, classes, city_qids, code_property=None):
         """``{city: {metro: {"name", "codes"}}}`` for the cities' P8138 links to
         metros of ``classes``, batched; ``codes`` holds each metro's
         ``code_property`` values when one is asked for."""
-        ids = sorted({str(qid) for qid in city_qids if qid})
-        # Only QIDs reach the query text: an arbitrary string could alter it.
-        invalid = [qid for qid in [*ids, *classes] if not QID_PATTERN.match(qid)]
-        if invalid:
-            raise GazetteerError(f"not Wikidata QIDs: {invalid[:5]}")
+        ids = self._checked_qids(city_qids)
+        self._checked_qids(classes)
         raw = {}
         for start in progress(range(0, len(ids), self.batch_size), "wikidata p8138"):
             self._p8138_batch(

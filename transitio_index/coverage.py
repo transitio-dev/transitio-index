@@ -305,12 +305,12 @@ def _route_keys(feed_dir, state):
     """A crawl's routes as ``(route_type, name)`` — the short name, else the
     long name, casefolded — from its digest-verified routes.txt; empty when
     it cannot be read."""
-    from transitio_index import classify, crawl
+    from transitio_index import crawl
 
     keys = set()
     try:
         with crawl.verified_member(feed_dir, state, "routes.txt") as opened:
-            for row in classify._reader(opened) if opened is not None else ():
+            for row in crawl.member_rows(opened) if opened is not None else ():
                 value = (row.get("route_type") or "").strip()
                 name = (row.get("route_short_name") or "").strip() or (
                     row.get("route_long_name") or ""

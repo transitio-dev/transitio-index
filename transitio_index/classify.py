@@ -52,13 +52,11 @@ trips of a route-level feed, or null whenever the counts are empty.
 
 import collections
 import contextlib
-import csv
 import datetime
 import heapq
 import json
 import os
 import stat
-import io
 import math
 import statistics
 
@@ -318,19 +316,6 @@ class _LaterFirst:
         return self.value == other.value
 
 
-def _reader(opened):
-    """csv rows over a binary file, leaving the file open afterwards.
-
-    A ``TextIOWrapper`` closes its underlying file when it is collected;
-    detaching keeps ``opened`` usable for a second pass.
-    """
-    text = io.TextIOWrapper(opened, encoding="utf-8-sig", errors="strict")
-    try:
-        yield from csv.DictReader(text)
-    finally:
-        text.detach()
-
-
 def _read_routes(opened):
     """``({route_id: {"route_type", "agency_id"}}, route_types)`` — an
     unparsable type is a missing signal (None), never a guessed one; ids
@@ -338,7 +323,7 @@ def _read_routes(opened):
     crawl's skip predicate saw them."""
     routes = {}
     route_types = []
-    for row in _reader(opened):
+    for row in crawl.member_rows(opened):
         value = (row.get("route_type") or "").strip()
         route_type = int(value) if value.isdigit() else None
         route_types.append(route_type)
@@ -359,7 +344,7 @@ def _read_trips(opened, routes):
     trips = {}
     services = {}
     orphans = set()
-    for row in _reader(opened):
+    for row in crawl.member_rows(opened):
         trip_id = row.get("trip_id") or ""
         route_id = row.get("route_id") or ""
         if not trip_id:
@@ -389,7 +374,7 @@ def _read_calendar(calendar, calendar_dates):
     """
     windows = {}
     if calendar is not None:
-        for row in _reader(calendar):
+        for row in crawl.member_rows(calendar):
             service_id = row.get("service_id") or ""
             start = _date(row.get("start_date"))
             end = _date(row.get("end_date"))
@@ -411,7 +396,7 @@ def _read_calendar(calendar, calendar_dates):
     added = collections.defaultdict(set)
     removed = collections.defaultdict(set)
     if calendar_dates is not None:
-        for row in _reader(calendar_dates):
+        for row in crawl.member_rows(calendar_dates):
             service_id = row.get("service_id") or ""
             date = _date(row.get("date"))
             kind = (row.get("exception_type") or "").strip()
@@ -533,7 +518,7 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     trip_rows = collections.Counter()
     departures = collections.Counter()
     dangling = 0
-    for row in _reader(opened):
+    for row in crawl.member_rows(opened):
         trip_id = row.get("trip_id") or ""
         route_id = trip_routes.get(trip_id)
         stop_id = row.get("stop_id") or ""
@@ -581,7 +566,7 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     opened.seek(0)
     rows = collections.defaultdict(list)
     unordered = set()
-    for row in _reader(opened):
+    for row in crawl.member_rows(opened):
         trip_id = row.get("trip_id") or ""
         stop_id = row.get("stop_id") or ""
         if trip_id not in wanted:

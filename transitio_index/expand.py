@@ -16,6 +16,7 @@ unchanged as ``places_expanded.jsonl``, so the declared path keeps running end
 to end.
 """
 
+import collections
 import datetime
 import functools
 
@@ -133,7 +134,7 @@ def _stop_points(feed_dir, state):
         return None
 
 
-def _attach_boundary(place, rows):
+def _attach_boundary(place, rows, inventory, shipped):
     """The division's licence-audited, simplified boundary onto the place.
 
     ``rows`` are the division's COMPLETE land areas from an id-filtered
@@ -141,12 +142,13 @@ def _attach_boundary(place, rows):
     which would ship a multi-part city truncated to wherever its stops were.
     The contract mirrors the geometry stage's exactly: every area's every
     source allowlisted and every polygon valid, else the place ships without
-    geometry rather than with unaudited or partial geometry.
+    geometry rather than with unaudited or partial geometry. The audit is
+    recorded in ``inventory`` and ``shipped`` as the geometry stage records it.
     """
     place.setdefault("geometry", None)
     place.setdefault("geometry_source", None)
     if rows:
-        geometry.ship_area(place, rows)
+        geometry.ship_area(place, rows, inventory, shipped)
 
 
 def _attach_metros(places_by_id, codes, new_cities, wikidata, report, registry=None):
@@ -265,15 +267,15 @@ def _draw_member_geometry(places_by_id, keys):
 
 
 def _derived_inputs(cache_dir, recorded):
-    """The Eurostat, Urban Audit and FAO inputs, and the UCDB names, the
-    metros stage published metros from: ``(eurostat, urau, fao, names)``,
-    loaded under the digests the run's ``derived_inputs`` recorded — so
-    expansion derives metros from the run's snapshot, never from the modules'
-    current pins — each None (the names empty) where the run records none,
-    that definition or branch having published none. A recorded input the
-    raw store no longer holds, or one no longer allowlisted, refuses the
-    expansion: the seeded metros were derived from it, so only a gazetteer
-    rerun keeps the output consistent."""
+    """The Eurostat, Urban Audit and FAO inputs, the UCDB names and the FAO
+    centres the metros stage published metros from: ``(eurostat, urau, fao,
+    names, centres)``, loaded under the digests the run's ``derived_inputs``
+    recorded — so expansion derives metros from the run's snapshot, never
+    from the modules' current pins — each None (the names empty) where the
+    run records none, that definition or branch having published none. A
+    recorded input the raw store no longer holds, or one no longer
+    allowlisted, refuses the expansion: the seeded metros were derived from
+    it, so only a gazetteer rerun keeps the output consistent."""
     from transitio_index import eurostat, fao, ucdb, urau
 
     def load(branch, keys, read):
@@ -308,14 +310,20 @@ def _derived_inputs(cache_dir, recorded):
         metros.FAO_DERIVED,
         lambda pins: fao.load_inputs(cache_dir, expected=pins),
     )
-    names = None
+    names = centres = None
     if fao_inputs is not None:
         names = load(
             "ucdb",
             (ucdb.DERIVED,),
             lambda pins: ucdb.load_names(cache_dir, expected=pins),
         )
-    return euro, urau_inputs, fao_inputs, names[0] if names is not None else {}
+        centres = load(
+            "fao_centres",
+            metros.FAO_DERIVED,
+            lambda pins: ucdb.centre_points(cache_dir, expected=pins),
+        )
+    names = names[0] if names is not None else {}
+    return euro, urau_inputs, fao_inputs, names, centres
 
 
 class _SeededPlacement:
@@ -413,13 +421,14 @@ def _attach_fao_metros(
     report,
     fao_inputs,
     names,
+    centres,
 ):
     """FAO city-region membership for the discovered cities, mirroring the
-    metros stage over the inputs it read (``fao_inputs``, None for none, and
-    the UCDB ``names``): each city joins its region's metro, found by its
-    code (``codes``) or minted — over every city in the region, the seeded
-    ones included, when the seed left it unpublished. Returns ``(added,
-    touched)``."""
+    metros stage over the inputs it read (``fao_inputs``, None for none, the
+    UCDB ``names`` and the FAO ``centres``): each city joins its region's
+    metro, found by its code (``codes``) or minted — over every city in the
+    region, the seeded ones included, when the seed left it unpublished —
+    and every FAO metro's core is settled. Returns ``(added, touched)``."""
     from transitio_index import fao
 
     added = []
@@ -458,6 +467,17 @@ def _attach_fao_metros(
         touched.add(metro["place_id"])
         for city_id in sorted(members):
             metros.join(metro, places_by_id[city_id])
+    if centres is not None:
+        # A discovered region may hold the centre of a metro no discovered
+        # city joined.
+        changed = metros.settle_fao_cores(
+            places_by_id, places_by_id, _shipped_footprint, regions, patches, centres
+        )
+        for key in changed:
+            # Redrawn from the members it now has, never kept around a core
+            # that left.
+            places_by_id[key]["geometry"] = places_by_id[key]["geometry_source"] = None
+        touched |= changed
     return added, touched
 
 
@@ -473,12 +493,14 @@ def _discover(
     release,
     derived,
     reopen=None,
+    curated=(),
 ):
     """Resolve crawled stops and fold the missing places in; returns counts.
     With ``registry``, every discovered place is identified through it;
     ``derived`` is the run's ``derived_inputs`` — the digests the metros stage
-    derived metros from — and ``reopen`` reopens ``area_dataset`` when its S3
-    scan stalls."""
+    derived metros from — ``reopen`` reopens ``area_dataset`` when its S3
+    scan stalls, and ``curated`` holds the ``set_boundary`` entries a
+    discovered place takes."""
     # Two passes, one feed's stops in memory at a time — never every crawled
     # feed's stops at once: first the lookup boxes, then, with the boxes
     # ensured, the per-point division resolution.
@@ -634,15 +656,33 @@ def _discover(
         countries={discovered[qid].get("country_code") for qid in new_ids} - {None},
     )
     given = geometry.lend_areas(areas, lent)
+    # The geometry stage applied the entries naming a seeded key; the rest
+    # name a place discovery added, or a seeded row it gave their QID.
+    pending = [entry for entry in curated if entry["place"] not in places_by_id]
+    inventory = collections.Counter()
+    shipped = set()
     for qid in new_ids:
         place = discovered[qid]
         place.setdefault("aliases", [])
         place.setdefault("statistical_area_id", None)
         place.setdefault("metro_ids", [])
-        _attach_boundary(place, areas.get(place["overture_id"]))
+        _attach_boundary(place, areas.get(place["overture_id"]), inventory, shipped)
         if place["geometry"] and place["overture_id"] in given:
             place["geometry_source"] = given[place["overture_id"]]
         places_by_id[qid] = place
+    # A curated boundary replaces the Overture one before any metro is drawn
+    # from it.
+    fresh = set(new_ids)
+    targets = {}
+    for qid, key in canonical.items():
+        row = places_by_id.get(qid if qid in fresh else key)
+        if row is not None:
+            targets[qid] = targets[key] = row
+    stale = []
+    for entry in pending:
+        if entry["place"] in targets:
+            geometry.set_boundary(targets[entry["place"]], entry, stale)
+    report.extend({"kind": "stale_override", **row} for row in stale)
     # A discovered place under a seeded one links to the key the seeded row
     # is held by — its own id, for a place no QID names.
     held = {**survivors, **canonical}
@@ -658,10 +698,13 @@ def _discover(
     new_metros, metro_pairs = _attach_metros(
         places_by_id, codes, new_cities, wikidata, report, registry
     )
-    euro = urau_inputs = fao_inputs = None
+    euro = urau_inputs = fao_inputs = centres = None
     names = {}
-    if city_rows:
-        euro, urau_inputs, fao_inputs, names = _derived_inputs(cache_dir, derived)
+    # A discovered region may hold a FAO metro's centre.
+    if city_rows or any(places_by_id[q].get("kind") == "region" for q in new_ids):
+        euro, urau_inputs, fao_inputs, names, centres = _derived_inputs(
+            cache_dir, derived
+        )
     # One join per Eurostat definition the run derived, over the same cities.
     eurostat_metros, eurostat_touched, assignments = [], set(), []
     for definition, inputs in (
@@ -691,6 +734,7 @@ def _discover(
         report,
         fao_inputs,
         names,
+        centres,
     )
     dropped |= metros.partition(
         {key: places_by_id[key] for key in fao_touched}, places_by_id, codes, report
@@ -748,6 +792,14 @@ def _discover(
         "places_added": len(new_ids) + len(new_metros),
         "metros_added": len(new_metros),
         "identified": identified,
+        # The audit of the boundaries shipped here, in the geometry stage's
+        # form: the licence stage credits what that stage's NOTICE does not.
+        "licence_sources": sorted("|".join(pair) for pair in shipped),
+        "licence_inventory": [
+            row
+            for row in geometry._inventory_rows(inventory, 0)
+            if row["role"] == "component"
+        ],
     }
 
 
@@ -763,6 +815,7 @@ def _expanded(
     registry,
     digest,
     derived,
+    curated,
 ):
     """Discovery under the crawl lock; ``(crawl_digest, counts, mode)``.
 
@@ -805,6 +858,7 @@ def _expanded(
                 release,
                 derived,
                 reopen,
+                curated,
             )
     finally:
         if opened_lookup is not None:
@@ -851,9 +905,13 @@ def expand(
                     f"{geometry.SIMPLIFY_TOLERANCE_DEG}°; re-run the geometry "
                     "stage before expanding"
                 )
+            # Keyed by QID, as discovery joins.
+            place_overrides, places_digest = overrides.load_place_overrides(
+                overrides_dir, registry=registry, internal=True
+            )
             overrides.expect_digest(
                 names_manifest.get("places_overrides_sha256"),
-                overrides.places_digest(overrides_dir),
+                places_digest,
                 "places.yaml",
                 "gazetteer",
             )
@@ -892,6 +950,8 @@ def expand(
                 "places_added": 0,
                 "metros_added": 0,
                 "identified": 0,
+                "licence_sources": [],
+                "licence_inventory": [],
             }
             with crawl.reading(cache_dir):
                 crawl_digest, counts, mode = _expanded(
@@ -906,6 +966,7 @@ def expand(
                     registry,
                     digest,
                     derived,
+                    overrides.by_operation(place_overrides, "set_boundary"),
                 )
             # Saved before the generation is visible, as the gazetteer run
             # does: a crash between the two leaves rows a rerun reproduces.
@@ -927,7 +988,10 @@ def expand(
                 "places_overrides_sha256": names_manifest.get(
                     "places_overrides_sha256"
                 ),
-                "stale_place_overrides": names_manifest.get("stale_place_overrides"),
+                "stale_place_overrides": (
+                    names_manifest.get("stale_place_overrides") or 0
+                )
+                + sum(row.get("kind") == "stale_override" for row in report),
                 "crawl_digest": crawl_digest,
                 "mode": mode,
                 "places": len(places_by_id),

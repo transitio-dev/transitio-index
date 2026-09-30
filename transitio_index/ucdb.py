@@ -74,24 +74,24 @@ def prepare_inputs(cache_dir, *, files=None, expected=PINS):
     return manifest
 
 
-def _polygons(frame, name):
-    """The frame's geometries in the equal-area projection as valid polygons:
-    repaired where the source's are not, refused where missing, empty, of
-    another type or without area."""
+def _polygons(frame, name, crs=EQUAL_AREA):
+    """The frame's geometries in ``crs`` (the equal-area projection by
+    default) as valid polygons: repaired where the source's are not, refused
+    where missing, empty, of another type or without area."""
     geoms = frame.geometry
     if geoms.isna().any() or geoms.is_empty.any():
         raise UcdbError(f"{name}: a geometry is missing or empty")
     if not set(geoms.geom_type) <= {"Polygon", "MultiPolygon"}:
         raise UcdbError(f"{name}: a geometry is not a polygon")
-    valid = shapely.make_valid(geoms.to_crs(EQUAL_AREA).to_numpy())
+    valid = shapely.make_valid(geoms.to_crs(crs).to_numpy())
     if (shapely.area(valid) <= 0).any():
         raise UcdbError(f"{name}: a geometry has no area")
     return valid
 
 
-def read_centres(data):
-    """``[{"id", "type", "geom"}]`` for every FAO urban centre in the zipped
-    shapefile bytes: unique integer ids, a type in 1–4, polygons."""
+def _centre_frame(data):
+    """``(frame, ids, types)`` of the FAO urban centres in the zipped
+    shapefile bytes: unique integer ids, a type in 1–4."""
     frame = fao.read_zipped(data, CENTRES_FILE, error=UcdbError)
     missing = [c for c in ("id", "type") if c not in frame.columns]
     if missing:
@@ -102,10 +102,30 @@ def read_centres(data):
     types = fao.integer_ids(frame, "type", CENTRES_FILE, error=UcdbError)
     if not set(types) <= set(fao.TIERS):
         raise UcdbError(f"{CENTRES_FILE}: a centre type is not a tier")
+    return frame, ids, types
+
+
+def read_centres(data):
+    """``[{"id", "type", "geom"}]`` for every FAO urban centre in the zipped
+    shapefile bytes: unique integer ids, a type in 1–4, polygons."""
+    frame, ids, types = _centre_frame(data)
     geoms = _polygons(frame, CENTRES_FILE)
     return [
         {"id": int(i), "type": int(t), "geom": g} for i, t, g in zip(ids, types, geoms)
     ]
+
+
+def centre_points(cache_dir, *, expected=PINS):
+    """``{centre_id: Point}``: a point on each FAO urban centre's polygon, in
+    WGS84, read from the pinned inputs. A FAO region's id is its centre's."""
+    generation, _ = pinned.resolve(
+        cache_dir, pointer=POINTER, expected=expected, error=UcdbError
+    )
+    with generation:
+        data = generation.read_bytes(CENTRES_FILE)
+    frame, ids, _ = _centre_frame(data)
+    points = shapely.point_on_surface(_polygons(frame, CENTRES_FILE, "EPSG:4326"))
+    return {str(i): point for i, point in zip(ids, points)}
 
 
 def _text(value):

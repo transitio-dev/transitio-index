@@ -22,7 +22,8 @@ stale when indexed — its ``service_end`` more than ``STALE_DAYS`` before its
 ``last_crawled`` — scores 0 on every edge, so it sorts last in its category
 with its tier and category unchanged; the edge's evidence records that
 ``service_end`` as ``stale_when_indexed``. The weights live here and nothing
-else in the pipeline reads them.
+else in the pipeline reads them; the merge rescores merged edges through
+:func:`score_edges`, the half of the scoring that depends on the place.
 """
 
 import collections
@@ -102,6 +103,65 @@ def rank_edges(edges, feeds, places):
             raise RankError(f"edge of an unknown feed {edge['feed_id']!r}")
         if edge["tier"] not in CATEGORY_BY_TIER:
             raise RankError(f"edge with an unknown tier {edge['tier']!r}")
+
+    prepared = []
+    for edge in edges:
+        feed = feed_by_id[edge["feed_id"]]
+        home = feed.get("home_country")
+        evidence = dict(edge.get("evidence") or {})
+        if places[edge["place_id"]].get("kind") in FEED_SHARE_KINDS:
+            country_stops = feed.get("country_stops") or {}
+            denominator = (
+                country_stops.get(home, 0) if home else sum(country_stops.values())
+            )
+            if denominator:
+                stops = pairs[(edge["feed_id"], edge["place_id"])].get("stops")
+                evidence["share_of_feed"] = min(1.0, float(stops or 0) / denominator)
+            else:
+                evidence["share_of_feed"] = 0.0
+                evidence["relevance_note"] = "no_country_stops"
+        ended = stale[edge["feed_id"]]
+        if ended is not None:
+            evidence["stale_when_indexed"] = ended
+        prepared.append({**edge, "evidence": evidence})
+    scored, basis, _ = score_edges(prepared, places)
+
+    ranked = []
+    categories = collections.Counter()
+    by_kind = collections.defaultdict(list)
+    cross_border = 0
+    for edge in scored:
+        home = feed_by_id[edge["feed_id"]].get("home_country")
+        place = places[edge["place_id"]]
+        crossing = home is None or place.get("country_code") != home
+        cross_border += crossing
+        categories[edge["relevance_category"]] += 1
+        by_kind[place.get("kind")].append(edge["relevance"])
+        ranked.append({**edge, "cross_border": crossing})
+    report = {
+        "edges_by_category": dict(categories),
+        "cross_border_edges": cross_border,
+        "share_basis_by_place": dict(collections.Counter(basis.values())),
+        "relevance_by_kind": {kind: _quantiles(v) for kind, v in by_kind.items()},
+    }
+    return ranked, report
+
+
+def score_edges(edges, places):
+    """``(scored, basis_by_place, unscored)``: the edges with the fields that
+    depend on their place and on the whole edge set, recomputed.
+
+    Each edge's evidence already holds the per-feed terms: ``share_of_feed``
+    on city, metro and region edges and ``stale_when_indexed`` when the feed
+    was stale. Scoring sets ``share_basis``, ``share_of_place`` and, on other
+    kinds, ``breadth`` in a copy of the evidence, and the edge's
+    ``relevance_category``, ``relevance`` and ``needs_review``. A city, metro
+    or region edge without ``share_of_feed`` scores 0 for it and carries the
+    ``no_share_of_feed`` note unless it has a note; ``unscored`` counts them.
+    """
+    pairs = {}
+    for edge in edges:
+        pairs.setdefault((edge["feed_id"], edge["place_id"]), edge.get("service") or {})
     by_place = collections.defaultdict(list)
     for key in pairs:
         by_place[key[1]].append(key)
@@ -118,16 +178,11 @@ def rank_edges(edges, feeds, places):
             served_cities[place.get("country_code")].add(place_id)
             feed_cities[(feed_id, place.get("country_code"))].add(place_id)
 
-    ranked = []
-    categories = collections.Counter()
-    by_kind = collections.defaultdict(list)
-    cross_border = 0
+    scored = []
+    unscored = 0
     for edge in edges:
-        feed = feed_by_id[edge["feed_id"]]
         place = places[edge["place_id"]]
         service = pairs[(edge["feed_id"], edge["place_id"])]
-        home = feed.get("home_country")
-        country = place.get("country_code")
         category = CATEGORY_BY_TIER[edge["tier"]]
         evidence = dict(edge.get("evidence") or {})
         evidence["share_basis"] = basis[edge["place_id"]]
@@ -137,17 +192,14 @@ def rank_edges(edges, feeds, places):
         )
         evidence["share_of_place"] = share_of_place
         if place.get("kind") in FEED_SHARE_KINDS:
-            country_stops = feed.get("country_stops") or {}
-            denominator = (
-                country_stops.get(home, 0) if home else sum(country_stops.values())
-            )
-            if denominator:
-                second = min(1.0, float(service.get("stops") or 0) / denominator)
+            if "share_of_feed" in evidence:
+                second = evidence["share_of_feed"]
             else:
                 second = 0.0
-                evidence["relevance_note"] = "no_country_stops"
-            evidence["share_of_feed"] = second
+                evidence.setdefault("relevance_note", "no_share_of_feed")
+                unscored += 1
         else:
+            country = place.get("country_code")
             cities = served_cities.get(country, ())
             second = (
                 len(feed_cities.get((edge["feed_id"], country), ())) / len(cities)
@@ -155,35 +207,21 @@ def rank_edges(edges, feeds, places):
                 else 0.0
             )
             evidence["breadth"] = second
-        ended = stale[edge["feed_id"]]
-        if ended is not None:
-            evidence["stale_when_indexed"] = ended
         relevance = (
             0.0
-            if category == "unknown" or ended is not None
+            if category == "unknown" or "stale_when_indexed" in evidence
             else W_PLACE * share_of_place + W_FEED * second
         )
-        crossing = home is None or country != home
-        cross_border += crossing
-        categories[category] += 1
-        by_kind[place.get("kind")].append(relevance)
-        ranked.append(
+        scored.append(
             {
                 **edge,
                 "relevance_category": category,
                 "relevance": relevance,
-                "cross_border": crossing,
                 "needs_review": bool(edge.get("needs_review")) or category == "unknown",
                 "evidence": evidence,
             }
         )
-    report = {
-        "edges_by_category": dict(categories),
-        "cross_border_edges": cross_border,
-        "share_basis_by_place": dict(collections.Counter(basis.values())),
-        "relevance_by_kind": {kind: _quantiles(v) for kind, v in by_kind.items()},
-    }
-    return ranked, report
+    return scored, basis, unscored
 
 
 def _quantiles(values):

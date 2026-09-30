@@ -20,11 +20,13 @@ import test_index_boundaries as bt  # noqa: E402
 import test_index_coverage as ct  # noqa: E402
 import test_index_crawl as crt  # noqa: E402
 import test_index_fetch as ft  # noqa: E402
+import test_index_ziprange as zt  # noqa: E402
 from transitio_index import (  # noqa: E402
     atlas,
     boundaries,
     classify,
     coverage,
+    crawl,
     crosswalk,
     fetch,
     geometry,
@@ -1090,3 +1092,352 @@ def test_a_failed_refetch_keeping_its_crawl_gets_that_crawl_identity(tmp_path):
     _, log = crt._crawl(cache, crt._server({}))
     assert log["f-a"]["method"] == "failed"
     assert json.loads(path.read_text())["identity"] == identity
+
+
+def test_the_merge_rescores_relevance_over_the_merged_edges(tmp_path):
+    """The merge kept each edge's relevance from the build that won its
+    feed, so a feed alone at Paris in one build kept 0.7 for its place share
+    and outranked Paris's main feed from another build."""
+    import json
+
+    from builds_fixture import BOX, _feed7, _place, _run
+
+    from transitio_index import builds, merge, rank
+
+    def edge(place, feed, tier, stops, departures, evidence, relevance, category=None):
+        service = {"stops": stops}
+        if departures is not None:
+            service["departures_per_day"] = departures
+        return {
+            "place_id": place,
+            "feed_id": feed,
+            "tier": tier,
+            "service": json.dumps(service),
+            "evidence": json.dumps(evidence),
+            "needs_review": False,
+            "relevance_category": category or rank.CATEGORY_BY_TIER[tier],
+            "relevance": relevance,
+            "cross_border": False,
+        }
+
+    places = [
+        _place(*row, country="FR")
+        for row in (
+            ("fr", "country", "France", None, BOX(-5, 42, 8, 51)),
+            ("ara", "region", "Rhône", "fr", BOX(4, 44, 7, 46.5)),
+            ("par", "city", "Paris", "fr", BOX(2.2, 48.8, 2.5, 48.9)),
+            ("mrs", "city", "Marseille", "fr", BOX(5.3, 43.2, 5.5, 43.4)),
+            ("lyo", "city", "Lyon", "ara", BOX(4.8, 45.7, 4.9, 45.8)),
+        )
+    ]
+    older = [
+        ("par", "x", "local", 4, 4.5, {"share_of_feed": 0.0002}, 0.7 + 0.3 * 0.0002),
+        # A place filed under another kind in this build.
+        ("mrs", "x", "local", 5, None, {"breadth": 1.0}, 1.0),
+        ("fr", "x", "national", 9, 4.5, {"breadth": 1.0}, 1.0),
+    ]
+    stale = {"share_of_feed": 0.9, "stale_when_indexed": "2026-01-31"}
+    newer = [
+        ("par", "y", "local", 400, 15614, {"share_of_feed": 0.5}, 0.85),
+        ("mrs", "y", "local", 20, 100, {"share_of_feed": 0.05}, 0.715),
+        ("lyo", "z", "local", 30, 50, {"share_of_feed": 0.4}, 0.82),
+        ("ara", "s", "regional", 3, 2, stale, 0.0),
+        ("ara", "z", "unknown", 1, 1, {"share_of_feed": 0.1}, 0.3, "primary"),
+    ]
+    sources = []
+    for label, digit, feeds, rows, day in (
+        ("atlas1", 1, ["x"], older, 10),
+        ("mdb", 2, ["y", "z", "s"], newer, 15),
+    ):
+        run = _run(
+            tmp_path,
+            label,
+            digit,
+            places=places,
+            feeds=[_feed7(f, f, "FR", "domestic") for f in feeds],
+            edges={"FR": [edge(*row) for row in rows]},
+            built_at=f"2026-09-{day}T00:00:00+00:00",
+        )
+        snapshot, _, tables = builds.load_tables(tmp_path / run / "index")
+        sources.append((run, snapshot, tables))
+    snapshot, tables = merge.merge_tables(sources)
+    edges = {
+        (e["place_id"], e["feed_id"]): {**e, "evidence": json.loads(e["evidence"])}
+        for e in tables["edges.parquet"].to_pylist()
+    }
+    paris = 4.5 + 15614
+    assert edges["par", "x"]["relevance"] == pytest.approx(
+        0.7 * 4.5 / paris + 0.3 * 0.0002
+    )
+    assert edges["par", "y"]["relevance"] == pytest.approx(
+        0.7 * 15614 / paris + 0.3 * 0.5
+    )
+    # One pair without departures puts the whole place on stops.
+    for feed, share in (("x", 5 / 25), ("y", 20 / 25)):
+        assert edges["mrs", feed]["evidence"]["share_basis"] == "stops"
+        assert edges["mrs", feed]["evidence"]["share_of_place"] == pytest.approx(share)
+    assert edges["mrs", "x"]["relevance"] == pytest.approx(0.7 * 5 / 25)
+    assert edges["mrs", "x"]["evidence"]["relevance_note"] == "no_share_of_feed"
+    assert edges["lyo", "z"]["relevance"] == pytest.approx(0.82)
+    assert edges["fr", "x"]["evidence"]["breadth"] == pytest.approx(2 / 3)
+    assert edges["fr", "x"]["relevance"] == pytest.approx(0.7 + 0.3 * 2 / 3)
+    assert edges["ara", "s"]["relevance"] == 0.0
+    assert edges["ara", "s"]["evidence"]["stale_when_indexed"] == "2026-01-31"
+    unknown = edges["ara", "z"]
+    assert (unknown["relevance_category"], unknown["relevance"]) == ("unknown", 0.0)
+    assert unknown["needs_review"] is True
+    assert snapshot["relevance"] == {
+        "edges": 8,
+        "changed": 6,
+        "share_basis_by_place": {"departures": 4, "stops": 1},
+        "no_share_of_feed": 1,
+    }
+
+
+def _padded(text, width=150):
+    """Every line of ``text`` padded with trailing spaces, as Renfe writes."""
+    return "".join(line + " " * width + "\n" for line in text.splitlines()).encode()
+
+
+_CALENDAR = (
+    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+    "start_date,end_date\ns1,1,1,1,1,1,1,1,20260929,20261011\n"
+)
+_CALENDAR_DATES = "service_id,date,exception_type\ns1,20261001,2\n"
+_ROUTES = "route_id,agency_id,route_type\nr1,a,3\nr2,a,0\n"
+_STOPS = "stop_id,stop_lat,stop_lon\ns1,40.4,-3.7\ns2,40.5,-3.6\n"
+
+
+@pytest.mark.parametrize(
+    "read, members",
+    [
+        pytest.param(
+            lambda calendar, dates: classify._read_calendar(calendar, dates),
+            (_CALENDAR, _CALENDAR_DATES),
+            id="calendar",
+        ),
+        pytest.param(classify._read_routes, (_ROUTES,), id="routes"),
+        pytest.param(crawl.stop_rows, (_STOPS,), id="stops"),
+    ],
+)
+def test_a_padded_member_reads_as_the_clean_one(read, members):
+    """Renfe pads every line, headers included, so the last column's
+    name carried the padding and every calendar row lost its end_date."""
+    import io
+
+    clean = read(*(io.BytesIO(m.encode()) for m in members))
+    assert read(*(io.BytesIO(_padded(m)) for m in members)) == clean
+    if members[0] == _CALENDAR:
+        active, _, span = clean
+        assert active == {"s1": 12}
+        assert [d.isoformat() for d in span] == ["2026-09-29", "2026-10-11"]
+
+
+def test_a_feed_with_spaced_header_names_keeps_its_fingerprint():
+    """Metra writes a space after each comma of its header rows, so no
+    stop coordinate parsed and the feed had no edge."""
+    import io
+
+    from transitio.index import fingerprint
+
+    trips = "route_id,service_id,trip_id\nr1,s1,t1\nr2,s1,t2\n"
+    stop_times = (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:00:00,08:00:00,s1,1\nt1,08:10:00,08:10:00,s2,2\n"
+        "t2,09:00:00,09:00:00,s2,1\nt2,09:05:00,09:05:00,s1,2\n"
+    )
+
+    def digest(spaced):
+        def member(text):
+            header, _, rest = text.partition("\n")
+            return io.BytesIO(
+                (
+                    (header.replace(",", ", ") if spaced else header) + "\n" + rest
+                ).encode()
+            )
+
+        routes, _ = classify._read_routes(member(_ROUTES))
+        rows, _ = crawl.stop_rows(member(_STOPS))
+        coords = {stop_id: (x, y) for stop_id, x, y in rows}
+        trip_routes, trip_services, _ = classify._read_trips(member(trips), routes)
+        stops = classify._read_stop_times(
+            member(stop_times), trip_routes, trip_services
+        )[0]
+        return fingerprint.compute("route_stops", routes, coords, stops)
+
+    assert digest(spaced=True) == digest(spaced=False)
+
+
+def test_a_streamed_archive_is_read_through_ranges(tmp_path):
+    """A zip written to a stream flags every member with a data descriptor and
+    leaves each local CRC and size zero, as a Mobility Database hosted copy
+    does; the range reader refused such an archive, so the crawl downloaded
+    it whole."""
+    cache = tmp_path / "cache"
+    data = zt._zip_bytes(crt.FULL_MEMBERS, streamed=True)
+    crt._publish_resolved(cache, [crt._feed("f-a", "https://feeds.example/a.zip")])
+    _, log = crt._crawl(
+        cache, crt._server({"/a.zip": (data, '"v1"')}), range_threshold=1
+    )
+    assert log["f-a"]["method"] == "range"
+    assert log["f-a"]["fallback_reason"] is None
+    stop_times = crt._feed_dir(cache, "f-a") / "stop_times.txt"
+    assert stop_times.read_bytes() == crt.STOP_TIMES
+
+
+LINZ_CREDIT = (
+    "  - Land Information New Zealand (LINZ) — CC BY 4.0 "
+    "(https://creativecommons.org/licenses/by/4.0/)"
+)
+
+
+def test_a_linz_area_ships_and_is_credited(tmp_path):
+    """Overture's New Zealand localities carry the LINZ source under CC BY
+    4.0, which was not allowlisted: their boundaries were omitted and the
+    licence stage drew each from its feeds' hulls."""
+    import test_index_geometry as gt
+
+    cache = tmp_path / "cache"
+    gt._publish(
+        cache, [gt._place("Q37100", "city", overture_id="nz-akl", country="NZ")]
+    )
+    linz = [{"dataset": "Linz", "license": "CC-BY-4.0", "record_id": "L"}]
+    dataset = fx.write_area_dataset(
+        tmp_path / "areas.parquet", [fx.area("nz-akl", gt.BOX, linz)]
+    )
+    geometry.attach_geometry(cache, dataset=dataset)
+    (place,), _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    assert place["geometry_source"] == "overture"
+    assert LINZ_CREDIT + "\n" in gt._read_text(cache, "NOTICE")
+    inventory, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    assert [
+        (row["dataset"], row["license"], row["allowed"])
+        for row in inventory
+        if row["role"] == "component"
+    ] == [("Linz", "CC-BY-4.0", True)]
+
+
+def test_a_source_only_expand_shipped_is_credited(tmp_path):
+    """The expand stage shipped boundaries without recording their sources,
+    and the NOTICE was the geometry stage's, written over the seeded places
+    only: a source that shipped only through expand went uncredited."""
+    import test_index_license as lt
+
+    from transitio_index import licensing, merge
+
+    component = {
+        "role": "component",
+        "use": "geometry",
+        "dataset": "Linz",
+        "license": "CC-BY-4.0",
+        "url": "https://creativecommons.org/licenses/by/4.0/",
+        "version": "2026-08-19.0",
+        "allowed": True,
+        "geometries": 1,
+    }
+    cache = lt._cache(
+        tmp_path,
+        expanded={
+            "licence_sources": ["Linz|CC-BY-4.0"],
+            "licence_inventory": [component],
+        },
+    )
+    licensing.license_index(cache)
+    generation, _ = store.resolve(cache / "license", "licensed.json")
+    with generation:
+        notice = generation.read_bytes("NOTICE")
+    assert LINZ_CREDIT in merge._notice_sections(notice, "b")["geometry"]
+    inventory, _ = store.read_jsonl(
+        cache / "license", "licensed.json", "licence_inventory.jsonl"
+    )
+    assert {**component, "stage": "expand"} in inventory
+
+
+@pytest.mark.parametrize(
+    ("expanded", "error"),
+    [
+        # Expanded before the stage recorded what its boundaries shipped.
+        ({"mode": "expanded"}, "rerun the expand stage"),
+        # A shipped source the allowlist has since dropped.
+        (
+            {
+                "mode": "expanded",
+                "licence_sources": ["Retired|X-1.0"],
+                "licence_inventory": [],
+            },
+            "no longer allowlisted",
+        ),
+    ],
+    ids=["unaudited", "dropped"],
+)
+def test_an_expand_audit_the_licence_stage_cannot_credit_is_refused(expanded, error):
+    """Expanded places whose shipped sources cannot be credited are refused,
+    not licensed with the geometry stage's credit alone."""
+    from transitio_index import licensing
+
+    with pytest.raises(licensing.LicenseError, match=error):
+        licensing._geometry_notice("", [], {}, expanded, "2026-08-19.0")
+
+
+@pytest.mark.parametrize(
+    ("stale", "joined"),
+    [(False, False), (True, False), (False, True)],
+    ids=["discovered", "stale", "joined"],
+)
+def test_set_boundary_applies_to_a_place_expand_discovers(tmp_path, stale, joined):
+    """The geometry stage applies ``set_boundary`` to the seeded places it
+    can key, and expand applied none: a place first found by expand — every
+    place of a build that seeds none — or a seeded row that gained the
+    entry's QID only in expand shipped its Overture boundary instead of the
+    curated one. Expand now applies it, judged like the geometry stage's."""
+    import test_index_expand as ex
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import overrides
+
+    curated = shapely.box(23.7, 61.45, 23.9, 61.55)
+    entry = {"place": "Q40840", "set_boundary": shapely.to_wkt(curated)}
+    if stale:
+        entry["evidence_hash"] = "0" * 64
+    directory = write_overrides(tmp_path, places=[entry])
+    cache = tmp_path / "cache"
+    seeded, known = list(ex.SEED_PLACES), []
+    if joined:
+        # Tampere seeded without a QID, known by its Overture division.
+        known.append({"overture": ["fi-tre"]})
+        seeded.append(
+            {
+                "place_id": "tp_2",
+                "tp_id": "tp_2",
+                "kind": "city",
+                "name": "Tampere",
+                "country_code": "FI",
+                "overture_id": "fi-tre",
+                "metro_ids": [],
+                "member_ids": [],
+            }
+        )
+    ex._publish_names(
+        cache, seeded, places_overrides_sha256=overrides.places_digest(directory)
+    )
+    ex._write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    path = tmp_path / "places_registry.jsonl"
+    ex._publish_run(cache, ex._seeded_registry(path, *known))
+    with registry.session(path) as reg:
+        manifest, places, report = ex._expand(
+            tmp_path, cache, registry=reg, overrides_dir=directory
+        )
+    # Joined, Tampere is the seeded row and only Pirkanmaa is added.
+    assert manifest["places_added"] == (1 if joined else 2)
+    tampere = places["Q40840"]
+    assert tampere["geometry_source"] == geometry.CURATED
+    assert shapely.from_wkb(bytes.fromhex(tampere["geometry"])).equals(curated)
+    rows = [row for row in report if row.get("kind") == "stale_override"]
+    assert [(row["place"], row["operation"]) for row in rows] == [
+        ("Q40840", "set_boundary")
+    ] * stale
+    assert manifest["stale_place_overrides"] == stale

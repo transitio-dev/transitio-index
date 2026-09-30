@@ -147,6 +147,32 @@ def _dir_name(feed_id):
     return "id-" + hashlib.sha256(feed_id.encode("utf-8")).hexdigest()
 
 
+def member_rows(opened):
+    """csv rows over a binary member file, leaving the file open afterwards.
+
+    Header names lose surrounding whitespace (``str.strip``, as transitio's
+    fingerprint reads them); a name repeated after that keeps its first
+    column, and later ones read under ``""``. Values stay as written: ids
+    feed the classification fingerprint. Decoding is strict UTF-8 with an
+    optional BOM: replacing malformed bytes would let distinct invalid ids
+    collapse into one. A ``TextIOWrapper`` closes its file when collected;
+    detaching keeps ``opened`` usable for a second pass.
+    """
+    text = io.TextIOWrapper(opened, encoding="utf-8-sig", errors="strict")
+    try:
+        reader = csv.DictReader(text)
+        if reader.fieldnames is not None:
+            names, seen = [], set()
+            for name in reader.fieldnames:
+                name = name.strip()
+                names.append("" if name in seen else name)
+                seen.add(name)
+            reader.fieldnames = names
+        yield from reader
+    finally:
+        text.detach()
+
+
 def stop_rows(source):
     """``(rows, dropped)`` parsed from ``stops.txt`` bytes or a binary file.
 
@@ -159,10 +185,7 @@ def stop_rows(source):
     rows = []
     dropped = 0
     stream = io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source
-    # Strict: replacing malformed bytes would let distinct invalid ids
-    # collapse into one; a bad byte is a data error the caller handles.
-    text = io.TextIOWrapper(stream, encoding="utf-8-sig", errors="strict")
-    for row in csv.DictReader(text):
+    for row in member_rows(stream):
         try:
             x = float(row.get("stop_lon") or "")
             y = float(row.get("stop_lat") or "")
@@ -343,11 +366,7 @@ def _skip_stop_times(feed_dir, digests, lookup, force):
         routes_path = feed_dir.path / "routes.txt"
         stops_path = feed_dir.path / "stops.txt"
         with os.fdopen(store.open_nofollow(routes_path), "rb") as opened:
-            rows = list(
-                csv.DictReader(
-                    io.TextIOWrapper(opened, encoding="utf-8-sig", errors="strict")
-                )
-            )
+            rows = list(member_rows(opened))
         route_types = []
         for row in rows:
             value = (row.get("route_type") or "").strip()
@@ -730,8 +749,8 @@ def _html_page(feed_dir, content_type):
 def _extract_members(feed_dir, decide, fragment=None):
     """Extract the members from the downloaded archive, streamed and bounded.
 
-    ``zipfile`` handles what ziprange deliberately refuses (ZIP64, data
-    descriptors); each member is capped and streamed straight to its file, so
+    ``zipfile`` handles what ziprange deliberately refuses (ZIP64, bzip2 or
+    LZMA members); each member is capped and streamed straight to its file, so
     members never accumulate in memory. An archive fragment names a nested zip,
     extracted first and read in the outer one's place. The cheap members land
     first; ``decide`` then rules on extracting ``stop_times.txt``. Returns the

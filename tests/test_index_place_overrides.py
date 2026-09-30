@@ -353,7 +353,8 @@ def test_a_file_may_reference_the_places_its_add_place_entries_create(tmp_path):
         overrides.load_edge_overrides(directory, registry=reg)
 
 
-def test_the_committed_place_overrides_load_with_valid_boundaries():
+@pytest.mark.parametrize("operation", ["set_boundary", "add_place"])
+def test_the_committed_place_overrides_load_with_valid_boundaries(operation):
     from pathlib import Path
 
     pytest.importorskip("pyarrow")
@@ -362,9 +363,14 @@ def test_the_committed_place_overrides_load_with_valid_boundaries():
     entries, _ = overrides.load_place_overrides(
         Path(__file__).resolve().parent.parent / "overrides"
     )
-    boundaries = overrides.by_operation(entries, "set_boundary")
-    assert entries and boundaries
-    for entry in boundaries:
+    checked = 0
+    for entry in overrides.by_operation(entries, operation):
+        spec = entry[operation]
+        boundary = spec.get("boundary") if operation == "add_place" else spec
+        if boundary is None:
+            continue
         place = {"place_id": entry["place"]}
-        geometry._curated_geometry(place, entry["set_boundary"])
+        geometry._curated_geometry(place, boundary)
         assert place["geometry_source"] == geometry.CURATED
+        checked += 1
+    assert checked
