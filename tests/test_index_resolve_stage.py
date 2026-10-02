@@ -456,6 +456,26 @@ def test_a_provider_claims_urls_by_origin_and_whole_path_segments(url, claimed):
     assert overrides.claiming_provider(url, providers) == ("p" if claimed else None)
 
 
+def test_the_committed_access_overrides_load():
+    from pathlib import Path
+
+    directory = Path(__file__).resolve().parent.parent / "overrides"
+    providers, refused, _ = overrides.load_access_providers(directory)
+    assert providers and refused == []
+    entries, _ = overrides.load_feed_overrides(directory)
+    protected = [
+        entry["add_feed"]
+        for entry in entries.values()
+        if entry.get("add_feed", {}).get("access") == "key"
+    ]
+    assert protected
+    # A curated feed names an accepted provider, which also claims its URL.
+    for spec in protected:
+        provider = spec["access_provider"]
+        assert provider in providers
+        assert overrides.claiming_provider(spec["url"], providers) == provider
+
+
 def test_resolve_binds_protected_feeds_to_providers_and_reports_the_rest(tmp_path):
     page = "https://register.example/"
 

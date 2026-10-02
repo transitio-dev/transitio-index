@@ -409,9 +409,9 @@ def load_feed_overrides(overrides_dir, *, registry=None):
 
 def load_catalogue_exceptions(overrides_dir):
     """``{catalogue id: reason}`` from ``catalogue_exceptions.yaml``: the MDB
-    and Atlas GTFS ids a merged index may lack, each entry naming the id as
-    ``feed`` with a non-empty ``reason`` (and optionally an ``author`` and a
-    ``date``). No file means no exceptions."""
+    and Atlas GTFS ids and the ``add_feed`` ids a merged index may lack, each
+    entry naming the id as ``feed`` with a non-empty ``reason`` (and
+    optionally an ``author`` and a ``date``). No file means no exceptions."""
     path, entries, _ = _feed_entries(
         overrides_dir, CATALOGUE_EXCEPTIONS_FILE, _EXCEPTION_KEYS
     )

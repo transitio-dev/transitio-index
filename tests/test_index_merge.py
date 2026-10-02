@@ -1227,16 +1227,27 @@ def _cut_read(mdb, atlas):
 
 
 def test_the_catalogue_check_looks_each_id_up_as_a_feed_or_an_alias():
+    from transitio_index import overrides
+
     feeds = pa.table(
         {
             "feed_id": ["f-mdb-1", "f-abc", "f-xyz"],
-            "aliases": [[], ["f-mdb-2"], ["f-old"]],
+            "aliases": [[], ["f-mdb-2"], ["f-old", "f-curated-folded"]],
         }
     )
     cut = {"mdb_sha256": "m" * 64, "atlas_sha256": "a" * 64}
+    curated = {
+        ref: {"feed": ref, "add_feed": {"location": {"country_code": code}}}
+        for ref, code in (
+            ("f-curated-folded", "FI"),
+            ("f-curated-lost", "FI"),
+            ("f-curated-nowhere", "AR"),
+        )
+    }
+    curated["f-abc"] = {"feed": "f-abc", "mark_uncrawlable": True}
     partition = {
         "catalogues": {"atlas_commit": "c0ffee"},
-        "labels": {"fi": cut, "se": cut, "zw": cut},
+        "labels": {"fi": {**cut, "countries": ["FI"]}, "se": cut, "zw": cut},
         "mdb": {"mdb-1": "fi", "mdb-2": "fi", "mdb-3": "fi", "mdb-9": "zw"},
         "atlas": {"f-abc": "fi", "f-old": "se", "f-gone": "se"},
     }
@@ -1245,12 +1256,17 @@ def test_the_catalogue_check_looks_each_id_up_as_a_feed_or_an_alias():
         {"label": "se", "build_id": "se-2", "snapshot": _cut_read("m" * 64, "0" * 64)},
         {"label": "us", "build_id": "us-3", "snapshot": _cut_read("m" * 64, "a" * 64)},
     ]
-    check = merge.catalogue_check(partition, "p" * 64, feeds, loaded)
+    check = merge.catalogue_check(partition, "p" * 64, feeds, loaded, curated)
     assert check == {
         "partition_sha256": "p" * 64,
         "catalogues": {"atlas_commit": "c0ffee"},
-        "expected": {"mdb": 4, "atlas": 3},
+        "expected": {"mdb": 4, "atlas": 3, "curated": 3},
+        "curated_sha256": overrides.phase_digest(
+            curated, overrides.CROSSWALK_OPERATIONS
+        ),
         "missing": [
+            {"catalogue": "curated", "id": "f-curated-nowhere", "label": None},
+            {"catalogue": "curated", "id": "f-curated-lost", "label": "fi"},
             {"catalogue": "mdb", "id": "mdb-3", "label": "fi"},
             {"catalogue": "atlas", "id": "f-gone", "label": "se"},
             {"catalogue": "mdb", "id": "mdb-9", "label": "zw"},
@@ -1263,6 +1279,8 @@ def test_the_catalogue_check_looks_each_id_up_as_a_feed_or_an_alias():
     merge._report_check(check, lines.append)
     assert lines == [
         "label zw not merged: 1 catalogue feeds missing",
+        "missing curated f-curated-nowhere (no label holds its country)",
+        "missing curated f-curated-lost (label fi)",
         "missing mdb mdb-3 (label fi)",
         "missing atlas f-gone (label se)",
         "label us is not in the partition",
@@ -1282,6 +1300,16 @@ def test_the_catalogue_check_looks_each_id_up_as_a_feed_or_an_alias():
         (
             {"labels": {}, "mdb": {"mdb-1": "zw"}, "atlas": {}},
             "mdb mdb-1 is in 'zw', a label the partition does not list",
+        ),
+        (
+            {
+                "labels": {
+                    "fi": {"mdb_sha256": "", "atlas_sha256": "", "countries": "FI"}
+                },
+                "mdb": {},
+                "atlas": {},
+            },
+            "label fi lists no country codes",
         ),
     ],
 )
@@ -1325,7 +1353,7 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
         merge.main(
             [
                 *("--builds", str(builds), "--cache-dir", str(cache)),
-                *("--partition", str(partition)),
+                *("--partition", str(partition), "--overrides-dir", str(tmp_path)),
             ]
         )
         == 0
@@ -1518,9 +1546,10 @@ def _small_run(fx, archived, label, digit, built_at):
     )
 
 
-def _merged_cache(fx, tmp_path, partition=None):
+def _merged_cache(fx, tmp_path, partition=None, overrides_dir=None):
     """The two runs and a skipped one merged, checked against ``PARTITION``
-    as ``partition`` edits it; ``False`` merges without a check."""
+    as ``partition`` edits it and the add_feed entries of ``overrides_dir``;
+    ``False`` merges without a check."""
     builds, cache = tmp_path / "builds", tmp_path / "cache"
     fi, de = _two_runs(
         fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
@@ -1531,6 +1560,7 @@ def _merged_cache(fx, tmp_path, partition=None):
         cache,
         log=lambda line: None,
         partition=None if partition is False else _partition(tmp_path, partition),
+        overrides_dir=overrides_dir,
     )
     return builds, cache, fi, de, manifest
 
@@ -1688,27 +1718,40 @@ def _de_cut_again(partition):
 
 
 EXCEPTED = "- feed: lost\n  reason: withdrawn by its operator\n"
+CURATED = (
+    "- feed: f-curated-lost\n  add_feed: {name: Lost, url: 'https://lost.example/',"
+    " spec: gtfs, license: {url: 'https://lost.example/'}, location: {country_code: ZW}}\n"
+)
 
 
 @pytest.mark.parametrize(
-    "partition, exceptions, message",
+    "partition, feeds, exceptions, message",
     [
-        (False, None, "no catalogue check; re-run the merge with --partition"),
-        (_a_feed_lost, None, r"1 catalogue feeds missing .*: lost \(fi\)$"),
-        (_a_feed_lost, EXCEPTED, None),
-        (_de_not_listed, None, "merges labels outside the partition: de"),
-        (_de_cut_again, None, "merges labels built from another cut: de"),
+        (False, None, None, "no catalogue check; re-run the merge with --partition"),
+        (_a_feed_lost, None, None, r"1 catalogue feeds missing .*: lost \(fi\)$"),
+        (_a_feed_lost, None, EXCEPTED, None),
+        (
+            None,
+            CURATED,
+            None,
+            r"1 catalogue feeds missing .*: f-curated-lost \(no label\)$",
+        ),
+        (None, CURATED, EXCEPTED.replace("lost", "f-curated-lost"), None),
+        (_de_not_listed, None, None, "merges labels outside the partition: de"),
+        (_de_cut_again, None, None, "merges labels built from another cut: de"),
     ],
 )
 def test_a_merged_snapshot_is_released_only_with_its_whole_catalogue_cut(
-    tmp_path, partition, exceptions, message
+    tmp_path, partition, feeds, exceptions, message
 ):
     fx = pytest.importorskip("index_fixture")
     from transitio_index import publisher
 
-    builds, cache, *_ = _merged_cache(fx, tmp_path, partition)
     excepted = tmp_path / "overrides" / "catalogue_exceptions.yaml"
     excepted.parent.mkdir()
+    if feeds is not None:
+        (excepted.parent / "feeds.yaml").write_text(feeds)
+    builds, cache, *_ = _merged_cache(fx, tmp_path, partition, excepted.parent)
     if exceptions is not None:
         excepted.write_text(exceptions)
     options = {"builds_dir": builds, "overrides_dir": excepted.parent}
@@ -1717,16 +1760,20 @@ def test_a_merged_snapshot_is_released_only_with_its_whole_catalogue_cut(
             publisher.pack(cache / "index", **options)
         return
     _, release = publisher.pack(cache / "index", **options)
-    # The flip-time check reads the exceptions again.
+    # The flip-time check reads the exceptions and the add_feed entries again.
     excepted.unlink()
-    with pytest.raises(publisher.PublishIndexError, match=r"lost \(fi\)"):
+    with pytest.raises(publisher.PublishIndexError, match=r"lost \("):
+        publisher._check_lineage(cache, release["lineage"], excepted.parent, builds)
+    (excepted.parent / "feeds.yaml").write_text(CURATED.replace("lost", "new"))
+    with pytest.raises(publisher.PublishIndexError, match="other add_feed entries"):
         publisher._check_lineage(cache, release["lineage"], excepted.parent, builds)
 
 
 CHECKED = {
     "partition_sha256": "0" * 64,
+    "curated_sha256": None,
     "catalogues": {},
-    "expected": {"mdb": 0, "atlas": 1},
+    "expected": {"mdb": 0, "atlas": 1, "curated": 0},
     "missing": [],
     "labels_not_merged": [],
     "labels_outside": [],
@@ -1742,6 +1789,8 @@ CHECKED = {
         {**CHECKED, "expected": {"mdb": 0}},
         {**CHECKED, "labels_not_merged": None},
         {**CHECKED, "missing": [{"id": "lost", "label": "fi"}]},
+        {**CHECKED, "missing": [{"catalogue": "mdb", "id": "lost", "label": None}]},
+        {key: value for key, value in CHECKED.items() if key != "curated_sha256"},
     ],
 )
 def test_a_catalogue_check_not_shaped_as_the_merge_writes_it_is_refused(check):

@@ -17,7 +17,8 @@ toolchain they were merged with. ``write_snapshot`` reads the assembled
 snapshot back through the reader before committing it into the cache's
 ``index/`` as publish commits its own. Given the ``partition.json`` of the
 catalogue cut the builds came from, ``catalogue_check`` records which of its
-feeds and labels the merged index lacks; the publisher refuses the gaps.
+feeds and labels, and which ``add_feed`` feeds of ``overrides/feeds.yaml``, the
+merged index lacks; the publisher refuses the gaps.
 """
 
 import argparse
@@ -38,7 +39,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from transitio.index import fingerprint
 
-from . import classify, coverage, crosswalk, licensing, publish, rank, store
+from . import classify, coverage, crosswalk, licensing, overrides, publish, rank, store
 from .builds import (
     _EPOCH,
     _SNAPSHOT_ERRORS,
@@ -73,8 +74,8 @@ OVERRIDE_FIELDS = (
 # merged ids. 5: a re-keyed id keeps its companions, and a feed lists the
 # companions linked to it. 6: feeds of different builds with one content
 # identity fold. 7: relevance is rescored over the merged edges. 8: the
-# manifest records the catalogue check.
-MERGE_FORMAT = 8
+# manifest records the catalogue check. 9: the check covers the curated feeds.
+MERGE_FORMAT = 9
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -751,14 +752,15 @@ def _partition_files(routed, snapshot_id):
     return files, listing
 
 
-def _merged_id(loaded, partition_sha256=None):
+def _merged_id(loaded, partition_sha256=None, curated_sha256=None):
     """The snapshot id: the first sixteen hex digits of a SHA-256 over the
     schema version, the merge format, the transitio and pyarrow versions,
-    the digest of the partition the merge was checked against (None
-    without one) and, per source in label order, its label, build id and
-    the digests of its manifest and NOTICE. The same sources merged the
-    same way name the same artefact; a change in any source, the
-    partition, the format or the toolchain names another."""
+    the digests of the partition and of the curated feeds the merge was
+    checked against (None without them) and, per source in label order, its
+    label, build id and the digests of its manifest and NOTICE. The same
+    sources merged the same way name the same artefact; a change in any
+    source, the partition, the curated feeds, the format or the toolchain
+    names another."""
     from transitio import __version__ as transitio_version
 
     parts = [
@@ -767,6 +769,7 @@ def _merged_id(loaded, partition_sha256=None):
         transitio_version,
         pa.__version__,
         partition_sha256,
+        curated_sha256,
     ]
     for source in sorted(loaded, key=lambda s: s["label"]):
         parts.append(
@@ -945,8 +948,9 @@ def read_partition(path):
     """``(partition, sha256)`` of a catalogue cut's ``partition.json``, read
     once: its ``catalogues`` pins, its ``labels``, each recording the digests
     of its cut's MDB CSV and Atlas archive, and its ``mdb`` and ``atlas`` maps
-    of GTFS id to label. A file that is not such a JSON object, or that
-    assigns an id to a label it does not list, is refused."""
+    of GTFS id to label; a label may list the ``countries`` it owns. A file
+    that is not such a JSON object, or that assigns an id to a label it does
+    not list, is refused."""
     try:
         data = Path(path).read_bytes()
         partition = json.loads(data)
@@ -967,6 +971,11 @@ def read_partition(path):
             isinstance(entry.get(key), str) for key in ("mdb_sha256", "atlas_sha256")
         ):
             raise MergeError(f"{path}: label {label} records no cut digests")
+        countries = entry.get("countries", [])
+        if not isinstance(countries, list) or not all(
+            isinstance(code, str) for code in countries
+        ):
+            raise MergeError(f"{path}: label {label} lists no country codes")
     for catalogue in ("mdb", "atlas"):
         for feed_id, label in partition[catalogue].items():
             if not isinstance(label, str) or label not in labels:
@@ -977,16 +986,20 @@ def read_partition(path):
     return partition, hashlib.sha256(data).hexdigest()
 
 
-def catalogue_check(partition, digest, feeds, loaded):
+def catalogue_check(partition, digest, feeds, loaded, feed_overrides=None):
     """The merged manifest's ``catalogue_check`` of the merged ``feeds``
     and the ``loaded`` sources against a cut's ``partition`` and its
-    ``digest``, as :func:`read_partition` returns them: the digest, the
-    partition's catalogue pins and id counts; ``missing``, by label and id,
-    every id that is neither a merged ``feed_id`` nor an alias of one (an
-    MDB row is looked up by its minted ``f-mdb-`` id); the partition's
-    labels no source was merged for; the merged labels it does not list;
-    and the merged labels whose build read another MDB CSV or Atlas archive
-    than the cut the partition records for them."""
+    ``digest``, as :func:`read_partition` returns them, and against the
+    ``add_feed`` entries of ``feed_overrides`` (``feeds.yaml`` by reference):
+    the digest, the partition's catalogue pins, the id counts and the digest
+    of the add_feed entries whose ids were looked up (the one the crosswalk
+    records as ``feeds_add_sha256``); ``missing``, by label and id, every id
+    that is neither a merged ``feed_id`` nor an alias of one (an MDB row is
+    looked up by its minted ``f-mdb-`` id; a curated feed is filed under the
+    label owning its country, None when no label does); the partition's
+    labels no source was merged for; the merged labels it does not list; and
+    the merged labels whose build read another MDB CSV or Atlas archive than
+    the cut the partition records for them."""
     present = set(feeds["feed_id"].to_pylist())
     if "aliases" in feeds.column_names:
         present.update(pc.list_flatten(feeds["aliases"]).to_pylist())
@@ -997,8 +1010,19 @@ def catalogue_check(partition, digest, feeds, loaded):
         ("atlas", feed_id, label, feed_id)
         for feed_id, label in partition["atlas"].items()
     ]
-    wanted.sort(key=lambda row: (row[2], row[1], row[0]))
     labels = partition["labels"]
+    owner = {
+        code: label
+        for label, entry in labels.items()
+        for code in entry.get("countries", [])
+    }
+    curated = {
+        ref: entry["add_feed"]["location"]["country_code"]
+        for ref, entry in (feed_overrides or {}).items()
+        if "add_feed" in entry
+    }
+    wanted += [("curated", ref, owner.get(code), ref) for ref, code in curated.items()]
+    wanted.sort(key=lambda row: (row[2] or "", row[1], row[0]))
     merged = {source["label"]: source for source in loaded}
     another_cut = []
     for label in sorted(labels.keys() & merged.keys()):
@@ -1012,7 +1036,14 @@ def catalogue_check(partition, digest, feeds, loaded):
     return {
         "partition_sha256": digest,
         "catalogues": partition.get("catalogues"),
-        "expected": {"mdb": len(partition["mdb"]), "atlas": len(partition["atlas"])},
+        "expected": {
+            "mdb": len(partition["mdb"]),
+            "atlas": len(partition["atlas"]),
+            "curated": len(curated),
+        },
+        "curated_sha256": overrides.phase_digest(
+            feed_overrides or {}, overrides.CROSSWALK_OPERATIONS
+        ),
         "missing": [
             {"catalogue": catalogue, "id": feed_id, "label": label}
             for catalogue, feed_id, label, key in wanted
@@ -1033,7 +1064,9 @@ def _report_check(check, log):
     for label in check["labels_not_merged"]:
         log(f"label {label} not merged: {counts[label]} catalogue feeds missing")
     for row in check["missing"]:
-        if row["label"] not in unmerged:
+        if row["label"] is None:
+            log(f"missing {row['catalogue']} {row['id']} (no label holds its country)")
+        elif row["label"] not in unmerged:
             log(f"missing {row['catalogue']} {row['id']} (label {row['label']})")
     for label in check["labels_outside"]:
         log(f"label {label} is not in the partition")
@@ -1064,7 +1097,10 @@ def assemble(loaded, tables, notice, alias_conflicts=(), catalogue_check=None):
 
     loaded = sorted(loaded, key=lambda s: s["label"])
     agreed = _check_sources([(s["build_id"], s["snapshot"]) for s in loaded])
-    snapshot_id = _merged_id(loaded, (catalogue_check or {}).get("partition_sha256"))
+    check = catalogue_check or {}
+    snapshot_id = _merged_id(
+        loaded, check.get("partition_sha256"), check.get("curated_sha256")
+    )
     files, listing = _partition_files(_route(tables), snapshot_id)
     unknown_share, margin_share = _shares(tables["edges.parquet"])
     newest = max(loaded, key=lambda s: _built_at(s["snapshot"]) or _EPOCH)
@@ -1375,15 +1411,26 @@ def write_snapshot(cache_dir, manifest, files, notice):
         root.close()
 
 
-def merge_builds(builds, cache_dir, read_bytes=_read_file, log=print, partition=None):
+def merge_builds(
+    builds,
+    cache_dir,
+    read_bytes=_read_file,
+    log=print,
+    partition=None,
+    overrides_dir=None,
+):
     """Merge the newest run of every label archived under ``builds`` into
     ``<cache_dir>/index``; returns the manifest. The labels whose newest
     run cannot be a source are reported through ``log`` and left out; an
     older run never stands in for one. Nothing to merge is refused. With
     the path of a cut's ``partition`` the merged feeds are checked against
-    it (:func:`catalogue_check`), the gaps reported through ``log`` and
+    it and the ``add_feed`` entries of ``overrides_dir``'s ``feeds.yaml``
+    (:func:`catalogue_check`), the gaps reported through ``log`` and
     recorded in the manifest."""
-    cut = None if partition is None else read_partition(partition)
+    cut = None
+    if partition is not None:
+        cut = read_partition(partition)
+        feed_overrides, _ = overrides.load_feed_overrides(overrides_dir)
     sources, skipped = select_sources(builds, read_bytes)
     for run in skipped:
         log(f"skipped {run['id']}: {run['reason']}")
@@ -1408,7 +1455,7 @@ def merge_builds(builds, cache_dir, read_bytes=_read_file, log=print, partition=
             log(f"{relevance['no_share_of_feed']} edges lack share_of_feed")
     check = None
     if cut is not None:
-        check = catalogue_check(*cut, tables["feeds.parquet"], loaded)
+        check = catalogue_check(*cut, tables["feeds.parquet"], loaded, feed_overrides)
         _report_check(check, log)
     notice = compose_notice(loaded, tables["feeds.parquet"])
     manifest, files = assemble(
@@ -1445,6 +1492,13 @@ def parse_args(argv=None):
         help="the partition.json of the catalogue cut the builds came from; the "
         "merge checks every GTFS feed it lists is in the merged index",
     )
+    parser.add_argument(
+        "--overrides-dir",
+        type=Path,
+        default=Path("overrides"),
+        help="directory of override YAML files; with --partition the merge also "
+        "checks every add_feed feed of its feeds.yaml (default: overrides)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1452,9 +1506,12 @@ def main(argv=None):
     arguments = parse_args(argv)
     try:
         manifest = merge_builds(
-            arguments.builds, arguments.cache_dir, partition=arguments.partition
+            arguments.builds,
+            arguments.cache_dir,
+            partition=arguments.partition,
+            overrides_dir=arguments.overrides_dir,
         )
-    except (MergeError, store.StoreError) as error:
+    except (MergeError, store.StoreError, overrides.OverrideError) as error:
         print(f"merge: {error}", file=sys.stderr)
         return 1
     counts, check = manifest["counts"], manifest["catalogue_check"]
