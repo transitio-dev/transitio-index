@@ -512,7 +512,9 @@ def test_a_seeded_city_ships_its_urban_centre_only_without_another_boundary(
             "resolution_method": "overture_id",
         }
 
-    def seeded(place_id, overture_id, polygon=shapely.box(24.9, 60.1, 25.1, 60.3)):
+    def seeded(place_id, overture_id, polygon=None):
+        if polygon is None:
+            polygon = shapely.box(24.9, 60.1, 25.1, 60.3)
         return {
             **_place(place_id, "city", overture_id=overture_id),
             "ucdb_id": 1,
