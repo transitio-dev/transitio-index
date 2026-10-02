@@ -120,8 +120,9 @@ matching registry together.
 11. `prune` — drop the places that no kept edge needs.
 12. `license` — record each shipped feed's licence and lineage, and write the
     NOTICE.
-13. `publish` — write the shippable `cache/index/`: the GeoParquet tables and
-    manifest the reader installs.
+13. `publish` — write the shippable `cache/index/`: the GeoParquet tables,
+    the table of the access providers its feeds name and the manifest the
+    reader installs.
 14. `stats` — write statistics about the catalogue rows the build saw and the
     feeds they became, for reporting; the shipped index does not depend on
     them.

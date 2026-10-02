@@ -5,7 +5,8 @@ import tarfile
 import pytest
 
 import transitio.index as transitio_index  # noqa: E402
-from transitio_index import classify, licensing, prune, publish, store  # noqa: E402
+from transitio_index import classify, geometry, licensing, prune  # noqa: E402
+from transitio_index import publish, store  # noqa: E402
 from test_index_publish import (  # noqa: E402
     GEOM_HEX,
     PLACES,
@@ -224,6 +225,42 @@ def test_a_places_build_without_a_geometry_audit_cannot_be_licensed(tmp_path):
         licensing.license_index(cache)
 
 
+OSM = ("OpenStreetMap", "ODbL-1.0")
+_UCDB = geometry.DERIVED_SOURCES[geometry.UCDB_DERIVED]
+UCDB_ROW = {
+    "role": "derived_input",
+    "dataset": geometry.UCDB_DERIVED[0],
+    "license": geometry.UCDB_DERIVED[1],
+    "credit": _UCDB["credit"],
+    "terms": _UCDB["licence"],
+    "url": _UCDB["url"],
+    "allowed": True,
+}
+
+
+@pytest.mark.parametrize(
+    "staged, derived, populated, recomposed",
+    [
+        ([OSM], [], True, True),
+        # Credited already: as a shipped source, or an allowed derived input.
+        ([OSM, geometry.UCDB_DERIVED], [], True, False),
+        ([OSM], [UCDB_ROW], True, False),
+        ([OSM], [], False, False),
+    ],
+)
+def test_a_shipped_population_credits_the_ucdb_once(
+    staged, derived, populated, recomposed
+):
+    release = "2026-08-19.0"
+    sources = ["|".join(pair) for pair in staged]
+    notice = geometry._notice(set(staged), release, derived)
+    composed = licensing._geometry_notice(
+        notice, derived, {"licence_sources": sources}, {}, release, populated
+    )
+    assert (composed != notice) == recomposed
+    assert composed.count(_UCDB["credit"]) == (populated or len(staged) > 1)
+
+
 def test_a_moved_geometry_audit_requires_the_gazetteer_to_rerun(tmp_path):
     cache = _cache(tmp_path)
     licensing.license_index(cache)
@@ -335,6 +372,7 @@ def test_a_build_of_seeded_places_without_feeds_publishes_a_merge_source(tmp_pat
     assert (len(index.feeds), len(index.edges), len(index.places)) == (0, 0, 2)
     lima = transitio_index.place("tp_lima", index=index)
     assert list(lima.feeds(categories=None)) == [] and lima.validity is None
+    assert lima.population == 10**7
     assert lima.service.feeds == 0
     # Archived, the build is a merge source and loads verified.
     archived = tmp_path / "builds" / "cities-0000000000000003"

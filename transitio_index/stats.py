@@ -649,7 +649,8 @@ def _region_of(place_id, places):
 
 
 def _licence_state(feed):
-    """Whether the catalogues declare a licence for the feed."""
+    """Whether the feed's record declares a licence: its Atlas block (which
+    holds a curated feed's licence) or its MDB licence URL."""
     atlas = (feed.get("atlas") or {}).get("license") or {}
     if atlas.get("spdx_identifier") or atlas.get("url"):
         return "declared"
@@ -659,10 +660,12 @@ def _licence_state(feed):
 
 
 def _download_url(feed):
-    mdb = ((feed.get("mdb") or {}).get("urls") or {}).get("direct_download")
-    atlas = ((feed.get("atlas") or {}).get("urls") or {}).get("static_current")
-    gbfs = (feed.get("gbfs") or {}).get("auto_discovery_url")
-    return _clean_url(mdb) or _clean_url(atlas) or _clean_url(gbfs)
+    """The URL the crawl reads (``crawl.feed_url``): the published
+    ``download_url``, and for a realtime companion, whose table has none,
+    the one its catalogue blocks give."""
+    from transitio_index import crawl
+
+    return feed["download_url"] if "download_url" in feed else crawl.feed_url(feed)
 
 
 def feed_rows(

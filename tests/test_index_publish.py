@@ -30,9 +30,9 @@ from transitio.exceptions import IncompatibleIndexError  # noqa: E402
 from transitio.exceptions import PlaceNotFoundError  # noqa: E402
 
 # The feeds columns schema 7 added; an older shape is recreated by dropping them.
-# The columns schema 7, 8 and 9 added over the flat layout's (feeds, and the
-# places' ``validity``); schema 8 also dropped the ``gbfs`` block, which the
-# flat layout still expects.
+# The columns schema 7 to 11 added over the flat layout's (feeds, and the
+# places' ``validity``, ``centre`` and ``population``); schema 8 also dropped
+# the ``gbfs`` block, which the flat layout still expects.
 _SCHEMA_7_FEED_COLUMNS = (
     "home_country",
     "country_shares",
@@ -43,6 +43,14 @@ _SCHEMA_7_FEED_COLUMNS = (
     "service_end",
     "validity",
     "contained_in",
+    "download_url",
+    "access",
+    "access_provider",
+    "auth_method",
+    "auth_params",
+    "registration_url",
+    "centre",
+    "population",
 )
 
 
@@ -259,10 +267,18 @@ def _edge(place_id, feed_id, **kw):
 
 
 def _edges_index(
-    tmp_path, edges, feeds=None, release="2026-08-19.0", places=None, stale=(0, 0)
+    tmp_path,
+    edges,
+    feeds=None,
+    release="2026-08-19.0",
+    places=None,
+    stale=(0, 0),
+    lineage=None,
+    overrides_dir=None,
 ):
     """A cache with expanded places and a coverage generation, published;
-    ``stale`` is the (place, feed) override staleness those record."""
+    ``stale`` is the (place, feed) override staleness those record and
+    ``lineage`` more of the coverage manifest."""
     cache = tmp_path / "cache"
     expanded = _publish_gen(
         cache,
@@ -297,13 +313,14 @@ def _edges_index(
                     "overture_release": "2026-08-19.0",
                     "expanded_generation": expanded["generation"],
                     "stale_feed_overrides": stale[1],
+                    **(lineage or {}),
                 },
                 held=directory,
             )
     finally:
         directory.close()
     classify.classify(cache)
-    manifest = publish.publish(cache)
+    manifest = publish.publish(cache, overrides_dir=overrides_dir)
     return cache, manifest
 
 
@@ -648,6 +665,24 @@ def test_a_feeds_only_index_has_no_places(tmp_path, monkeypatch):
     monkeypatch.setattr(publish, "_read_resolved", read_then_write_feeds)
     with pytest.raises(publish.PublishError, match="feeds.yaml changed during"):
         publish.publish(cache, overrides_dir=late_feeds)
+    # And an access_providers.yaml no resolve generation applied, before and
+    # at activation.
+    from test_index_resolve_stage import _provider, _providers_dir
+
+    monkeypatch.undo()
+    for name in ("providers", "late_providers/overrides"):
+        (tmp_path / name).mkdir(parents=True)
+    providers = _providers_dir(tmp_path / "providers", [_provider("p")])
+    with pytest.raises(publish.PublishError, match="re-run the resolve stage"):
+        publish.publish(cache, overrides_dir=providers)
+
+    def read_then_write_providers(overrides_dir, resolve_manifest):
+        _providers_dir(tmp_path / "late_providers", [_provider("p")])
+        return {}
+
+    monkeypatch.setattr(publish, "_read_providers", read_then_write_providers)
+    with pytest.raises(publish.PublishError, match="access_providers.yaml changed"):
+        publish.publish(cache, overrides_dir=tmp_path / "late_providers" / "overrides")
 
 
 def test_the_reader_refuses_a_places_parquet_that_does_not_match(tmp_path):
@@ -1034,7 +1069,7 @@ def _publish_resolved(cache, feeds, manifest):
     directory = store.open_subdir(cache, "resolve")
     try:
         with store.exclusive_writer(directory):
-            store.publish(
+            return store.publish(
                 cache / "resolve",
                 "feeds_resolved.json",
                 {"feeds_resolved.jsonl": store.jsonl_chunks(feeds)},
@@ -1067,6 +1102,7 @@ def test_a_feeds_only_snapshot_ships_the_resolved_feeds(tmp_path):
         "crosswalk_generation": crosswalk["generation"],
         "sources": crosswalk["sources"],
         "feeds_overrides_sha256": None,
+        "access_providers_sha256": None,
     }
     _publish_resolved(cache, feeds, lineage)
     manifest = publish.publish(cache)
@@ -1074,6 +1110,11 @@ def test_a_feeds_only_snapshot_ships_the_resolved_feeds(tmp_path):
     row = index.feeds.set_index("feed_id").loc[feeds[0]["feed_id"]]
     assert not row["crawlable"]
     assert manifest["snapshot_id"] != before["snapshot_id"]
+    # Resolved before feeds took their access providers: refused.
+    pre = {k: v for k, v in lineage.items() if k != "access_providers_sha256"}
+    _publish_resolved(cache, feeds, pre)
+    with pytest.raises(publish.PublishError, match="predates access providers"):
+        publish.publish(cache)
     # A feeds.yaml the resolve generation did not apply: refused, before
     # and at activation; one nobody applied is a stage that has not run.
     directory = write_overrides(
@@ -1275,7 +1316,7 @@ def _restamp(index_dir, version, places):
     table."""
     _flatten(index_dir, version)
     # Minus the place columns added since: the flat layout predates them.
-    gone = [c for c in ("validity",) if c in places.columns]
+    gone = [c for c in ("validity", "centre", "population") if c in places.columns]
     places.drop(columns=gone).to_parquet(index_dir / "places.parquet", index=False)
     snapshot = json.loads((index_dir / "snapshot.json").read_text())
     snapshot["places_sha256"] = hashlib.sha256(
@@ -1490,39 +1531,148 @@ def test_a_place_without_a_qid_publishes_and_reads_back(tmp_path):
     assert tampere.concordances == {"overture": ["fi-tre"]} and tampere.former_ids == []
 
 
-def test_the_index_ships_the_country_and_relevance_columns(tmp_path):
-    import pyarrow.parquet as pq
+MUNI_LICENCE = {
+    "url": "https://511.example/terms",
+    "attribution_text": "Data provided by 511.org",
+}
 
+
+def test_the_index_ships_the_country_relevance_and_access_columns(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from test_index_place_overrides import write_overrides
+    from test_index_resolve_stage import _provider, _providers_dir
+
+    from transitio_index import resolve
+
+    # The providers file the resolve stage applied: one provider a feed
+    # names, and one no feed does, which does not ship.
+    directory = _providers_dir(
+        tmp_path,
+        [_provider("mtc-511", docs_url="https://511.example/docs", free=True)]
+        + [_provider("other")],
+    )
+    cache, _ = _build_index(tmp_path)
+    _, crosswalk_manifest = store.read_jsonl(
+        cache / "crosswalk", "feeds.json", "feeds.jsonl"
+    )
+    resolved = _publish_resolved(
+        cache,
+        [],
+        {
+            "crosswalk_generation": crosswalk_manifest["generation"],
+            "sources": crosswalk_manifest["sources"],
+            "feeds_overrides_sha256": None,
+            "access_providers_sha256": overrides.override_digest(
+                directory, overrides.ACCESS_PROVIDERS_FILE
+            ),
+        },
+    )
     # Classify decides the country fields: a declared-only feed with an MDB
     # country keeps that claim and no home.
-    feed = {**_covered_feed("f-a"), "mdb": {"location": {"country_code": "fi"}}}
-    edge = {
-        **_edge("Q1757", "f-a", tier="local"),
-        "relevance_category": "primary",
-        "relevance": 0.75,
-        "cross_border": True,
+    feed = {
+        **_covered_feed("f-a"),
+        "mdb": {"location": {"country_code": "fi"}},
+        "atlas": {"urls": {"static_current": "https://a.example/gtfs.zip"}},
+        "access": "open",
     }
-    cache, manifest = _edges_index(tmp_path, [edge], feeds=[feed])
-    assert manifest["schema_version"] == 10 == publish.SCHEMA_VERSION
-    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
-        10, publish.MIN_READER_VERSION
+    # A curated feed as the crosswalk adds it and the resolve stage reads
+    # its access.
+    add_feed = {
+        "name": "Muni",
+        "url": "https://api.511.example/transit/datafeeds?operator_id=SF",
+        "spec": "gtfs",
+        "license": MUNI_LICENCE,
+        "location": {"country_code": "US"},
+        "access": "key",
+        "access_provider": "mtc-511",
+        "auth_method": "query_param",
+        "auth_params": {"api_key": "key"},
+        "registration_url": "https://511.example/token",
+    }
+    entries, _ = overrides.load_feed_overrides(
+        write_overrides(
+            tmp_path, feeds=[{"feed": "f-curated-muni", "add_feed": add_feed}], name="c"
+        )
     )
-    # Without a home country the feed sits in the international partition and
-    # its edge in the links, naming that partition.
-    assert set(manifest["partitions"]) == {"FI", "international", "links"}
-    feeds = pq.read_table(cache / "index" / "international" / "feeds.parquet")
-    (row,) = [r for r in feeds.to_pylist() if r["feed_id"] == "f-a"]
+    (muni,) = crosswalk.curated_records(entries, [{"mdb": add_feed}])
+    muni.update(resolve._catalogue_access(muni), coverage_source="declared")
+    ranked = {"relevance_category": "primary", "relevance": 0.75, "cross_border": True}
+    edges = [
+        {**_edge("Q1757", "f-a", tier="local"), **ranked},
+        {**_edge("Q1757", "f-curated-muni", tier="local"), **ranked},
+    ]
+    centre = shapely.to_wkb(shapely.Point(25.0, 60.2)).hex()
+    places = [
+        {**PLACES[0], "centre": centre, "population": 1_300_000},
+        PLACES[1],
+        _place("Q-tll", "city", country_code="EE"),
+    ]
+    cache, manifest = _edges_index(
+        tmp_path,
+        edges,
+        feeds=[feed, muni],
+        places=places,
+        lineage={"resolve_generation": resolved["generation"]},
+        overrides_dir=directory,
+    )
+    assert manifest["schema_version"] == 11 == publish.SCHEMA_VERSION
+    assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
+        11, publish.MIN_READER_VERSION
+    )
+    # Without a home country the feeds sit in the international partition and
+    # their edges in the links, naming that partition.
+    assert set(manifest["partitions"]) == {"EE", "FI", "international", "links"}
+    path = cache / "index" / "international" / "feeds.parquet"
+    feeds = pq.read_table(path)
+    rows = {r["feed_id"]: r for r in feeds.to_pylist()}
+    row = rows["f-a"]
     assert row["home_country"] is None and row["scope"] == "declared"
     assert json.loads(row["country_shares"]) == {}
     assert row["declared_countries"] == ["FI"]
+    assert row["download_url"] == "https://a.example/gtfs.zip"
+    assert row["access"] == "open" and row["auth_params"] is None
+    # A curated feed ships its own URL, access details and, as an Atlas
+    # block, its licence.
+    row = rows["f-curated-muni"]
+    assert row["download_url"] == add_feed["url"]
+    assert json.loads(row["atlas"]) == {"license": MUNI_LICENCE} and row["mdb"] is None
+    for name in ("access", "access_provider", "auth_method", "registration_url"):
+        assert row[name] == muni[name]
+    assert json.loads(row["auth_params"]) == {"api_key": "key"}
     links = pq.read_table(cache / "index" / "links" / "edges.parquet").to_pylist()
-    (edge_row,) = links
+    edge_row = links[0]
     assert edge_row["relevance_category"] == "primary"
     assert edge_row["relevance"] == 0.75 and edge_row["cross_border"] is True
     assert edge_row["feed_partition"] == "international"
-    assert manifest["partitions"]["links"]["edges"]["rows"] == 1
+    assert manifest["partitions"]["links"]["edges"]["rows"] == 2
     assert manifest["partitions"]["FI"]["places"]["rows"] == len(PLACES)
     assert "edges" not in manifest["partitions"]["FI"]
+    # The population typed even where no place records one.
+    ee_places = pq.read_table(cache / "index" / "EE" / "places.parquet")
+    assert ee_places.schema.field("population").type == pa.int64()
+    geo = json.loads(ee_places.schema.metadata[b"geo"])
+    assert geo["primary_column"] == "geometry"
+    assert geo["columns"]["centre"]["geometry_types"] == ["Point"]
+    # The root table holds the named provider only; the reader checks its
+    # digest and the columns' types.
+    root = pq.read_table(cache / "index" / publish.ACCESS_PROVIDERS_FILE)
+    assert root["provider_id"].to_pylist() == ["mtc-511"]
+    assert manifest["counts"]["access_providers"] == 1
+    index = transitio_index.read_index(cache / "index")
+    helsinki = transitio_index.place("Q1757", index=index)
+    assert (helsinki.centre.x, helsinki.centre.y) == (25.0, 60.2)
+    assert helsinki.population == 1_300_000
+    assert transitio_index.place("Q-tll", index=index).population is None
+    served = helsinki.feeds(categories=None, international=True)
+    by_id = {f.feed_id: f for f in served}
+    curated = by_id["f-curated-muni"]
+    assert curated.license == MUNI_LICENCE
+    assert curated.download_url == add_feed["url"]
+    assert "needs credentials from Mtc-511" in curated.access_instructions()
+    assert by_id["f-a"].access_instructions() is None
+    assert index.access_provider("mtc-511").docs_url == "https://511.example/docs"
+    assert index.access_provider("other") is None
 
 
 def test_partition_routes_by_home_country_and_place_country():

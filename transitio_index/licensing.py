@@ -66,8 +66,8 @@ KNOWN_PERMISSIVE = frozenset(
 
 # The sanitisation and attribution rules a licensed generation was built
 # under; publication refuses a generation from an older policy rather than
-# shipping it.
-POLICY_VERSION = 4
+# shipping it. 5: a shipped population credits the GHS-UCDB.
+POLICY_VERSION = 5
 
 # How an edge was derived, strongest provenance first; a merge keeps the
 # stronger.
@@ -355,10 +355,13 @@ def _pairs(values):
     return {tuple(value.split("|", 1)) for value in values or ()}
 
 
-def _geometry_notice(notice, audit_rows, audit, places_manifest, release):
+def _geometry_notice(
+    notice, audit_rows, audit, places_manifest, release, populated=False
+):
     """The NOTICE's geometry credit: the geometry stage's text, recomposed
     over both stages' sources when the expand stage shipped a boundary from
-    a source the geometry stage did not."""
+    a source the geometry stage did not, or when a place ships a population
+    (``populated``) and nothing credits the GHS-UCDB it comes from."""
     from transitio_index import geometry
 
     audited = {"licence_sources", "licence_inventory"} <= places_manifest.keys()
@@ -374,9 +377,16 @@ def _geometry_notice(notice, audit_rows, audit, places_manifest, release):
         raise LicenseError(
             f"{', '.join(stale)} is no longer allowlisted; rerun the gazetteer"
         )
+    derived = [row for row in audit_rows if row.get("role") == "derived_input"]
+    credited = shipped | {
+        (row.get("dataset"), row.get("license"))
+        for row in derived
+        if row.get("allowed")
+    }
+    if populated and geometry.UCDB_DERIVED not in credited:
+        shipped = shipped | {geometry.UCDB_DERIVED}
     if shipped == staged:
         return notice
-    derived = [row for row in audit_rows if row.get("role") == "derived_input"]
     return geometry._notice(shipped, release, derived)
 
 
@@ -528,14 +538,6 @@ def license_index(cache_dir, *, overrides_dir=None):
                 "stage"
             )
         places_manifest = inputs["places_manifest"] or {}
-        if geometry_notice is not None:
-            geometry_notice = _geometry_notice(
-                geometry_notice,
-                audit_rows,
-                audit,
-                places_manifest,
-                inputs["overture_release"],
-            )
         expand_rows = [
             {**row, "stage": "expand"}
             for row in places_manifest.get("licence_inventory") or ()
@@ -560,6 +562,15 @@ def license_index(cache_dir, *, overrides_dir=None):
             edges if rehoming is not None else [],
             records,
         )
+        if geometry_notice is not None:
+            geometry_notice = _geometry_notice(
+                geometry_notice,
+                audit_rows,
+                audit,
+                places_manifest,
+                inputs["overture_release"],
+                populated=any(p.get("population") is not None for p in places or ()),
+            )
         feed_rows = _feed_rows(records)
         inventory = (
             audit_rows + expand_rows + _catalogue_rows(inputs["sources"]) + feed_rows

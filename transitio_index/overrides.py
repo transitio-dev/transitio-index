@@ -672,9 +672,15 @@ def edges_digest(overrides_dir):
     no file: what a curate generation records, and what publish checks the
     current file against, so an edited override can never ship through a
     generation built before the edit."""
+    return override_digest(overrides_dir, EDGES_FILE)
+
+
+def override_digest(overrides_dir, name):
+    """The SHA-256 of the override file ``name``'s current bytes, or None
+    without the file or an overrides directory."""
     if overrides_dir is None:
         return None
-    return read_override(overrides_dir, EDGES_FILE)[1]
+    return read_override(overrides_dir, name)[1]
 
 
 # ---- edges.yaml ----
@@ -1135,16 +1141,18 @@ def phase_digest(by_feed, operations):
 
 def feeds_digest(overrides_dir):
     """The SHA-256 of the current ``feeds.yaml`` bytes, or None without one."""
-    return (
-        None if overrides_dir is None else read_override(overrides_dir, FEEDS_FILE)[1]
-    )
+    return override_digest(overrides_dir, FEEDS_FILE)
 
 
 def places_digest(overrides_dir):
     """The SHA-256 of the current ``places.yaml`` bytes, or None without one."""
-    return (
-        None if overrides_dir is None else read_override(overrides_dir, PLACES_FILE)[1]
-    )
+    return override_digest(overrides_dir, PLACES_FILE)
+
+
+def access_providers_digest(overrides_dir):
+    """The SHA-256 of the current ``access_providers.yaml`` bytes, or None
+    without one."""
+    return override_digest(overrides_dir, ACCESS_PROVIDERS_FILE)
 
 
 def expect_digest(recorded, current, what, rerun):

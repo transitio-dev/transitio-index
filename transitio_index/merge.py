@@ -76,6 +76,9 @@ OVERRIDE_FIELDS = (
 # identity fold. 7: relevance is rescored over the merged edges. 8: the
 # manifest records the catalogue check. 9: the check covers the curated feeds.
 MERGE_FORMAT = 9
+# The schema the merge takes and writes: a schema-11 build carries a
+# providers table at its root, which the merge does not carry.
+SCHEMA_VERSION = 10
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -522,10 +525,10 @@ def _check_sources(snapshots):
     agreed = {}
     for build_id, snapshot in snapshots:
         version = snapshot.get("schema_version")
-        if version != publish.SCHEMA_VERSION:
+        if version != SCHEMA_VERSION:
             raise MergeError(
                 f"{build_id}: schema_version {version!r}; the merge takes schema "
-                f"{publish.SCHEMA_VERSION} builds only"
+                f"{SCHEMA_VERSION} builds only"
             )
         if snapshot.get("licensed") is not True or not isinstance(
             snapshot.get("notice_sha256"), str
@@ -764,7 +767,7 @@ def _merged_id(loaded, partition_sha256=None, curated_sha256=None):
     from transitio import __version__ as transitio_version
 
     parts = [
-        publish.SCHEMA_VERSION,
+        SCHEMA_VERSION,
         MERGE_FORMAT,
         transitio_version,
         pa.__version__,
@@ -1109,10 +1112,10 @@ def assemble(loaded, tables, notice, alias_conflicts=(), catalogue_check=None):
         for field in STALE_FIELDS
     }
     manifest = {
-        "schema_version": publish.SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION,
         "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
         "min_reader_version": MIN_READER_VERSIONS.get(
-            publish.SCHEMA_VERSION, publish.MIN_READER_VERSION
+            SCHEMA_VERSION, publish.MIN_READER_VERSION
         ),
         "built_with": built_with,
         "snapshot_id": snapshot_id,

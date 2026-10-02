@@ -414,6 +414,11 @@ def _current(cache_dir, snapshot, overrides_dir):
         ("edges.yaml", "overrides_sha256", overrides.edges_digest),
         ("feeds.yaml", "feeds_overrides_sha256", overrides.feeds_digest),
         ("places.yaml", "places_overrides_sha256", overrides.places_digest),
+        (
+            overrides.ACCESS_PROVIDERS_FILE,
+            "access_providers_overrides_sha256",
+            overrides.access_providers_digest,
+        ),
     ):
         if key not in snapshot:
             raise PublishIndexError(
@@ -500,6 +505,7 @@ def pack(
                 "overrides_sha256",
                 "feeds_overrides_sha256",
                 "places_overrides_sha256",
+                "access_providers_overrides_sha256",
                 "crawl_digest",
                 "licensed",
             )

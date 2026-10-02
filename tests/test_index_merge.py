@@ -1415,26 +1415,18 @@ def compose_notice_for(loaded, tables):
     return merge.compose_notice(loaded, tables["feeds.parquet"])
 
 
-def test_a_build_of_places_without_feeds_merges_with_fed_ones(tmp_path):
+def test_a_published_build_is_of_a_schema_the_merge_refuses(tmp_path):
     fx = pytest.importorskip("index_fixture")
     pytest.importorskip("geopandas")
     from test_index_license import _feedless_index
 
-    from transitio_index import geometry, ucdb
-
-    read_index = _reader()
     builds, merged = tmp_path / "builds", tmp_path / "merged"
     _two_runs(fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM]))
     feedless = _feedless_index(tmp_path)
     shutil.copytree(feedless / "index", builds / "cities-0000000000000003" / "index")
-    manifest = merge.merge_builds(builds, merged, log=lambda line: None)
-    assert len(manifest["merged"]) == 3
-    credit = geometry.DERIVED_SOURCES[ucdb.DERIVED]["credit"]
-    assert (merged / "index" / "NOTICE").read_text().count(credit) == 1
-    index = read_index(merged / "index")
-    assert len(index.feeds) == 4 and len(index.places) == 5
-    peru = read_index(merged / "index", country="PE")
-    assert sorted(peru.places["place_id"]) == ["tp_lima", "tp_pe"]
+    with pytest.raises(merge.MergeError, match="schema_version 11; the merge takes"):
+        merge.merge_builds(builds, merged, log=lambda line: None)
+    assert not (merged / "index").exists()
 
 
 def test_a_second_merge_replaces_the_live_index_and_drops_what_it_lacks(tmp_path):
