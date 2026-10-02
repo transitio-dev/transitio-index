@@ -5,7 +5,8 @@ Reads exactly what publication would read — the feeds, edges and places of
 the current build, through the same lineage-checked readers — records every
 contributing source in ``licence_inventory.jsonl`` (the geometry and expand
 stages' audit rows and the feeds' own licence blocks), writes the ``NOTICE``
-that ships with the index, and publishes the three tables as
+that ships with the index (crediting each credential provider whose feeds'
+data it holds), and publishes the three tables as
 ``feeds_licensed.jsonl``, ``places_licensed.jsonl`` and
 ``edges_licensed.jsonl``.
 
@@ -32,7 +33,7 @@ import collections
 import contextlib
 import datetime
 
-from transitio_index import crawl, store
+from transitio_index import crawl, overrides, store
 from transitio_index.progress import progress
 
 POINTER = "licensed.json"
@@ -66,8 +67,9 @@ KNOWN_PERMISSIVE = frozenset(
 
 # The sanitisation and attribution rules a licensed generation was built
 # under; publication refuses a generation from an older policy rather than
-# shipping it. 5: a shipped population credits the GHS-UCDB.
-POLICY_VERSION = 5
+# shipping it. 5: a shipped population credits the GHS-UCDB. 6: the NOTICE
+# credits the credential providers whose feeds' data the index holds.
+POLICY_VERSION = 6
 
 # How an edge was derived, strongest provenance first; a merge keeps the
 # stronger.
@@ -86,6 +88,15 @@ class LicenseError(RuntimeError):
 def _licence_block(record):
     """The feed's Atlas licence block, or a curated feed's own."""
     return (record.get("atlas") or record.get("curated") or {}).get("license") or {}
+
+
+def _declared(record):
+    """The SPDX id and licence URL the feed's catalogue record declares. The
+    Atlas declaration is taken whole; the Mobility Database's licence URL
+    stands in only for a feed with no Atlas declaration."""
+    block = _licence_block(record)
+    url = block.get("url") if block else (record.get("mdb") or {}).get("license_url")
+    return block.get("spdx_identifier") or block.get("spdx_id"), url
 
 
 def redistribution_allowed(record):
@@ -400,16 +411,9 @@ def _feed_rows(records):
     judgements = collections.defaultdict(collections.Counter)
     for record in records:
         block = _licence_block(record)
-        # The Atlas declaration is taken whole; the Mobility Database's
-        # licence URL stands in only for a feed with no Atlas declaration,
-        # never combined with one.
-        url = block.get("url")
-        if not block:
-            url = (record.get("mdb") or {}).get("license_url")
         # Feeds group only when their whole attribution requirement matches.
         key = (
-            block.get("spdx_identifier") or block.get("spdx_id"),
-            url,
+            *_declared(record),
             block.get("attribution_text"),
             block.get("attribution_instructions"),
         )
@@ -471,9 +475,75 @@ def _catalogue_rows(sources):
     return rows
 
 
-def _notice(geometry_notice, sources, feed_rows):
+PROVIDER_OPENING = "Feeds from credential providers, under their terms:"
+
+
+def provider_head(provider_id, name, dates):
+    """The NOTICE line opening a provider's entry; ``dates`` are the days
+    its feeds' data were obtained."""
+    obtained = f"; data obtained {min(dates)} to {max(dates)}" if dates else ""
+    return f"  - {provider_id}: {_one_line(name)}{obtained}"
+
+
+def _one_line(text):
+    """``text`` with every run of whitespace, line breaks included, one
+    space: a NOTICE entry is one line."""
+    return " ".join(str(text).split())
+
+
+def _provider_lines(records, providers):
+    """The NOTICE paragraph crediting each provider in ``providers`` whose
+    feeds' crawled data the index holds; empty when there is none. A feed
+    read with a key counts for the provider of that key, one read from the
+    MDB-hosted copy for the provider it is bound to, and otherwise for the
+    provider whose ``url_prefixes`` claim the URL it was read from. Each
+    entry gives the days the data were obtained, the provider's ``notice``
+    and one ``feed:`` line per feed: its licence and URL, and, for data read
+    from the feed's own URL, when they were last modified."""
+    credited = collections.defaultdict(list)
+    for record in records:
+        if record.get("crawl_status") == "ok" and "fetched_from" not in record:
+            raise LicenseError(
+                "the coverage generation predates crawl provenance; re-run the "
+                "coverage stage"
+            )
+        fetched_from = record.get("fetched_from")
+        if not fetched_from:
+            continue
+        # A hosted copy's own URL is the Mobility Database's.
+        hosted = fetched_from == crawl.HOSTED_COPY
+        url = crawl.feed_url(record) if hosted else record.get("crawled_url")
+        provider_id = overrides.claiming_provider(url, providers)
+        if fetched_from == crawl.MAINTAINER_KEY:
+            provider_id = record.get("key_provider")
+        elif hosted:
+            provider_id = record.get("access_provider") or provider_id
+        if provider_id in providers:
+            credited[provider_id].append((record, url))
+    lines = [PROVIDER_OPENING] if credited else []
+    for provider_id, feeds in sorted(credited.items()):
+        provider = providers[provider_id]
+        dates = {r["last_crawled"][:10] for r, _ in feeds if r.get("last_crawled")}
+        lines.append(provider_head(provider_id, provider["name"], dates))
+        notice = provider.get("notice")
+        lines += [
+            f"      notice: {line}" for line in (notice or "").split("\n") if line
+        ]
+        for record, url in sorted(feeds, key=lambda pair: pair[0]["feed_id"]):
+            spdx_id, licence_url = _declared(record)
+            name = f" ({record['name']})" if record.get("name") else ""
+            licence = spdx_id or licence_url or "no licence declared"
+            parts = [record["feed_id"] + name, licence, url]
+            if record.get("last_modified"):
+                parts.append(f"last modified {record['last_modified']}")
+            lines.append("      feed: " + "; ".join(map(_one_line, parts)))
+    return lines
+
+
+def _notice(geometry_notice, sources, feed_rows, provider_lines=()):
     """The NOTICE that ships: the geometry audit's text, then the feed
-    catalogues at their pinned versions and the feed licences seen."""
+    catalogues at their pinned versions, the credential providers'
+    paragraph (:func:`_provider_lines`) and the feed licences seen."""
     lines = []
     if geometry_notice:
         lines.append(geometry_notice.rstrip("\n"))
@@ -489,6 +559,8 @@ def _notice(geometry_notice, sources, feed_rows):
     if gbfs.get("csv_sha256"):
         lines.append(f"  - GBFS systems.csv, sha256 {gbfs['csv_sha256']}")
     lines.append("")
+    if provider_lines:
+        lines += [*provider_lines, ""]
     lines.extend(_licence_lines(feed_rows))
     return "\n".join(lines) + "\n"
 
@@ -575,7 +647,8 @@ def license_index(cache_dir, *, overrides_dir=None):
         inventory = (
             audit_rows + expand_rows + _catalogue_rows(inputs["sources"]) + feed_rows
         )
-        notice = _notice(geometry_notice, inputs["sources"], feed_rows)
+        provider_lines = _provider_lines(records, inputs["providers"])
+        notice = _notice(geometry_notice, inputs["sources"], feed_rows, provider_lines)
         artifacts = {
             FEEDS_ARTIFACT: store.jsonl_chunks(inputs["records"]),
             INVENTORY_ARTIFACT: store.jsonl_chunks(inventory),

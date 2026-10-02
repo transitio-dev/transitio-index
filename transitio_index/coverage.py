@@ -690,6 +690,11 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
             # stale or tampered state cannot publish nested or non-printable
             # names.
             "files": crawl._manifest_list(state.get("files")) or [],
+            # How and from where it was read, and whose key read it: the
+            # NOTICE credits it.
+            "fetched_from": state.get("fetched_from"),
+            "crawled_url": state.get("url"),
+            "key_provider": state.get("key_provider"),
         }
         if not points:
             continue

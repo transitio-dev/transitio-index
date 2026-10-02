@@ -196,7 +196,12 @@ keyless read, in feed order, and a 401 stops a provider's key for the rest of
 the run. A keyed read whose provider
 no longer approves it, or no longer serves the feed, is removed at the next
 crawl. Data read with a key are refreshed with each index release, on a
-best-effort basis; there is no separate weekly rebuild.
+best-effort basis; there is no separate weekly rebuild. The NOTICE credits
+each provider whose feeds' data the index holds, read with its key or from
+the hosted copy of a feed bound to it, or from a feed's own URL its
+`url_prefixes` claim: the days the data were obtained, the provider's
+`notice` (the attribution its terms ask for, in `access_providers.yaml`) and
+each feed's licence and URL.
 
 ### A small sample end to end
 

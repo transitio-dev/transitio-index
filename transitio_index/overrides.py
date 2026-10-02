@@ -436,6 +436,7 @@ _PROVIDER_OPTIONAL = frozenset(
         "terms_checked",
         "terms_note",
         "crawl_budget",
+        "notice",
     }
 )
 
@@ -554,6 +555,10 @@ def _provider(entry):
     budget = entry.get("crawl_budget")
     if budget is not None and (type(budget) is not int or budget < 1):
         raise OverrideError("crawl_budget must be a whole number of at least 1")
+    notice = entry.get("notice")
+    lines = notice.strip("\n").split("\n") if isinstance(notice, str) else [""]
+    if notice is not None and not all(line.strip() for line in lines):
+        raise OverrideError("notice must be a non-empty string without blank lines")
     canonical = set()
     for _, host, port, segments in scopes:
         host = f"[{host}]" if ":" in host else host
@@ -569,6 +574,7 @@ def _provider(entry):
         "terms_checked": checked,
         "terms_note": note,
         "crawl_budget": budget,
+        "notice": None if notice is None else "\n".join(lines),
     }
 
 
@@ -584,7 +590,8 @@ def load_access_providers(overrides_dir):
     ``crawl_approved``; optionally ``docs_url``, ``terms_url``, ``free``,
     ``url_prefixes`` (the https URLs under which it claims feeds), the
     ``terms_checked`` date with a ``terms_note``, which an approval needs,
-    and ``crawl_budget``, the keyed requests a month the crawl may make.
+    ``crawl_budget``, the keyed requests a month the crawl may make, and
+    ``notice``, the attribution its terms ask for, which the NOTICE carries.
     An entry breaking these rules is refused; two providers whose prefixes
     cover one URL are a build error.
     """

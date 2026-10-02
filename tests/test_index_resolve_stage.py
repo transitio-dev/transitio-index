@@ -381,6 +381,7 @@ def _providers_dir(tmp_path, entries):
         (_provider("p", crawl_approved=True), "needs terms_checked and terms_note"),
         (_provider("p", terms_checked="last week"), "terms_checked must be a date"),
         *[(_provider("p", crawl_budget=b), "crawl_budget") for b in (0, True, "9")],
+        *[(_provider("p", notice=n), "notice must be") for n in ("A\n \nB", 1)],
         (_provider("dup"), "not unique"),
     ],
 )
@@ -393,6 +394,7 @@ def test_access_providers_refuse_a_broken_entry(tmp_path, entry, message):
         terms_note="Crawling allowed.",
         free=True,
         crawl_budget=50,
+        notice="Data: the operator.\nCC BY 4.0\n",
     )
     entries = [dict(accepted, provider_id="ok"), entry]
     providers, refused, digest = overrides.load_access_providers(
@@ -415,6 +417,7 @@ def test_access_providers_refuse_a_broken_entry(tmp_path, entry, message):
     ]
     assert providers["ok"]["terms_checked"] == "2026-10-01"
     assert providers["ok"]["crawl_budget"] == 50
+    assert providers["ok"]["notice"] == "Data: the operator.\nCC BY 4.0"
     assert len(refused) == 1 and message in refused[0]["error"]
 
 
