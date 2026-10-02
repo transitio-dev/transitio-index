@@ -63,11 +63,21 @@ def _name_variants(record):
 # sub-county).
 COUNCIL_AREA_COUNTRIES = frozenset({"CA", "CO", "GB"})
 
+# The countries whose municipality carries its own QID and is named after its
+# town, which has no area of its own; the value is the municipality's subtype.
+MUNICIPALITY_SUBTYPES = {"DK": "county", "NO": "county", "SE": "county", "SI": "region"}
+
+# The suffixes a municipality's name adds to its town's, which may take a
+# genitive "s": "Stockholms kommun", "Göteborgs Stad", "Københavns Kommune".
+_MUNICIPALITY_SUFFIXES = (" municipality", " kommun", " kommune", " stad")
+
 
 def _area_names(record):
     """The folded names a division carries as a city's council area: each
     label, and each without a ``City`` affix — "City of Edinburgh" and
-    "Glasgow City" carry Edinburgh's and Glasgow's names."""
+    "Glasgow City" carry Edinburgh's and Glasgow's names — or a municipality
+    suffix, its genitive "s" taken off too: "Stockholms kommun" carries
+    Stockholm's."""
     names = set()
     for name in _name_variants(record):
         names.add(name)
@@ -75,21 +85,36 @@ def _area_names(record):
             names.add(name[len("city of ") :])
         if name.endswith(" city"):
             names.add(name[: -len(" city")])
+        for suffix in _MUNICIPALITY_SUFFIXES:
+            if name.endswith(suffix):
+                town = name[: -len(suffix)]
+                names.add(town)
+                if town.endswith("s"):
+                    names.add(town[:-1])
+    names.discard("")
     return names
 
 
-def council_area(city, area):
-    """Whether ``area`` is ``city``'s own council area: a county no QID names
-    that carries the city's name (Manchester's Manchester, Edinburgh's City of
-    Edinburgh), in a country where such a county is the city's own unit. A
+def council_unit(area):
+    """Whether ``area`` may be a city's own council area: a county no QID
+    names in ``COUNCIL_AREA_COUNTRIES``, or a municipality of the subtype
+    ``MUNICIPALITY_SUBTYPES`` gives its country, with or without a QID. A
     candidate record and a place row answer alike."""
     country = area.get("country") or area.get("country_code")
+    subtype = area.get("source_subtype")
+    if country in COUNCIL_AREA_COUNTRIES:
+        return subtype == "county" and area.get("resolution_method") == "overture_id"
     return (
-        country in COUNCIL_AREA_COUNTRIES
-        and area.get("source_subtype") == "county"
-        and area.get("resolution_method") == "overture_id"
-        and bool(_name_variants(city) & _area_names(area))
+        country in MUNICIPALITY_SUBTYPES and subtype == MUNICIPALITY_SUBTYPES[country]
     )
+
+
+def council_area(city, area):
+    """Whether ``area`` is ``city``'s own council area: a council unit
+    (``council_unit``) that carries the city's name — Manchester's
+    Manchester, Edinburgh's City of Edinburgh, Stockholm's Stockholms kommun.
+    A candidate record and a place row answer alike."""
+    return council_unit(area) and bool(_name_variants(city) & _area_names(area))
 
 
 def declared_locations(feeds):
@@ -248,8 +273,8 @@ def _principal_qid(candidates):
     """The one QID of a city that is its own district, while the other
     same-name divisions are hamlets — or ``None`` when no QID is, or more than
     one. Such a city appears at both levels under its QID (Augsburg, Karlsruhe,
-    Ulm), or its district is its council area, a county no QID names
-    (Manchester, Cardiff)."""
+    Ulm), or its district is its council area (``council_area``: Manchester,
+    Cardiff, Bergen)."""
     levels = {}
     for candidate in candidates:
         if candidate["qid"]:

@@ -1526,3 +1526,74 @@ def test_set_boundary_applies_to_a_place_expand_discovers(tmp_path, stale, joine
         ("Q40840", "set_boundary")
     ] * stale
     assert manifest["stale_place_overrides"] == stale
+
+
+def _council(country, subtype, name, qid=None, **names):
+    """A division record as ``seed.council_area`` reads it."""
+    return {
+        "country": country,
+        "source_subtype": subtype,
+        "qid": qid,
+        "resolution_method": "overture_wikidata" if qid else "overture_id",
+        "name": name,
+        "names": names,
+    }
+
+
+@pytest.mark.parametrize(
+    ("city", "area", "expected"),
+    [
+        (
+            "Stockholm",
+            _council(
+                "SE",
+                "county",
+                "Stockholms kommun",
+                "Q506250",
+                en="Stockholm Municipality",
+            ),
+            True,
+        ),
+        ("Göteborg", _council("SE", "county", "Göteborgs Stad", "Q52502"), True),
+        ("København", _council("DK", "county", "Københavns Kommune", "Q999101"), True),
+        ("Bergen", _council("NO", "county", "Bergen", "Q10428388"), True),
+        # A place row keys its country as ``country_code``.
+        (
+            "Ljubljana",
+            {
+                "country_code": "SI",
+                **_council(None, "region", "Ljubljana", "Q3434113"),
+            },
+            True,
+        ),
+        (
+            "Stockholm",
+            _council("SE", "region", "Stockholms län", "Q999102", sv="Stockholm"),
+            False,
+        ),
+        ("Oslo", _council("NO", "county", "Bergen", "Q10428388"), False),
+        ("Turku", _council("FI", "county", "Turku", "Q999103"), False),
+        ("Leeds", _council("GB", "county", "Leeds", "Q999104"), False),
+        ("Edinburgh", _council("GB", "county", "City of Edinburgh"), True),
+    ],
+    ids=[
+        "municipality",
+        "stad",
+        "kommune",
+        "bare",
+        "place-row",
+        "not-the-subtype",
+        "other-town",
+        "other-country",
+        "gb-with-qid",
+        "gb-council-area",
+    ],
+)
+def test_a_municipality_named_after_its_town_is_its_council_area(city, area, expected):
+    """Stockholm, Göteborg, Bergen and Ljubljana were found only as their
+    municipalities: a stop reaches the municipality's area alone, and the
+    council-area rule knew only the QID-less counties of GB, CA and CO, with
+    only a "City" affix stripped. A municipality in DK, NO, SE or SI, with
+    its own QID and its town's name, a suffix or a genitive "s" aside, is
+    now its town's council area."""
+    assert seed.council_area({"name": city, "names": {}}, area) is expected

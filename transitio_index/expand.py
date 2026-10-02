@@ -549,20 +549,20 @@ def _discover(
     for record in candidates:
         if record["kind"] == "region" and record["qid"] in cities:
             record["kind"] = "city"
-    # A county no QID names may be the council area of the city carrying its
-    # name (Manchester, the City of Edinburgh), which has no area of its own
-    # for a stop to reach: the city joins it, and takes its area below.
-    counties = [
-        c
-        for c in candidates
-        if c["source_subtype"] == "county" and c["resolution_method"] == "overture_id"
-    ]
+    # A county no QID names, or a municipality, may be the council area of
+    # the city carrying its name (Manchester, the City of Edinburgh,
+    # Stockholm), which has no area of its own for a stop to reach: the city
+    # joins it, and takes its area below. A city made of its own region or
+    # district above (Oslo) is not joined to it again.
+    counties = [c for c in candidates if seed.council_unit(c)]
     if counties:
         if dataset is None:
             dataset = lookup.division_dataset() or overture.overture_dataset(release)
         found = list(seed.council_area_cities(dataset, counties).values())
         seed._resolve_candidates(found, wikidata)
-        candidates += [city for city in found if city["qid"]]
+        candidates += [
+            city for city in found if city["qid"] and city["qid"] not in cities
+        ]
     skeleton = {}
     for record in candidates:
         if record["qid"] or overture.qidless_place(record):

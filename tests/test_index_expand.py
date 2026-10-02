@@ -187,6 +187,60 @@ DIVISIONS = [
             ("gb-edi", "locality", "Edinburgh"),
         ),
     ),
+    # Stockholm: a locality with no area inside its municipality, a county
+    # with a QID of its own.
+    fx.division(
+        "se-sto-county",
+        "SE",
+        "county",
+        wikidata="Q506250",
+        name="Stockholms kommun",
+        common={"en": "Stockholm Municipality"},
+        hierarchies=fx.chain(("se-sto-county", "county", "Stockholms kommun")),
+    ),
+    fx.division(
+        "se-sto",
+        "SE",
+        "locality",
+        wikidata="Q1754",
+        name="Stockholm",
+        hierarchies=fx.chain(
+            ("se-sto-county", "county", "Stockholms kommun"),
+            ("se-sto", "locality", "Stockholm"),
+        ),
+    ),
+    # Oslo: the region shares its QID with the locality, which has no area
+    # and sits in the municipality, a county in the region.
+    fx.division(
+        "no-osl",
+        "NO",
+        "region",
+        wikidata="Q585",
+        name="Oslo",
+        hierarchies=fx.chain(("no-osl", "region", "Oslo")),
+    ),
+    fx.division(
+        "no-osl-county",
+        "NO",
+        "county",
+        wikidata="Q5245991",
+        name="Oslo",
+        hierarchies=fx.chain(
+            ("no-osl", "region", "Oslo"), ("no-osl-county", "county", "Oslo")
+        ),
+    ),
+    fx.division(
+        "no-osl-loc",
+        "NO",
+        "locality",
+        wikidata="Q585",
+        name="Oslo",
+        hierarchies=fx.chain(
+            ("no-osl", "region", "Oslo"),
+            ("no-osl-county", "county", "Oslo"),
+            ("no-osl-loc", "locality", "Oslo"),
+        ),
+    ),
 ]
 
 AREAS = [
@@ -206,6 +260,9 @@ AREAS = [
     fx.area("se-hap", _wkb(24.1, 61.7, 24.2, 61.8), GOOD, country="SE"),
     fx.area("gb-edi-county", _wkb(-3.4, 55.85, -3.0, 56.0), GOOD, country="GB"),
     fx.area("gb-edi-ward", _wkb(-3.2, 55.94, -3.18, 55.96), GOOD, country="GB"),
+    fx.area("se-sto-county", _wkb(17.8, 59.2, 18.2, 59.45), GOOD, country="SE"),
+    fx.area("no-osl", _wkb(10.4, 59.8, 11.0, 60.1), GOOD, country="NO"),
+    fx.area("no-osl-county", _wkb(10.5, 59.85, 10.9, 60.0), GOOD, country="NO"),
 ]
 
 
@@ -390,6 +447,34 @@ def test_a_stop_in_a_council_area_discovers_its_city(tmp_path, kind):
     assert places["Q999005"]["geometry_source"] == "overture"
     index = coverage.place_index({p["place_id"]: p for p in places.values()})
     assert sorted(index["gb-edi-county"]) == sorted([council_id, edinburgh["place_id"]])
+
+
+def test_a_stop_in_a_municipality_discovers_its_city(tmp_path):
+    from transitio_index import coverage
+
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES)
+    _write_crawl(cache, "f-sto", ["s1,59.33,18.07\n"])
+    _write_crawl(cache, "f-osl", ["s1,59.91,10.75\n"])
+    _, places, _ = _expand(tmp_path, cache)
+    by_id = {p["place_id"]: p for p in places.values()}
+    # Stockholm sits in its municipality and ships the municipality's area.
+    stockholm = places["Q1754"]
+    assert stockholm["kind"] == "city" and stockholm["parent_id"] == "Q506250"
+    assert stockholm["geometry_source"] == geometry.COUNCIL_AREA
+    index = coverage.place_index(by_id)
+    assert sorted(index["se-sto-county"]) == ["Q1754", "Q506250"]
+    # Oslo is its own region; its municipality stays a district inside it.
+    oslo = places["Q585"]
+    assert oslo["kind"] == "city" and oslo["overture_id"] == "no-osl"
+    assert oslo["parent_id"] is None
+    assert places["Q5245991"]["parent_id"] == "Q585"
+    for key in by_id:
+        chain = []
+        while key is not None:
+            assert key not in chain
+            chain.append(key)
+            key = by_id[key].get("parent_id")
 
 
 def test_an_already_seeded_place_is_not_re_added(tmp_path):
