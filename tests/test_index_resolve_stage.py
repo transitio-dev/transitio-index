@@ -5,7 +5,7 @@ import pytest
 pytest.importorskip("yaml")
 import yaml  # noqa: E402
 
-from transitio_index import overrides, resolve, store  # noqa: E402
+from transitio_index import crawl, overrides, resolve, store  # noqa: E402
 
 
 def _feed(feed_id, **kw):
@@ -519,7 +519,12 @@ def test_resolve_binds_protected_feeds_to_providers_and_reports_the_rest(tmp_pat
             ("two", "query_param", pair),
         ),
         "f-open": (mdb("0", None, one + "o.zip"), (None, None, None)),
-        "f-none": (mdb("1", "key", "https://n.example/"), unresolved),
+        # An http URL is read as the https form a provider claims, else kept.
+        "f-http": (
+            mdb("1", "token", "http://one.example/h.zip"),
+            ("one", "query_param", {"token": "key"}),
+        ),
+        "f-none": (mdb("1", "key", "http://n.example/"), unresolved),
     }
     errors = {
         "f-multi": (mdb("1", "client_id", two + "m.zip"), ("two", "unsupported", {})),
@@ -576,10 +581,12 @@ def test_resolve_binds_protected_feeds_to_providers_and_reports_the_rest(tmp_pat
     assert rows["unresolved"] == [
         {"kind": "unresolved", "feed_id": ref, "url": url, "registration_url": page}
         for ref, url in (
-            ("f-none", "https://n.example/"),
+            ("f-none", "http://n.example/"),
             ("f-ghost", "https://g.example/"),
         )
     ]
+    assert crawl.feed_url(feeds["f-http"]) == one + "h.zip"
+    assert "download_url" not in feeds["f-none"]
     assert manifest["access_providers"] == 3
     assert manifest["access_unresolved"] == 2
     assert manifest["access_curation_errors"] == len(errors) + 1

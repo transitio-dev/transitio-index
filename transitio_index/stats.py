@@ -659,15 +659,6 @@ def _licence_state(feed):
     return "none"
 
 
-def _download_url(feed):
-    """The URL the crawl reads (``crawl.feed_url``): the published
-    ``download_url``, and for a realtime companion, whose table has none,
-    the one its catalogue blocks give."""
-    from transitio_index import crawl
-
-    return feed["download_url"] if "download_url" in feed else crawl.feed_url(feed)
-
-
 def feed_rows(
     feeds, edges, places, crawl_log, placements, status_by_mdb_id, snapshot_id=None
 ):
@@ -739,7 +730,8 @@ def feed_rows(
                 "municipality_outcome": _municipality_outcome(
                     placed.get(feed_id), crawled, places
                 ),
-                "download_url": _download_url(feed),
+                # The published URL; a realtime companion's from its blocks.
+                "download_url": crawl.feed_url(feed),
                 "places_served": len(served),
                 "cities_served": sum(
                     1 for p in served if (places.get(p) or {}).get("kind") == "city"

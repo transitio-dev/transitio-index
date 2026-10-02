@@ -26,7 +26,9 @@ times out, cannot connect, answers 401, 403, 404 or 410, or serves an HTML page
 is retried once from the feed's MDB-hosted copy (``urls.latest``), as is any
 failed producer read of a feed that needs a key, which is requested without
 one; the state and the log record say which was read (``fetched_from``) and
-keep the producer's failure.
+keep the producer's failure. When both fail, it is read with the maintainer's
+key where its provider approves (:mod:`transitio_index.keys`), and the state
+names that provider (``key_provider``); ``key_crawl`` says how the key was used.
 
 ``crawl_log.jsonl`` records, per feed, its catalogue source (mdb, atlas, both
 or systems_csv; curated for a feed ``add_feed`` added), the method taken, the
@@ -43,6 +45,7 @@ no city) reads the member: the safe direction. A recrawl request always reads
 it.
 """
 
+import collections
 import concurrent.futures
 import contextlib
 import csv
@@ -62,6 +65,7 @@ import zlib
 from transitio.index import fingerprint
 
 from transitio_index import fetch, store, ziprange
+from transitio_index.keys import Keys
 from transitio_index.progress import progress
 
 MEMBERS = (
@@ -102,6 +106,7 @@ DOWNLOAD_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 # Where a crawl read the feed from: its producer URL, or the MDB-hosted copy.
 PRODUCER = "producer"
 HOSTED_COPY = "mdb_latest"
+MAINTAINER_KEY = "maintainer_key"  # its producer URL, with the maintainer's key
 # The producer answers that refuse or lose the link rather than fail the feed;
 # a 401 asks for credentials the catalogues did not mention, a 403 is often a
 # bot wall, or a storage bucket hiding a removed object.
@@ -118,8 +123,11 @@ class HtmlPage(fetch.FetchError):
 
 
 def feed_url(feed):
-    """The URL to crawl: a curated feed's own, else the Atlas static feed,
-    else the MDB direct download."""
+    """The URL to crawl: the ``download_url`` resolve settled (a published
+    row's too), else a curated feed's own, else the Atlas static feed, else
+    the MDB direct download."""
+    if "download_url" in feed:
+        return feed["download_url"]
     atlas = feed.get("atlas") or {}
     mdb = feed.get("mdb") or {}
     return (
@@ -757,14 +765,15 @@ def _html_page(feed_dir, content_type):
     return head.startswith(b"<") and any(tag in head for tag in HTML_TAGS)
 
 
-def _extract_members(feed_dir, decide, fragment=None):
+def _extract_members(feed_dir, decide, fragment=None, check=None):
     """Extract the members from the downloaded archive, streamed and bounded.
 
     ``zipfile`` handles what ziprange deliberately refuses (ZIP64, bzip2 or
     LZMA members); each member is capped and streamed straight to its file, so
     members never accumulate in memory. An archive fragment names a nested zip,
     extracted first and read in the outer one's place. The cheap members land
-    first; ``decide`` then rules on extracting ``stop_times.txt``. Returns the
+    first; ``decide`` then rules on extracting ``stop_times.txt``. ``check``
+    may refuse the file manifest before any member is written. Returns the
     digests and the archive file manifest, which comes from the same
     ``zipfile`` reader that extracts the members, so the two never disagree
     about what the archive holds.
@@ -788,6 +797,8 @@ def _extract_members(feed_dir, decide, fragment=None):
             names, fragment[1] if fragment and fragment[0] == "folder" else None
         )
         files = _root_files(_under(names, root))
+        if check is not None:
+            check(files)
 
         def extract(name):
             try:
@@ -809,8 +820,8 @@ def _extract_members(feed_dir, decide, fragment=None):
     return digests, files, skipped, reason
 
 
-def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
-    """Crawl one feed; returns its log record (never raises).
+def _crawl_keyless(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
+    """Crawl one feed without a key; returns its log record.
 
     The producer URL is read first, without credentials. When it fails the
     way a dead, moved or unreachable link does (:func:`_link_failed`), or in
@@ -837,6 +848,42 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
     return retry
 
 
+def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup, keys):
+    """Crawl one feed; returns its log record (never raises): without a key
+    (:func:`_crawl_keyless`), then, for a feed that needs a key and was not
+    read so, with the maintainer's key when ``keys`` lends one."""
+    options = {"force": force, "range_threshold": range_threshold, "lookup": lookup}
+    record = _crawl_keyless(fetcher, cache_dir, feed, **options)
+    if feed.get("access") != "key":
+        return record
+    if record["fetched_from"] is not None:
+        record["key_crawl"] = "not_needed"
+    elif keys is None:
+        record["key_crawl"] = "keys_off"
+    else:
+        return _crawl_keyed(fetcher, cache_dir, feed, record, keys, options)
+    return record
+
+
+def _crawl_keyed(fetcher, cache_dir, feed, record, keys, options):
+    """Read a key-flagged feed whose keyless reads failed with the
+    maintainer's key; returns the log record, whose ``key_crawl`` says
+    whether, and how, the key was used."""
+    access, outcome = keys.access(feed, record["url"])
+    if access is None:
+        record["key_crawl"] = outcome
+        return record
+    failure = record["producer_failure"] or record["fallback_reason"]
+    keyed = {"fetched_from": MAINTAINER_KEY, "keys": keys, "access": access}
+    url = record["url"]
+    retry, error = _crawl_from(
+        fetcher, cache_dir, feed, url, producer_failure=failure, **keyed, **options
+    )
+    retry["bytes_fetched"] += record["bytes_fetched"]
+    retry["key_crawl"] = "failed" if error else "read"
+    return retry
+
+
 def _crawl_from(
     fetcher,
     cache_dir,
@@ -845,13 +892,16 @@ def _crawl_from(
     *,
     fetched_from=PRODUCER,
     producer_failure=None,
+    keys=None,
+    access=None,
     force,
     range_threshold,
     lookup,
 ):
     """Crawl one feed from ``url``; returns ``(log record, the error that
     failed it or None)``, never raises. ``fetched_from`` and
-    ``producer_failure`` are recorded in the state it writes."""
+    ``producer_failure`` are recorded in the state it writes. With ``access``
+    the read is keyed (:meth:`keys.Keys.session`): no HEAD or range reads."""
     feed_id = feed["feed_id"]
     record = {
         "feed_id": feed_id,
@@ -882,13 +932,20 @@ def _crawl_from(
     def decide(directory, digests):
         return _skip_stop_times(directory, digests, lookup, force)
 
+    def check(texts):
+        # A keyed response holding a secret is refused before anything is kept.
+        if access is not None and any(keys.holds(t) for t in texts if t):
+            raise fetch.FetchError("the response reflects a credential")
+
     try:
         feed_dir = store.open_subdir(cache_dir / "crawl", record["directory"])
         state = _read_state(feed_dir)
+        # A cache read another way (keyed or not) is never reused for this one.
+        same_source = state.get("fetched_from", PRODUCER) == fetched_from
         probe = None
         fallback_reason = None
         try:
-            probe = fetcher.head(url)
+            probe = None if access else fetcher.head(url)
         except fetch.FetchError as error:
             fallback_reason = f"HEAD failed: {error}"
 
@@ -912,6 +969,7 @@ def _crawl_from(
             if (
                 unchanged
                 and manifest is not None
+                and same_source
                 and _cache_reusable(feed_dir, state, url, force, lookup)
             ):
                 _backfill_state(feed_dir, state)
@@ -974,6 +1032,7 @@ def _crawl_from(
             usable = (
                 _cache_reusable(feed_dir, state, url, force, lookup)
                 and manifest is not None
+                and same_source
             )
             conditional = state if usable else {}
             outcome = fetcher.download(
@@ -982,8 +1041,11 @@ def _crawl_from(
                 ARCHIVE_FILE,
                 etag=conditional.get("etag"),
                 last_modified=conditional.get("last_modified"),
+                keyed=access and (lambda: keys.session(fetcher, access)),
             )
             if outcome["status"] == "not_modified":
+                if not (conditional.get("etag") or conditional.get("last_modified")):
+                    raise fetch.FetchError(f"GET {url}: HTTP 304 to no validator")
                 _backfill_state(feed_dir, state)
                 record["method"] = "not_modified"
                 record["fetched_from"] = fetched_from
@@ -991,9 +1053,14 @@ def _crawl_from(
                 record["files"] = manifest
                 record["stop_times"] = (state.get("stop_times") or {}).get("state")
                 return record, None
+            validators = {
+                "etag": outcome.get("etag"),
+                "last_modified": outcome.get("last_modified"),
+            }
             try:
+                check(validators.values())
                 digests, files, skipped, skip_reason = _extract_members(
-                    feed_dir, decide, fragment
+                    feed_dir, decide, fragment, check
                 )
             except zipfile.BadZipFile:
                 if _html_page(feed_dir, outcome.get("content_type")):
@@ -1004,10 +1071,6 @@ def _crawl_from(
                 store.unlink(feed_dir, ARCHIVE_FILE)
             record["method"] = "download"
             record["archive_sha256"] = outcome["sha256"]
-            validators = {
-                "etag": outcome.get("etag"),
-                "last_modified": outcome.get("last_modified"),
-            }
 
         _prune_members(feed_dir, digests)
         record["fetched_from"] = fetched_from
@@ -1055,6 +1118,7 @@ def _crawl_from(
                 ).isoformat(),
                 # The normalized per-table digests the fold compares.
                 **_identity_fields(feed_dir, digests),
+                **({"key_provider": feed["access_provider"]} if access else {}),
             },
         )
         return record, None
@@ -1090,7 +1154,7 @@ def _crawl_from(
             feed_dir.close()
 
 
-def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
+def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup, keys):
     """:func:`_crawl_one`, guaranteed not to raise. An unexpected error (not one
     it already turns into a ``failed`` record) becomes a ``skipped`` record so a
     single broken feed never aborts the run — identically on the sequential and
@@ -1103,6 +1167,7 @@ def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup)
             force=force,
             range_threshold=range_threshold,
             lookup=lookup,
+            keys=keys,
         )
     except Exception as error:  # noqa: B902 — containment at any worker count
         return {
@@ -1120,6 +1185,7 @@ def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup)
             "files": [],
             "stop_times": None,
             "stop_times_reason": None,
+            **({"key_crawl": "failed"} if feed.get("access") == "key" else {}),
         }
 
 
@@ -1130,6 +1196,7 @@ def crawl(
     range_threshold=fetch.RANGE_THRESHOLD,
     lookup=None,
     workers=1,
+    overrides_dir=None,
 ):
     """Crawl every crawlable resolved feed. Returns the run summary.
 
@@ -1142,13 +1209,17 @@ def crawl(
     ``stop_times.txt``, the safe direction. ``workers`` runs that many feeds
     concurrently over one shared network-bound ``Fetcher`` (per-feed dirs never
     collide, one host stays rate-limited); the built artifacts are identical to
-    a sequential run at any worker count.
+    a sequential run at any worker count. With ``overrides_dir`` the keys
+    :class:`keys.Keys` lends read feeds, and are masked in the log.
     """
     if fetcher is None:
         fetcher = fetch.Fetcher()
     feeds, resolve_manifest = store.read_jsonl(
         cache_dir / "resolve", "feeds_resolved.json", "feeds_resolved.jsonl"
     )
+    keys = None
+    if overrides_dir is not None:
+        keys = Keys.load(overrides_dir, feeds, resolve_manifest)
     opened_lookup = None
     log = []
     try:
@@ -1192,6 +1263,7 @@ def crawl(
                             force=force,
                             range_threshold=range_threshold,
                             lookup=lookup,
+                            keys=keys,
                         )
                         for feed, force in progress(eligible, "crawl")
                     ]
@@ -1209,6 +1281,7 @@ def crawl(
                                 force=force,
                                 range_threshold=range_threshold,
                                 lookup=lookup,
+                                keys=keys,
                             ): ordinal
                             for ordinal, (feed, force) in enumerate(eligible)
                         }
@@ -1218,6 +1291,8 @@ def crawl(
                             total=len(eligible),
                         ):
                             log[futures[future]] = future.result()
+                if keys is not None:
+                    log = [keys.redact(record) for record in log]
                 store.write_file(
                     directory,
                     LOG_FILE,
@@ -1283,15 +1358,19 @@ def crawl(
     finally:
         if opened_lookup is not None:
             opened_lookup.close()
+        if keys is not None:
+            keys.close()
 
     methods = {}
     for record in log:
         methods[record["method"]] = methods.get(record["method"], 0) + 1
+    key_crawls = collections.Counter(r["key_crawl"] for r in log if "key_crawl" in r)
     return {
         "source": "crawl",
         "sources": resolve_manifest.get("sources"),
         "feeds_crawlable": len(log),
         "by_method": methods,
+        "by_key_crawl": dict(key_crawls),
         "stop_times_skipped": sum(1 for r in log if r.get("stop_times") == "skipped"),
         "bytes_fetched": sum(r["bytes_fetched"] for r in log),
         "bytes_saved": sum(r["bytes_saved"] for r in log),

@@ -273,7 +273,8 @@ def run_expand(arguments):
 
 
 def run_crawl(arguments):
-    return [crawl.crawl(arguments.cache_dir, workers=arguments.workers)]
+    options = {"workers": arguments.workers, "overrides_dir": arguments.overrides_dir}
+    return [crawl.crawl(arguments.cache_dir, **options)]
 
 
 @consumes_run

@@ -204,7 +204,9 @@ def _bind_access(feed, providers, report):
     """Settle a protected feed's provider and request details.
 
     The provider is the curated one, else the one claiming the feed's URL; a
-    feed with none stays unresolved. A catalogue parameter or header name is
+    feed with none stays unresolved. An http URL whose https form that
+    provider claims becomes that form (``download_url``): no key goes over
+    http. A catalogue parameter or header name is
     bound to a provider's only credential field, and catalogue basic auth
     needs the fields ``username`` and ``password``. A pair that cannot be
     bound, or one naming a field the provider does not declare, is reported
@@ -214,6 +216,11 @@ def _bind_access(feed, providers, report):
         return
     url = crawl.feed_url(feed)
     provider_id = feed["access_provider"]
+    if url and url[:7].lower() == "http://":
+        secure = "https://" + url[7:]
+        claimant = overrides.claiming_provider(secure, providers)
+        if claimant is not None and provider_id in (None, claimant):
+            feed["download_url"] = url = secure
 
     def error(message):
         report.append(

@@ -8,7 +8,7 @@ import pytest
 pytest.importorskip("pyarrow")
 import pyarrow.parquet as pq  # noqa: E402
 
-from transitio_index import stats, store  # noqa: E402
+from transitio_index import crawl, stats, store  # noqa: E402
 
 
 def _mdb(mdb_id, status="active", **kw):
@@ -569,8 +569,8 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
     # A published download_url wins over the blocks; a realtime companion's
     # row, which has none, gives its MDB endpoint.
     mdb = {"urls": {"direct_download": "https://rt.example/vp"}}
-    assert stats._download_url({"download_url": None, "mdb": mdb}) is None
-    assert stats._download_url({"mdb": mdb}) == "https://rt.example/vp"
+    assert crawl.feed_url({"download_url": None, "mdb": mdb}) is None
+    assert crawl.feed_url({"mdb": mdb}) == "https://rt.example/vp"
     sections = stats.feed_sections(rows)
     assert sections["availability"]["by_outcome"] == {
         "ok": 2,

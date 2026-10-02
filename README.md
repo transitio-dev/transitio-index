@@ -102,13 +102,14 @@ matching registry together.
    that needs a key takes its provider from `overrides/access_providers.yaml`;
    the generation's `access_report.jsonl` lists the protected feeds no
    provider claims and the access curation errors.
-5. `crawl` — fetch every crawlable feed, without credentials. A feed's own
+5. `crawl` — fetch every crawlable feed, first without credentials. A feed's own
    URL is read first; when it fails as a dead or refused link does, the
    crawl reads the feed's copy hosted by the Mobility Database instead. A
    GTFS feed the catalogues or overrides say needs a key is crawled the same
-   way, falling back to that copy on any failure; one without a URL, or of
-   which the crawl reads no copy, is marked uncrawlable, "requires
-   authentication". Its access details stay as given either way.
+   way, falling back to that copy on any failure and then to the
+   maintainer's key where its provider approves (see below); one without a
+   URL, or of which the crawl reads no copy, is marked uncrawlable,
+   "requires authentication". Its access details stay as given either way.
 6. `expand` — add the places a feed's crawled stops actually fall in that the
    declared seed missed.
 7. `coverage` — derive the membership edges: which places each feed serves.
@@ -174,6 +175,20 @@ python -m transitio_index.build --stage gazetteer
 Pin the Atlas revision with `--commit <sha>` so the ingest is reproducible.
 `--help` lists every flag. The build logs its progress to the screen by default;
 `--verbose` / `--quiet`, `--log-file` and `--no-console` control the log.
+
+### Crawl key-protected feeds
+
+A provider in `overrides/access_providers.yaml` lends the crawl the
+maintainer's key once `crawl_approved: true` lands in a reviewed pull
+request. The key goes over https alone, for a URL under the provider's
+`url_prefixes`, and to that URL's host alone; an `http://` feed whose
+`https://` form lies there is resolved, crawled and published in that form. Each credential field is
+`TRANSITIO_KEY_<PROVIDER>__<FIELD>`, else read from the file
+`TRANSITIO_INDEX_CREDENTIALS` names, else from transitio's own credentials
+file. The crawl log is masked of every secret and says, per key-flagged
+feed, how its key was used (`key_crawl`; the summary counts them in
+`by_key_crawl`). Data read with a key are refreshed with each index release,
+on a best-effort basis; there is no separate weekly rebuild.
 
 ### A small sample end to end
 

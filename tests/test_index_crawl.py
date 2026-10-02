@@ -1,14 +1,18 @@
 import hashlib
 import io
 import json
+import logging
+import os
+import sys
 import threading
+import urllib.parse
 import zipfile
 
 import httpx
 import pytest
 from transitio.index import fingerprint
 
-from transitio_index import crawl, fetch, store  # noqa: E402
+from transitio_index import crawl, fetch, keys, overrides, store  # noqa: E402
 
 STOPS = b"stop_id,stop_lat,stop_lon\ns1,60.1,24.9\n"
 ROUTES = b"route_id,route_type\nr1,3\n"
@@ -82,7 +86,11 @@ def _feed(feed_id, url, *, crawlable=True, aliases=()):
     }
 
 
-def _publish_resolved(cache, feeds):
+def _publish_resolved(cache, feeds, overrides_dir=None):
+    manifest = {"source": "resolve", "sources": {"atlas": {"commit": "abc"}}}
+    if overrides_dir is not None:
+        digest = overrides.access_providers_digest(overrides_dir)
+        manifest["access_providers_sha256"] = digest
     directory = store.open_subdir(cache, "resolve")
     try:
         with store.exclusive_writer(directory):
@@ -90,7 +98,7 @@ def _publish_resolved(cache, feeds):
                 cache / "resolve",
                 "feeds_resolved.json",
                 {"feeds_resolved.jsonl": store.jsonl_chunks(feeds)},
-                {"source": "resolve", "sources": {"atlas": {"commit": "abc"}}},
+                manifest,
                 held=directory,
             )
     finally:
@@ -108,10 +116,14 @@ def _feed_dir(cache, feed_id):
     return cache / "crawl" / crawl._dir_name(feed_id)
 
 
-def _crawl(cache, transport, *, range_threshold=10**9, lookup=None):
+def _crawl(cache, transport, *, range_threshold=10**9, lookup=None, **options):
     with _fetcher(transport) as fetcher:
         summary = crawl.crawl(
-            cache, fetcher=fetcher, range_threshold=range_threshold, lookup=lookup
+            cache,
+            fetcher=fetcher,
+            range_threshold=range_threshold,
+            lookup=lookup,
+            **options,
         )
     log = store.parse_jsonl((cache / "crawl" / "crawl_log.jsonl").read_bytes())
     return summary, {record["feed_id"]: record for record in log}
@@ -1171,16 +1183,16 @@ def test_the_crawl_log_records_source_even_when_a_feed_errors(tmp_path, monkeypa
     # is present on every crawl-log path, not just the successful one.
     cache = tmp_path / "cache"
     feed = _feed("f-a", "https://feeds.example/a.zip")
-    feed["source"] = "atlas"
+    feed.update(source="atlas", access="key")
     _publish_resolved(cache, [feed])
 
     def boom(*args, **kwargs):
         raise RuntimeError("unexpected")
 
     monkeypatch.setattr(crawl, "_crawl_one", boom)
-    _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_members()), '"v1"')}))
-    assert log["f-a"]["method"] == "skipped"
-    assert log["f-a"]["source"] == "atlas"
+    summary, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_members()), '"v1"')}))
+    assert log["f-a"]["method"] == "skipped" and log["f-a"]["key_crawl"] == "failed"
+    assert log["f-a"]["source"] == "atlas" and summary["by_key_crawl"] == {"failed": 1}
 
 
 @pytest.mark.parametrize(
@@ -1205,3 +1217,268 @@ def test_member_rows_trims_header_names_and_keeps_values(data, rows):
     opened = io.BytesIO(data)
     assert list(crawl.member_rows(opened)) == rows
     opened.seek(0)
+
+
+# --- Crawl with the maintainer's keys -----------------------------------------
+
+SENTINEL = "k3y/S3ntinel"
+ENCODED = urllib.parse.quote(SENTINEL, safe="")
+A, B = "https://a.example", "https://b.example"
+FEED = A + "/feed.zip"
+NO_FILE = pytest.mark.skipif(sys.platform == "win32", reason="no file on Windows")
+APPROVED = dict(name="P", registration_url="https://r.ex/", credential_fields=["key"])
+APPROVED.update(crawl_approved=True, terms_checked="2026-10-02", terms_note="Allowed.")
+APPROVED["url_prefixes"] = [A + "/"]
+
+
+@pytest.fixture(autouse=True)
+def _no_maintainer_keys(tmp_path, monkeypatch):
+    """No test reads the maintainer's own credentials."""
+    for name in [n for n in os.environ if n.startswith("TRANSITIO_KEY_")]:
+        monkeypatch.delenv(name)
+    if sys.platform != "win32":
+        path = tmp_path / "credentials.toml"
+        path.write_text("")
+        path.chmod(0o600)
+        monkeypatch.setenv(keys.CREDENTIALS, str(path))
+
+
+def _keyed(feed_id, url=FEED, provider="p", method="query_param", params=None):
+    access = {"access": "key", "access_provider": provider, "auth_method": method}
+    return _feed(feed_id, url) | access | {"auth_params": params or {"key": "key"}}
+
+
+def _providers(tmp_path, **entries):
+    """An overrides directory approving each provider, with its changes."""
+    directory = tmp_path / "overrides"
+    directory.mkdir(exist_ok=True)
+    rows = [{"provider_id": p, **APPROVED, **changes} for p, changes in entries.items()]
+    (directory / overrides.ACCESS_PROVIDERS_FILE).write_text(json.dumps(rows))
+    return directory
+
+
+def _carries_key(request):
+    return (
+        request.url.params.get("key") == SENTINEL
+        or SENTINEL in request.headers.get("x-key", "")
+        or "authorization" in request.headers
+    )
+
+
+def _key_server(answers, seen=None):
+    """A stub answering ``{URL without query: answer(request)}``, keeping
+    ``(method, URL without query, carries the key, request)`` in ``seen``."""
+
+    def handler(request):
+        url = str(request.url.copy_with(query=None))
+        if seen is not None:
+            seen.append((request.method, url, _carries_key(request), request))
+        answer = answers.get(url)
+        return httpx.Response(404) if answer is None else answer(request)
+
+    return httpx.MockTransport(handler)
+
+
+def _answer(status=200, keyed=True, etag=None, data=None, **headers):
+    """An answer serving ``data`` or the archive (or ``status``), only with
+    the key when ``keyed``; an ``etag`` makes it conditional."""
+
+    def answer(request):
+        if keyed and not _carries_key(request):
+            return httpx.Response(401)
+        if etag and request.headers.get("If-None-Match") == etag:
+            return httpx.Response(304)
+        if status != 200:
+            return httpx.Response(status, headers=headers)
+        tags = {"ETag": etag} if etag else {}
+        content = data or _zip_bytes()
+        return httpx.Response(200, headers=tags | headers, content=content)
+
+    return answer
+
+
+def _moved(location, keyed=True, **headers):
+    return _answer(302, keyed=keyed, Location=location, **headers)
+
+
+# A cookie A sets never comes back to it.
+WALK = {
+    FEED: _moved(B + "/x", **{"Set-Cookie": "s=1"}),
+    B + "/x": _moved(A + "/final.zip", keyed=False),
+    A + "/final.zip": _answer(keyed=False),
+}
+METHODS = {"query_param": {"key": "key"}, "header": {"X-Key": "key"}, "basic_auth": {}}
+
+
+@pytest.mark.parametrize(
+    "method, answers, expected, outcome",
+    [
+        *[(m, WALK, [FEED, B + "/x", A + "/final.zip"], "read") for m in METHODS],
+        # The credential parameter set to another value never reaches B.
+        (
+            "query_param",
+            {FEED: _moved(B + "/x?key=other"), B + "/x": _answer(keyed=False)},
+            [FEED, B + "/x"],
+            "read",
+        ),
+        ("query_param", {FEED: _moved(f"{B}/{ENCODED}/x")}, [FEED], "failed"),
+        ("query_param", {FEED: _moved("http://a.example/final.zip")}, [FEED], "failed"),
+    ],
+    ids=["query", "header", "basic", "param", "secret-path", "http"],
+)
+def test_a_maintainer_key_reaches_only_the_access_origin(
+    tmp_path, monkeypatch, method, answers, expected, outcome
+):
+    cache = tmp_path / "cache"
+    fields = ["username", "password"] if method == "basic_auth" else ["key"]
+    overrides_dir = _providers(tmp_path, p={"credential_fields": fields})
+    for field, value in (("KEY", SENTINEL), ("USERNAME", "u"), ("PASSWORD", SENTINEL)):
+        monkeypatch.setenv(f"TRANSITIO_KEY_P__{field}", value)
+    feed = _keyed("f", method=method, params=METHODS[method])
+    _publish_resolved(cache, [feed], overrides_dir)
+    seen = []
+    _, log = _crawl(cache, _key_server(answers, seen), overrides_dir=overrides_dir)
+    assert log["f"]["key_crawl"] == outcome
+    first = next(i for i, (*_, carries, _) in enumerate(seen) if carries)
+    walked = seen[first:]
+    assert [url for _, url, *_ in walked] == expected
+    # Only the access origin's hops before the walk left it carry the key.
+    stayed = [
+        all(u.startswith(A) for u in expected[: i + 1]) for i in range(len(expected))
+    ]
+    assert [carries for *_, carries, _ in walked] == stayed
+    for verb, _, carries, request in walked:
+        assert verb == "GET" and request.headers["accept-encoding"] == "gzip"
+        assert carries or "key" not in request.url.params
+    assert all("cookie" not in request.headers for *_, request in seen)
+    assert SENTINEL not in str(log["f"]["fallback_reason"])
+
+
+@pytest.mark.parametrize(
+    "case, outcome, sent, kept",
+    [
+        ("keyless", "not_needed", False, "producer"),
+        ("hosted", "not_needed", False, "mdb_latest"),
+        ("keys-off", "keys_off", False, "p"),
+        # Changed data whose ETag reflects the key leave the earlier read whole.
+        ("reflected", "failed", True, "p"),
+        ("no-url", "not_https", False, None),
+        # A key goes only to a URL under its provider's url_prefixes.
+        ("unclaimed", "not_claimed", False, None),
+        # A cache read without the key is read afresh with it, not reused.
+        ("was-keyless", "read", True, "p"),
+        ("unbound", "no_provider", False, None),
+        ("unapproved", "not_approved", False, None),
+        ("no-keys", "no_credentials", False, "p"),
+        ("environment", "read", True, "p"),
+        pytest.param("file", "read", True, "p", marks=NO_FILE),
+        ("http", "not_https", False, None),
+        pytest.param("malformed", None, False, None, marks=NO_FILE),
+    ],
+)
+def test_a_key_crawl_needs_an_approved_provider_and_credentials(
+    tmp_path, monkeypatch, case, outcome, sent, kept
+):
+    cache = tmp_path / "cache"
+    url = {"http": "http://a.example/feed.zip", "no-url": None}.get(case, FEED)
+    feed = _keyed("f", url)
+    answers = {FEED: _answer(keyed=case != "keyless", etag='"v1"')}
+    if case == "hosted":
+        feed["mdb"] = {"urls": {"latest": HOSTED}}
+        answers[HOSTED] = _answer(keyed=False)
+    entries = {"p": {"url_prefixes": [A + "/other/"]} if case == "unclaimed" else {}}
+    monkeypatch.setenv("TRANSITIO_KEY_P__KEY", SENTINEL)
+    if case == "was-keyless":
+        _publish_resolved(cache, [feed])
+        _crawl(cache, _key_server({FEED: _answer(keyed=False, etag='"v1"')}))
+    if case in ("keys-off", "no-keys", "reflected"):
+        # An earlier crawl read the feed with p's key.
+        overrides_dir = _providers(tmp_path, **entries)
+        _publish_resolved(cache, [feed], overrides_dir)
+        _crawl(cache, _key_server(answers), overrides_dir=overrides_dir)
+    if case == "reflected":
+        changed = _zip_bytes(_members(stops=TWO_STOPS))
+        answers[FEED] = _answer(etag=f'"{SENTINEL}"', data=changed)
+    feed["access_provider"] = {"unbound": None}.get(case, "p")
+    if case == "unapproved":
+        entries["p"] = {"crawl_approved": False}
+    if case in ("no-keys", "file", "malformed"):
+        monkeypatch.delenv("TRANSITIO_KEY_P__KEY")
+        text = f'[p]\nkey = "{SENTINEL}"\n' if case == "file" else "[p\n"
+        (tmp_path / "credentials.toml").write_text("" if case == "no-keys" else text)
+    overrides_dir = None if case == "keys-off" else _providers(tmp_path, **entries)
+    _publish_resolved(cache, [feed], overrides_dir)
+    seen = []
+    server = _key_server(answers, seen)
+    if case == "malformed":
+        with pytest.raises(ValueError, match="credentials.toml"):
+            _crawl(cache, server, overrides_dir=overrides_dir)
+        assert seen == []
+        return
+    _, log = _crawl(cache, server, overrides_dir=overrides_dir)
+    assert log["f"]["key_crawl"] == outcome
+    assert any(carries for *_, carries, _ in seen) is sent
+    path = _feed_dir(cache, "f") / crawl.STATE_FILE
+    state = json.loads(path.read_text()) if path.exists() else {}
+    assert (state.get("key_provider") or state.get("fetched_from")) == kept
+    for name, digest in state.get("member_sha256", {}).items():
+        assert hashlib.sha256((path.parent / name).read_bytes()).hexdigest() == digest
+    if case == "environment":
+        # The next run spends one conditional request, answered 304.
+        seen.clear()
+        _, log = _crawl(cache, server, overrides_dir=overrides_dir)
+        assert (log["f"]["method"], log["f"]["key_crawl"]) == ("not_modified", "read")
+        assert [carries for *_, carries, _ in seen].count(True) == 1
+
+
+def test_a_maintainer_key_appears_in_no_output(tmp_path, monkeypatch, caplog):
+    cache = tmp_path / "cache"
+    C = "https://c.example"
+    nsw = {"credential_fields": ["api_key"], "url_prefixes": [C + "/"]}
+    overrides_dir = _providers(tmp_path, p={}, nsw=nsw)
+    monkeypatch.setenv("TRANSITIO_KEY_P__KEY", SENTINEL)
+    monkeypatch.setenv("TRANSITIO_KEY_NSW__API_KEY", "apikey " + SENTINEL)
+    trace = logging.getLogger("httpcore.http11")
+
+    def drops(request):
+        # A connection lost mid-body, its error naming the credentialed URL.
+        def body():
+            yield b"PK"
+            raise httpx.ReadError(str(request.url))
+
+        if not _carries_key(request):
+            return httpx.Response(401)
+        return httpx.Response(200, content=body())
+
+    def traced(request):
+        location = f"{B}/x?echo={SENTINEL}&again={ENCODED}"
+        if trace.isEnabledFor(logging.DEBUG):
+            trace.debug("receive_response_headers.complete %s", location)
+        return _moved(location)(request)
+
+    answers = {
+        A + "/read.zip": _answer(),
+        A + "/drop.zip": drops,
+        A + "/traced.zip": traced,
+        # A TfNSW-shaped "apikey <key>" header whose bare key is reflected.
+        C + "/nsw-moved.zip": _moved(f"{B}/{ENCODED}/x"),
+        C + "/nsw-etag.zip": _answer(etag=f'"{ENCODED}"'),
+    }
+    header = dict(provider="nsw", method="header", params={"Authorization": "api_key"})
+    feeds = [_keyed(name, f"{A}/{name}.zip") for name in ("read", "drop", "traced")]
+    feeds += [_keyed(n, f"{C}/{n}.zip", **header) for n in ("nsw-moved", "nsw-etag")]
+    _publish_resolved(cache, feeds, overrides_dir)
+    caplog.set_level(logging.DEBUG)
+    seen = []
+    summary, log = _crawl(
+        cache, _key_server(answers, seen), overrides_dir=overrides_dir
+    )
+    outcomes = {feed_id: record["key_crawl"] for feed_id, record in log.items()}
+    assert outcomes == dict.fromkeys(log, "failed") | {"read": "read"}
+    assert not trace.filters
+    assert not any(B in url for _, url, *_ in seen)
+    states = [p.read_text() for p in (cache / "crawl").glob("*/state.json")]
+    assert [json.loads(text)["url"] for text in states] == [A + "/read.zip"]
+    texts = [*states, json.dumps(summary), caplog.text]
+    texts.append((cache / "crawl" / crawl.LOG_FILE).read_text())
+    assert not any(form in text for text in texts for form in (SENTINEL, ENCODED))
