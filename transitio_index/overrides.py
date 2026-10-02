@@ -54,9 +54,23 @@ _STATIC_LINK_METHODS = frozenset({"declared", "same_file", "same_host", "none"})
 
 # The operations a feed entry may carry. ``set_coverage`` is applied by the
 # coverage stage, not the resolve stage, but is a valid key here.
-_OPERATIONS = frozenset({"set_identity", "mark_uncrawlable", "set_coverage"})
+_OPERATIONS = frozenset(
+    {"set_identity", "mark_uncrawlable", "set_coverage", "set_access"}
+)
 # The operations the resolve stage applies; set_coverage enters at coverage.
-RESOLVE_OPERATIONS = frozenset({"set_identity", "mark_uncrawlable"})
+RESOLVE_OPERATIONS = frozenset({"set_identity", "mark_uncrawlable", "set_access"})
+
+# How a request to a key-protected feed carries the credentials; catalogue
+# methods transitio does not send (a key in the path, a URL template) are
+# ``unsupported``.
+AUTH_METHODS = ("query_param", "header", "basic_auth", "unsupported")
+# A provider's credential field; a header name (an RFC 9110 token); a query
+# parameter name, sent percent-encoded (``acl:consumerKey``, ``api[key]``).
+_CREDENTIAL_FIELD = re.compile(r"[a-z][a-z0-9]*(_[a-z0-9]+)*")
+PARAM_NAMES = {
+    "header": re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"),
+    "query_param": re.compile(r"[^\x00-\x20\x7f]+"),
+}
 _METADATA = frozenset({"feed", "reason", "author", "date", "evidence_hash"})
 _EXCEPTION_KEYS = frozenset({"feed", "reason", "author", "date"})
 
@@ -140,6 +154,36 @@ def _validate_identity(path, ref, identity):
         )
 
 
+def _validate_access(path, ref, spec):
+    """Reject a ``set_access`` that is not one whole, well-formed auth pair:
+    ``auth_params`` maps each query parameter (at least one) or the one header
+    to a credential field, and is empty for basic auth and unsupported."""
+    where = f"{path}: feed {ref!r} set_access"
+    if not isinstance(spec, dict) or set(spec) != {"auth_method", "auth_params"}:
+        raise OverrideError(f"{where} must be a mapping of auth_method and auth_params")
+    method, params = spec["auth_method"], spec["auth_params"]
+    if method not in AUTH_METHODS:
+        raise OverrideError(f"{where} auth_method must be one of {list(AUTH_METHODS)}")
+    if method == "query_param":
+        fits = isinstance(params, dict) and bool(params)
+    elif method == "header":
+        fits = isinstance(params, dict) and len(params) == 1
+    else:
+        fits = params == {}
+    if not fits:
+        raise OverrideError(f"{where} auth_params does not fit auth_method {method!r}")
+    if not all(
+        isinstance(name, str)
+        and PARAM_NAMES[method].fullmatch(name)
+        and isinstance(field, str)
+        and _CREDENTIAL_FIELD.fullmatch(field)
+        for name, field in params.items()
+    ):
+        raise OverrideError(
+            f"{where} auth_params must map parameter names to credential fields"
+        )
+
+
 def _validate_operations(path, ref, entry):
     if not set(entry) & _OPERATIONS:
         raise OverrideError(f"{path}: feed {ref!r} carries no operation")
@@ -151,6 +195,8 @@ def _validate_operations(path, ref, entry):
             raise OverrideError(
                 f"{path}: feed {ref!r} mark_uncrawlable must be true or a mapping"
             )
+    if "set_access" in entry:
+        _validate_access(path, ref, entry["set_access"])
     if "set_coverage" in entry:
         spec = entry["set_coverage"]
         if not isinstance(spec, dict) or set(spec) != {"level", "place_id"}:
