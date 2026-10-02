@@ -64,6 +64,16 @@ DEFAULT_CACHE_DIR = pathlib.Path("cache")
 SOURCES = ("atlas", "mdb", "gbfs")
 
 
+def country_list(value):
+    """A comma-separated list of two-capital country codes."""
+    codes = value.split(",")
+    if not all(
+        len(c) == 2 and c.isascii() and c.isalpha() and c.isupper() for c in codes
+    ):
+        raise argparse.ArgumentTypeError(f"not a list of country codes: {value!r}")
+    return codes
+
+
 def commit_sha(value):
     """A full 40-character hex SHA, so the pin cannot move.
 
@@ -211,7 +221,11 @@ def run_gazetteer(arguments):
     stages = [
         lambda places, run: overture.resolve(cache_dir, run=run),
         lambda places, run: seed.resolve_seed(
-            cache_dir, registry=places, run=run, **options
+            cache_dir,
+            registry=places,
+            run=run,
+            seed_countries=arguments.seed_countries,
+            **options,
         ),
         lambda places, run: metros.attach_metros(
             cache_dir, registry=places, run=run, **options
@@ -435,6 +449,14 @@ def parse_args(argv=None):
         action="store_true",
         help="fail the gazetteer, coverage and curate stages on a stale override "
         "instead of flagging it",
+    )
+    parser.add_argument(
+        "--seed-countries",
+        type=country_list,
+        default=[],
+        metavar="CC[,CC...]",
+        help="seed the capitals and the cities of at least 200,000 people "
+        "(GHS-UCDB) in these countries as places, with or without feeds",
     )
     parser.add_argument(
         "--downstream",

@@ -1054,7 +1054,8 @@ def crosswalk(cache_dir):
     )
     records, summary = build_records(atlas_feeds, mdb_feeds, atlas_operators, systems)
     records, gbfs_records = split_transit(records)
-    if not records:
+    # Empty catalogues are a label without feeds; rows that yield none are not.
+    if not records and (atlas_feeds or mdb_feeds or systems):
         raise CrosswalkError("crosswalk produced no transit feeds")
     # The summary's feed counts describe the transit feeds the stage ships;
     # the systems have their own count (the gbfs_* keys describe their linking).

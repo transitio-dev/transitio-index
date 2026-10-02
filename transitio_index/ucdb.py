@@ -30,6 +30,8 @@ UCDB_ID = "ID_UC_G0"
 UCDB_NAME = "GC_UCN_MAI_2025"
 UCDB_NAMES = "GC_UCN_LIS_2025"
 UCDB_COUNTRY = "GC_CNT_GAD_2025"
+UCDB_POPULATION = "GC_POP_TOT_2025"
+UCDB_CAPITAL = "GC_UCM_CAP"
 POINTER = "ucdb.json"
 NAMES_POINTER = "fao-names.json"
 NAMES_FILE = "centre_names.jsonl"
@@ -40,6 +42,8 @@ DERIVED = ("GHS-UCDB R2024A", "CC-BY-4.0")
 EQUAL_AREA = "EPSG:6933"
 MIN_SHARE = 0.1
 AMBIGUITY = 0.5
+# The centres seeded as places: national capitals and cities this large.
+MIN_POPULATION = 200_000
 
 # The bytes verified live on 2026-09-07; a fetch that differs is refused.
 PINS = {
@@ -136,25 +140,40 @@ def _text(value):
     return value or None
 
 
-def read_ucdb(data):
-    """``(centres, nameless)``: ``[{"id", "name", "names", "country", "geom"}]``
-    for every named UCDB centre in the zipped GeoPackage bytes — unique
-    integer ids, polygons — and the count of nameless ones dropped."""
+def _count(value):
+    """A number rounded to an int, else None (NaN and missing alike)."""
+    if value is None or value != value:
+        return None
+    return int(round(float(value)))
+
+
+def read_ucdb(data, crs=EQUAL_AREA):
+    """``(centres, nameless)``: ``[{"id", "name", "names", "country",
+    "population", "capital", "geom"}]`` for every named UCDB centre in the
+    zipped GeoPackage bytes — unique integer ids, the 2025 population rounded,
+    polygons in ``crs`` — and the count of nameless ones dropped."""
     frame = fao.read_zipped(
         data, UCDB_FILE, member=UCDB_MEMBER, layer=UCDB_LAYER, error=UcdbError
     )
-    columns = (UCDB_ID, UCDB_NAME, UCDB_NAMES, UCDB_COUNTRY)
+    columns = (
+        UCDB_ID,
+        UCDB_NAME,
+        UCDB_NAMES,
+        UCDB_COUNTRY,
+        UCDB_POPULATION,
+        UCDB_CAPITAL,
+    )
     missing = [c for c in columns if c not in frame.columns]
     if missing:
         raise UcdbError(f"{UCDB_FILE}: missing columns {missing}")
     ids = fao.integer_ids(frame, UCDB_ID, UCDB_FILE, error=UcdbError)
     if len(set(ids)) != len(ids):
         raise UcdbError(f"{UCDB_FILE}: centre ids are not unique")
-    geoms = _polygons(frame, UCDB_FILE)
+    geoms = _polygons(frame, UCDB_FILE, crs)
     centres = []
     nameless = 0
-    for i, name, names, country, geom in zip(
-        ids, frame[UCDB_NAME], frame[UCDB_NAMES], frame[UCDB_COUNTRY], geoms
+    for i, name, names, country, population, capital, geom in zip(
+        ids, *(frame[column] for column in columns[1:]), geoms
     ):
         name = _text(name)
         if name is None:
@@ -167,10 +186,18 @@ def read_ucdb(data):
                 "name": name,
                 "names": [n for n in listed if n],
                 "country": _text(country),
+                "population": _count(population),
+                "capital": bool(capital == 1),
                 "geom": geom,
             }
         )
     return centres, nameless
+
+
+def qualifies(centre):
+    """Whether a centre is seeded as a place: a capital, or at least
+    ``MIN_POPULATION`` people."""
+    return centre["capital"] or (centre["population"] or 0) >= MIN_POPULATION
 
 
 def match(centres, ucdb):
