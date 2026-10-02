@@ -237,7 +237,8 @@ The index is built one label at a time and each build is archived under
 the newest complete run of every label and writes one snapshot from them:
 
 ```
-python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache-dir cache/merged
+python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache-dir cache/merged \
+    --partition cache/sample/partition-<id>/partition.json
 ```
 
 Every source must be a licensed schema-10 build, and the sources must agree on
@@ -250,6 +251,14 @@ committed into `cache/merged/index/`, and its manifest records each source by
 label, build id and digests, so the publisher can check the lineage. A label
 whose newest run is incomplete or holds no feeds is skipped and reported; an
 older run never stands in for it.
+
+With `--partition`, the merge looks up every MDB and Atlas GTFS id of the cut
+among the merged feed ids and aliases, logs each one missing, each label not
+merged, outside the partition or built from another cut, and records the
+result in the manifest. The publisher refuses a merged snapshot without that
+check, with a label outside the partition or from another cut, or with a
+missing id that `overrides/catalogue_exceptions.yaml` does not list (entries
+of `feed` and `reason`, optionally `author` and `date`).
 
 ### Publish a snapshot
 

@@ -182,8 +182,68 @@ def _lock_lineage(stack, cache_dir, merged):
 def _check_lineage(cache_dir, snapshot, overrides_dir, builds_dir):
     if _is_merged(snapshot):
         _merged_current(snapshot, builds_dir)
+        _catalogue_complete(snapshot, overrides_dir)
     else:
         _current(cache_dir, snapshot, overrides_dir)
+
+
+def _well_formed(check):
+    """Whether ``check`` has the shape of the merge's ``catalogue_check``."""
+
+    def names(values):
+        return isinstance(values, list) and all(
+            isinstance(value, str) and value for value in values
+        )
+
+    labels = ("labels_not_merged", "labels_outside", "labels_from_another_cut")
+    return (
+        isinstance(check, dict)
+        and isinstance(check.get("partition_sha256"), str)
+        and store.DIGEST_PATTERN.match(check["partition_sha256"]) is not None
+        and isinstance(check.get("catalogues"), dict)
+        and isinstance(check.get("expected"), dict)
+        and all(type(check["expected"].get(key)) is int for key in ("mdb", "atlas"))
+        and all(names(check.get(key)) for key in labels)
+        and isinstance(check.get("missing"), list)
+        and all(
+            isinstance(row, dict)
+            and row.get("catalogue") in ("mdb", "atlas")
+            and names([row.get("id"), row.get("label")])
+            for row in check["missing"]
+        )
+    )
+
+
+def _catalogue_complete(snapshot, overrides_dir):
+    """Refuse a merged index that does not hold its catalogue cut: one that
+    records no catalogue check (merged without a partition), one with a
+    merged label the partition does not list or one built from another cut,
+    and one lacking a catalogue id that ``catalogue_exceptions.yaml`` under
+    ``overrides_dir``, read now, does not name."""
+    from transitio_index import overrides
+
+    check = snapshot.get("catalogue_check")
+    if not _well_formed(check):
+        raise PublishIndexError(
+            "the index records no catalogue check; re-run the merge with --partition"
+        )
+    for key, what in (
+        ("labels_outside", "labels outside the partition"),
+        ("labels_from_another_cut", "labels built from another cut"),
+    ):
+        if check[key]:
+            raise PublishIndexError(
+                f"the index merges {what}: {', '.join(map(str, check[key]))}; "
+                "merge only builds of the partition's cuts"
+            )
+    excepted = overrides.load_catalogue_exceptions(overrides_dir)
+    missing = [row for row in check["missing"] if row["id"] not in excepted]
+    if missing:
+        named = ", ".join(f"{row['id']} ({row['label']})" for row in missing[:10])
+        raise PublishIndexError(
+            f"{len(missing)} catalogue feeds missing from the index and not in "
+            f"{overrides.CATALOGUE_EXCEPTIONS_FILE}: {named}"
+        )
 
 
 def _merged_current(snapshot, builds_dir):
@@ -357,7 +417,8 @@ def pack(
     escape hatch): for a built index its stage generations, checked under
     the stage locks the publish stage takes, in its order, so nothing moves
     between the check and the capture; for a merged index its sources
-    against the archived builds under ``builds_dir``. A merged index is
+    against the archived builds under ``builds_dir`` and its catalogue
+    check against the exceptions under ``overrides_dir``. A merged index is
     keyed by ``builds_dir`` and a built one by ``cache_dir``, so a merged
     snapshot can never be packed with only ``cache_dir`` and slip its
     lineage check."""
@@ -423,7 +484,11 @@ def pack(
                 "licensed",
             )
         }
-        | ({"merged": snapshot["merged"]} if _is_merged(snapshot) else {}),
+        | (
+            {key: snapshot.get(key) for key in ("merged", "catalogue_check")}
+            if _is_merged(snapshot)
+            else {}
+        ),
     }
     ok, reason = contract.compatible(manifest)
     if not ok:

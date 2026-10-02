@@ -2,6 +2,7 @@
 sources' tables become one set with one row per id, and what a merge
 refuses to load."""
 
+import copy
 import hashlib
 import io
 import json
@@ -435,6 +436,30 @@ DE_SOURCES = {
 }
 
 
+# The cut of the two runs: each label's Atlas ids and the digests its build
+# read (``MANIFEST_9``'s for fi, ``DE_SOURCES`` for de); nl holds none.
+PARTITION = {
+    "catalogues": {"atlas_commit": None},
+    "labels": {
+        "de": {"mdb_sha256": "e" * 64, "atlas_sha256": "d" * 64},
+        "fi": {"mdb_sha256": "b" * 64, "atlas_sha256": "a" * 64},
+        "nl": {"mdb_sha256": "0" * 64, "atlas_sha256": "0" * 64},
+    },
+    "mdb": {},
+    "atlas": {"hsl": "fi", "nat": "fi", "flix": "de", "ferry": "de"},
+}
+
+
+def _partition(directory, change=None):
+    """A ``partition.json`` of ``PARTITION`` as ``change`` edits a copy."""
+    partition = copy.deepcopy(PARTITION)
+    if change is not None:
+        change(partition)
+    path = directory / "partition.json"
+    path.write_text(json.dumps(partition))
+    return path
+
+
 def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
     """A Finnish run and a newer German one that also carries Helsinki; the
     German run read other catalogue samples."""
@@ -854,6 +879,12 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         loaded, tables, b"NOTICE\n", alias_conflicts=[("p", "q", "r")]
     )
     assert conflicted["alias_conflicts"] == [["p", "q", "r"]]
+    assert manifest["catalogue_check"] is None
+    # A check against a partition is recorded, and the partition names the id.
+    check = {"partition_sha256": "p" * 64}
+    checked, _ = merge.assemble(loaded, tables, b"NOTICE\n", catalogue_check=check)
+    assert checked["catalogue_check"] == check
+    assert checked["snapshot_id"] != snapshot_id
     # The sources by portable identities only, in label order.
     assert [(s["label"], s["build_id"]) for s in manifest["merged"]] == [
         ("de", de),
@@ -1188,6 +1219,83 @@ def test_a_catalogue_without_its_digest_is_refused(pins, message):
         merge._catalogue_lines(loaded)
 
 
+# ---- the catalogue check against a partition ----
+
+
+def _cut_read(mdb, atlas):
+    return {"sources": {"mdb": {"csv_sha256": mdb}, "atlas": {"archive_sha256": atlas}}}
+
+
+def test_the_catalogue_check_looks_each_id_up_as_a_feed_or_an_alias():
+    feeds = pa.table(
+        {
+            "feed_id": ["f-mdb-1", "f-abc", "f-xyz"],
+            "aliases": [[], ["f-mdb-2"], ["f-old"]],
+        }
+    )
+    cut = {"mdb_sha256": "m" * 64, "atlas_sha256": "a" * 64}
+    partition = {
+        "catalogues": {"atlas_commit": "c0ffee"},
+        "labels": {"fi": cut, "se": cut, "zw": cut},
+        "mdb": {"mdb-1": "fi", "mdb-2": "fi", "mdb-3": "fi", "mdb-9": "zw"},
+        "atlas": {"f-abc": "fi", "f-old": "se", "f-gone": "se"},
+    }
+    loaded = [
+        {"label": "fi", "build_id": "fi-1", "snapshot": _cut_read("m" * 64, "a" * 64)},
+        {"label": "se", "build_id": "se-2", "snapshot": _cut_read("m" * 64, "0" * 64)},
+        {"label": "us", "build_id": "us-3", "snapshot": _cut_read("m" * 64, "a" * 64)},
+    ]
+    check = merge.catalogue_check(partition, "p" * 64, feeds, loaded)
+    assert check == {
+        "partition_sha256": "p" * 64,
+        "catalogues": {"atlas_commit": "c0ffee"},
+        "expected": {"mdb": 4, "atlas": 3},
+        "missing": [
+            {"catalogue": "mdb", "id": "mdb-3", "label": "fi"},
+            {"catalogue": "atlas", "id": "f-gone", "label": "se"},
+            {"catalogue": "mdb", "id": "mdb-9", "label": "zw"},
+        ],
+        "labels_not_merged": ["zw"],
+        "labels_outside": ["us"],
+        "labels_from_another_cut": ["se"],
+    }
+    lines = []
+    merge._report_check(check, lines.append)
+    assert lines == [
+        "label zw not merged: 1 catalogue feeds missing",
+        "missing mdb mdb-3 (label fi)",
+        "missing atlas f-gone (label se)",
+        "label us is not in the partition",
+        "label se was built from another cut",
+    ]
+
+
+@pytest.mark.parametrize(
+    "partition, message",
+    [
+        ("{not json", "not JSON"),
+        ({"labels": {}, "mdb": {}}, "needs catalogues, labels, mdb and atlas"),
+        (
+            {"labels": {"fi": {"mdb_sha256": "m"}}, "mdb": {}, "atlas": {}},
+            "label fi records no cut digests",
+        ),
+        (
+            {"labels": {}, "mdb": {"mdb-1": "zw"}, "atlas": {}},
+            "mdb mdb-1 is in 'zw', a label the partition does not list",
+        ),
+    ],
+)
+def test_a_partition_the_merge_cannot_check_against_is_refused(
+    tmp_path, partition, message
+):
+    path = tmp_path / "partition.json"
+    if not isinstance(partition, str):
+        partition = json.dumps({"catalogues": {}, **partition})
+    path.write_text(partition)
+    with pytest.raises(merge.MergeError, match=message):
+        merge.read_partition(path)
+
+
 # ---- writing the merged snapshot and the command ----
 
 
@@ -1212,12 +1320,22 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
         fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
     )
     _run(builds, "nl", 3, feeds=[], edges={})  # no feeds: skipped, reported
-    assert merge.main(["--builds", str(builds), "--cache-dir", str(cache)]) == 0
+    partition = _partition(tmp_path, lambda p: p["atlas"].update(lost="fi"))
+    assert (
+        merge.main(
+            [
+                *("--builds", str(builds), "--cache-dir", str(cache)),
+                *("--partition", str(partition)),
+            ]
+        )
+        == 0
+    )
     out = capsys.readouterr().out
     assert "skipped nl-0000000000000003: no feeds" in out
+    assert "missing atlas lost (label fi)" in out
     assert (
         "merged 2 builds into" in out
-        and "4 feeds, 3 places, 5 edges, 2 companions" in out
+        and "4 feeds, 3 places, 5 edges, 2 companions; 1 catalogue feeds missing" in out
     )
     index = read_index(cache / "index")
     assert index.snapshot["merged"][0]["build_id"] == de
@@ -1378,13 +1496,20 @@ def _small_run(fx, archived, label, digit, built_at):
     )
 
 
-def _merged_cache(fx, tmp_path):
+def _merged_cache(fx, tmp_path, partition=None):
+    """The two runs and a skipped one merged, checked against ``PARTITION``
+    as ``partition`` edits it; ``False`` merges without a check."""
     builds, cache = tmp_path / "builds", tmp_path / "cache"
     fi, de = _two_runs(
         fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
     )
     _run(builds, "nl", 3, feeds=[], edges={})  # skipped: no feeds
-    manifest = merge.merge_builds(builds, cache, log=lambda line: None)
+    manifest = merge.merge_builds(
+        builds,
+        cache,
+        log=lambda line: None,
+        partition=None if partition is False else _partition(tmp_path, partition),
+    )
     return builds, cache, fi, de, manifest
 
 
@@ -1398,6 +1523,7 @@ def test_the_publisher_packs_a_merged_snapshot_with_its_lineage_checked(tmp_path
     )
     assert release["snapshot_id"] == manifest["snapshot_id"]
     assert release["lineage"]["merged"] == manifest["merged"]
+    assert release["lineage"]["catalogue_check"] == manifest["catalogue_check"]
     assert (
         release["lineage"]["licensed"] is True
         and release["lineage"]["generations"] is None
@@ -1524,3 +1650,101 @@ def test_a_builds_directory_that_cannot_be_read_is_a_publish_error(
         publisher.PublishIndexError, match="cannot read the archived builds"
     ):
         publisher.pack(cache / "index", cache_dir=cache, builds_dir=builds)
+
+
+def _a_feed_lost(partition):
+    partition["atlas"]["lost"] = "fi"
+
+
+def _de_not_listed(partition):
+    del partition["labels"]["de"]
+    partition["atlas"] = {"hsl": "fi", "nat": "fi"}
+
+
+def _de_cut_again(partition):
+    partition["labels"]["de"]["atlas_sha256"] = "9" * 64
+
+
+EXCEPTED = "- feed: lost\n  reason: withdrawn by its operator\n"
+
+
+@pytest.mark.parametrize(
+    "partition, exceptions, message",
+    [
+        (False, None, "no catalogue check; re-run the merge with --partition"),
+        (_a_feed_lost, None, r"1 catalogue feeds missing .*: lost \(fi\)$"),
+        (_a_feed_lost, EXCEPTED, None),
+        (_de_not_listed, None, "merges labels outside the partition: de"),
+        (_de_cut_again, None, "merges labels built from another cut: de"),
+    ],
+)
+def test_a_merged_snapshot_is_released_only_with_its_whole_catalogue_cut(
+    tmp_path, partition, exceptions, message
+):
+    fx = pytest.importorskip("index_fixture")
+    from transitio_index import publisher
+
+    builds, cache, *_ = _merged_cache(fx, tmp_path, partition)
+    excepted = tmp_path / "overrides" / "catalogue_exceptions.yaml"
+    excepted.parent.mkdir()
+    if exceptions is not None:
+        excepted.write_text(exceptions)
+    options = {"builds_dir": builds, "overrides_dir": excepted.parent}
+    if message is not None:
+        with pytest.raises(publisher.PublishIndexError, match=message):
+            publisher.pack(cache / "index", **options)
+        return
+    _, release = publisher.pack(cache / "index", **options)
+    # The flip-time check reads the exceptions again.
+    excepted.unlink()
+    with pytest.raises(publisher.PublishIndexError, match=r"lost \(fi\)"):
+        publisher._check_lineage(cache, release["lineage"], excepted.parent, builds)
+
+
+CHECKED = {
+    "partition_sha256": "0" * 64,
+    "catalogues": {},
+    "expected": {"mdb": 0, "atlas": 1},
+    "missing": [],
+    "labels_not_merged": [],
+    "labels_outside": [],
+    "labels_from_another_cut": [],
+}
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        {key: [] for key in ("missing", "labels_outside", "labels_from_another_cut")},
+        {**CHECKED, "partition_sha256": "p" * 64},
+        {**CHECKED, "expected": {"mdb": 0}},
+        {**CHECKED, "labels_not_merged": None},
+        {**CHECKED, "missing": [{"id": "lost", "label": "fi"}]},
+    ],
+)
+def test_a_catalogue_check_not_shaped_as_the_merge_writes_it_is_refused(check):
+    from transitio_index import publisher
+
+    publisher._catalogue_complete({"catalogue_check": CHECKED}, None)
+    with pytest.raises(publisher.PublishIndexError, match="no catalogue check"):
+        publisher._catalogue_complete({"catalogue_check": check}, None)
+
+
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        ("feed: lost\n", "expected a list"),
+        ("- feed: lost\n", "'lost' needs a reason"),
+        ("- {feed: lost, reason: ' '}\n", "'lost' needs a reason"),
+        ("- {feed: lost, reason: a}\n- {feed: lost, reason: b}\n", "duplicate"),
+        ("- {feed: lost, reason: a, set_identity: {}}\n", "unknown keys"),
+    ],
+)
+def test_a_catalogue_exceptions_file_without_a_reason_per_id_is_refused(
+    tmp_path, text, message
+):
+    from transitio_index import overrides
+
+    (tmp_path / "catalogue_exceptions.yaml").write_text(text)
+    with pytest.raises(overrides.OverrideError, match=message):
+        overrides.load_catalogue_exceptions(tmp_path)
