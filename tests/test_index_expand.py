@@ -327,11 +327,11 @@ def _expand(tmp_path, cache, registry=None, labels=None, overrides_dir=None):
         {
             "Q40840": {
                 "labels": {"en": "Tampere", "fi": "Tampere"},
-                "aliases": ["Manse"],
+                "aliases": {"fi": ["Manse"]},
             },
             "Q912579": {
                 "labels": {"fi": "Springfieldin metropolialue"},
-                "aliases": ["Greater Springfield"],
+                "aliases": {"en": ["Greater Springfield"]},
             },
             **(labels or {}),
         },
@@ -1119,7 +1119,7 @@ def test_a_discovered_alias_qid_is_its_survivor(tmp_path, seeded):
         '"concordances": {"wikidata": ["Q40840"]}, "at": "2026-09-08", "reason": "dup"}\n'
     )
     _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
-    canonical = {"Q77777": {"labels": {"sv": "Tammerfors"}, "aliases": []}}
+    canonical = {"Q77777": {"labels": {"sv": "Tammerfors"}, "aliases": {}}}
     with registry.session(path) as reg:
         manifest, places, _ = _expand(tmp_path, cache, registry=reg, labels=canonical)
         # The survivor's registry row takes the crawled division's Overture

@@ -13,6 +13,7 @@ def _place(place_id, *, name, names=None, aliases=None):
     return {
         "place_id": place_id,
         "kind": "city",
+        "country_code": "FI",
         "name": name,
         "names": names or {},
         "aliases": [] if aliases is None else aliases,
@@ -31,9 +32,9 @@ PLACES = [
 LABELS = {
     "Q1757": {
         "labels": {"en": "Helsinki (wd)", "sv": "Helsingfors", "fi": "Helsinki (wd)"},
-        "aliases": ["Stadi", "Hesa", "Helsinki"],
+        "aliases": {"fi": ["Hesa", "Stadi"], "en": ["Helsinki"]},
     },
-    "Q3000": {"labels": {"en": "X"}, "aliases": ["New"]},
+    "Q3000": {"labels": {"en": "X"}, "aliases": {"en": ["New"]}},
 }
 
 
@@ -83,8 +84,9 @@ def test_name_becomes_the_english_label(tmp_path):
 
 def test_aliases_are_the_union_minus_the_name(tmp_path):
     _, places = _run(tmp_path)
-    # "Helsinki" is dropped (it equals the name); Stadi/Hesa remain, sorted.
-    assert places["Q1757"]["aliases"] == ["Hesa", "Stadi"]
+    # "Helsinki" is dropped (it equals the name); Stadi/Hesa remain, sorted, and
+    # the Wikidata label Overture replaced joins them.
+    assert places["Q1757"]["aliases"] == ["Helsinki (wd)", "Hesa", "Stadi"]
 
 
 def test_existing_aliases_are_preserved(tmp_path):
@@ -111,7 +113,9 @@ def test_labels_and_aliases_parses_wbgetentities(monkeypatch):
                     "en": [
                         {"language": "en", "value": "City of New York"},
                         {"language": "en", "value": "NYC"},
-                    ]
+                    ],
+                    "mul": [{"language": "mul", "value": "Big Apple"}],
+                    "de": [{"language": "de", "value": ""}],  # no value: dropped
                 },
             },
             "Q999999999": {"missing": ""},  # a missing entity is skipped
@@ -126,7 +130,7 @@ def test_labels_and_aliases_parses_wbgetentities(monkeypatch):
     assert result == {
         "Q60": {
             "labels": {"en": "New York City", "sv": "New York"},
-            "aliases": ["City of New York", "NYC"],
+            "aliases": {"en": ["City of New York", "NYC"], "mul": ["Big Apple"]},
         }
     }
 

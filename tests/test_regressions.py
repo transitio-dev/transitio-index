@@ -31,6 +31,7 @@ from transitio_index import (  # noqa: E402
     crosswalk,
     fetch,
     geometry,
+    names,
     overture,
     registry,
     seed,
@@ -139,7 +140,7 @@ def test_wikidata_labels_bisect_a_failing_batch_and_skip_a_bad_entity(boom):
             if len(batch) > 3 or "Q666" in batch:
                 raise boom()
             for qid in batch:
-                out[qid] = {"labels": {"en": qid}, "aliases": []}
+                out[qid] = {"labels": {"en": qid}, "aliases": {}}
 
     client = Flaky()
     qids = [f"Q{n}" for n in range(1, 11)] + ["Q666"]
@@ -1597,3 +1598,44 @@ def test_a_municipality_named_after_its_town_is_its_council_area(city, area, exp
     its own QID and its town's name, a suffix or a genitive "s" aside, is
     now its town's council area."""
     assert seed.council_area({"name": city, "names": {}}, area) is expected
+
+
+@pytest.mark.parametrize(
+    "place, entry, expected",
+    [
+        (
+            {"country_code": "DE", "names": {"en": "Munich"}},
+            {
+                "labels": {},
+                "aliases": {
+                    "it": ["Monaco"],
+                    "de": ["MUC"],
+                    "de-at": ["LHM"],
+                    "mul": ["München"],
+                    "en": ["Muenchen"],
+                },
+            },
+            ["LHM", "MUC", "Muenchen", "München"],
+        ),
+        (
+            {"country_code": "US", "names": {"en": "New York"}},
+            {
+                "labels": {"en": "New York City", "fr": "New York"},
+                "aliases": {"mul": ["NYC"], "eo": ["Gotham"]},
+            },
+            ["NYC", "New York City"],
+        ),
+        (
+            {"names": {"en": "Z"}},
+            {"labels": {}, "aliases": {"en": ["Y"], "fr": ["X"]}},
+            ["Y"],
+        ),
+    ],
+    ids=["foreign-alias", "replaced-label", "no-country"],
+)
+def test_wikidata_aliases_are_kept_in_the_places_own_languages(place, entry, expected):
+    """A Wikidata alias in a language not the place's own ("Monaco", Italian for
+    Munich) does not join its aliases; English, ``mul`` and the country's
+    languages do, and so does an own-language label Overture replaced."""
+    names._merge(place, entry)
+    assert place["aliases"] == expected

@@ -458,7 +458,7 @@ class WikidataClient:
                 found[osm] = qid
 
     def labels_and_aliases(self, qids):
-        """``{qid: {"labels": {lang: label}, "aliases": [str, ...]}}`` per QID.
+        """``{qid: {"labels": {lang: label}, "aliases": {lang: [alias, ...]}}}``.
 
         From the ``wbgetentities`` action (all-language labels and aliases in one
         call), batched to the API's 50-id limit. A QID Wikidata reports as missing
@@ -523,14 +523,11 @@ class WikidataClient:
                 lang: value.get("value")
                 for lang, value in (entity.get("labels") or {}).items()
             }
-            aliases = sorted(
-                {
-                    alias.get("value")
-                    for values in (entity.get("aliases") or {}).values()
-                    for alias in values
-                    if alias.get("value")
-                }
-            )
+            aliases = {}
+            for lang, values in (entity.get("aliases") or {}).items():
+                kept = sorted({a.get("value") for a in values if a.get("value")})
+                if kept:
+                    aliases[lang] = kept
             out[qid] = {"labels": labels, "aliases": aliases}
 
     def _get(self, query):

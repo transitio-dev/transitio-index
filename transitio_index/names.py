@@ -3,12 +3,17 @@
 Each place keeps its Overture ``names`` — Overture wins for a shared language —
 and gains Wikidata labels for the languages Overture lacks; ``name`` is set to the
 English label. ``aliases`` is the union of any existing aliases and Wikidata's
-"also known as" values (both CC0), with the place's own name removed. Wikidata is
-queried once per build via the ``wbgetentities`` API; a curator's
-``set_aliases`` additions are applied here, after the Wikidata merge.
+"also known as" values (both CC0) in the place's own languages: English,
+Wikidata's multilingual ``mul`` and its country's languages, by the reader's
+rule. An own-language Wikidata label Overture replaced in ``names`` joins them,
+and the place's own name is removed. Wikidata is queried once per build via the
+``wbgetentities`` API; a curator's ``set_aliases`` additions are applied here,
+after the Wikidata merge, and are not filtered.
 """
 
 import datetime
+
+from transitio.index.places import _own_language
 
 from transitio_index import overrides, overture, store
 from transitio_index.progress import progress
@@ -16,13 +21,26 @@ from transitio_index.progress import progress
 
 def _merge(place, entry):
     """Fold one place's Wikidata labels and aliases into its record in place."""
+    country = place.get("country_code")
     names = dict(entry["labels"])
     names.update(place.get("names") or {})  # Overture wins for a shared language
     place["names"] = names
     name = names.get("en") or place.get("name")
     place["name"] = name
+    own = {
+        alias
+        for language, values in entry["aliases"].items()
+        if _own_language(country, language)
+        for alias in values
+    }
+    # An own-language label Overture replaced stays findable as an alias.
+    own.update(
+        label
+        for language, label in entry["labels"].items()
+        if label and names[language] != label and _own_language(country, language)
+    )
     existing = set(place.get("aliases") or [])
-    place["aliases"] = sorted((existing | set(entry["aliases"])) - {name})
+    place["aliases"] = sorted((existing | own) - {name})
 
 
 def _set_aliases(places, entries, report):
