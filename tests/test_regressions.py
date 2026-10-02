@@ -35,6 +35,7 @@ from transitio_index import (  # noqa: E402
     names,
     overture,
     registry,
+    resolve,
     seed,
     store,
 )
@@ -1769,3 +1770,45 @@ def test_a_seeded_citys_population_survives_the_merge(tmp_path):
         "name": "Lima (fed)",
         "population": 10**7,
     }
+
+
+def test_a_feed_needing_a_key_is_crawled_from_its_hosted_copy(tmp_path):
+    """resolve refused every GTFS feed the catalogues flag as needing a key,
+    so the crawl never read one, though the Mobility Database hosts keyless
+    copies of many (all of Trafiklab's). Its URL is now read without the key,
+    then the hosted copy; the access details stay the catalogue's."""
+    cache = tmp_path / "cache"
+    page = "https://register.example/"
+    mdb = {
+        "requires_auth": True,
+        "authentication_type": "1",
+        "api_key_parameter_name": "key",
+        "authentication_info": page,
+        "urls": {"direct_download": crt.PRODUCER_URL, "latest": crt.HOSTED},
+    }
+    ct._publish(
+        cache,
+        "crosswalk",
+        "feeds.json",
+        "feeds.jsonl",
+        [
+            {
+                "feed_id": "f-key",
+                "spec": "gtfs",
+                "source": "mdb",
+                "aliases": [],
+                "mdb": mdb,
+            }
+        ],
+    )
+    resolve.resolve(cache, overrides_dir=None)
+    served = {"/a.zip": (401, None), "/mdb-1/latest.zip": (crt._zip_bytes(), None)}
+    _, log = crt._crawl(cache, crt._server(served))
+    record = log["f-key"]
+    assert (record["method"], record["fetched_from"]) == ("download", "mdb_latest")
+    assert "HTTP 401" in record["producer_failure"]
+    feeds, _ = store.read_jsonl(
+        cache / "resolve", "feeds_resolved.json", "feeds_resolved.jsonl"
+    )
+    fields = ("crawlable", "access", "auth_method", "registration_url")
+    assert [feeds[0][field] for field in fields] == [True, "key", "query_param", page]

@@ -69,25 +69,29 @@ def test_no_overrides_pass_feeds_through_as_crawlable(tmp_path):
     assert manifest["uncrawlable"] == 0
 
 
-def test_only_open_static_gtfs_defaults_to_crawlable(tmp_path):
-    # Realtime and GBFS are indexed but never fetched; a GTFS feed whose download
-    # URL needs a key is refused up front, judged by the record that supplies
-    # the URL (the Atlas static URL first, else the MDB download).
+def test_static_gtfs_defaults_to_crawlable(tmp_path):
+    # Realtime and GBFS are indexed but never fetched; a GTFS feed that needs a
+    # key is crawled without one, so only one without a URL to try is refused.
     gated = {"requires_auth": True, "urls": {"direct_download": "https://x/a.zip"}}
     open_atlas = {"requires_auth": False, "urls": {"static_current": "https://y/a.zip"}}
     cases = [
         (_feed("f-rt", spec="gtfs-rt"), False, None),
         (_feed("f-bike", spec="gbfs"), False, None),
-        (dict(_feed("f-key"), mdb=gated), False, resolve.AUTH_REASON),
+        (dict(_feed("f-key"), mdb=gated), True, None),
         (dict(_feed("f-both"), atlas=open_atlas, mdb=gated), True, None),
         (
             dict(_feed("f-atlas"), atlas=dict(open_atlas, requires_auth=True)),
+            True,
+            None,
+        ),
+        (
+            dict(_feed("f-no-url"), mdb=dict(gated, urls={})),
             False,
             resolve.AUTH_REASON,
         ),
         (_feed("f-open"), True, None),
         # An upstream decision stands; an override's reason wins over the default.
-        (dict(_feed("f-forced"), mdb=gated, crawlable=True), True, None),
+        (dict(_feed("f-forced"), mdb=dict(gated, urls={}), crawlable=True), True, None),
         (dict(_feed("f-said"), mdb=gated), False, "closed"),
     ]
     cache = tmp_path / "cache"
@@ -100,8 +104,8 @@ def test_only_open_static_gtfs_defaults_to_crawlable(tmp_path):
     for feed, crawlable, reason in cases:
         assert feeds[feed["feed_id"]]["crawlable"] is crawlable, feed["feed_id"]
         assert feeds[feed["feed_id"]]["uncrawlable_reason"] == reason, feed["feed_id"]
-    assert manifest["uncrawlable"] == 5
-    assert manifest["requires_auth"] == 3
+    assert manifest["uncrawlable"] == 4
+    assert manifest["requires_auth"] == 2
 
 
 def test_access_details_come_from_the_record_supplying_the_url(tmp_path):
@@ -180,7 +184,7 @@ def test_access_details_come_from_the_record_supplying_the_url(tmp_path):
         assert feeds[ref]["auth_params"] is None
 
 
-def test_set_access_records_the_curated_pair_and_stops_the_crawl(tmp_path):
+def test_set_access_records_the_curated_pair(tmp_path):
     page = "https://register.example/"
     gated = {
         "requires_auth": True,
@@ -220,12 +224,13 @@ def test_set_access_records_the_curated_pair_and_stops_the_crawl(tmp_path):
     feeds, manifest = _resolved(cache)
     assert feeds["f-open"]["access"] == "key"
     assert feeds["f-open"]["auth_params"] == pair
-    assert feeds["f-open"]["uncrawlable_reason"] == resolve.AUTH_REASON
+    # Its URL is still crawled, without the key.
+    assert feeds["f-open"]["crawlable"] is True
     assert feeds["f-open"]["registration_url"] == page
     assert feeds["f-key"]["auth_method"] == "header"
     assert feeds["f-key"]["auth_params"] == {"Authorization": "key"}
     assert feeds["f-key"]["auth_param_name"] is None
-    assert manifest["requires_auth"] == 2
+    assert manifest["requires_auth"] == 0
 
 
 @pytest.mark.parametrize(

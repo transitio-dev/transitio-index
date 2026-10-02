@@ -169,20 +169,20 @@ def _canonical_ids(feeds):
     return lookup
 
 
-def crawled_states(cache_dir, feeds):
+def crawled_states(cache_dir, feeds, *, stops=True):
     """``({feed_id: (feed_dir, state)}, unmatched crawl ids)``: one crawl per feed.
 
     A crawl is filed under the id the crawl saw, so it maps to the feed's
     canonical id; when several map to one feed (a rename's old crawl, a
     folded duplicate's), the crawl under the feed's own id wins, then the
-    smallest id.
+    smallest id. ``stops`` is :func:`crawl.crawled_feeds`'s.
     """
     from transitio_index import crawl
 
     canonical = _canonical_ids(feeds)
     found = {}
     unmatched = set()
-    for feed_dir, state in crawl.crawled_feeds(cache_dir):
+    for feed_dir, state in crawl.crawled_feeds(cache_dir, stops=stops):
         state_id = state.get("feed_id")
         feed_id = canonical.get(state_id) if isinstance(state_id, str) else None
         if feed_id is None:
@@ -621,7 +621,7 @@ def stale_expansion(stale):
     )
 
 
-def crawled_edges(states, places, lookup, conflicts=frozenset()):
+def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
     """Measured edges for the crawled feeds; ``(edges_by_key, report)``.
 
     Reads each crawled feed's digest-verified stops (``states``, from
@@ -639,6 +639,10 @@ def crawled_edges(states, places, lookup, conflicts=frozenset()):
     miss — the stop counts for the enclosing places it also hit — where any
     other unknown QID-bearing division means ``places_expanded`` predates the
     crawl.
+
+    ``urls`` maps each feed to the download URL it is published with; a
+    state's validators are published only when they were recorded against
+    it, since the reader probes that URL with them.
     """
     # Heavy deps (shapely/pyarrow via the gazetteer modules) load only when
     # crawl artifacts exist; the declared path stays importable without them.
@@ -673,11 +677,13 @@ def crawled_edges(states, places, lookup, conflicts=frozenset()):
         # evidence: measured hull, stop count, validators, retrieval time.
         # A digest-valid file whose rows are all unparsable is still the
         # crawl's answer: it supersedes, counts its rows, and places nothing.
+        # Not those of the hosted copy or of a former producer URL.
+        own = state.get("url") == urls.get(feed_id)
         crawl_fields[feed_id] = {
             "stop_count": len(points) + dropped,
             "coverage": (shapely.to_wkb(_stop_hull(points)).hex() if points else None),
-            "etag": state.get("etag"),
-            "last_modified": state.get("last_modified"),
+            "etag": state.get("etag") if own else None,
+            "last_modified": state.get("last_modified") if own else None,
             "last_crawled": state.get("retrieved_at"),
             "crawl_status": "ok",
             # Sanitize the recorded manifest the same way the crawl does, so a
@@ -855,7 +861,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
 
     Reads the resolved feeds, the expanded places and the seed placements, and
     writes ``feeds_covered.jsonl`` (every feed stamped with its
-    ``coverage_source``) and ``edges_candidate.jsonl``. Returns the manifest.
+    ``coverage_source``; a feed that needs a key and has no crawl becomes
+    uncrawlable) and ``edges_candidate.jsonl``. Returns the manifest.
     """
     directory = store.open_subdir(cache_dir, "coverage")
     try:
@@ -882,7 +889,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 cache_dir / "gazetteer", "seed.json", "feed_places.jsonl"
             )
             _check_lineage(resolve_manifest, seed_manifest, expanded_manifest)
-            from transitio_index import crawl
+            from transitio_index import crawl, resolve
 
             places = {place["place_id"]: place for place in place_rows}
             override_report = []
@@ -912,6 +919,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             near = []
             contained = {}
             content = {}
+            # Every feed with a committed crawl, stops or none.
+            read = set()
             opened_lookup = None
             crawl_digest = None
             crawl_lock = crawl.reading(cache_dir)
@@ -935,6 +944,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                         )
                         lookup = opened_lookup
                     states, unmatched = crawled_states(cache_dir, feeds)
+                    read = set(crawled_states(cache_dir, feeds, stops=False)[0])
                     folded = fold_duplicates(feeds, states)
                     near = near_duplicates(states)
                     contained = contained_feeds(states)
@@ -947,7 +957,11 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     }
                     try:
                         crawled_by_key, crawl_report = crawled_edges(
-                            states, places, lookup, conflicts=conflicts
+                            states,
+                            places,
+                            lookup,
+                            conflicts=conflicts,
+                            urls={f["feed_id"]: crawl.feed_url(f) for f in feeds},
                         )
                     except store.StoreError as error:
                         raise CoverageError(
@@ -1003,6 +1017,14 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     feed.update(crawl_report["crawl_fields"].get(feed["feed_id"]) or {})
                 else:
                     feed["coverage_source"] = None
+                if (
+                    feed.get("crawlable")
+                    and feed.get("access") == "key"
+                    and feed["feed_id"] not in read
+                ):
+                    # The crawl read no copy of it without a key.
+                    feed["crawlable"] = False
+                    feed["uncrawlable_reason"] = resolve.AUTH_REASON
             covered = {
                 feed["feed_id"] for feed in feeds if feed["coverage_source"] is not None
             }
@@ -1039,6 +1061,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     if feed.get("dangling_static_feed_id")
                 ),
                 "feeds_crawl_covered": len(superseded),
+                # Uncrawlable GTFS feeds that need a key, after the crawl.
+                "requires_auth": resolve.count_requires_auth(feeds),
                 "crawl_state_mismatches": crawl_report["state_mismatches"],
                 "unmatched_crawl_ids": crawl_report["unmatched_crawl_ids"],
                 "dropped_divisions_hit": crawl_report["dropped_divisions_hit"],

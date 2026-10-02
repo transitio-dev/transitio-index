@@ -1331,7 +1331,8 @@ def test_curated_feeds_join_the_builds_of_their_country(tmp_path):
         pair,
         "https://register.example/",
     ]
-    assert feed["uncrawlable_reason"] == resolve.AUTH_REASON
+    # Its URL is crawled without the key.
+    assert (feed["crawlable"], feed["uncrawlable_reason"]) == (True, None)
     # An add_feed edited since the crosswalk applied it is refused.
     write(gcba)
     with pytest.raises(overrides.OverrideError, match="re-run the crosswalk"):
