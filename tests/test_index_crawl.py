@@ -859,33 +859,39 @@ HOSTED = "https://files.example/mdb-1/latest.zip"
 
 
 @pytest.mark.parametrize(
-    ("producer", "hosted", "method", "fetched_from", "failure"),
+    ("access", "producer", "hosted", "method", "fetched_from", "failure"),
     [
-        (httpx.ConnectTimeout, HOSTED, "download", "mdb_latest", "stub failure"),
-        (None, None, "failed", None, None),  # a 404 with no hosted copy
-        (410, HOSTED, "download", "mdb_latest", "HTTP 410"),
-        (403, HOSTED, "download", "mdb_latest", "HTTP 403"),
-        (HTML, HOSTED, "download", "mdb_latest", "an HTML page"),
-        (503, HOSTED, "failed", None, None),  # the server's failure, not the link's
-        (401, HOSTED, "failed", None, None),  # credentials asked for
-        (_zip_bytes(), HOSTED, "download", "producer", None),
+        ("open", httpx.ConnectTimeout, HOSTED, "download", "mdb_latest", "stub"),
+        ("open", None, None, "failed", None, None),  # a 404 with no hosted copy
+        ("open", 410, HOSTED, "download", "mdb_latest", "HTTP 410"),
+        ("open", 403, HOSTED, "download", "mdb_latest", "HTTP 403"),
+        ("open", 401, HOSTED, "download", "mdb_latest", "HTTP 401"),
+        ("open", HTML, HOSTED, "download", "mdb_latest", "an HTML page"),
+        ("open", 503, HOSTED, "failed", None, None),  # the server's failure
+        ("open", _zip_bytes(), HOSTED, "download", "producer", None),
+        # A feed flagged as needing a key: its URL is read without one first,
+        # and any failure of that read falls back.
+        ("key", _zip_bytes(), HOSTED, "download", "producer", None),
+        ("key", 503, HOSTED, "download", "mdb_latest", "HTTP 503"),
     ],
     ids=[
         "timeout",
         "404-no-hosted-copy",
         "410",
         "403",
+        "401",
         "html",
         "5xx",
-        "401",
         "producer-ok",
+        "key-served-without-one",
+        "key-5xx",
     ],
 )
 def test_a_dead_producer_link_falls_back_to_the_hosted_copy(
-    tmp_path, producer, hosted, method, fetched_from, failure
+    tmp_path, access, producer, hosted, method, fetched_from, failure
 ):
     cache = tmp_path / "cache"
-    feed = _feed("f-a", PRODUCER_URL)
+    feed = dict(_feed("f-a", PRODUCER_URL), access=access)
     feed["mdb"] = {"urls": {"latest": hosted}}
     _publish_resolved(cache, [feed])
     served = {"/mdb-1/latest.zip": (_zip_bytes(), '"h1"')}

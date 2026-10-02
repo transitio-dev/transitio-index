@@ -102,7 +102,13 @@ matching registry together.
    that needs a key takes its provider from `overrides/access_providers.yaml`;
    the generation's `access_report.jsonl` lists the protected feeds no
    provider claims and the access curation errors.
-5. `crawl` — fetch every crawlable feed.
+5. `crawl` — fetch every crawlable feed, without credentials. A feed's own
+   URL is read first; when it fails as a dead or refused link does, the
+   crawl reads the feed's copy hosted by the Mobility Database instead. A
+   GTFS feed the catalogues or overrides say needs a key is crawled the same
+   way, falling back to that copy on any failure; one without a URL, or of
+   which the crawl reads no copy, is marked uncrawlable, "requires
+   authentication". Its access details stay as given either way.
 6. `expand` — add the places a feed's crawled stops actually fall in that the
    declared seed missed.
 7. `coverage` — derive the membership edges: which places each feed serves.

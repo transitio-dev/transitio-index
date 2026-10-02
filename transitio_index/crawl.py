@@ -22,10 +22,11 @@ members verify against their recorded digests — is skipped, except when
 ``cache/recrawl_requests.jsonl`` names it, which bypasses the skip so a
 requested complete read cannot be starved by an unchanged ETag. One feed's
 failure of any kind is logged, never fatal to the run. A producer link that
-times out, cannot connect, answers 403, 404 or 410, or serves an HTML page is
-retried once from the feed's MDB-hosted copy (``urls.latest``); the state and
-the log record say which was read (``fetched_from``) and keep the producer's
-failure.
+times out, cannot connect, answers 401, 403, 404 or 410, or serves an HTML page
+is retried once from the feed's MDB-hosted copy (``urls.latest``), as is any
+failed producer read of a feed that needs a key, which is requested without
+one; the state and the log record say which was read (``fetched_from``) and
+keep the producer's failure.
 
 ``crawl_log.jsonl`` records, per feed, its catalogue source (mdb, atlas, both
 or systems_csv; curated for a feed ``add_feed`` added), the method taken, the
@@ -102,8 +103,9 @@ DOWNLOAD_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 PRODUCER = "producer"
 HOSTED_COPY = "mdb_latest"
 # The producer answers that refuse or lose the link rather than fail the feed;
-# a 403 is often a bot wall, or a storage bucket hiding a removed object.
-FALLBACK_STATUSES = (403, 404, 410)
+# a 401 asks for credentials the catalogues did not mention, a 403 is often a
+# bot wall, or a storage bucket hiding a removed object.
+FALLBACK_STATUSES = (401, 403, 404, 410)
 # A body that is not a zip archive is an HTML page when served as one, or when
 # it opens with markup carrying one of these tags in its first 4 KiB.
 HTML_TYPES = ("text/html", "application/xhtml+xml")
@@ -134,7 +136,8 @@ def _hosted_url(feed):
 
 def _link_failed(error):
     """Whether a producer failure is the link's rather than the feed's: a
-    timeout or failed connection, an HTTP 403, 404 or 410, or an HTML page."""
+    timeout or failed connection, an HTTP 401, 403, 404 or 410, or an HTML
+    page."""
     return isinstance(error, fetch.FetchError) and (
         error.transport
         or error.status in FALLBACK_STATUSES
@@ -256,7 +259,7 @@ def states_digest(cache_dir):
         return None
     lines = sorted(
         json.dumps(state, sort_keys=True, ensure_ascii=False)
-        for _, state in crawled_feeds(cache_dir)
+        for _, state in crawled_feeds(cache_dir, stops=False)
     )
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
@@ -278,8 +281,9 @@ def reading(cache_dir):
         directory.close()
 
 
-def crawled_feeds(cache_dir):
-    """``(feed_dir, state)`` for crawled feeds whose state records stops.
+def crawled_feeds(cache_dir, *, stops=True):
+    """``(feed_dir, state)`` for crawled feeds whose state records stops, or
+    with ``stops=False`` for every committed crawl.
 
     The per-feed ``state.json`` is the crawl's commit point, so it — not the
     run-level log alone — decides what may be read as evidence. Every path
@@ -321,7 +325,7 @@ def crawled_feeds(cache_dir):
             continue
         if not _valid_state(state) or not isinstance(state.get("members"), list):
             continue
-        if "stops.txt" in state["members"]:
+        if not stops or "stops.txt" in state["members"]:
             found.append((feed_dir, state))
     return found
 
@@ -808,14 +812,16 @@ def _extract_members(feed_dir, decide, fragment=None):
 def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
     """Crawl one feed; returns its log record (never raises).
 
-    The producer URL is read first. When it fails the way a dead, moved or
-    unreachable link does (:func:`_link_failed`), the MDB-hosted copy is read
-    once in its place; the record keeps the producer URL and its failure.
+    The producer URL is read first, without credentials. When it fails the
+    way a dead, moved or unreachable link does (:func:`_link_failed`), or in
+    any way for a feed that needs a key, the MDB-hosted copy is read once in
+    its place; the record keeps the producer URL and its failure.
     """
     options = {"force": force, "range_threshold": range_threshold, "lookup": lookup}
     record, error = _crawl_from(fetcher, cache_dir, feed, feed_url(feed), **options)
     hosted = _hosted_url(feed)
-    if not _link_failed(error) or not hosted or hosted == record["url"]:
+    keyed = error is not None and feed.get("access") == "key"
+    if not (keyed or _link_failed(error)) or not hosted or hosted == record["url"]:
         return record
     retry, _ = _crawl_from(
         fetcher,

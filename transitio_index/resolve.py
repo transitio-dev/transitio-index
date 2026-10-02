@@ -12,9 +12,11 @@ record supplying its URL; a curated feed (``add_feed``, which the crosswalk
 adds) from its own entry. A feed that needs a key takes its provider from
 ``set_access`` or else from the ``overrides/access_providers.yaml`` entry whose
 URL prefix covers its URL; ``access_report.jsonl`` lists the protected feeds
-no provider claims and the curation errors. A GTFS feed whose download URL
-needs a key is uncrawlable from the start, so the crawl never spends a request
-to learn the 401. It fetches nothing. An override references a feed by its
+no provider claims and the curation errors. A GTFS feed that needs a key
+stays crawlable while it has a URL: the crawl requests it once without a key,
+else reads the feed's MDB-hosted copy, and the coverage stage marks a feed it
+read no copy of uncrawlable. Only one without a URL is uncrawlable from the
+start. This stage fetches nothing. An override references a feed by its
 ``feed_id`` or any of its aliases — the crosswalk keeps superseded ids in
 ``aliases`` for exactly this — so a correction filed against a pre-crosswalk
 id still lands.
@@ -68,6 +70,28 @@ _OPEN = {
     "auth_param_name": None,
     "registration_url": None,
 }
+
+
+def _gated(feed):
+    """Whether a GTFS feed that needs a key is kept from the crawl: it has
+    no URL to request without one."""
+    return (
+        feed.get("spec") == "gtfs"
+        and feed["access"] == "key"
+        and not crawl.feed_url(feed)
+    )
+
+
+def count_requires_auth(feeds):
+    """How many GTFS feeds need a key and are uncrawlable, whatever reason
+    an override gave."""
+    return sum(
+        1
+        for feed in feeds
+        if not feed.get("crawlable")
+        and feed.get("spec") == "gtfs"
+        and feed.get("access") == "key"
+    )
 
 
 def _access_source(feed):
@@ -162,7 +186,7 @@ def _apply(feed, entry):
                 auth_params=dict(spec["auth_params"]),
                 auth_param_name=None,
             )
-        if feed.get("spec") == "gtfs":
+        if _gated(feed):
             feed["crawlable"] = False
             feed["uncrawlable_reason"] = AUTH_REASON
     if "mark_uncrawlable" in entry:
@@ -272,7 +296,7 @@ def resolve(cache_dir, *, overrides_dir=None):
                 # Only static GTFS is crawled in v1; GTFS-RT and GBFS are
                 # indexed but never fetched.
                 if "crawlable" not in feed:
-                    gated = feed.get("spec") == "gtfs" and feed["access"] == "key"
+                    gated = _gated(feed)
                     feed["crawlable"] = feed.get("spec") == "gtfs" and not gated
                     feed["uncrawlable_reason"] = AUTH_REASON if gated else None
                 feed.setdefault("uncrawlable_reason", None)
@@ -308,15 +332,8 @@ def resolve(cache_dir, *, overrides_dir=None):
                 "feeds": len(feeds),
                 "overridden_feeds": len(matched),
                 "uncrawlable": sum(1 for feed in feeds if not feed["crawlable"]),
-                # Refused GTFS feeds whose URL is key-gated, whatever reason an
-                # override gave.
-                "requires_auth": sum(
-                    1
-                    for feed in feeds
-                    if not feed["crawlable"]
-                    and feed.get("spec") == "gtfs"
-                    and feed["access"] == "key"
-                ),
+                # Refused before the crawl; coverage counts them after it.
+                "requires_auth": count_requires_auth(feeds),
                 "unmatched_overrides": sorted(set(feed_overrides) - matched),
                 # Listed in the access report for curation.
                 "access_providers": len(providers),

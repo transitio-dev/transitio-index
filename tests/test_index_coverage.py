@@ -5,7 +5,14 @@ import json  # noqa: E402
 
 from transitio.index import fingerprint  # noqa: E402
 
-from transitio_index import coverage, crawl, geometry, overrides, store  # noqa: E402
+from transitio_index import (  # noqa: E402
+    coverage,
+    crawl,
+    geometry,
+    overrides,
+    resolve,
+    store,
+)
 
 
 def _publish(cache, subdir, pointer, artifact, records, manifest=None, extra=None):
@@ -104,6 +111,7 @@ def _cover(
     late_crawl=None,
     report=None,
     members=None,
+    states=None,
     **cover_args,
 ):
     cache = tmp_path / "cache"
@@ -152,7 +160,13 @@ def _cover(
         },
     )
     for feed_id, stops_rows in (crawls or {}).items():
-        _write_crawl(cache, feed_id, stops_rows, (members or {}).get(feed_id))
+        _write_crawl(
+            cache,
+            feed_id,
+            stops_rows,
+            (members or {}).get(feed_id),
+            (states or {}).get(feed_id),
+        )
     if tamper:
         stops = cache / "crawl" / crawl._dir_name(tamper) / "stops.txt"
         stops.write_bytes(stops.read_bytes() + b"sx,1.0,10.0\n")
@@ -176,7 +190,9 @@ def _cover(
             extra={"expansion_report.jsonl": report} if report is not None else None,
         )
     if late_crawl:
-        _write_crawl(cache, late_crawl, _rows(2, 10.0))
+        _write_crawl(
+            cache, late_crawl, _rows(2, 10.0), state=(states or {}).get(late_crawl)
+        )
     manifest = coverage.cover(cache, lookup=lookup, **cover_args)
     covered, _ = store.read_jsonl(
         cache / "coverage", "coverage.json", "feeds_covered.jsonl"
@@ -190,7 +206,7 @@ def _cover(
     return manifest, {f["feed_id"]: f for f in covered}, grouped
 
 
-def _write_crawl(cache, feed_id, stops_rows, members=None):
+def _write_crawl(cache, feed_id, stops_rows, members=None, state=None):
     feed_dir = cache / "crawl" / crawl._dir_name(feed_id)
     feed_dir.mkdir(parents=True, exist_ok=True)
     stops = ("stop_id,stop_lat,stop_lon\n" + "".join(stops_rows)).encode()
@@ -208,6 +224,7 @@ def _write_crawl(cache, feed_id, stops_rows, members=None):
                 },
                 "identity": fingerprint.identity(feed_dir),
                 "identity_version": fingerprint.IDENTITY_VERSION,
+                **(state or {}),
             }
         )
     )
@@ -629,13 +646,18 @@ def test_a_feed_records_the_larger_feeds_containing_it(
     assert manifest["containment_rules"] == contained
 
 
-def test_a_crawl_that_changed_after_expansion_is_refused(tmp_path):
+@pytest.mark.parametrize(
+    "state", [None, {"members": ["agency.txt"]}], ids=["stops", "none"]
+)
+def test_a_crawl_that_changed_after_expansion_is_refused(tmp_path, state):
+    # A crawl without stops counts too: coverage reads it for access.
     with pytest.raises(coverage.CoverageError, match="re-run the expand"):
         _cover(
             tmp_path,
             crawls={"f-city": _rows(6, 10.0)},
             lookup=LOOKUP,
             late_crawl="f-none",
+            states={"f-none": state},
         )
 
 
@@ -768,6 +790,69 @@ def test_an_unplaced_feed_has_no_edges_and_no_coverage_source(tmp_path):
     _, covered, edges = _cover(tmp_path)
     assert "f-none" not in edges
     assert covered["f-none"]["coverage_source"] is None
+
+
+def test_a_feed_needing_a_key_that_the_crawl_never_read_is_uncrawlable(tmp_path):
+    # The crawl reads a feed that needs a key without one where it can (f-city),
+    # an archive without stops included (f-lost). A feed it read no copy of
+    # (f-reg) is refused; an open feed without a crawl (f-none) is not.
+    access = {"f-city": "key", "f-lost": "key", "f-reg": "key"}
+    feeds = [
+        dict(
+            feed,
+            crawlable=True,
+            uncrawlable_reason=None,
+            access=access.get(feed["feed_id"], "open"),
+        )
+        for feed in FEEDS
+    ]
+    manifest, covered, _ = _cover(
+        tmp_path,
+        feeds=feeds,
+        crawls={"f-city": _rows(2, 10.0), "f-lost": _rows(2, 10.0)},
+        states={"f-lost": {"members": ["agency.txt"]}},
+        lookup=LOOKUP,
+    )
+    flags = {
+        feed_id: (covered[feed_id]["crawlable"], covered[feed_id]["uncrawlable_reason"])
+        for feed_id in ("f-city", "f-lost", "f-reg", "f-none")
+    }
+    assert flags == {
+        "f-city": (True, None),
+        "f-lost": (True, None),
+        "f-reg": (False, resolve.AUTH_REASON),
+        "f-none": (True, None),
+    }
+    assert manifest["requires_auth"] == 1
+
+
+@pytest.mark.parametrize(
+    ("state_url", "published"),
+    [
+        ("https://p.example/a.zip", True),
+        ("https://files.example/mdb-1/latest.zip", False),
+        ("https://p.example/old.zip", False),
+    ],
+    ids=["download-url", "hosted-copy", "former-url"],
+)
+def test_validators_are_published_only_for_the_download_url(
+    tmp_path, state_url, published
+):
+    # The reader probes the published download URL with them.
+    url = {"static_current": "https://p.example/a.zip"}
+    feeds = [
+        dict(feed, atlas={"urls": url}) if feed["feed_id"] == "f-city" else feed
+        for feed in FEEDS
+    ]
+    _, covered, _ = _cover(
+        tmp_path,
+        feeds=feeds,
+        crawls={"f-city": _rows(2, 10.0)},
+        states={"f-city": {"url": state_url, "etag": "e", "last_modified": "m"}},
+        lookup=LOOKUP,
+    )
+    validators = (covered["f-city"]["etag"], covered["f-city"]["last_modified"])
+    assert validators == (("e", "m") if published else (None, None))
 
 
 def test_unknown_places_and_unmatched_feeds_are_reported(tmp_path):
