@@ -20,7 +20,12 @@
   credential_fields: [key]
   url_prefixes: ["https://opendata.samtrafiken.se/gtfs/"]
   free: true
-  crawl_approved: false
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    CC0 1.0; a Bronze key allows 10 calls a minute and 50 a month. The feeds
+    have Mobility Database copies, so keyed reads are rare.
+  crawl_budget: 50
 
 - provider_id: trafiklab-gtfs-sweden
   name: Trafiklab GTFS Sweden 3 (Samtrafiken)
@@ -29,7 +34,12 @@
   credential_fields: [key]
   url_prefixes: ["https://opendata.samtrafiken.se/gtfs-sweden/"]
   free: true
-  crawl_approved: false
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    CC0 1.0; a Bronze key allows 10 calls a minute and 50 a month. The feed
+    has a Mobility Database copy, so keyed reads are rare.
+  crawl_budget: 50
 
 # One 511.org key serves every operator's feed under the transit API.
 - provider_id: mtc-511
@@ -40,4 +50,156 @@
   credential_fields: [api_key]
   url_prefixes: ["https://api.511.org/transit/"]
   free: null
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    511 Data Disseminator Agreement: credit "data provided by 511.org" with a
+    link to http://www.511.org, keep the data current, no public keyless
+    mirror, and tell MTC about the product within 30 days of the first
+    release that uses the data.
+  notice: data provided by 511.org (http://www.511.org)
+
+# One consumer key serves every dataset of the Center.
+- provider_id: odpt
+  name: Public Transportation Open Data Center (ODPT), Japan
+  registration_url: https://developer.odpt.org/
+  terms_url: https://developer.odpt.org/terms/center_use_rules.html
+  credential_fields: [consumer_key]
+  url_prefixes: ["https://api.odpt.org/"]
+  free: null
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    ODPT terms of use and each dataset's licence (ODPT basic licence, CC BY
+    4.0 or CC0): credit the Center, say the data's accuracy is not
+    guaranteed, show when the data were obtained, publish nothing the
+    basic-licence originals can be rebuilt from, delete the data if access
+    ends.
+  notice: |-
+    The source of the public transportation data in this index is the Public Transportation Open Data Center.
+    They are based on the data provided by the public transportation operators.
+    The accuracy and integrity of the data are not guaranteed.
+    Please do not contact the public transportation operators directly regarding the content of the index.
+    This index uses the CC-BY-4.0 feeds below with modifications, each credited as its provider and dataset, named in the feed's URL, Creative Commons License Attribution 4.0 International (https://creativecommons.org/licenses/by/4.0/deed.en).
+
+# One key serves every file of Spain's national access point; it travels in
+# the ApiKey header.
+- provider_id: es-nap
+  name: Spain National Access Point for multimodal transport (MITRAMS)
+  registration_url: https://nap.transportes.gob.es/
+  terms_url: https://nap.transportes.gob.es/licencia-datos
+  credential_fields: [api_key]
+  url_prefixes: ["https://nap.transportes.gob.es/"]
+  free: null
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    MITRAMS open data licence (LDA) and each dataset's source licence, the
+    stricter applying: credit "Powered by MITRAMS" with a link, say whether
+    the data are raw or processed, keep them current, imply no endorsement.
+  notice: |-
+    Powered by MITRAMS (https://www.transportes.gob.es/)
+    Source: MITRAMS; processed data (datos explotados), not the raw files.
+
+# The Authorization header carries "apikey <key>", the whole api_key value.
+- provider_id: tfnsw
+  name: Transport for NSW Open Data Hub
+  registration_url: https://opendata.transport.nsw.gov.au/
+  docs_url: https://opendata.transport.nsw.gov.au/developers/userguide
+  terms_url: https://opendata.transport.nsw.gov.au/sites/default/files/2024-09/TfNSW-Open-Data-Portal-Terms.pdf
+  credential_fields: [api_key]
+  url_prefixes: ["https://api.transport.nsw.gov.au/v1/publictransport/timetables/"]
+  free: null
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    CC BY 4.0 and the Open Data Hub terms: credit Transport for NSW, imply no
+    official status or endorsement, no excessive use (Bronze plan: 60,000
+    calls a day, 5 a second). The api_key field is stored with the "apikey "
+    prefix.
+  notice: >-
+    Source: Transport for NSW, licensed under CC BY 4.0
+    (https://creativecommons.org/licenses/by/4.0/)
+
+# Basic auth: the username is an Anypoint application's Client ID, the
+# password its Client Secret.
+- provider_id: transport-canberra
+  name: Transport Canberra (ACT Government) GTFS API
+  registration_url: https://anypoint.mulesoft.com/exchange/portals/act-government-9/e48d1999-b5c6-4944-b5cf-23de022d1287/gtfs-prx-api/
+  docs_url: https://www.transport.act.gov.au/__data/assets/pdf_file/0005/2865398/MyWayPlus-GTFS-developer-access-guide-v1.1.pdf
+  terms_url: https://www.transport.act.gov.au/contact-us/information-for-developers
+  credential_fields: [username, password]
+  url_prefixes: ["https://transport.api.act.gov.au/"]
+  free: null
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    CC BY 4.0 per the developer page and access guide: credit Transport
+    Canberra as the source; access can be limited for excessive use.
+  notice: >-
+    Source: Transport Canberra, ACT Government, licensed under CC BY 4.0
+    (https://creativecommons.org/licenses/by/4.0/)
+
+# The TMB API takes an app_id and an app_key; feeds.yaml binds both.
+- provider_id: tmb
+  name: Transports Metropolitans de Barcelona (TMB) API
+  registration_url: https://developer.tmb.cat/
+  terms_url: https://developer.tmb.cat/docs/terms-conditions
+  credential_fields: [app_id, app_key]
+  url_prefixes: ["https://api.tmb.cat/"]
+  free: null
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    TMB developer terms: cite TMB as the source with the date of the last
+    update, do not alter the content, use the data only for the application
+    the key was issued for; TMB can end the licence without notice.
+  notice: |-
+    Source: Transports Metropolitans de Barcelona (TMB)
+    Date of the last update: the feed line's last-modified date; where none is given, the data are as of the dates obtained.
+
+# The public login printed on KD's GTFS page opens the kd_sample path only.
+- provider_id: koleje-dolnoslaskie
+  name: Koleje Dolnośląskie
+  registration_url: https://kolejedolnoslaskie.pl/rozklady-gtfs/
+  credential_fields: [username, password]
+  url_prefixes: ["https://kd.kiedyprzyjedzie.pl/gtfs/kd_sample/"]
+  free: true
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    KD's GTFS page: the static timetables are free to use without notice or
+    consent; website access is a trial and may change or be limited. No raw
+    mirror until KD confirms the CC0 licence Atlas gives.
+
+# The TfWM API takes an app_id and an app_key; feeds.yaml binds both.
+- provider_id: tfwm
+  name: Transport for West Midlands (TfWM) API
+  registration_url: https://api-portal.tfwm.org.uk/
+  terms_url: https://api-portal.tfwm.org.uk/signup?plan_ids[]=2357355859549
+  credential_fields: [app_id, app_key]
+  url_prefixes: ["https://api.tfwm.org.uk/"]
+  free: null
+  crawl_approved: true
+  terms_checked: 2026-10-02
+  terms_note: >-
+    TfWM licence based on OGL v2.0: credit "Powered by TfWM part of West
+    Midlands Combined Authority Open Data"; at most 300 calls a minute per
+    feed and 10,000 a day. api.tfwm.org.uk presents a *.itoworld.com
+    certificate, so no key is sent until that is fixed.
+  notice: Powered by TfWM part of West Midlands Combined Authority Open Data
+
+- provider_id: grandlyon
+  name: data.grandlyon.com (Métropole de Lyon)
+  registration_url: https://data.grandlyon.com/portail/fr/connexion
+  terms_url: https://data.grandlyon.com/cms/conditions-generales-dutilisation/
+  credential_fields: [username, password]
+  url_prefixes: ["https://download.data.grandlyon.com/"]
+  free: null
   crawl_approved: false
+  terms_checked: 2026-10-02
+  terms_note: >-
+    Not approved: access to the TCL GTFS dataset has not been granted to the
+    account yet. The Licence Mobilités and the Grand Lyon terms of use ask
+    for the licence notice, the source, producer and last-update date, and a
+    licence contract after the first 30 days.
