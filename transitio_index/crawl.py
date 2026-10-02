@@ -22,7 +22,7 @@ members verify against their recorded digests — is skipped, except when
 ``cache/recrawl_requests.jsonl`` names it, which bypasses the skip so a
 requested complete read cannot be starved by an unchanged ETag. One feed's
 failure of any kind is logged, never fatal to the run. A producer link that
-times out, cannot connect, answers 404 or 410, or serves an HTML page is
+times out, cannot connect, answers 403, 404 or 410, or serves an HTML page is
 retried once from the feed's MDB-hosted copy (``urls.latest``); the state and
 the log record say which was read (``fetched_from``) and keep the producer's
 failure.
@@ -100,8 +100,9 @@ DOWNLOAD_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 # Where a crawl read the feed from: its producer URL, or the MDB-hosted copy.
 PRODUCER = "producer"
 HOSTED_COPY = "mdb_latest"
-# The producer answers that say the link is gone, not the feed.
-GONE_STATUSES = (404, 410)
+# The producer answers that refuse or lose the link rather than fail the feed;
+# a 403 is often a bot wall, or a storage bucket hiding a removed object.
+FALLBACK_STATUSES = (403, 404, 410)
 # A body that is not a zip archive is an HTML page when served as one, or when
 # it opens with markup carrying one of these tags in its first 4 KiB.
 HTML_TYPES = ("text/html", "application/xhtml+xml")
@@ -129,9 +130,11 @@ def _hosted_url(feed):
 
 def _link_failed(error):
     """Whether a producer failure is the link's rather than the feed's: a
-    timeout or failed connection, an HTTP 404 or 410, or an HTML page."""
+    timeout or failed connection, an HTTP 403, 404 or 410, or an HTML page."""
     return isinstance(error, fetch.FetchError) and (
-        error.transport or error.status in GONE_STATUSES or isinstance(error, HtmlPage)
+        error.transport
+        or error.status in FALLBACK_STATUSES
+        or isinstance(error, HtmlPage)
     )
 
 

@@ -864,11 +864,22 @@ HOSTED = "https://files.example/mdb-1/latest.zip"
         (httpx.ConnectTimeout, HOSTED, "download", "mdb_latest", "stub failure"),
         (None, None, "failed", None, None),  # a 404 with no hosted copy
         (410, HOSTED, "download", "mdb_latest", "HTTP 410"),
+        (403, HOSTED, "download", "mdb_latest", "HTTP 403"),
         (HTML, HOSTED, "download", "mdb_latest", "an HTML page"),
         (503, HOSTED, "failed", None, None),  # the server's failure, not the link's
+        (401, HOSTED, "failed", None, None),  # credentials asked for
         (_zip_bytes(), HOSTED, "download", "producer", None),
     ],
-    ids=["timeout", "404-no-hosted-copy", "410", "html", "5xx", "producer-ok"],
+    ids=[
+        "timeout",
+        "404-no-hosted-copy",
+        "410",
+        "403",
+        "html",
+        "5xx",
+        "401",
+        "producer-ok",
+    ],
 )
 def test_a_dead_producer_link_falls_back_to_the_hosted_copy(
     tmp_path, producer, hosted, method, fetched_from, failure
