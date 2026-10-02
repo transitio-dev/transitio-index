@@ -27,3 +27,38 @@
     auth_params: {key: key}
   reason: Trafiklab GTFS Regional needs a key.
   date: 2026-10-02
+
+# Muni's own GTFS URL serves a feed whose service ended; 511.org serves the
+# current one, behind a key.
+- feed: f-curated-sfmta-511
+  add_feed:
+    name: San Francisco Municipal Transportation Agency (Muni) via 511.org
+    url: https://api.511.org/transit/datafeeds?operator_id=SF
+    spec: gtfs
+    license:
+      url: https://511.org/sites/default/files/pdfs/511_Data_Agreement_Final.pdf
+      use_without_attribution: "no"
+      create_derived_product: "yes"
+      redistribution_allowed: "yes"
+      commercial_use_allowed: "yes"
+      share_alike_optional: "yes"
+      attribution_text: data provided by 511.org
+      attribution_instructions: >-
+        MUST acknowledge the source of the Provided Data with the tag line
+        "powered by 511.org," or "data provided by 511.org," or a variant
+        approved in writing by MTC, and a link to http://www.511.org.  The
+        acknowledgement must be in visual proximity to the user's access to
+        the Provided Data.  If space allows, Registered Data Disseminators are
+        encouraged to provide the MTC 511 + Design logo with the link to
+        511.org.
+    location:
+      country_code: US
+      subdivision_name: California
+      municipality: San Francisco
+    access: key
+    registration_url: https://511.org/open-data/token
+    access_provider: mtc-511
+    auth_method: query_param
+    auth_params: {api_key: api_key}
+  reason: The current Muni GTFS; the Mobility Database feed's service ended 2026-08-28.
+  date: 2026-10-02
