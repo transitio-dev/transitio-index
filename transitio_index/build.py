@@ -112,7 +112,9 @@ def run_ingest(arguments):
 
 
 def run_crosswalk(arguments):
-    return [crosswalk.crosswalk(arguments.cache_dir)]
+    return [
+        crosswalk.crosswalk(arguments.cache_dir, overrides_dir=arguments.overrides_dir)
+    ]
 
 
 def registry_path(arguments):

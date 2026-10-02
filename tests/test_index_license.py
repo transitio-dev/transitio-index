@@ -5,7 +5,8 @@ import tarfile
 import pytest
 
 import transitio.index as transitio_index  # noqa: E402
-from transitio_index import classify, licensing, prune, publish, store  # noqa: E402
+from transitio_index import classify, geometry, licensing, prune  # noqa: E402
+from transitio_index import publish, store  # noqa: E402
 from test_index_publish import (  # noqa: E402
     GEOM_HEX,
     PLACES,
@@ -140,6 +141,8 @@ def test_feed_licences_are_inventoried_per_declared_licence():
     rows = licensing._feed_rows(
         [
             {**_covered_feed("f-a"), "atlas": {"license": LICENSED}},
+            # A curated feed's licence is read as an Atlas one.
+            {**_covered_feed("f-curated-a"), "curated": {"license": LICENSED}},
             {
                 **_covered_feed("f-b"),
                 "atlas": {"license": {**LICENSED, "redistribution_allowed": False}},
@@ -162,13 +165,13 @@ def test_feed_licences_are_inventoried_per_declared_licence():
         (r["license"], r["url"], r["feeds"], r["redistribution_allowed"]) for r in rows
     ] == [
         ("CC-BY-4.0", "https://example.org/l", 1, {"yes": 1}),
-        ("CC-BY-4.0", "https://example.org/l", 2, {"false": 1, "yes": 1}),
+        ("CC-BY-4.0", "https://example.org/l", 3, {"false": 1, "yes": 2}),
         (None, None, 1, {"unknown": 1}),
         (None, "https://example.org/m", 1, {"unknown": 1}),
         ("ODbL-1.0", None, 1, {"unknown": 1}),
     ]
     notice = licensing._notice(None, {}, rows)
-    assert "  - CC-BY-4.0: 2\n      url: https://example.org/l" in notice
+    assert "  - CC-BY-4.0: 3\n      url: https://example.org/l" in notice
     assert "  - no identifier: 1\n      url: https://example.org/m" in notice
     assert "  - none declared: 1" in notice
     # A required attribution ships verbatim, grouped apart from feeds without it.
@@ -222,6 +225,42 @@ def test_a_places_build_without_a_geometry_audit_cannot_be_licensed(tmp_path):
         licensing.license_index(cache)
 
 
+OSM = ("OpenStreetMap", "ODbL-1.0")
+_UCDB = geometry.DERIVED_SOURCES[geometry.UCDB_DERIVED]
+UCDB_ROW = {
+    "role": "derived_input",
+    "dataset": geometry.UCDB_DERIVED[0],
+    "license": geometry.UCDB_DERIVED[1],
+    "credit": _UCDB["credit"],
+    "terms": _UCDB["licence"],
+    "url": _UCDB["url"],
+    "allowed": True,
+}
+
+
+@pytest.mark.parametrize(
+    "staged, derived, populated, recomposed",
+    [
+        ([OSM], [], True, True),
+        # Credited already: as a shipped source, or an allowed derived input.
+        ([OSM, geometry.UCDB_DERIVED], [], True, False),
+        ([OSM], [UCDB_ROW], True, False),
+        ([OSM], [], False, False),
+    ],
+)
+def test_a_shipped_population_credits_the_ucdb_once(
+    staged, derived, populated, recomposed
+):
+    release = "2026-08-19.0"
+    sources = ["|".join(pair) for pair in staged]
+    notice = geometry._notice(set(staged), release, derived)
+    composed = licensing._geometry_notice(
+        notice, derived, {"licence_sources": sources}, {}, release, populated
+    )
+    assert (composed != notice) == recomposed
+    assert composed.count(_UCDB["credit"]) == (populated or len(staged) > 1)
+
+
 def test_a_moved_geometry_audit_requires_the_gazetteer_to_rerun(tmp_path):
     cache = _cache(tmp_path)
     licensing.license_index(cache)
@@ -257,7 +296,8 @@ def _feedless_index(tmp_path, release="2026-08-19.0"):
     )
     gbfs.ingest(cache, csv_path=_write(tmp_path / "s.csv", _csv(GBFS_COLUMNS, [])))
     crosswalk.crosswalk(cache)
-    sources = resolve.resolve(cache, overrides_dir=None)["sources"]
+    resolved = resolve.resolve(cache, overrides_dir=None)
+    sources = resolved["sources"]
     crawl.crawl(cache, lookup=StubLookup({}))
     assert (cache / "crawl" / "crawl_log.jsonl").read_text() == ""
     seed = _publish_gen(
@@ -265,7 +305,12 @@ def _feedless_index(tmp_path, release="2026-08-19.0"):
         "seed.json",
         "feed_places.jsonl",
         [],
-        {"source": "seed", "sources": sources, "overture_release": release},
+        {
+            "source": "seed",
+            "sources": sources,
+            "crosswalk_generation": resolved["crosswalk_generation"],
+            "overture_release": release,
+        },
     )
     audit = _publish_audit(
         cache,
@@ -327,6 +372,7 @@ def test_a_build_of_seeded_places_without_feeds_publishes_a_merge_source(tmp_pat
     assert (len(index.feeds), len(index.edges), len(index.places)) == (0, 0, 2)
     lima = transitio_index.place("tp_lima", index=index)
     assert list(lima.feeds(categories=None)) == [] and lima.validity is None
+    assert lima.population == 10**7
     assert lima.service.feeds == 0
     # Archived, the build is a merge source and loads verified.
     archived = tmp_path / "builds" / "cities-0000000000000003"
@@ -423,16 +469,19 @@ def test_prohibited_hulls_are_nulled_and_the_judgement_ships(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "block, derived",
+    "block, derived, centre, kept",
     [
-        ({"spdx_identifier": "CC-BY-4.0"}, True),  # redistributable: contributes
-        ({}, False),  # unknown: ships, but builds no boundary
+        # Redistributable: contributes, and keeps a centre only inside it.
+        ({"spdx_identifier": "CC-BY-4.0"}, True, (25.0, 60.2), True),
+        ({"spdx_identifier": "CC-BY-4.0"}, True, (27.7, 62.9), False),
+        ({}, False, None, False),  # unknown: ships, but builds no boundary
     ],
 )
 def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
-    tmp_path, block, derived
+    tmp_path, block, derived, centre, kept
 ):
     shapely = pytest.importorskip("shapely")
+    point = shapely.to_wkb(shapely.Point(centre)).hex() if centre else None
     near = shapely.to_wkb(shapely.box(24.9, 60.1, 25.1, 60.3)).hex()
     far = shapely.to_wkb(shapely.box(27.6, 62.8, 27.8, 63.0)).hex()
     feeds = [
@@ -444,7 +493,8 @@ def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
         },
     ]
     edges = [_edge("Q1757", "f-a"), _edge("Q-metro", "f-a"), _edge("Q-metro", "f-p")]
-    cache = _cache(tmp_path, feeds, edges)
+    places = [PLACES[0], {**PLACES[1], "centre": point}]
+    cache = _cache(tmp_path, feeds, edges, places)
     manifest = licensing.license_index(cache)
     places, _ = store.read_jsonl(
         cache / "license", "licensed.json", "places_licensed.jsonl"
@@ -468,6 +518,7 @@ def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
     # not in it.
     assert boundary.covers(shapely.from_wkb(bytes.fromhex(near)))
     assert boundary.disjoint(shapely.from_wkb(bytes.fromhex(far)))
+    assert metro["centre"] == (point if kept else None)
     publish.publish(cache)
     index = transitio_index.read_index(cache / "index")
     rows = index.places.set_index("place_id")

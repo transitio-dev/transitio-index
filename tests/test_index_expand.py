@@ -315,8 +315,10 @@ def _write_crawl(cache, feed_id, stops_rows):
     log_path.write_text(existing + json.dumps(log) + "\n")
 
 
-def _expand(tmp_path, cache, registry=None, labels=None, overrides_dir=None):
-    divisions = fx.write_dataset(tmp_path / "divisions.parquet", DIVISIONS)
+def _expand(tmp_path, cache, registry=None, labels=None, overrides_dir=None, rows=None):
+    divisions = fx.write_dataset(
+        tmp_path / "divisions.parquet", DIVISIONS if rows is None else rows
+    )
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
     lookup = boundaries.BoundaryLookup(
         cache, release="2026-08-19.0", area_dataset=areas, division_dataset=divisions
@@ -809,6 +811,35 @@ def test_an_unauditable_boundary_ships_without_geometry(tmp_path):
     assert [
         (row["dataset"], row["allowed"]) for row in manifest["licence_inventory"]
     ] == [("Mystery Maps", False)]
+
+
+def test_a_discovered_place_keeps_its_label_point_inside_its_boundary(tmp_path):
+    esri = {"dataset": "Esri Community Maps", "license": "CC0-1.0", "record_id": "1"}
+    points = {"fi-tre": ((23.8, 61.5), [esri]), "fi-pirk": ((25.0, 61.5), [esri])}
+    rows = [
+        (
+            {
+                **row,
+                "geometry": shapely.to_wkb(shapely.Point(points[row["id"]][0])),
+                "sources": points[row["id"]][1],
+            }
+            if row["id"] in points
+            else row
+        )
+        for row in DIVISIONS
+    ]
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES)
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    # A fresh lookup reads the label points with the divisions; one answered
+    # from its memo reads them apart.
+    for _ in range(2):
+        manifest, places, _ = _expand(tmp_path, cache, rows=rows)
+        tampere, region = places["Q40840"], places["Q5697"]
+        assert shapely.from_wkb(tampere["centre"]).equals(shapely.Point(23.8, 61.5))
+        assert region["centre"] is None
+        assert "centre_sources" not in tampere and "centre_sources" not in region
+        assert "Esri Community Maps|CC0-1.0" in manifest["licence_sources"]
 
 
 def test_a_stops_file_that_fails_its_state_digest_is_skipped(tmp_path):

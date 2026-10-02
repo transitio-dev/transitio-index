@@ -1,0 +1,32 @@
+# The issuers of the credentials key-protected feeds need. A provider claims
+# the feeds whose URL lies under one of its url_prefixes, by whole path
+# segments; crawl_approved stays false until its terms are checked.
+
+- provider_id: gcba-transporte
+  name: API Transporte, Gobierno de la Ciudad de Buenos Aires
+  registration_url: https://api-transporte.buenosaires.gob.ar/registro
+  docs_url: https://api-transporte.buenosaires.gob.ar/console
+  # One client_id and client_secret pair serves every resource of the API.
+  credential_fields: [client_id, client_secret]
+  url_prefixes: ["https://apitransporte.buenosaires.gob.ar/"]
+  free: null
+  crawl_approved: false
+
+# Trafiklab issues a key per API, so each GTFS API is a provider of its own.
+- provider_id: trafiklab
+  name: Trafiklab GTFS Regional (Samtrafiken)
+  registration_url: https://developer.trafiklab.se/register
+  docs_url: https://www.trafiklab.se/api/gtfs-datasets/gtfs-regional/
+  credential_fields: [key]
+  url_prefixes: ["https://opendata.samtrafiken.se/gtfs/"]
+  free: true
+  crawl_approved: false
+
+- provider_id: trafiklab-gtfs-sweden
+  name: Trafiklab GTFS Sweden 3 (Samtrafiken)
+  registration_url: https://developer.trafiklab.se/register
+  docs_url: https://www.trafiklab.se/api/gtfs-datasets/gtfs-sweden/
+  credential_fields: [key]
+  url_prefixes: ["https://opendata.samtrafiken.se/gtfs-sweden/"]
+  free: true
+  crawl_approved: false

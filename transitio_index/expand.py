@@ -587,6 +587,18 @@ def _discover(
                 }
             )
 
+    # The boundary memo keeps no label point: one scan reads those it lacks.
+    unread = [record for record in skeleton.values() if "point" not in record]
+    if unread:
+        if dataset is None:
+            dataset = lookup.division_dataset() or overture.overture_dataset(release)
+        points = overture.division_points(
+            dataset,
+            [record["overture_id"] for record in unread],
+            {record.get("country") for record in unread},
+        )
+        for record in unread:
+            record["point"] = points.get(record["overture_id"])
     discovered = {}
     for record in skeleton.values():
         seed._add_place(discovered, skeleton, record)
@@ -764,6 +776,13 @@ def _discover(
         for member in metro["member_ids"]:
             places_by_id[member]["metro_ids"].sort()
     _draw_member_geometry(places_by_id, touched)
+    if centres is not None:
+        metros.fao_centres(
+            [places_by_id[key] for key in fao_touched - dropped], centres
+        )
+    geometry.settle_centres(
+        {key: places_by_id[key] for key in [*new_ids, *touched]}.values(), shipped
+    )
     if registry is not None:
         # A seeded metro a discovered CBSA pair names is enriched too; the
         # Eurostat and FAO metros minted here are identified by their code.
@@ -795,6 +814,7 @@ def _discover(
         entry = labels.get(qid)
         if entry is not None:
             names_stage._merge(places_by_id[key], entry)
+    names_stage.fill_centres(places_by_id, enrich, wikidata)
 
     return {
         "feeds_scanned": len(crawled),

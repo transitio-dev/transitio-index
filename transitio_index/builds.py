@@ -17,7 +17,8 @@ one generation's places with another's edges: a digest that does not match
 means the build is mid-publish, and it is reported unavailable rather than
 read. A partitioned build's tables are joined into flat frames (feeds
 with their ``partition``, places, edges with ``feed_partition`` on the
-links, and from schema 8 the realtime companions keyed by static feed).
+links, and from schema 8 the realtime companions keyed by static feed); a
+table at the root (schema 11's ``access_providers.parquet``) passes through.
 The viewer and the merge of builds both read through this module.
 """
 
@@ -88,6 +89,29 @@ SCHEMA_9_COLUMNS = {
 }
 # What schema 10 adds: the feeds containing each feed.
 SCHEMA_10_COLUMNS = {"feeds.parquet": {"contained_in"}}
+# What schema 11 adds: the feeds' URL and access details, the places' centre
+# and population, and the providers table at the root.
+ACCESS_PROVIDERS = "access_providers.parquet"
+SCHEMA_11_COLUMNS = {
+    "feeds.parquet": {
+        "download_url",
+        "access",
+        "access_provider",
+        "auth_method",
+        "auth_params",
+        "registration_url",
+    },
+    "places.parquet": {"centre", "population"},
+    ACCESS_PROVIDERS: {
+        "provider_id",
+        "name",
+        "registration_url",
+        "docs_url",
+        "terms_url",
+        "credential_fields",
+        "free",
+    },
+}
 
 
 LATEST = "latest"  # the id of the build at cache/index
@@ -201,14 +225,20 @@ def snapshot_files(snapshot):
     From schema 7 every partition table (a partition name of the layout, a
     table of the layout, a string digest and an integer row count) and the
     ``NOTICE`` when the build is licensed (``notice_sha256`` a string; an
-    unlicensed build has none).
+    unlicensed build has none); from schema 11 the root
+    ``access_providers.parquet`` (``access_providers_sha256``, no row count).
     """
     if not isinstance(snapshot, dict):
         return None
+    version = snapshot.get("schema_version")
+    accessed = isinstance(version, int) and version >= 11
     listing = snapshot.get("partitions")
     if listing is None:
         digests = snapshot_digests(snapshot)
-        return None if digests is None else {n: (d, None) for n, d in digests.items()}
+        # A schema-11 build is partitioned, with its providers at the root.
+        if digests is None or accessed:
+            return None
+        return {n: (d, None) for n, d in digests.items()}
     if not isinstance(listing, dict) or not listing:
         return None
     files = {}
@@ -234,6 +264,11 @@ def snapshot_files(snapshot):
         if not isinstance(notice, str) or not notice:
             return None
         files["NOTICE"] = (notice, None)
+    if accessed:
+        digest = snapshot.get("access_providers_sha256")
+        if not isinstance(digest, str) or not digest:
+            return None
+        files[ACCESS_PROVIDERS] = (digest, None)
     return files
 
 
@@ -253,8 +288,12 @@ def _join_partitions(tables):
     tables by path: feeds with their ``partition``, places, and the domestic
     edges with the links (``feed_partition`` on the links, null elsewhere)."""
     parts = {name: [] for name in (*PARTITION_TABLES, REALTIME)}
+    joined = {}
     for path, table in tables.items():
         partition, _, file = path.partition("/")
+        if not file:
+            joined[path] = table
+            continue
         kind = file[: -len(".parquet")]
         if kind in ("feeds", REALTIME):
             column = pa.array([partition] * len(table), pa.string())
@@ -264,7 +303,6 @@ def _join_partitions(tables):
                 "feed_partition", pa.nulls(len(table), pa.string())
             )
         parts[kind].append(table)
-    joined = {}
     for kind, found in parts.items():
         if not found:
             if kind == REALTIME:
@@ -316,6 +354,7 @@ def load_tables(path, read_bytes=_read_file, expected=None):
         version = snapshot.get("schema_version")
         dated = isinstance(version, int) and version >= 9
         nested = isinstance(version, int) and version >= 10
+        accessed = isinstance(version, int) and version >= 11
         digests, tables = {}, {}
         for name, (digest, rows) in files.items():
             partition = name.rpartition("/")[0]
@@ -337,6 +376,7 @@ def load_tables(path, read_bytes=_read_file, expected=None):
                     and _has_columns(table, base, SCHEMA_7_COLUMNS)
                     and (not dated or _has_columns(table, base, SCHEMA_9_COLUMNS))
                     and (not nested or _has_columns(table, base, SCHEMA_10_COLUMNS))
+                    and (not accessed or _has_columns(table, base, SCHEMA_11_COLUMNS))
                 ):
                     return None
                 tables[name] = table
@@ -348,9 +388,10 @@ def load_tables(path, read_bytes=_read_file, expected=None):
             if not _has_columns(tables[name], name, REQUIRED_COLUMNS):
                 return None
         # The schema's columns whatever the layout: a flat build claiming
-        # schema 9 or 10 must carry them too.
+        # schema 9, 10 or 11 must carry them too.
         claimed = [SCHEMA_9_COLUMNS] if dated else []
         claimed += [SCHEMA_10_COLUMNS] if nested else []
+        claimed += [SCHEMA_11_COLUMNS] if accessed else []
         for required in claimed:
             for name in required:
                 if name in tables and not _has_columns(tables[name], name, required):

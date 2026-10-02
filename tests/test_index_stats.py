@@ -462,7 +462,17 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
             mdb={"urls": {"license": "https://l"}},
         ),
         _feed("gone", mdb_id="mdb-3", declared=["FI"]),
-        _feed("far", mdb_id="mdb-4", home="FI", scope="domestic"),
+        # A curated feed: its licence in an Atlas block, its published URL.
+        {
+            **_feed(
+                "far",
+                source="curated",
+                home="FI",
+                scope="domestic",
+                atlas={"license": {"url": "https://far.example/terms"}},
+            ),
+            "download_url": "https://far.example/g.zip",
+        },
         _feed("lost", mdb_id="mdb-5", home="FI", scope="domestic"),
         _feed(
             "bikes",
@@ -548,12 +558,19 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
     assert gone["municipality_outcome"] is None and gone["places_served"] == 1
     assert gone["relevance_max"] is None and gone["licence_state"] == "none"
     assert by_id["far"]["municipality_outcome"] == "elsewhere"
+    assert by_id["far"]["licence_state"] == "declared"
+    assert by_id["far"]["download_url"] == "https://far.example/g.zip"
     assert by_id["far"]["crawl_outcome"] == "not_modified"
     assert by_id["lost"]["municipality_outcome"] == "unplaceable"
     assert by_id["lost"]["country_agreement"] == "undeclared"
     bikes = by_id["bikes"]
     assert bikes["crawl_outcome"] == "skipped" and bikes["failure_class"] is None
-    assert bikes["download_url"] == "https://b/gbfs.json"
+    assert bikes["download_url"] is None  # not a URL the crawl reads
+    # A published download_url wins over the blocks; a realtime companion's
+    # row, which has none, gives its MDB endpoint.
+    mdb = {"urls": {"direct_download": "https://rt.example/vp"}}
+    assert stats._download_url({"download_url": None, "mdb": mdb}) is None
+    assert stats._download_url({"mdb": mdb}) == "https://rt.example/vp"
     sections = stats.feed_sections(rows)
     assert sections["availability"]["by_outcome"] == {
         "ok": 2,
@@ -569,7 +586,7 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
         "deprecated": {"failed": 1},
         "unknown": {"ok": 1, "not_modified": 1, "range": 1, "skipped": 1},
     }
-    assert sections["licensing"]["licence_state"] == {"declared": 2, "none": 4}
+    assert sections["licensing"]["licence_state"] == {"declared": 3, "none": 3}
     assert sections["licensing"]["redistribution_allowed"] == {"yes": 1, "unknown": 5}
     assert sections["scale"]["stop_count"] == {
         "count": 2,

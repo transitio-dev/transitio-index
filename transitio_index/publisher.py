@@ -195,20 +195,29 @@ def _well_formed(check):
             isinstance(value, str) and value for value in values
         )
 
+    def digest(value):
+        return isinstance(value, str) and store.DIGEST_PATTERN.match(value) is not None
+
     labels = ("labels_not_merged", "labels_outside", "labels_from_another_cut")
+    counts = ("mdb", "atlas", "curated")
     return (
         isinstance(check, dict)
-        and isinstance(check.get("partition_sha256"), str)
-        and store.DIGEST_PATTERN.match(check["partition_sha256"]) is not None
+        and digest(check.get("partition_sha256"))
+        and "curated_sha256" in check
+        and (check["curated_sha256"] is None or digest(check["curated_sha256"]))
         and isinstance(check.get("catalogues"), dict)
         and isinstance(check.get("expected"), dict)
-        and all(type(check["expected"].get(key)) is int for key in ("mdb", "atlas"))
+        and all(type(check["expected"].get(key)) is int for key in counts)
         and all(names(check.get(key)) for key in labels)
         and isinstance(check.get("missing"), list)
         and all(
             isinstance(row, dict)
-            and row.get("catalogue") in ("mdb", "atlas")
-            and names([row.get("id"), row.get("label")])
+            and row.get("catalogue") in counts
+            and names([row.get("id")])
+            and (
+                names([row.get("label")])
+                or (row["catalogue"] == "curated" and row.get("label") is None)
+            )
             for row in check["missing"]
         )
     )
@@ -218,8 +227,10 @@ def _catalogue_complete(snapshot, overrides_dir):
     """Refuse a merged index that does not hold its catalogue cut: one that
     records no catalogue check (merged without a partition), one with a
     merged label the partition does not list or one built from another cut,
-    and one lacking a catalogue id that ``catalogue_exceptions.yaml`` under
-    ``overrides_dir``, read now, does not name."""
+    one checked against other ``add_feed`` entries than those of
+    ``feeds.yaml`` under ``overrides_dir``, and one lacking a catalogue or
+    curated id that ``catalogue_exceptions.yaml`` there does not name; both
+    files are read now."""
     from transitio_index import overrides
 
     check = snapshot.get("catalogue_check")
@@ -236,10 +247,19 @@ def _catalogue_complete(snapshot, overrides_dir):
                 f"the index merges {what}: {', '.join(map(str, check[key]))}; "
                 "merge only builds of the partition's cuts"
             )
+    feed_overrides, _ = overrides.load_feed_overrides(overrides_dir)
+    curated = overrides.phase_digest(feed_overrides, overrides.CROSSWALK_OPERATIONS)
+    if check["curated_sha256"] != curated:
+        raise PublishIndexError(
+            "the index was checked against other add_feed entries than "
+            f"{overrides.FEEDS_FILE}'s; re-run the merge"
+        )
     excepted = overrides.load_catalogue_exceptions(overrides_dir)
     missing = [row for row in check["missing"] if row["id"] not in excepted]
     if missing:
-        named = ", ".join(f"{row['id']} ({row['label']})" for row in missing[:10])
+        named = ", ".join(
+            f"{row['id']} ({row['label'] or 'no label'})" for row in missing[:10]
+        )
         raise PublishIndexError(
             f"{len(missing)} catalogue feeds missing from the index and not in "
             f"{overrides.CATALOGUE_EXCEPTIONS_FILE}: {named}"
@@ -394,6 +414,11 @@ def _current(cache_dir, snapshot, overrides_dir):
         ("edges.yaml", "overrides_sha256", overrides.edges_digest),
         ("feeds.yaml", "feeds_overrides_sha256", overrides.feeds_digest),
         ("places.yaml", "places_overrides_sha256", overrides.places_digest),
+        (
+            overrides.ACCESS_PROVIDERS_FILE,
+            "access_providers_overrides_sha256",
+            overrides.access_providers_digest,
+        ),
     ):
         if key not in snapshot:
             raise PublishIndexError(
@@ -480,6 +505,7 @@ def pack(
                 "overrides_sha256",
                 "feeds_overrides_sha256",
                 "places_overrides_sha256",
+                "access_providers_overrides_sha256",
                 "crawl_digest",
                 "licensed",
             )

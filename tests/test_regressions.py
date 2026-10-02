@@ -1113,7 +1113,8 @@ def test_a_feeds_own_crawl_outranks_one_filed_under_its_alias(tmp_path):
     assert states["f-new"][1]["feed_id"] == "f-new" and not unmatched
 
 
-def test_a_flat_build_claiming_schema_10_needs_its_columns(tmp_path):
+@pytest.mark.parametrize("version", [10, 11])
+def test_a_flat_build_claiming_schema_10_needs_its_columns(tmp_path, version):
     """The schema's required columns were checked on partitioned builds only,
     so a flat manifest claiming schema 10 loaded without contained_in."""
     import json
@@ -1126,8 +1127,11 @@ def test_a_flat_build_claiming_schema_10_needs_its_columns(tmp_path):
     write_build(path)
     assert builds.load_tables(path) is not None
     snapshot = json.loads((path / "snapshot.json").read_text())
-    (path / "snapshot.json").write_text(json.dumps({**snapshot, "schema_version": 10}))
+    snapshot["schema_version"] = version
+    (path / "snapshot.json").write_text(json.dumps(snapshot))
     assert builds.load_tables(path) is None
+    # Whatever its columns: a schema-11 build ships its providers at the root.
+    assert (builds.snapshot_files(snapshot) is None) == (version == 11)
 
 
 def test_a_dropped_download_resumes_from_the_bytes_that_arrived(tmp_path):
@@ -1682,3 +1686,86 @@ def test_a_fao_metros_country_is_its_centres_whatever_cities_a_build_holds(
     regions = {region_id: {"country": iso3}}
     country = metros.fao_country(region_id, sorted(by_id), by_id, names, regions)
     assert country == expected
+
+
+@pytest.mark.parametrize("place_id, refused", [("Q404", False), ("Q-nowhere", True)])
+def test_a_set_coverage_for_another_builds_feed_is_skipped(tmp_path, place_id, refused):
+    """A set_coverage naming a feed the build does not hold raised "names no
+    feed", so a partitioned rebuild failed in every label but the feed's."""
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import overrides
+
+    entries = [
+        {
+            "feed": "f-elsewhere",
+            "set_coverage": {"level": "country", "place_id": place_id},
+        }
+    ]
+    directory = write_overrides(tmp_path, feeds=entries)
+    if refused:
+        with pytest.raises(overrides.OverrideError, match="names no feed"):
+            ct._cover(tmp_path, overrides_dir=directory)
+        return
+    manifest, _, edges = ct._cover(tmp_path, overrides_dir=directory)
+    assert manifest["overrides_applied"] == 0 and "f-elsewhere" not in edges
+
+
+def test_a_fao_metro_carries_its_fao_centre_not_its_members_centroid(tmp_path):
+    """CT-48: a place without a centre was routed from a point of its
+    polygon; a FAO metro from its member union, off its urban centre."""
+    import test_index_metros as mt
+
+    centre = shapely.box(-87.9, 41.9, -87.8, 42.0)
+    mt._run(
+        tmp_path,
+        {},
+        fao=mt._fao_inputs(tmp_path),
+        ucdb=mt._ucdb_inputs(tmp_path, centre=centre),
+    )
+    cache = tmp_path / "cache"
+    areas = fx.write_area_dataset(tmp_path / "areas-again.parquet", mt.AREAS)
+    manifest = geometry.attach_geometry(cache, dataset=areas)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    (metro,) = [p for p in places if p["place_id"] == "fao_city_region:50"]
+    point = shapely.from_wkb(metro["centre"])
+    union = shapely.from_wkb(metro["geometry"])
+    assert point.equals(shapely.point_on_surface(centre))
+    assert union.covers(point) and not point.equals(union.centroid)
+    assert manifest["centres"] == sum(bool(p.get("centre")) for p in places)
+
+
+def test_a_seeded_citys_population_survives_the_merge(tmp_path):
+    """Only the build seeding a city records its urban centre's population,
+    and the merge took the place row of the build serving it most, so a city
+    another build fed lost its population."""
+    fx = pytest.importorskip("index_fixture")
+    from test_index_merge import BUILT, _archive, _merged
+
+    # The seeding build serves only the country; the newer one feeds Lima.
+    for label, digit, lima, served in (
+        ("seed", 1, {"population": 10**7}, "pe"),
+        ("fed", 2, {"name": "Lima (fed)"}, "lima"),
+    ):
+        _archive(
+            fx,
+            tmp_path,
+            label,
+            digit,
+            built_at=BUILT(13 + digit),
+            feeds=[{**fx.covered_feed(f"{label}-bus"), "home_country": "PE"}],
+            places=[
+                fx.place("pe", "country", country_code="PE"),
+                fx.place("lima", "city", country_code="PE", **lima),
+            ],
+            edges=[fx.edge(served, f"{label}-bus", tier="local")],
+        )
+    _, tables = _merged(tmp_path)
+    places = tables["places.parquet"].select(["place_id", "name", "population"])
+    assert {row["place_id"]: row for row in places.to_pylist()}["lima"] == {
+        "place_id": "lima",
+        "name": "Lima (fed)",
+        "population": 10**7,
+    }

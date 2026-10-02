@@ -13,6 +13,7 @@ import time
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import shapely
 
 from builds_fixture import (
     BOX,
@@ -56,6 +57,11 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     when = _run(archived, "when", 12, built_at="yesterday")
     nodate = _run(archived, "nodate", 13)
     _rewrite_snapshot(archived / nodate / "index", lambda s: s.pop("built_at"))
+    # Claiming schema 11 without the providers table it lists.
+    eleven = _run(archived, "eleven", 16)
+    _rewrite_snapshot(
+        archived / eleven / "index", lambda s: s.update(schema_version=11)
+    )
     _run(archived, "raw", 14, built_at=day(13))  # a run without its index yet
     (archived / "raw-000000000000000f").mkdir()
     write_build(archived / "old" / "index")
@@ -70,6 +76,7 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     assert all(path == archived / b / "index" for b, path, _ in sources)
     assert skipped == [
         {"id": bad, "reason": "incomplete"},
+        {"id": eleven, "reason": "incomplete"},
         {"id": gone, "reason": "incomplete"},
         {"id": nl, "reason": "no feeds"},
         {"id": nodate, "reason": "undated"},
@@ -390,9 +397,9 @@ def test_feeds_another_build_kept_with_the_same_content_fold(
     assert snapshot["content_folds"] == {"f-mdb-648": "f-wl"}
 
 
-# ---- loading a selection for a merge: the reader's schema-9 fixture ----
+# ---- loading a selection for a merge: the reader's schema-11 fixture ----
 
-# What a schema-9 build's manifest carries that a merge checks or copies.
+# What a build's manifest carries that a merge checks or copies.
 MANIFEST_9 = {
     "overture_release": "2026-08-19.0",
     "simplify_tolerance_deg": 0.0005,
@@ -409,8 +416,9 @@ MANIFEST_9 = {
 
 
 def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fields):
-    """A schema-10 run archived as ``<label>-<16 hex>``: the reader fixture's
-    partitioned index with the manifest fields a merge checks."""
+    """A schema-11 run archived as ``<label>-<16 hex>``: the reader fixture's
+    partitioned index (``access`` its providers, none by default) with the
+    manifest fields a merge checks."""
     path = archived / f"{label}-{digit:016x}" / "index"
     fx.write_partitioned_index(
         path,
@@ -419,6 +427,7 @@ def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fiel
         edges=fields.pop("edges"),
         realtime=fields.pop("realtime", []),
         contained=fields.pop("contained", {}),
+        access=fields.pop("access", {"providers": []}),
         snapshot_id=f"{digit:016x}",
         notice=notice,
     )
@@ -429,6 +438,17 @@ def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fiel
 
 
 HSL_LICENCE = {"spdx_identifier": "CC-BY-4.0", "url": "https://hsl.example/licence"}
+NAT_LICENCE = {"url": "https://nat.example/terms", "attribution_text": "Data by Nat"}
+FLIX = {
+    "provider_id": "flix",
+    "name": "FlixBus",
+    "registration_url": "https://flix.example/register",
+    "docs_url": None,
+    "terms_url": None,
+    "credential_fields": ["key"],
+    "free": None,
+}
+HEL_CENTRE = shapely.to_wkb(shapely.Point(24.94, 60.17), hex=True)
 DE_SOURCES = {
     "atlas": {"archive_sha256": "d" * 64},
     "mdb": {"csv_sha256": "e" * 64},
@@ -479,7 +499,14 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
                 "service_end": "2026-12-31",
                 "atlas": {"license": HSL_LICENCE},
             },
-            {**fx.covered_feed("nat"), "home_country": "FI", "scope": "domestic"},
+            # A curated feed: its licence rides in its Atlas block.
+            {
+                **fx.covered_feed("nat"),
+                "source": "curated",
+                "home_country": "FI",
+                "scope": "domestic",
+                "atlas": {"license": NAT_LICENCE},
+            },
         ],
         places=[
             fx.place("fi", "country", country_code="FI"),
@@ -499,8 +526,15 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         built_at=BUILT(15),
         notice=de_notice,
         sources=DE_SOURCES,
+        access={"providers": [FLIX]},
         feeds=[
-            {**fx.covered_feed("flix"), "home_country": "DE", "scope": "domestic"},
+            {
+                **fx.covered_feed("flix"),
+                "home_country": "DE",
+                "scope": "domestic",
+                "access": "key",
+                "access_provider": "flix",
+            },
             {
                 **fx.covered_feed("ferry"),
                 "home_country": None,
@@ -509,7 +543,9 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         ],
         places=[
             fx.place("ber", "city", country_code="DE"),
-            fx.place("hel", "city", country_code="FI", parent_id="fi"),
+            fx.place(
+                "hel", "city", country_code="FI", parent_id="fi", centre=HEL_CENTRE
+            ),
         ],
         edges=[
             fx.edge("ber", "flix", tier="local", relevance_category="primary"),
@@ -558,8 +594,8 @@ def _mixed_overture(archived, fi, de):
     )
 
 
-def _below_schema_10(archived, fi, de):
-    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(schema_version=9))
+def _below_schema_11(archived, fi, de):
+    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(schema_version=10))
 
 
 def _without_a_release(archived, fi, de):
@@ -592,6 +628,10 @@ def _feeds_without_service_spans(archived, fi, de):
 
 def _feeds_without_containers(archived, fi, de):
     _drop_feed_columns(archived, fi, ["contained_in"])
+
+
+def _feeds_without_access_details(archived, fi, de):
+    _drop_feed_columns(archived, fi, ["download_url"])
 
 
 def _drop_feed_columns(archived, fi, columns):
@@ -627,13 +667,14 @@ def _rewritten_notice(archived, fi, de):
     [
         (_unlicensed, "not a licensed build"),
         (_mixed_overture, "overture_release differs"),
-        (_below_schema_10, "schema_version 9"),
+        (_below_schema_11, "schema_version 10"),
         (_without_a_release, "no usable overture_release"),
         (_another_classifier, "classifier differs"),
         (_a_malformed_classifier_everywhere, "no usable classifier"),
         (_a_negative_tolerance, "no usable simplify_tolerance_deg"),
         (_feeds_without_service_spans, "does not verify"),
         (_feeds_without_containers, "does not verify"),
+        (_feeds_without_access_details, "does not verify"),
         (_tampered_table, "does not verify"),
         (_rewritten_notice, "does not verify"),
     ],
@@ -645,6 +686,59 @@ def test_a_selection_a_merge_cannot_ship_is_refused(tmp_path, tamper, message):
     sources, _ = merge.select_sources(tmp_path)
     with pytest.raises(merge.MergeError, match=message):
         merge.load_sources(sources)
+
+
+def _provider_runs(fx, archived, fi_providers, de_providers):
+    """An older Finnish and a newer German run listing the given providers;
+    the German feed takes ``flix``."""
+    for label, digit, providers in (("fi", 1, fi_providers), ("de", 2, de_providers)):
+        code = label.upper()
+        _archive(
+            fx,
+            archived,
+            label,
+            digit,
+            built_at=BUILT(13 + digit),
+            access={"providers": providers},
+            feeds=[
+                {
+                    **fx.covered_feed(f"{label}-bus"),
+                    "home_country": code,
+                    "access_provider": "flix" if label == "de" else None,
+                }
+            ],
+            places=[fx.place(label, "country", country_code=code)],
+            edges=[fx.edge(label, f"{label}-bus", tier="national")],
+        )
+
+
+TOKEN_FLIX = {**FLIX, "credential_fields": ["token"]}
+
+
+@pytest.mark.parametrize(
+    "fi_providers, de_providers, expected",
+    [
+        ([FLIX], [FLIX], [FLIX]),
+        # A label with no feed of the provider ships no row of it, so a newer
+        # definition elsewhere stands alone.
+        ([], [TOKEN_FLIX], [TOKEN_FLIX]),
+        # A feed's auth_params were bound to its own build's fields.
+        ([TOKEN_FLIX], [FLIX], "access provider flix differs between"),
+        # Another build's row cannot stand in for the feed's own.
+        ([FLIX], [], "their build does not list: \\[\\('flix', 'de-"),
+    ],
+)
+def test_the_sources_providers_merge_only_when_they_agree(
+    tmp_path, fi_providers, de_providers, expected
+):
+    fx = pytest.importorskip("index_fixture")
+    _provider_runs(fx, tmp_path, fi_providers, de_providers)
+    if isinstance(expected, str):
+        with pytest.raises(merge.MergeError, match=expected):
+            _merged(tmp_path)
+        return
+    _, tables = _merged(tmp_path)
+    assert tables["access_providers.parquet"].to_pylist() == expected
 
 
 def test_a_manifest_rewritten_after_selection_is_refused_even_when_equal_in_python(
@@ -731,6 +825,7 @@ def test_every_merged_row_lands_in_its_partition_sorted_without_the_merge_column
         ("international", "feeds"),
         ("international", "realtime"),
         ("links", "edges"),
+        (None, "access_providers"),
     ]
     # Feeds under their home country, ``international`` without one.
     assert routed[("FI", "feeds")]["feed_id"].to_pylist() == ["hsl", "nat"]
@@ -800,6 +895,10 @@ def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadat
     _two_runs(fx, tmp_path)
     _, tables = _merged(tmp_path)
     files, listing = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
+    # The providers table at the root, outside the listing.
+    root_bytes = files.pop((None, "access_providers"))
+    root = pq.read_table(io.BytesIO(root_bytes))
+    assert root.to_pylist() == [FLIX]
     assert set(files) == {(p, t) for p, tables_ in listing.items() for t in tables_}
     for (partition, table), data in files.items():
         read = pq.read_table(io.BytesIO(data))
@@ -810,10 +909,11 @@ def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadat
         }
     assert listing["links"]["edges"]["rows"] == 2
     assert listing["FI"]["realtime"]["rows"] == 1
-    assert b"geo" in pq.read_schema(io.BytesIO(files[("FI", "places")])).metadata
+    geo = pq.read_schema(io.BytesIO(files[("FI", "places")])).metadata[b"geo"]
+    assert json.loads(geo)["columns"]["centre"]["geometry_types"] == ["Point"]
     # The same tables give the same bytes again.
     again, _ = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
-    assert again == files
+    assert again.pop((None, "access_providers")) == root_bytes and again == files
 
 
 # ---- the merged snapshot: its id and its manifest ----
@@ -834,14 +934,14 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
     read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
     assert set(read["snapshot"].to_pylist()) == {snapshot_id}
-    assert manifest["schema_version"] == 10
+    assert manifest["schema_version"] == 11
     assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
-    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[10]
+    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[11]
     assert manifest["built_with"] == transitio.__version__
     assert manifest["built_at"] == BUILT(15)  # the newest source's, not the clock
     assert manifest["counts"] == {
         "feeds": 4,
-        "by_source": {"atlas": 4},
+        "by_source": {"atlas": 3, "curated": 1},
         "feeds_dated": 1,
         "realtime": 2,
         "realtime_linked": 1,
@@ -850,6 +950,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         "places_by_kind": {"city": 2, "country": 1},
         "edges": 5,
         "edges_by_tier": {"international": 2, "local": 2, "national": 1},
+        "access_providers": 1,
     }
     assert {
         p: {t: e["rows"] for t, e in ts.items()}
@@ -861,10 +962,12 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         "links": {"edges": 2},
     }
     for (partition, table), data in files.items():
-        assert (
-            manifest["partitions"][partition][table]["sha256"]
-            == hashlib.sha256(data).hexdigest()
+        entry = (
+            manifest["partitions"][partition][table]
+            if partition is not None
+            else {"sha256": manifest["access_providers_sha256"]}
         )
+        assert entry["sha256"] == hashlib.sha256(data).hexdigest()
     assert manifest["licensed"] is True
     assert manifest["notice_sha256"] == hashlib.sha256(b"NOTICE\n").hexdigest()
     assert manifest["overture_release"] == "2026-08-19.0"
@@ -1140,7 +1243,11 @@ def test_the_merged_notice_credits_every_source_once_and_recounts_the_licences(
                 "Feed licences declared by the catalogues (feeds per licence):",
                 "  - CC-BY-4.0: 1",
                 "      url: https://hsl.example/licence",
-                "  - none declared: 3",
+                "  - none declared: 2",
+                # The curated feed's licence and the attribution it requires.
+                "  - no identifier: 1",
+                "      url: https://nat.example/terms",
+                "      attribution: Data by Nat",
             ],
         ]
     )
@@ -1227,16 +1334,27 @@ def _cut_read(mdb, atlas):
 
 
 def test_the_catalogue_check_looks_each_id_up_as_a_feed_or_an_alias():
+    from transitio_index import overrides
+
     feeds = pa.table(
         {
             "feed_id": ["f-mdb-1", "f-abc", "f-xyz"],
-            "aliases": [[], ["f-mdb-2"], ["f-old"]],
+            "aliases": [[], ["f-mdb-2"], ["f-old", "f-curated-folded"]],
         }
     )
     cut = {"mdb_sha256": "m" * 64, "atlas_sha256": "a" * 64}
+    curated = {
+        ref: {"feed": ref, "add_feed": {"location": {"country_code": code}}}
+        for ref, code in (
+            ("f-curated-folded", "FI"),
+            ("f-curated-lost", "FI"),
+            ("f-curated-nowhere", "AR"),
+        )
+    }
+    curated["f-abc"] = {"feed": "f-abc", "mark_uncrawlable": True}
     partition = {
         "catalogues": {"atlas_commit": "c0ffee"},
-        "labels": {"fi": cut, "se": cut, "zw": cut},
+        "labels": {"fi": {**cut, "countries": ["FI"]}, "se": cut, "zw": cut},
         "mdb": {"mdb-1": "fi", "mdb-2": "fi", "mdb-3": "fi", "mdb-9": "zw"},
         "atlas": {"f-abc": "fi", "f-old": "se", "f-gone": "se"},
     }
@@ -1245,12 +1363,17 @@ def test_the_catalogue_check_looks_each_id_up_as_a_feed_or_an_alias():
         {"label": "se", "build_id": "se-2", "snapshot": _cut_read("m" * 64, "0" * 64)},
         {"label": "us", "build_id": "us-3", "snapshot": _cut_read("m" * 64, "a" * 64)},
     ]
-    check = merge.catalogue_check(partition, "p" * 64, feeds, loaded)
+    check = merge.catalogue_check(partition, "p" * 64, feeds, loaded, curated)
     assert check == {
         "partition_sha256": "p" * 64,
         "catalogues": {"atlas_commit": "c0ffee"},
-        "expected": {"mdb": 4, "atlas": 3},
+        "expected": {"mdb": 4, "atlas": 3, "curated": 3},
+        "curated_sha256": overrides.phase_digest(
+            curated, overrides.CROSSWALK_OPERATIONS
+        ),
         "missing": [
+            {"catalogue": "curated", "id": "f-curated-nowhere", "label": None},
+            {"catalogue": "curated", "id": "f-curated-lost", "label": "fi"},
             {"catalogue": "mdb", "id": "mdb-3", "label": "fi"},
             {"catalogue": "atlas", "id": "f-gone", "label": "se"},
             {"catalogue": "mdb", "id": "mdb-9", "label": "zw"},
@@ -1263,6 +1386,8 @@ def test_the_catalogue_check_looks_each_id_up_as_a_feed_or_an_alias():
     merge._report_check(check, lines.append)
     assert lines == [
         "label zw not merged: 1 catalogue feeds missing",
+        "missing curated f-curated-nowhere (no label holds its country)",
+        "missing curated f-curated-lost (label fi)",
         "missing mdb mdb-3 (label fi)",
         "missing atlas f-gone (label se)",
         "label us is not in the partition",
@@ -1282,6 +1407,16 @@ def test_the_catalogue_check_looks_each_id_up_as_a_feed_or_an_alias():
         (
             {"labels": {}, "mdb": {"mdb-1": "zw"}, "atlas": {}},
             "mdb mdb-1 is in 'zw', a label the partition does not list",
+        ),
+        (
+            {
+                "labels": {
+                    "fi": {"mdb_sha256": "", "atlas_sha256": "", "countries": "FI"}
+                },
+                "mdb": {},
+                "atlas": {},
+            },
+            "label fi lists no country codes",
         ),
     ],
 )
@@ -1325,7 +1460,7 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
         merge.main(
             [
                 *("--builds", str(builds), "--cache-dir", str(cache)),
-                *("--partition", str(partition)),
+                *("--partition", str(partition), "--overrides-dir", str(tmp_path)),
             ]
         )
         == 0
@@ -1342,6 +1477,9 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
     assert len(index.feeds) == 4 and len(index.places) == 3 and len(index.edges) == 5
     assert len(index.links) == 2 and len(index.realtime) == 2
     assert set(index.feeds["snapshot"]) == {index.snapshot["snapshot_id"]}
+    assert index.access_provider("flix").name == "FlixBus"
+    centre = index.places.set_index("place_id").loc["hel", "centre"]
+    assert centre.equals(shapely.from_wkb(HEL_CENTRE))
     notice = (cache / "index" / "NOTICE").read_bytes()
     assert notice.startswith(b"This index includes place boundary geometry")
     assert hashlib.sha256(notice).hexdigest() == index.snapshot["notice_sha256"]
@@ -1518,9 +1656,10 @@ def _small_run(fx, archived, label, digit, built_at):
     )
 
 
-def _merged_cache(fx, tmp_path, partition=None):
+def _merged_cache(fx, tmp_path, partition=None, overrides_dir=None):
     """The two runs and a skipped one merged, checked against ``PARTITION``
-    as ``partition`` edits it; ``False`` merges without a check."""
+    as ``partition`` edits it and the add_feed entries of ``overrides_dir``;
+    ``False`` merges without a check."""
     builds, cache = tmp_path / "builds", tmp_path / "cache"
     fi, de = _two_runs(
         fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
@@ -1531,6 +1670,7 @@ def _merged_cache(fx, tmp_path, partition=None):
         cache,
         log=lambda line: None,
         partition=None if partition is False else _partition(tmp_path, partition),
+        overrides_dir=overrides_dir,
     )
     return builds, cache, fi, de, manifest
 
@@ -1688,27 +1828,40 @@ def _de_cut_again(partition):
 
 
 EXCEPTED = "- feed: lost\n  reason: withdrawn by its operator\n"
+CURATED = (
+    "- feed: f-curated-lost\n  add_feed: {name: Lost, url: 'https://lost.example/',"
+    " spec: gtfs, license: {url: 'https://lost.example/'}, location: {country_code: ZW}}\n"
+)
 
 
 @pytest.mark.parametrize(
-    "partition, exceptions, message",
+    "partition, feeds, exceptions, message",
     [
-        (False, None, "no catalogue check; re-run the merge with --partition"),
-        (_a_feed_lost, None, r"1 catalogue feeds missing .*: lost \(fi\)$"),
-        (_a_feed_lost, EXCEPTED, None),
-        (_de_not_listed, None, "merges labels outside the partition: de"),
-        (_de_cut_again, None, "merges labels built from another cut: de"),
+        (False, None, None, "no catalogue check; re-run the merge with --partition"),
+        (_a_feed_lost, None, None, r"1 catalogue feeds missing .*: lost \(fi\)$"),
+        (_a_feed_lost, None, EXCEPTED, None),
+        (
+            None,
+            CURATED,
+            None,
+            r"1 catalogue feeds missing .*: f-curated-lost \(no label\)$",
+        ),
+        (None, CURATED, EXCEPTED.replace("lost", "f-curated-lost"), None),
+        (_de_not_listed, None, None, "merges labels outside the partition: de"),
+        (_de_cut_again, None, None, "merges labels built from another cut: de"),
     ],
 )
 def test_a_merged_snapshot_is_released_only_with_its_whole_catalogue_cut(
-    tmp_path, partition, exceptions, message
+    tmp_path, partition, feeds, exceptions, message
 ):
     fx = pytest.importorskip("index_fixture")
     from transitio_index import publisher
 
-    builds, cache, *_ = _merged_cache(fx, tmp_path, partition)
     excepted = tmp_path / "overrides" / "catalogue_exceptions.yaml"
     excepted.parent.mkdir()
+    if feeds is not None:
+        (excepted.parent / "feeds.yaml").write_text(feeds)
+    builds, cache, *_ = _merged_cache(fx, tmp_path, partition, excepted.parent)
     if exceptions is not None:
         excepted.write_text(exceptions)
     options = {"builds_dir": builds, "overrides_dir": excepted.parent}
@@ -1717,16 +1870,20 @@ def test_a_merged_snapshot_is_released_only_with_its_whole_catalogue_cut(
             publisher.pack(cache / "index", **options)
         return
     _, release = publisher.pack(cache / "index", **options)
-    # The flip-time check reads the exceptions again.
+    # The flip-time check reads the exceptions and the add_feed entries again.
     excepted.unlink()
-    with pytest.raises(publisher.PublishIndexError, match=r"lost \(fi\)"):
+    with pytest.raises(publisher.PublishIndexError, match=r"lost \("):
+        publisher._check_lineage(cache, release["lineage"], excepted.parent, builds)
+    (excepted.parent / "feeds.yaml").write_text(CURATED.replace("lost", "new"))
+    with pytest.raises(publisher.PublishIndexError, match="other add_feed entries"):
         publisher._check_lineage(cache, release["lineage"], excepted.parent, builds)
 
 
 CHECKED = {
     "partition_sha256": "0" * 64,
+    "curated_sha256": None,
     "catalogues": {},
-    "expected": {"mdb": 0, "atlas": 1},
+    "expected": {"mdb": 0, "atlas": 1, "curated": 0},
     "missing": [],
     "labels_not_merged": [],
     "labels_outside": [],
@@ -1742,6 +1899,8 @@ CHECKED = {
         {**CHECKED, "expected": {"mdb": 0}},
         {**CHECKED, "labels_not_merged": None},
         {**CHECKED, "missing": [{"id": "lost", "label": "fi"}]},
+        {**CHECKED, "missing": [{"catalogue": "mdb", "id": "lost", "label": None}]},
+        {key: value for key, value in CHECKED.items() if key != "curated_sha256"},
     ],
 )
 def test_a_catalogue_check_not_shaped_as_the_merge_writes_it_is_refused(check):

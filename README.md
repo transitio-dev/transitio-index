@@ -90,12 +90,18 @@ matching registry together.
    Mobility Database into one de-duplicated table. A deprecated Mobility
    Database row that redirects to a live row becomes an alias of that feed.
    The GBFS systems go to a table of their own, which the index does not
-   publish.
+   publish. The feeds no catalogue lists that `overrides/feeds.yaml` adds
+   with `add_feed` join the table in every build whose catalogue feeds
+   declare their country; later stages place, crawl and fold them like
+   catalogue feeds, and a catalogue feed with the same data keeps its own id.
 3. `gazetteer` — resolve Overture administrative divisions to Wikidata QIDs,
-   seed the cities the feeds declare, attach metros, boundary geometry and
-   names, and mint the place registry.
-4. `resolve` — settle each feed's identity and whether it is crawlable (from
-   the overrides), before anything is fetched.
+   seed the cities the feeds declare, attach metros, boundary geometry, centre
+   points and names, and mint the place registry.
+4. `resolve` — settle each feed's identity, its access details and whether
+   it is crawlable (from the overrides), before anything is fetched. A feed
+   that needs a key takes its provider from `overrides/access_providers.yaml`;
+   the generation's `access_report.jsonl` lists the protected feeds no
+   provider claims and the access curation errors.
 5. `crawl` — fetch every crawlable feed.
 6. `expand` — add the places a feed's crawled stops actually fall in that the
    declared seed missed.
@@ -114,8 +120,9 @@ matching registry together.
 11. `prune` — drop the places that no kept edge needs.
 12. `license` — record each shipped feed's licence and lineage, and write the
     NOTICE.
-13. `publish` — write the shippable `cache/index/`: the GeoParquet tables and
-    manifest the reader installs.
+13. `publish` — write the shippable `cache/index/`: the GeoParquet tables,
+    the table of the access providers its feeds name and the manifest the
+    reader installs.
 14. `stats` — write statistics about the catalogue rows the build saw and the
     feeds they became, for reporting; the shipped index does not depend on
     them.
@@ -141,12 +148,15 @@ python -m transitio_index.build --stage ingest --downstream   # ingest -> stats
 
 To redo only part of a build, run the earliest stage you need to change with
 `--downstream`, reusing the cache the earlier stages already left. For example,
-after editing a curated override, re-apply it and rebuild the shipped index
-without re-crawling:
+after editing an edge override (`overrides/edges.yaml`), re-apply it and
+rebuild the shipped index without re-crawling:
 
 ```
 python -m transitio_index.build --stage curate --downstream   # curate -> stats
 ```
+
+An `add_feed` entry in `overrides/feeds.yaml` enters at the crosswalk, so a
+change to one starts there: `--stage crosswalk --downstream`.
 
 Running a single stage (no `--downstream`) is for iterating on that one stage
 once its inputs are built:
@@ -241,24 +251,30 @@ python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache
     --partition cache/sample/partition-<id>/partition.json
 ```
 
-Every source must be a licensed schema-10 build, and the sources must agree on
+Every source must be a licensed schema-11 build, and the sources must agree on
 the Overture release, the simplification tolerance and the classifier. A feed
 comes from the newest build carrying it and its edges from that same build; a
-place comes from the build serving it most. The merged NOTICE credits every
-source once, names the catalogues by the digests each build read, and recounts
-the feed licences. The snapshot is read back through the reader before it is
+place comes from the build serving it most, with the largest population any
+build records for it. The access providers are the union of the sources',
+which must give a provider the same fields wherever they list it, and the
+build a merged feed comes from must list the provider the feed names. The
+merged NOTICE credits every source once, names the catalogues by the digests
+each build read, and recounts the feed licences. The snapshot is read back
+through the reader before it is
 committed into `cache/merged/index/`, and its manifest records each source by
 label, build id and digests, so the publisher can check the lineage. A label
 whose newest run is incomplete or holds no feeds is skipped and reported; an
 older run never stands in for it.
 
-With `--partition`, the merge looks up every MDB and Atlas GTFS id of the cut
-among the merged feed ids and aliases, logs each one missing, each label not
-merged, outside the partition or built from another cut, and records the
-result in the manifest. The publisher refuses a merged snapshot without that
-check, with a label outside the partition or from another cut, or with a
-missing id that `overrides/catalogue_exceptions.yaml` does not list (entries
-of `feed` and `reason`, optionally `author` and `date`).
+With `--partition`, the merge looks up every MDB and Atlas GTFS id of the cut,
+and every `add_feed` id of `overrides/feeds.yaml` (`--overrides-dir`), among
+the merged feed ids and aliases, logs each one missing, each label not merged,
+outside the partition or built from another cut, and records the result in the
+manifest. The publisher refuses a merged snapshot without that check, with a
+label outside the partition or from another cut, checked against other
+`add_feed` entries than the committed ones, or with a missing id that
+`overrides/catalogue_exceptions.yaml` does not list (entries of `feed` and
+`reason`, optionally `author` and `date`).
 
 ### Publish a snapshot
 

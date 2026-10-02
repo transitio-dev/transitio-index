@@ -1,0 +1,29 @@
+# Curated feed overrides, each keyed by a feed id or one of its aliases.
+
+- feed: f-curated-gcba-colectivos
+  add_feed:
+    name: Colectivos Buenos Aires (API Transporte)
+    url: https://apitransporte.buenosaires.gob.ar/colectivos/feed-gtfs
+    spec: gtfs
+    license:
+      url: https://api-transporte.buenosaires.gob.ar/
+    location:
+      country_code: AR
+      subdivision_name: Ciudad Autónoma de Buenos Aires
+      municipality: Buenos Aires
+    access: key
+    registration_url: https://api-transporte.buenosaires.gob.ar/registro
+    access_provider: gcba-transporte
+    auth_method: query_param
+    auth_params: {client_id: client_id, client_secret: client_secret}
+  reason: The current bus GTFS of Buenos Aires, which no catalogue lists.
+  date: 2026-10-02
+
+# Its Atlas record supplies the URL and lists no authorization; the URL
+# answers 403 without a key.
+- feed: f-xtrafik~se
+  set_access:
+    auth_method: query_param
+    auth_params: {key: key}
+  reason: Trafiklab GTFS Regional needs a key.
+  date: 2026-10-02

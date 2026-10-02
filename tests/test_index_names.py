@@ -5,6 +5,7 @@ import pytest
 
 pytest.importorskip("pyarrow")
 import overture_fixture as fx  # noqa: E402
+import shapely  # noqa: E402
 
 from transitio_index import names, overture, store  # noqa: E402
 
@@ -38,6 +39,10 @@ LABELS = {
 }
 
 
+def _hex(x, y):
+    return shapely.to_wkb(shapely.Point(x, y)).hex()
+
+
 def _run(tmp_path, overrides_dir=None, strict=False):
     from transitio_index import overrides
 
@@ -59,7 +64,7 @@ def _run(tmp_path, overrides_dir=None, strict=False):
         directory.close()
     manifest = names.merge_names(
         cache,
-        wikidata=fx.StubWikidata(labels=LABELS),
+        wikidata=fx.StubWikidata(labels=LABELS, points={"Q1757": [(24.9, 60.2)]}),
         overrides_dir=overrides_dir,
         strict=strict,
     )
@@ -99,6 +104,31 @@ def test_a_place_without_wikidata_is_left_unchanged(tmp_path):
     assert places["Q2000"]["names"] == {"en": "Nowhere"}
     assert places["Q2000"]["aliases"] == []
     assert manifest["enriched"] == 2  # Q1757 and Q3000, not Q2000
+    assert places["Q1757"]["centre"] == _hex(24.9, 60.2)
+    assert (manifest["centres"], manifest["centres_from_wikidata"]) == (1, 1)
+
+
+BOX = shapely.to_wkb(shapely.box(24.0, 60.0, 26.0, 61.0)).hex()
+SMALL = shapely.to_wkb(shapely.box(27.0, 60.0, 28.0, 61.0)).hex()
+
+
+@pytest.mark.parametrize(
+    "place, expected",
+    [
+        ({"geometry": BOX}, _hex(25.0, 60.5)),
+        ({"geometry": SMALL}, None),
+        ({"geometry": BOX, "centre": _hex(25.5, 60.5)}, _hex(25.5, 60.5)),
+        ({"geometry": None}, _hex(23.0, 60.5)),
+    ],
+    ids=["first-covered", "none-covered", "has-centre", "no-geometry"],
+)
+def test_fill_centres_takes_the_first_coordinate_inside(place, expected):
+    wikidata = fx.StubWikidata(points={"Q1": [(23.0, 60.5), (25.0, 60.5)]})
+    places = {"p": dict(place)}
+    filled = names.fill_centres(places, {"p": "Q1"}, wikidata)
+    assert places["p"].get("centre") == expected
+    assert filled == (expected is not None and "centre" not in place)
+    assert wikidata.located == ([] if "centre" in place else [["Q1"]])
 
 
 def test_labels_and_aliases_parses_wbgetentities(monkeypatch):

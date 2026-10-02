@@ -64,7 +64,8 @@ def _check_lineage(resolve_manifest, seed_manifest, expanded_manifest):
     """Refuse a mixed snapshot: the three inputs move independently.
 
     The resolved feeds and the seed placements must descend from the same
-    crosswalk (same catalogue ``sources``), and the placements and the expanded
+    crosswalk (same catalogue ``sources`` and the same crosswalk generation,
+    which holds the curated feeds), and the placements and the expanded
     places from the same Overture release — otherwise a partial rerun or a
     concurrent republish would silently mix builds.
     """
@@ -72,6 +73,12 @@ def _check_lineage(resolve_manifest, seed_manifest, expanded_manifest):
         raise CoverageError(
             "resolved feeds and seed placements come from different "
             "catalogue versions; re-run the pipeline in stage order"
+        )
+    generation = resolve_manifest.get("crosswalk_generation")
+    if generation is None or seed_manifest.get("crosswalk_generation") != generation:
+        raise CoverageError(
+            "resolved feeds and seed placements come from different crosswalk "
+            "generations; re-run the pipeline in stage order"
         )
     if seed_manifest.get("overture_release") != expanded_manifest.get(
         "overture_release"
@@ -204,8 +211,9 @@ def _enough_stops(states, members):
     return False
 
 
-# Which feed of a folded group keeps its id: one both catalogues carry first.
-SOURCE_RANK = {"both": 0, "atlas": 1, "mdb": 2}
+# Which feed of a folded group keeps its id: one both catalogues carry first,
+# a curated feed after every catalogue's.
+SOURCE_RANK = {"both": 0, "atlas": 1, "mdb": 2, "curated": 3}
 
 
 def _identity(state):
@@ -738,15 +746,34 @@ def crawled_edges(states, places, lookup, conflicts=frozenset()):
     return by_key, report
 
 
+def _placed_elsewhere(feeds, places, feed_overrides, own_ids):
+    """The curated feeds another build places: those whose ``set_coverage``
+    names a place this build lacks and another may hold
+    (:func:`overrides.elsewhere`). A curated feed is added to every build of
+    its country, so only the builds holding its place keep it."""
+    refs = _canonical_ids(feeds)
+    curated = {f["feed_id"] for f in feeds if f.get("source") == "curated"}
+    return {
+        refs[ref]
+        for ref, entry in feed_overrides.items()
+        if "set_coverage" in entry
+        and refs.get(ref) in curated
+        and entry["set_coverage"]["place_id"] not in places
+        and overrides.elsewhere(entry["set_coverage"]["place_id"], own_ids=own_ids)
+    }
+
+
 def _set_coverage(
-    feeds, placements, places, feed_overrides, report, crawled, crawl_fields
+    feeds, placements, places, feed_overrides, report, crawled, crawl_fields, own_ids
 ):
     """A curator's declared placement for a feed replaces the seed's: one
     placement at the given level and place, which must be an expanded place.
-    Judged against the coverage the feed has now: its placements, its
-    crawl's status and measured fields, and the evidence of every edge the
-    crawl measured (``crawled`` is the measured edges by key). Returns the
-    count applied and the canonical ids of the feeds curated."""
+    An entry for a feed this build does not hold is another build's when its
+    place may be (:func:`overrides.elsewhere`, ``own_ids`` for a registry
+    build), and skipped. Judged against the coverage the feed has now: its
+    placements, its crawl's status and measured fields, and the evidence of
+    every edge the crawl measured (``crawled`` is the measured edges by key).
+    Returns the count applied and the canonical ids of the feeds curated."""
     refs = _canonical_ids(feeds)
     # Seed placements carry pre-resolution ids: canonicalise them too, so a
     # renamed feed's old placement is the one replaced, never a second one.
@@ -756,11 +783,15 @@ def _set_coverage(
     applied = 0
     curated = set()
     targets = {}
+    entries = {}
     for ref, entry in feed_overrides.items():
         if "set_coverage" not in entry:
             continue
         feed_id = refs.get(ref)
         if feed_id is None:
+            place_id = entry["set_coverage"]["place_id"]
+            if overrides.elsewhere(place_id, own_ids=own_ids):
+                continue
             raise overrides.OverrideError(f"feed {ref!r}: set_coverage names no feed")
         if feed_id in targets:
             # Two references to one feed (an alias and its id): neither wins.
@@ -769,10 +800,9 @@ def _set_coverage(
                 f"{targets[feed_id]!r}"
             )
         targets[feed_id] = ref
-    for ref, entry in feed_overrides.items():
-        spec = entry.get("set_coverage")
-        if spec is None:
-            continue
+        entries[ref] = entry
+    for ref, entry in entries.items():
+        spec = entry["set_coverage"]
         feed_id = refs[ref]
         if feed_id in linked:
             raise overrides.OverrideError(
@@ -862,9 +892,13 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             overrides.expect_digest(
                 resolve_manifest.get("feeds_resolve_sha256"),
                 overrides.phase_digest(feed_overrides, overrides.RESOLVE_OPERATIONS),
-                "feeds.yaml (identity and crawlability)",
+                "feeds.yaml (identity, access and crawlability)",
                 "resolve",
             )
+            own_ids = registry is not None
+            elsewhere = _placed_elsewhere(feeds, places, feed_overrides, own_ids)
+            feeds = [feed for feed in feeds if feed["feed_id"] not in elsewhere]
+            placements = [p for p in placements if p["feed_id"] not in elsewhere]
 
             crawled_by_key = {}
             crawl_report = {
@@ -920,7 +954,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                             "the boundary lookup cannot answer the crawled "
                             "stops; run the expand stage first"
                         ) from error
-                    crawl_report["unmatched_crawl_ids"] = sorted(unmatched)
+                    crawl_report["unmatched_crawl_ids"] = sorted(unmatched - elsewhere)
             finally:
                 crawl_lock.__exit__(None, None, None)
                 if opened_lookup is not None:
@@ -936,6 +970,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 override_report,
                 crawled_by_key,
                 crawl_report["crawl_fields"],
+                own_ids,
             )
             superseded = crawl_report["superseded"] - curated
             edges, unknown_places, unmatched_feeds, unknown_levels = declared_edges(
@@ -985,6 +1020,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "feeds": len(feeds),
                 "feeds_covered": len(covered),
                 "folded_feeds": dict(sorted(folded.items())),
+                "feeds_placed_elsewhere": sorted(elsewhere),
                 "near_duplicate_groups": len(near),
                 "feeds_contained": len(contained),
                 "containment_rules": dict(sorted(contained.items())),

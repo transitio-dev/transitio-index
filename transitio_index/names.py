@@ -8,11 +8,13 @@ Wikidata's multilingual ``mul`` and its country's languages, by the reader's
 rule. An own-language Wikidata label Overture replaced in ``names`` joins them,
 and the place's own name is removed. Wikidata is queried once per build via the
 ``wbgetentities`` API; a curator's ``set_aliases`` additions are applied here,
-after the Wikidata merge, and are not filtered.
+after the Wikidata merge, and are not filtered. A place still without a
+``centre`` takes its Wikidata coordinates (P625, CC0) inside its boundary.
 """
 
 import datetime
 
+import shapely
 from transitio.index.places import _own_language
 
 from transitio_index import overrides, overture, store
@@ -41,6 +43,36 @@ def _merge(place, entry):
     )
     existing = set(place.get("aliases") or [])
     place["aliases"] = sorted((existing | own) - {name})
+
+
+def fill_centres(places, qids, wikidata):
+    """Give each place of ``places`` (by key) without a ``centre`` the first
+    Wikidata coordinate location of its QID (``qids``, by key) that its
+    geometry covers, or the first for a place without geometry, as WKB hex.
+    One query; returns how many were filled."""
+    wanted = {
+        key: qid
+        for key, qid in qids.items()
+        if overture.QID_PATTERN.match(qid) and not places[key].get("centre")
+    }
+    found = wikidata.coordinates(sorted(set(wanted.values()))) if wanted else {}
+    pairs = [
+        (key, value) for key, qid in wanted.items() for value in found.get(qid, ())
+    ]
+    if not pairs:
+        return 0
+    keys = [key for key, _ in pairs]
+    points = shapely.points([value for _, value in pairs])
+    areas = shapely.from_wkb(
+        [places[key].get("geometry") for key in keys], on_invalid="ignore"
+    )
+    inside = shapely.is_missing(areas) | shapely.covers(areas, points)
+    filled = 0
+    for key, wkb, ok in zip(keys, shapely.to_wkb(points), inside):
+        if ok and not places[key].get("centre"):
+            places[key]["centre"] = wkb.hex()
+            filled += 1
+    return filled
 
 
 def _set_aliases(places, entries, report):
@@ -111,6 +143,9 @@ def merge_names(
                     continue
                 _merge(place, entry)
                 enriched += 1
+            from_wikidata = fill_centres(
+                {p["place_id"]: p for p in places}, qid_of, wikidata
+            )
             place_overrides, places_digest = overrides.load_place_overrides(
                 overrides_dir, registry=registry
             )
@@ -142,6 +177,8 @@ def merge_names(
                 ),
                 "places": len(places),
                 "enriched": enriched,
+                "centres": sum(bool(p.get("centre")) for p in places),
+                "centres_from_wikidata": from_wikidata,
                 "places_overrides_sha256": places_digest,
                 "overrides_applied": applied,
                 "stale_overrides": len(override_report),

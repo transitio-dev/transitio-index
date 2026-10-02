@@ -1249,6 +1249,137 @@ def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
     assert sorted(s["feed_id"] for s in systems) == ["f-gbfs-s", "f-gbfs-t"]
 
 
+def test_curated_feeds_join_the_builds_of_their_country(tmp_path):
+    import yaml
+
+    from transitio_index import atlas, crawl, overrides, resolve
+
+    cache = tmp_path / "cache"
+    taken = {"id": "f-curated-taken", "spec": "gtfs", "urls": {}}
+    atlas.ingest(cache, archive=atlas_archive(tmp_path, [taken]), commit="a" * 40)
+    row = {"id": "mdb-1", "data_type": "gtfs", "location.country_code": "AR"}
+    mdb.ingest(cache, csv_path=_write(tmp_path / "m.csv", mdb_csv(row)))
+    ingest_gbfs(cache, tmp_path)
+    url = "https://api.example.org/feed-gtfs"
+    pair = {"client_id": "client_id", "client_secret": "client_secret"}
+    directory = tmp_path / "overrides"
+    directory.mkdir()
+    (directory / overrides.ACCESS_PROVIDERS_FILE).write_text(
+        yaml.safe_dump(
+            [
+                {
+                    "provider_id": "gcba",
+                    "name": "GCBA",
+                    "registration_url": "https://register.example/",
+                    "credential_fields": sorted(pair),
+                    "crawl_approved": False,
+                }
+            ]
+        )
+    )
+
+    def write(*entries):
+        feeds = [
+            {
+                "feed": ref,
+                "add_feed": {
+                    "name": ref,
+                    "url": url,
+                    "spec": "gtfs",
+                    "license": {"url": "https://api.example.org/terms"},
+                    "location": {"country_code": country, "municipality": "X"},
+                    **access,
+                },
+            }
+            for ref, country, access in entries
+        ]
+        (directory / "feeds.yaml").write_text(yaml.safe_dump(feeds))
+        return directory
+
+    key = {
+        "access": "key",
+        "registration_url": "https://register.example/",
+        "access_provider": "gcba",
+        "auth_method": "query_param",
+        "auth_params": pair,
+    }
+    gcba = ("f-curated-gcba", "AR", key)
+    manifest = crosswalk.crosswalk(
+        cache, overrides_dir=write(gcba, ("f-curated-muni", "US", {}))
+    )
+    # Only the feed of a country this build's catalogues declare joins.
+    assert manifest["feeds_by_source"] == {"atlas": 1, "mdb": 1, "curated": 1}
+    entries, _ = overrides.load_feed_overrides(directory)
+    added = overrides.phase_digest(entries, overrides.CROSSWALK_OPERATIONS)
+    assert manifest["feeds_add_sha256"] == added
+    resolve.resolve(cache, overrides_dir=directory)
+    feeds, _ = store.read_jsonl(
+        cache / "resolve", "feeds_resolved.json", "feeds_resolved.jsonl"
+    )
+    feed = by_feed_id(feeds)["f-curated-gcba"]
+    assert (feed["source"], crawl.feed_url(feed)) == ("curated", url)
+    assert crosswalk.declared_location(feed) == {
+        "country_code": "AR",
+        "subdivision_name": None,
+        "municipality": "X",
+    }
+    assert crosswalk.declared_countries(feed) == ["AR"]
+    fields = ("access_provider", "auth_method", "auth_params", "registration_url")
+    assert [feed[field] for field in fields] == [
+        "gcba",
+        "query_param",
+        pair,
+        "https://register.example/",
+    ]
+    assert feed["uncrawlable_reason"] == resolve.AUTH_REASON
+    # An add_feed edited since the crosswalk applied it is refused.
+    write(gcba)
+    with pytest.raises(overrides.OverrideError, match="re-run the crosswalk"):
+        resolve.resolve(cache, overrides_dir=directory)
+    # So is an id a catalogue feed already uses, as its id or an alias.
+    write(("f-curated-taken", "AR", {}))
+    with pytest.raises(crosswalk.CrosswalkError, match="'f-curated-taken'"):
+        crosswalk.crosswalk(cache, overrides_dir=directory)
+    aliased = {
+        "feed_id": "f-a",
+        "aliases": ["f-curated-taken"],
+        "mdb": {"location": {"country_code": "AR"}},
+    }
+    curated = crosswalk.curated_records(
+        overrides.load_feed_overrides(directory)[0], [aliased]
+    )
+    with pytest.raises(crosswalk.CrosswalkError, match="'f-curated-taken'"):
+        crosswalk._require_unique_namespace([aliased, *curated])
+
+
+@pytest.mark.parametrize(
+    "sources, refused",
+    [
+        ([("feeds", "curated"), ("feeds", "mdb")], True),
+        ([("feeds", "curated"), ("realtime", "atlas")], True),
+        ([("feeds", "curated"), ("feeds", "curated")], False),
+    ],
+)
+def test_the_merge_refuses_a_curated_id_another_build_lists(sources, refused):
+    # A build checks a curated id against its own catalogue cut only.
+    pa = pytest.importorskip("pyarrow")
+    from transitio_index import merge
+
+    loaded = [
+        {
+            "tables": {
+                f"{name}.parquet": pa.table({"feed_id": ["f-curated-x"], "source": [s]})
+            }
+        }
+        for name, s in sources
+    ]
+    if refused:
+        with pytest.raises(merge.MergeError, match="f-curated-x"):
+            merge._refuse_curated_clashes(loaded)
+    else:
+        merge._refuse_curated_clashes(loaded)
+
+
 @pytest.mark.parametrize("systems", [(), ({"System ID": "s"},)])
 def test_only_empty_catalogues_crosswalk_to_no_feeds(tmp_path, systems):
     from transitio_index import atlas, publish

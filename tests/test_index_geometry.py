@@ -193,6 +193,34 @@ def test_a_null_source_is_denied_not_crashing():
     assert geometry._is_shippable([osm, None]) is False
 
 
+INSIDE = shapely.to_wkb(shapely.Point(25.0, 60.2)).hex()
+OUTSIDE = shapely.to_wkb(shapely.Point(26.0, 60.2)).hex()
+
+
+@pytest.mark.parametrize(
+    "centre, sources, area, kept",
+    [
+        (INSIDE, [_osm()], BOX, True),
+        (OUTSIDE, [_osm()], BOX, False),
+        (INSIDE, [_osm(), _osm("proprietary")], BOX, False),
+        (OUTSIDE, [_osm()], None, True),
+        (INSIDE, None, BOX, True),
+        (BOX.hex(), None, BOX, False),
+    ],
+    ids=["inside", "outside", "unlicensed", "no-geometry", "no-sources", "polygon"],
+)
+def test_settle_centres_keeps_a_licensed_point_inside_the_boundary(
+    centre, sources, area, kept
+):
+    geom = area.hex() if area else None
+    place = {"centre": centre, "centre_sources": sources, "geometry": geom}
+    shipped = set()
+    assert geometry.settle_centres([place], shipped) == kept
+    assert place == {"centre": centre if kept else None, "geometry": geom}
+    credited = {("OpenStreetMap", "ODbL-1.0")} if kept and sources else set()
+    assert shipped == credited
+
+
 def test_a_metro_and_an_arealess_place_have_no_geometry(tmp_path):
     _, places, _ = _run(tmp_path)
     assert places["Q_METRO"]["geometry"] is None

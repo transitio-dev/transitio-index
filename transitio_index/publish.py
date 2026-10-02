@@ -1,6 +1,6 @@
 """Publish stage: the feeds, places and membership edges as a shippable index.
 
-Writes ``<cache>/index/`` as a directory of partitions (schema 10): under each
+Writes ``<cache>/index/`` as a directory of partitions (schema 11): under each
 country code ``feeds.parquet`` (one row per GTFS feed whose home country it
 is), ``realtime.parquet`` (the GTFS-RT companions of those feeds),
 ``places.parquet`` (one row per place there, a GeoParquet with the simplified
@@ -19,7 +19,13 @@ names one. Places and edges are optional: an index built before those stages
 ran is feeds only, and the reader treats the missing tables the same way.
 
 Each feed carries the first and last date its services run and each place
-the windows over which its feeds' spans overlap (schema 9).
+the windows over which its feeds' spans overlap (schema 9). From schema 11 a
+feed carries the URL the crawl reads and its access details, a place its
+centre point and its urban centre's population, and
+``access_providers.parquet`` at the root lists the providers whose
+credentials the feeds take. A curated feed's ``atlas`` block holds its
+licence only, in the Atlas shape, so the NOTICE and the reader read it as an
+Atlas licence.
 The feeds table is GTFS only and every edge belongs to a GTFS feed: a GTFS-RT
 feed describes the vehicles of a static feed and has no places of its own, so
 it ships as a companion row keyed by ``static_feed_id``, and each static feed
@@ -45,14 +51,14 @@ import pyarrow.parquet as pq
 
 from transitio.index import fingerprint
 
-from transitio_index import overture
+from transitio_index import crawl, overture
 from transitio_index import registry as _registry
 from transitio_index import store
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 # The reader release that first reads this schema; the installed reader's own
 # floor table wins once it knows the version.
-MIN_READER_VERSION = "0.15.0"
+MIN_READER_VERSION = "0.19.0"
 # The edge generations that carry curation (curate, and rank on top of it).
 FINAL_SOURCES = ("curate", "rank")
 FEEDS_FILE = "feeds.parquet"
@@ -63,6 +69,8 @@ STATIC_SPEC = "gtfs"
 REALTIME_SPEC = "gtfs-rt"
 SNAPSHOT_FILE = "snapshot.json"
 NOTICE_FILE = "NOTICE"
+# Schema 11: the providers the feeds name, one table at the index root.
+ACCESS_PROVIDERS_FILE = "access_providers.parquet"
 # The index is a directory of partitions (schema_version 7, realtime tables
 # from 8): one per country
 # code holding the feeds whose home country it is, its places and their
@@ -77,6 +85,7 @@ TABLE_FILES = {
     "realtime": REALTIME_FILE,
     "places": PLACES_FILE,
     "edges": EDGES_FILE,
+    "access_providers": ACCESS_PROVIDERS_FILE,
 }
 
 
@@ -132,6 +141,14 @@ _SCHEMA = pa.schema(
         # The larger feeds whose stops and routes contain this feed's
         # (schema_version 10). Set by the coverage stage.
         ("contained_in", pa.list_(pa.string())),
+        # The URL the crawl reads and how to get the feed's credentials
+        # (schema_version 11); ``auth_params`` is a JSON object.
+        ("download_url", pa.string()),
+        ("access", pa.string()),
+        ("access_provider", pa.string()),
+        ("auth_method", pa.string()),
+        ("auth_params", pa.string()),
+        ("registration_url", pa.string()),
         ("snapshot", pa.string()),
     ]
 )
@@ -188,7 +205,7 @@ def _row(record, snapshot_id):
         "crosswalk_confidence": record["crosswalk_confidence"],
         "static_feed_id": record.get("static_feed_id"),
         "static_link_method": record.get("static_link_method"),
-        "atlas": _json_block(record.get("atlas")),
+        "atlas": _json_block(record.get("atlas") or _curated_atlas(record)),
         "mdb": _json_block(record.get("mdb")),
         "crawlable": record.get("crawlable"),
         "uncrawlable_reason": record.get("uncrawlable_reason"),
@@ -209,8 +226,20 @@ def _row(record, snapshot_id):
         "service_start": span[0].isoformat() if span else None,
         "service_end": span[1].isoformat() if span else None,
         "contained_in": record.get("contained_in") or [],
+        "download_url": crawl.feed_url(record),
+        "access": record.get("access"),
+        "access_provider": record.get("access_provider"),
+        "auth_method": record.get("auth_method"),
+        "auth_params": _json_block(record.get("auth_params")),
+        "registration_url": record.get("registration_url"),
         "snapshot": snapshot_id,
     }
+
+
+def _curated_atlas(record):
+    """A curated feed's licence as an Atlas block; None for another feed."""
+    curated = record.get("curated")
+    return None if curated is None else {"license": curated["license"]}
 
 
 def service_span(record):
@@ -396,6 +425,8 @@ def _place_row(record, snapshot_id, service=None, identity=None, validity=None):
         "geonames_id": record.get("geonames_id"),
         "geometry_source": record.get("geometry_source"),
         "snapshot": snapshot_id,
+        "centre": _wkb(record.get("centre")),
+        "population": record.get("population"),
     }
 
 
@@ -524,13 +555,18 @@ _PLACES_SCHEMA = pa.schema(
         ("former_ids", pa.list_(pa.string())),
         # Schema 9: the validity of the place's feeds and their overlap.
         ("validity", pa.string()),
+        # Schema 11: a point inside the boundary, and the population of the
+        # GHS-UCDB urban centre the place is.
+        ("centre", pa.binary()),
+        ("population", pa.int64()),
         ("geometry", pa.binary()),
     ]
 )
 
 
 def _geo_metadata():
-    """The GeoParquet ``geo`` metadata so a reader treats geometry as WKB."""
+    """The GeoParquet ``geo`` metadata so a reader treats the boundary and the
+    centre as WKB."""
     import pyproj
 
     crs = json.loads(pyproj.CRS.from_epsg(4326).to_json())
@@ -539,7 +575,8 @@ def _geo_metadata():
             "version": "1.0.0",
             "primary_column": "geometry",
             "columns": {
-                "geometry": {"encoding": "WKB", "geometry_types": [], "crs": crs}
+                "geometry": {"encoding": "WKB", "geometry_types": [], "crs": crs},
+                "centre": {"encoding": "WKB", "geometry_types": ["Point"], "crs": crs},
             },
         }
     ).encode("utf-8")
@@ -737,6 +774,38 @@ def _edge_row(record, snapshot_id):
 
 _LINKS_SCHEMA = _EDGES_SCHEMA.append(pa.field("feed_partition", pa.string()))
 
+# A provider of feed credentials as the reader shows it; its URL prefixes and
+# crawl approval stay internal.
+_ACCESS_PROVIDERS_SCHEMA = pa.schema(
+    [
+        ("provider_id", pa.string()),
+        ("name", pa.string()),
+        ("registration_url", pa.string()),
+        ("docs_url", pa.string()),
+        ("terms_url", pa.string()),
+        ("credential_fields", pa.list_(pa.string())),
+        ("free", pa.bool_()),
+    ]
+)
+
+
+def _provider_row(provider, snapshot_id=None):
+    return {name: provider[name] for name in _ACCESS_PROVIDERS_SCHEMA.names}
+
+
+def _access_providers(providers, records):
+    """The published rows of the ``providers`` (by id) the feed ``records``
+    name, in id order; a feed naming one the file lacks is an integrity
+    error."""
+    named = {record.get("access_provider") for record in records} - {None}
+    unknown = sorted(named - set(providers))
+    if unknown:
+        raise PublishError(
+            f"feeds name access providers access_providers.yaml lacks: {unknown}; "
+            "re-run the resolve stage"
+        )
+    return [_provider_row(providers[provider_id]) for provider_id in sorted(named)]
+
 
 def _edges_parquet_bytes(edges, snapshot_id, links=False):
     rows = [_edge_row(record, snapshot_id) for record in edges]
@@ -838,7 +907,8 @@ def _partition_tables(partitions, snapshot_id, service, identities, validity=Non
 def _write_partitions(directory, files, listing):
     """Write every partition table under ``directory`` after dropping the
     tables and partitions this build lacks — and the flat tables of the
-    layout before schema 7 — so nothing lingers from an earlier build."""
+    layout before schema 7 — so nothing lingers from an earlier build. A
+    table under the partition ``None`` is written at the root."""
     for name in sorted(directory.listdir()):
         if name.startswith("."):
             continue
@@ -856,6 +926,9 @@ def _write_partitions(directory, files, listing):
         elif name in TABLE_FILES.values():
             directory.unlink(name)
     for (name, table), data in files.items():
+        if name is None:
+            store.write_bytes(directory, TABLE_FILES[table], data)
+            continue
         child = directory.child(name)
         try:
             store.write_bytes(child, TABLE_FILES[table], data)
@@ -1226,6 +1299,7 @@ def read_inputs(cache_dir, overrides_dir):
     )
     if not records and not places:
         raise PublishError("no feeds to publish")
+    providers = _read_providers(overrides_dir, resolve_manifest)
     generations, leaves = _generations(
         cache_dir, coverage, resolve_manifest, places_manifest
     )
@@ -1280,6 +1354,7 @@ def read_inputs(cache_dir, overrides_dir):
         "override_digest": override_digest,
         "resolved": resolved,
         "resolve_manifest": resolve_manifest,
+        "providers": providers,
         "sources": sources,
         "places": places,
         "overture_release": overture_release,
@@ -1288,6 +1363,33 @@ def read_inputs(cache_dir, overrides_dir):
         "generations": generations,
         "leaves": leaves,
     }
+
+
+def _read_providers(overrides_dir, resolve_manifest):
+    """The accepted ``access_providers.yaml`` entries by id. The file must
+    be the one the resolve stage applied: one no resolve generation applied
+    is a stage that has not run, and a resolve generation that predates the
+    file settled no feed's provider."""
+    from transitio_index import overrides
+
+    if resolve_manifest is not None and "access_providers_sha256" not in (
+        resolve_manifest
+    ):
+        raise PublishError(
+            "the resolve generation predates access providers; re-run the resolve "
+            "stage"
+        )
+    try:
+        providers, _, digest = overrides.load_access_providers(overrides_dir)
+        overrides.expect_digest(
+            (resolve_manifest or {}).get("access_providers_sha256"),
+            digest,
+            overrides.ACCESS_PROVIDERS_FILE,
+            "resolve",
+        )
+    except overrides.OverrideError as error:
+        raise PublishError(str(error)) from error
+    return providers
 
 
 def _read_licensed(cache_dir, inputs):
@@ -1407,9 +1509,6 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
     publish can therefore only ever see a new Parquet with the old manifest — a
     digest mismatch it refuses — never a mismatched pair read as valid.
     """
-    # The coverage generation supersedes the crosswalk as the feed source: its
-    # feeds carry coverage_source and crawlability, and its edges ship alongside.
-    from transitio_index import crawl
     from transitio import __version__ as built_with
     from transitio.index import DISCOVERY_SEMANTICS_VERSION, MIN_READER_VERSIONS
 
@@ -1435,6 +1534,7 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
         # feeds and their edges are gated, digested, counted and partitioned.
         records, realtime = split_specs(inputs["records"])
         edges = static_edges(inputs["edges"], realtime)
+        providers = _access_providers(inputs["providers"], records)
         coverage = inputs["coverage"]
         override_digest = inputs["override_digest"]
         resolved = inputs["resolved"]
@@ -1480,6 +1580,7 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
         if licensed is not None:
             # The NOTICE ships too: a corrected attribution is a new snapshot.
             digests.append(hashlib.sha256(licensed).hexdigest())
+        digests.append(_content_digest(providers))
         snapshot_id = _snapshot_id(sources, overture_release, digests)
         partitions = partition(records, places, edges, realtime)
         files, listing = _partition_tables(
@@ -1489,8 +1590,12 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             identities,
             _validity_by_place(edges, records),
         )
+        files[(None, "access_providers")] = _parquet_bytes(
+            providers, snapshot_id, _provider_row, _ACCESS_PROVIDERS_SCHEMA
+        )
         counts = _counts(records, realtime)
         counts["feeds_dated"] = sum(1 for r in records if service_span(r))
+        counts["access_providers"] = len(providers)
         manifest = {
             "schema_version": SCHEMA_VERSION,
             # The snapshot pins the data; the discovery semantics and the
@@ -1508,6 +1613,10 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             # Every partition's tables with their row counts and digests: the
             # reader checks each file against these.
             "partitions": listing,
+            # The root providers table, which the listing does not carry.
+            "access_providers_sha256": hashlib.sha256(
+                files[(None, "access_providers")]
+            ).hexdigest(),
             # The stage generations this index was built from, by pointer,
             # the leaf that produced each table, and the override files
             # applied, so a release can check they are all still current.
@@ -1518,6 +1627,9 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             ).get("feeds_overrides_sha256"),
             "places_overrides_sha256": (places_manifest or {}).get(
                 "places_overrides_sha256"
+            ),
+            "access_providers_overrides_sha256": (resolve_manifest or {}).get(
+                "access_providers_sha256"
             ),
             # The crawl the edges and expanded places were measured against.
             "crawl_digest": crawl.states_digest(cache_dir),
@@ -1609,6 +1721,14 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
                 (places_manifest or {}).get("places_overrides_sha256"),
                 overrides.places_digest,
                 "gazetteer",
+            )
+        )
+        checks.append(
+            (
+                overrides.ACCESS_PROVIDERS_FILE,
+                (resolve_manifest or {}).get("access_providers_sha256"),
+                overrides.access_providers_digest,
+                "resolve",
             )
         )
 

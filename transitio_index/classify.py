@@ -62,6 +62,7 @@ import statistics
 
 from transitio.index import fingerprint
 from transitio_index import coverage, crawl, overrides, store
+from transitio_index.crosswalk import declared_countries
 from transitio_index.progress import progress
 
 CLASSIFY_POINTER = "edges.json"
@@ -791,17 +792,6 @@ def _stop_artefacts(stop_countries, border=0):
         "stops_without_country": sum(1 for c in stop_countries.values() if not c),
         "border_stops": border,
     }
-
-
-def declared_countries(feed):
-    """The country codes the catalogues claim for ``feed`` — MDB
-    ``location.country_code``, GBFS ``country_code``; Atlas records carry
-    none — upper-cased and sorted."""
-    codes = {
-        ((feed.get("mdb") or {}).get("location") or {}).get("country_code"),
-        (feed.get("gbfs") or {}).get("country_code"),
-    }
-    return sorted(code.strip().upper() for code in codes if code and code.strip())
 
 
 def feed_scope(country_stops, declared):

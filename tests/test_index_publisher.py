@@ -30,15 +30,15 @@ from transitio.index import release as contract  # noqa: E402
 
 
 def _expected_members(index_dir):
-    """The release members a partitioned index packs: the snapshot, every
-    partition table it lists, the NOTICE."""
+    """The release members a partitioned index packs: the snapshot, the
+    providers table, every partition table it lists, the NOTICE."""
     snapshot = json.loads((index_dir / "snapshot.json").read_text())
     tables = [
         f"{part}/{table}.parquet"
         for part, listed in sorted(snapshot["partitions"].items())
         for table in sorted(listed)
     ]
-    return ["snapshot.json", *tables, "NOTICE"]
+    return ["snapshot.json", "access_providers.parquet", *tables, "NOTICE"]
 
 
 def _index(tmp_path):
@@ -339,17 +339,22 @@ def test_releases_are_ordered_by_publication_not_commit_time():
     assert manifest["snapshot_id"] == "0000000000000002"
 
 
-def test_overrides_edited_after_the_build_are_not_released(tmp_path):
+@pytest.mark.parametrize(
+    "name, text",
+    [
+        ("edges.yaml", "- feed: f-a\n  place: Q1757\n  remove_edge: true\n"),
+        ("access_providers.yaml", "[]\n"),
+    ],
+)
+def test_overrides_edited_after_the_build_are_not_released(tmp_path, name, text):
     from test_index_place_overrides import write_overrides
 
     index_dir = _index(tmp_path)
     cache = index_dir.parent
     publisher.pack(index_dir, cache_dir=cache, overrides_dir=None)
     edited = write_overrides(tmp_path)
-    (edited / "edges.yaml").write_text(
-        "- feed: f-a\n  place: Q1757\n  remove_edge: true\n"
-    )
-    with pytest.raises(publisher.PublishIndexError, match="edges.yaml is not the one"):
+    (edited / name).write_text(text)
+    with pytest.raises(publisher.PublishIndexError, match=f"{name} is not the one"):
         publisher.pack(index_dir, cache_dir=cache, overrides_dir=edited)
 
 
