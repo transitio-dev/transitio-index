@@ -30,3 +30,14 @@
   url_prefixes: ["https://opendata.samtrafiken.se/gtfs-sweden/"]
   free: true
   crawl_approved: false
+
+# One 511.org key serves every operator's feed under the transit API.
+- provider_id: mtc-511
+  name: 511 SF Bay (Metropolitan Transportation Commission)
+  registration_url: https://511.org/open-data/token
+  docs_url: https://511.org/open-data/transit
+  terms_url: https://511.org/sites/default/files/pdfs/511_Data_Agreement_Final.pdf
+  credential_fields: [api_key]
+  url_prefixes: ["https://api.511.org/transit/"]
+  free: null
+  crawl_approved: false
