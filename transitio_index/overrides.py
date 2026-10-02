@@ -428,7 +428,15 @@ _PROVIDER_REQUIRED = frozenset(
     {"provider_id", "name", "registration_url", "credential_fields", "crawl_approved"}
 )
 _PROVIDER_OPTIONAL = frozenset(
-    {"docs_url", "terms_url", "url_prefixes", "free", "terms_checked", "terms_note"}
+    {
+        "docs_url",
+        "terms_url",
+        "url_prefixes",
+        "free",
+        "terms_checked",
+        "terms_note",
+        "crawl_budget",
+    }
 )
 
 
@@ -543,6 +551,9 @@ def _provider(entry):
         raise OverrideError("terms_note must be a non-empty string")
     if approved and (checked is None or note is None):
         raise OverrideError("crawl_approved needs terms_checked and terms_note")
+    budget = entry.get("crawl_budget")
+    if budget is not None and (type(budget) is not int or budget < 1):
+        raise OverrideError("crawl_budget must be a whole number of at least 1")
     canonical = set()
     for _, host, port, segments in scopes:
         host = f"[{host}]" if ":" in host else host
@@ -557,6 +568,7 @@ def _provider(entry):
         "crawl_approved": approved,
         "terms_checked": checked,
         "terms_note": note,
+        "crawl_budget": budget,
     }
 
 
@@ -570,8 +582,9 @@ def load_access_providers(overrides_dir):
     unique in the file), ``name``, ``registration_url``, the
     ``credential_fields`` its accounts issue (``key``, ``client_id``) and
     ``crawl_approved``; optionally ``docs_url``, ``terms_url``, ``free``,
-    ``url_prefixes`` (the https URLs under which it claims feeds) and the
-    ``terms_checked`` date with a ``terms_note``, which an approval needs.
+    ``url_prefixes`` (the https URLs under which it claims feeds), the
+    ``terms_checked`` date with a ``terms_note``, which an approval needs,
+    and ``crawl_budget``, the keyed requests a month the crawl may make.
     An entry breaking these rules is refused; two providers whose prefixes
     cover one URL are a build error.
     """

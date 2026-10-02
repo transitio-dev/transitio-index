@@ -187,8 +187,16 @@ request. The key goes over https alone, for a URL under the provider's
 `TRANSITIO_INDEX_CREDENTIALS` names, else from transitio's own credentials
 file. The crawl log is masked of every secret and says, per key-flagged
 feed, how its key was used (`key_crawl`; the summary counts them in
-`by_key_crawl`). Data read with a key are refreshed with each index release,
-on a best-effort basis; there is no separate weekly rebuild.
+`by_key_crawl`; the build statistics count them per provider). A provider's
+optional `crawl_budget` caps its keyed requests per calendar month (UTC),
+redirects and retries included, across every run on the machine; the tally is
+`key_requests.json` in the user state directory, or the file
+`TRANSITIO_INDEX_KEY_USAGE` names. Keyed reads run one at a time, after every
+keyless read, in feed order, and a 401 stops a provider's key for the rest of
+the run. A keyed read whose provider
+no longer approves it, or no longer serves the feed, is removed at the next
+crawl. Data read with a key are refreshed with each index release, on a
+best-effort basis; there is no separate weekly rebuild.
 
 ### A small sample end to end
 

@@ -30,7 +30,8 @@ from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host, _mint_md
 
 STATS_POINTER = "stats.json"
 # The shape of the stats artifacts; the aggregation script refuses a mismatch.
-STATS_SCHEMA_VERSION = 4  # 2: the realtime section; 3: validity; 4: hosted copies
+# 2: the realtime section; 3: validity; 4: hosted copies; 5: keyed crawls
+STATS_SCHEMA_VERSION = 5
 # A partition of the published index: a country code, international or links.
 PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 # The tables a partition kind may carry; a country partition any of them.
@@ -533,6 +534,10 @@ FEED_SCHEMA = pa.schema(
         ("failure_class", pa.string()),
         # The producer link's host when the crawl read the MDB-hosted copy.
         ("hosted_copy_host", pa.string()),
+        # How a key-flagged feed's crawl used the maintainer's key, and the
+        # provider the feed is bound to.
+        ("key_crawl", pa.string()),
+        ("access_provider", pa.string()),
         ("stop_count", pa.int64()),
         ("route_count", pa.int64()),
         ("has_calendar", pa.bool_()),
@@ -715,6 +720,8 @@ def feed_rows(
                     if record and record.get("fetched_from") == crawl.HOSTED_COPY
                     else None
                 ),
+                "key_crawl": (record or {}).get("key_crawl"),
+                "access_provider": feed.get("access_provider"),
                 "stop_count": feed.get("stop_count"),
                 "route_count": (record or {}).get("route_count"),
                 "has_calendar": bool(files & {"calendar.txt", "calendar_dates.txt"}),
@@ -870,6 +877,10 @@ def feed_sections(rows):
     by_status = collections.defaultdict(collections.Counter)
     for r in crawled:
         by_status[r["catalogue_status"] or "unknown"][r["crawl_outcome"]] += 1
+    by_provider = collections.defaultdict(collections.Counter)
+    for r in rows:
+        if r.get("key_crawl"):
+            by_provider[r.get("access_provider") or "none"][r["key_crawl"]] += 1
     return {
         "availability": {
             "feeds": len(rows),
@@ -877,6 +888,9 @@ def feed_sections(rows):
             "by_outcome": counts("crawl_outcome"),
             "failures_by_class": counts("failure_class"),
             "hosted_copy_by_host": counts("hosted_copy_host"),
+            "key_crawl_by_provider": {
+                provider: dict(c) for provider, c in sorted(by_provider.items())
+            },
             "outcome_by_catalogue_status": {
                 status: dict(c) for status, c in sorted(by_status.items())
             },

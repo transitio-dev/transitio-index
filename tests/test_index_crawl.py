@@ -1233,9 +1233,10 @@ APPROVED["url_prefixes"] = [A + "/"]
 
 @pytest.fixture(autouse=True)
 def _no_maintainer_keys(tmp_path, monkeypatch):
-    """No test reads the maintainer's own credentials."""
+    """No test reads the maintainer's own credentials or request tally."""
     for name in [n for n in os.environ if n.startswith("TRANSITIO_KEY_")]:
         monkeypatch.delenv(name)
+    monkeypatch.setenv(keys.USAGE, str(tmp_path / "state" / "key_requests.json"))
     if sys.platform != "win32":
         path = tmp_path / "credentials.toml"
         path.write_text("")
@@ -1367,8 +1368,12 @@ def test_a_maintainer_key_reaches_only_the_access_origin(
         ("unclaimed", "not_claimed", False, None),
         # A cache read without the key is read afresh with it, not reused.
         ("was-keyless", "read", True, "p"),
+        # An earlier keyed read is removed once its provider no longer serves
+        # the feed, and a rebound feed is read under its new provider.
         ("unbound", "no_provider", False, None),
         ("unapproved", "not_approved", False, None),
+        ("rebound", "read", True, "q"),
+        ("gone", None, False, None),
         ("no-keys", "no_credentials", False, "p"),
         ("environment", "read", True, "p"),
         pytest.param("file", "read", True, "p", marks=NO_FILE),
@@ -1388,10 +1393,19 @@ def test_a_key_crawl_needs_an_approved_provider_and_credentials(
         answers[HOSTED] = _answer(keyed=False)
     entries = {"p": {"url_prefixes": [A + "/other/"]} if case == "unclaimed" else {}}
     monkeypatch.setenv("TRANSITIO_KEY_P__KEY", SENTINEL)
+    monkeypatch.setenv("TRANSITIO_KEY_Q__KEY", SENTINEL)
     if case == "was-keyless":
         _publish_resolved(cache, [feed])
         _crawl(cache, _key_server({FEED: _answer(keyed=False, etag='"v1"')}))
-    if case in ("keys-off", "no-keys", "reflected"):
+    if case in (
+        "keys-off",
+        "no-keys",
+        "reflected",
+        "unbound",
+        "unapproved",
+        "rebound",
+        "gone",
+    ):
         # An earlier crawl read the feed with p's key.
         overrides_dir = _providers(tmp_path, **entries)
         _publish_resolved(cache, [feed], overrides_dir)
@@ -1399,24 +1413,36 @@ def test_a_key_crawl_needs_an_approved_provider_and_credentials(
     if case == "reflected":
         changed = _zip_bytes(_members(stops=TWO_STOPS))
         answers[FEED] = _answer(etag=f'"{SENTINEL}"', data=changed)
-    feed["access_provider"] = {"unbound": None}.get(case, "p")
+    feed["access_provider"] = {"unbound": None, "rebound": "q"}.get(case, "p")
     if case == "unapproved":
         entries["p"] = {"crawl_approved": False}
+    if case == "rebound":
+        entries = {"p": {"url_prefixes": [B + "/"]}, "q": {}}
     if case in ("no-keys", "file", "malformed"):
         monkeypatch.delenv("TRANSITIO_KEY_P__KEY")
         text = f'[p]\nkey = "{SENTINEL}"\n' if case == "file" else "[p\n"
         (tmp_path / "credentials.toml").write_text("" if case == "no-keys" else text)
     overrides_dir = None if case == "keys-off" else _providers(tmp_path, **entries)
-    _publish_resolved(cache, [feed], overrides_dir)
+    _publish_resolved(cache, [] if case == "gone" else [feed], overrides_dir)
     seen = []
     server = _key_server(answers, seen)
+    if case == "unapproved":
+        # A withdrawal cut short, before any request, keeps the state for the
+        # next crawl to finish.
+        def busy(*args):
+            raise OSError("busy")
+
+        with monkeypatch.context() as patch, pytest.raises(OSError):
+            patch.setattr(crawl, "_prune_members", busy)
+            _crawl(cache, server, overrides_dir=overrides_dir)
+        assert (_feed_dir(cache, "f") / crawl.STATE_FILE).exists() and seen == []
     if case == "malformed":
         with pytest.raises(ValueError, match="credentials.toml"):
             _crawl(cache, server, overrides_dir=overrides_dir)
         assert seen == []
         return
     _, log = _crawl(cache, server, overrides_dir=overrides_dir)
-    assert log["f"]["key_crawl"] == outcome
+    assert log.get("f", {}).get("key_crawl") == outcome
     assert any(carries for *_, carries, _ in seen) is sent
     path = _feed_dir(cache, "f") / crawl.STATE_FILE
     state = json.loads(path.read_text()) if path.exists() else {}
@@ -1429,6 +1455,96 @@ def test_a_key_crawl_needs_an_approved_provider_and_credentials(
         _, log = _crawl(cache, server, overrides_dir=overrides_dir)
         assert (log["f"]["method"], log["f"]["key_crawl"]) == ("not_modified", "read")
         assert [carries for *_, carries, _ in seen].count(True) == 1
+
+
+class _Overlap:
+    """Holds the first keyed request until a second arrives or ``wait``
+    seconds pass, and records the most keyed requests in flight at once."""
+
+    def __init__(self, wait):
+        self.wait = wait
+        self.lock = threading.Lock()
+        self.second = threading.Event()
+        self.flight = self.most = self.count = 0
+
+    def __call__(self, answer):
+        def held(request):
+            if not _carries_key(request):
+                return answer(request)
+            with self.lock:
+                self.flight += 1
+                self.count += 1
+                self.most = max(self.most, self.flight)
+                first = self.count == 1
+            if first:
+                self.second.wait(self.wait)
+            else:
+                self.second.set()
+            try:
+                return answer(request)
+            finally:
+                with self.lock:
+                    self.flight -= 1
+
+        return held
+
+
+THIS_MONTH = crawl.datetime.datetime.now(crawl.datetime.timezone.utc).strftime("%Y-%m")
+
+
+@pytest.mark.parametrize(
+    "budget, before, answer, feeds, sent, outcomes, after",
+    [
+        # The keyed reads follow feed order at any worker count.
+        (1, None, _answer(), 2, 1, ["read", "budget_spent"], 1),
+        # A chain of three keyed hops: two are sent, the third is not.
+        (2, None, _moved(A + "/hop.zip"), 1, 2, ["budget_spent"], 2),
+        # A 503 is retried only while the budget lasts.
+        (1, None, _answer(503), 1, 1, ["budget_spent"], 1),
+        (1, (THIS_MONTH, 1), _answer(), 1, 0, ["budget_spent"], 1),
+        (1, ("2000-01", 5), _answer(), 1, 1, ["read"], 1),
+        (1, ("2000-13", 0), _answer(), 1, 0, ["malformed"], None),
+        # A 401 counts once and stops the key for the provider's other feeds,
+        # whatever their own access.
+        (5, (THIS_MONTH, 2), _answer(401), 3, 1, ["failed"] + ["key_refused"] * 2, 3),
+    ],
+    ids=["two-feeds", "hops", "retry", "spent", "new-month", "malformed", "401"],
+)
+def test_a_key_budget_caps_the_keyed_requests_a_month(
+    tmp_path, monkeypatch, budget, before, answer, feeds, sent, outcomes, after
+):
+    cache = tmp_path / "cache"
+    tally = keys.usage_path()
+    if before:
+        tally.parent.mkdir()
+        month, count = before
+        tally.write_text(json.dumps({"month": month, "requests": {"p": count}}))
+    overrides_dir = _providers(tmp_path, p={"crawl_budget": budget})
+    monkeypatch.setenv("TRANSITIO_KEY_P__KEY", SENTINEL)
+    names = [f"f{i}" for i in range(feeds)]
+    methods = ["query_param", "query_param", "unsupported"]
+    resolved = [_keyed(n, f"{A}/{n}.zip", method=m) for n, m in zip(names, methods)]
+    _publish_resolved(cache, resolved, overrides_dir)
+    # Two feeds of one provider: a second keyed request while the first is
+    # held would mean the provider's keyed reads overlap.
+    overlap = _Overlap(0.5 if feeds > 1 else 0)
+    answers = {f"{A}/{n}.zip": overlap(answer) for n in names}
+    answers.update({A + "/hop.zip": _moved(A + "/end.zip"), A + "/end.zip": _answer()})
+    seen = []
+    server = _key_server(answers, seen)
+    if after is None:
+        # A malformed tally stops the crawl before its first request.
+        with pytest.raises(ValueError, match="not a tally"):
+            _crawl(cache, server, overrides_dir=overrides_dir)
+        assert seen == []
+        return
+    _, log = _crawl(cache, server, overrides_dir=overrides_dir, workers=feeds)
+    assert sum(carries for *_, carries, _ in seen) == sent and overlap.most <= 1
+    assert [log[name]["key_crawl"] for name in names] == outcomes
+    if budget == 5:
+        assert any("HTTP 401" in r["fallback_reason"] for r in log.values())
+    counts = {"month": THIS_MONTH, "requests": {"p": after}}
+    assert json.loads(tally.read_text()) == counts
 
 
 def test_a_maintainer_key_appears_in_no_output(tmp_path, monkeypatch, caplog):

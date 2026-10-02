@@ -323,12 +323,15 @@ def _keyed_errors():
 class _Guarded(httpx.BaseTransport):
     """The hops of a keyed download, each through the fetcher's checks
     before ``inner`` sends it: the URL check (on the URL without its query,
-    where a query credential travels), the host breaker and rate and the
-    request count. ``refuse``, when given, refuses a URL holding a secret."""
+    where a query credential travels), the host breaker and rate, the
+    request count and ``spend``, which counts the request against its
+    provider's budget or refuses it. ``refuse``, when given, refuses a URL
+    holding a secret."""
 
-    def __init__(self, fetcher, inner, refuse):
+    def __init__(self, fetcher, inner, spend, refuse):
         self._fetcher = fetcher
         self._inner = inner
+        self._spend = spend
         self._refuse = refuse
 
     def handle_request(self, request):
@@ -340,6 +343,7 @@ class _Guarded(httpx.BaseTransport):
         fetcher._admit(method, url, host)
         fetcher._throttle(host)
         fetcher._admit(method, url, host)
+        self._spend()
         fetcher.requests += 1
         try:
             response = self._inner.handle_request(request)
@@ -510,14 +514,14 @@ class Fetcher:
         raise FetchError(f"{method} {url}: more than {REDIRECT_LIMIT} redirects")
 
     @contextlib.contextmanager
-    def keyed(self, access, proxy, refuse=None):
+    def keyed(self, access, proxy, spend, refuse=None):
         """transitio's walk session for one download with the credentials of
         ``access`` (a transitio ``_Access``), each hop through
         :class:`_Guarded` over this fetcher's transport, else one through
         ``proxy(access.url)``, the proxy for credentialed requests."""
         inner = self._transport or httpx.HTTPTransport(proxy=proxy(access.url))
         try:
-            guarded = _Guarded(self, inner, refuse)
+            guarded = _Guarded(self, inner, spend, refuse)
             with access.session(self._client, guarded) as session:
                 yield session
         finally:

@@ -848,11 +848,16 @@ def _crawl_keyless(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
     return retry
 
 
-def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup, keys):
+def _crawl_one(
+    fetcher, cache_dir, feed, *, force, range_threshold, lookup, keys, keyless=None
+):
     """Crawl one feed; returns its log record (never raises): without a key
-    (:func:`_crawl_keyless`), then, for a feed that needs a key and was not
-    read so, with the maintainer's key when ``keys`` lends one."""
+    (:func:`_crawl_keyless`). A feed that needs a key and was not read so is
+    left without ``key_crawl`` when ``keys`` lends keys; given that record as
+    ``keyless``, it is read with the maintainer's key."""
     options = {"force": force, "range_threshold": range_threshold, "lookup": lookup}
+    if keyless is not None:
+        return _crawl_keyed(fetcher, cache_dir, feed, keyless, keys, options)
     record = _crawl_keyless(fetcher, cache_dir, feed, **options)
     if feed.get("access") != "key":
         return record
@@ -860,8 +865,6 @@ def _crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup, keys
         record["key_crawl"] = "not_needed"
     elif keys is None:
         record["key_crawl"] = "keys_off"
-    else:
-        return _crawl_keyed(fetcher, cache_dir, feed, record, keys, options)
     return record
 
 
@@ -870,7 +873,9 @@ def _crawl_keyed(fetcher, cache_dir, feed, record, keys, options):
     maintainer's key; returns the log record, whose ``key_crawl`` says
     whether, and how, the key was used."""
     access, outcome = keys.access(feed, record["url"])
-    if access is None:
+    provider_id = feed.get("access_provider")
+    outcome = keys.settled(provider_id) or outcome
+    if outcome is not None:
         record["key_crawl"] = outcome
         return record
     failure = record["producer_failure"] or record["fallback_reason"]
@@ -880,8 +885,35 @@ def _crawl_keyed(fetcher, cache_dir, feed, record, keys, options):
         fetcher, cache_dir, feed, url, producer_failure=failure, **keyed, **options
     )
     retry["bytes_fetched"] += record["bytes_fetched"]
-    retry["key_crawl"] = "failed" if error else "read"
+    retry["key_crawl"] = keys.outcome(provider_id, error)
     return retry
+
+
+def _withdraw(cache_dir, feeds, keys):
+    """Remove every committed keyed read, state and members, whose provider
+    no longer approves the crawl or no longer serves its feed
+    (:meth:`keys.Keys.serves`), a feed gone from ``feeds`` included."""
+    by_id = {
+        k: feed
+        for feed in feeds
+        for k in [feed["feed_id"], *(feed.get("aliases") or [])]
+    }
+    root = cache_dir / "crawl"
+    for name in sorted(os.listdir(root)):
+        if not _CRAWL_DIR.fullmatch(name) or (root / name).is_symlink():
+            continue
+        feed_dir = store.open_subdir(root, name)
+        try:
+            state = _read_state(feed_dir)
+            feed = by_id.get(state.get("feed_id"), {})
+            if state.get("fetched_from") == MAINTAINER_KEY and not keys.serves(
+                state.get("key_provider"), feed
+            ):
+                # The state goes last, so a withdrawal cut short is retried.
+                _prune_members(feed_dir, ())
+                store.unlink(feed_dir, STATE_FILE)
+        finally:
+            feed_dir.close()
 
 
 def _crawl_from(
@@ -1041,7 +1073,8 @@ def _crawl_from(
                 ARCHIVE_FILE,
                 etag=conditional.get("etag"),
                 last_modified=conditional.get("last_modified"),
-                keyed=access and (lambda: keys.session(fetcher, access)),
+                keyed=access
+                and (lambda: keys.session(fetcher, feed["access_provider"], access)),
             )
             if outcome["status"] == "not_modified":
                 if not (conditional.get("etag") or conditional.get("last_modified")):
@@ -1154,21 +1187,13 @@ def _crawl_from(
             feed_dir.close()
 
 
-def _safe_crawl_one(fetcher, cache_dir, feed, *, force, range_threshold, lookup, keys):
+def _safe_crawl_one(fetcher, cache_dir, feed, **options):
     """:func:`_crawl_one`, guaranteed not to raise. An unexpected error (not one
     it already turns into a ``failed`` record) becomes a ``skipped`` record so a
     single broken feed never aborts the run — identically on the sequential and
     the pooled paths, which both call this."""
     try:
-        return _crawl_one(
-            fetcher,
-            cache_dir,
-            feed,
-            force=force,
-            range_threshold=range_threshold,
-            lookup=lookup,
-            keys=keys,
-        )
+        return _crawl_one(fetcher, cache_dir, feed, **options)
     except Exception as error:  # noqa: B902 — containment at any worker count
         return {
             "feed_id": feed["feed_id"],
@@ -1245,6 +1270,9 @@ def crawl(
                     for key in [feed["feed_id"], *(feed.get("aliases") or [])]:
                         canonical[key] = feed["feed_id"]
                 forced = {canonical.get(rid, rid) for rid in recrawl}
+                if keys is not None:
+                    # Before any request, and failing the crawl if one stays.
+                    _withdraw(cache_dir, feeds, keys)
                 # Eligible feeds in traversal order; each keeps its ordinal so
                 # the log is byte-identical to a sequential build whatever order
                 # the workers finish in. Never sort by feed_id: that would
@@ -1291,6 +1319,21 @@ def crawl(
                             total=len(eligible),
                         ):
                             log[futures[future]] = future.result()
+                # Keyed reads follow every keyless one, one at a time in feed
+                # order: a budget or a refused key then settles the same
+                # feeds at any worker count.
+                for ordinal, (feed, force) in enumerate(eligible):
+                    if feed.get("access") == "key" and "key_crawl" not in log[ordinal]:
+                        log[ordinal] = _safe_crawl_one(
+                            fetcher,
+                            cache_dir,
+                            feed,
+                            force=force,
+                            range_threshold=range_threshold,
+                            lookup=lookup,
+                            keys=keys,
+                            keyless=log[ordinal],
+                        )
                 if keys is not None:
                     log = [keys.redact(record) for record in log]
                 store.write_file(
