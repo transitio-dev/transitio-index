@@ -8,6 +8,7 @@ import http.client
 import json
 import logging
 import os
+from pathlib import Path
 
 import httpx
 import pytest
@@ -808,9 +809,8 @@ def test_an_http_atlas_url_is_sampled_and_paired_with_its_https_mdb_twin(tmp_pat
         src, sc.MDB_COUNTRY, (sc.MDB_COUNTRY, sc.MDB_DOWNLOAD), {"CA"}
     )
     kept = sc._select_atlas(archive, *sc._mdb_targets(mdb_rows))
-    # The CA cut keeps the Atlas feed, so the unmatched cut leaves it out.
+    # The CA cut keeps the Atlas feed.
     assert [feed["id"] for _, payload in kept for feed in payload["feeds"]] == ["f-stm"]
-    assert sc._select_atlas_unmatched(archive, sc._mdb_url_countries(src)) == []
 
     sample = tmp_path / "atlas_sample.tar.gz"
     sc._write_atlas(sample, kept)
@@ -821,6 +821,91 @@ def test_an_http_atlas_url_is_sampled_and_paired_with_its_https_mdb_twin(tmp_pat
     assert [(r["source"], r["feed_id"], r["mdb_id"]) for r in records] == [
         ("both", "f-stm", "mdb-1")
     ]
+
+
+def test_a_partition_cut_places_every_static_feed_in_exactly_one_label(
+    tmp_path, monkeypatch
+):
+    """The rebuild's label map was assembled from country cuts: Japan's was
+    capped at 80 rows, some countries, rows without a country and misfiled
+    rows had no label, and the Atlas-only cut assumed every Atlas feed sharing
+    a URL with an MDB row was reached. 574 MDB and 385 Atlas GTFS feeds of
+    the 2026-10-02 catalogues were in no cut. The partition cuts every row and
+    feed into exactly one label, keeping each fold in one label.
+    """
+    import test_sample_catalogues as sct
+
+    sc = sct.sc
+    shared = "https://shared.example/g.zip"
+    rows = [
+        sct._mdb_gtfs("j2", "JP", "https://t.jp/2.zip", "Tokyo"),
+        sct._mdb_gtfs("j4", "JP", shared, "Tokyo"),
+        sct._mdb_gtfs("j1", "JP", "https://a.jp/1.zip", "Aichi"),
+        sct._mdb_gtfs("j3", "JP", "https://t.jp/3.zip", "Tokyo", redirect="j4"),
+        sct._mdb_gtfs("f1", "FI", "https://f.fi/1.zip", redirect="s1"),
+        sct._mdb_gtfs("f2", "FI", "https://f.fi/2.zip", redirect="s1"),
+        sct._mdb_gtfs("s1", "SE", shared),
+        sct._mdb_gtfs("b1", "", "https://a.jp/2.zip"),
+        sct._mdb_gtfs("x1", "SA", "https://x.tr/1.zip"),
+        sct._mdb_gtfs("n1", "ß", "https://n.example/1.zip"),  # not "SS"
+    ]
+    files = [
+        (
+            "r/feeds/a.jp.dmfr.json",
+            sct._payload(
+                sct._feed("f-j1", "https://a.jp/1.zip"),
+                sct._feed("f-a2", "https://a.jp/2.zip"),
+            ),
+        ),
+        ("r/feeds/shared.dmfr.json", sct._payload(sct._feed("f-shared", shared))),
+        (
+            "r/feeds/x.dmfr.json",
+            sct._payload(
+                sct._feed("f-lonely", "https://lonely.example/g.zip"),
+                sct._feed("f-nourl", None),
+                sct._feed("f-rt", "https://t.jp/2.zip", spec="gtfs-rt"),
+            ),
+        ),
+    ]
+    sct._partition_inputs(tmp_path, monkeypatch, rows, files)
+    out = tmp_path / "out"
+    argv = ["--partition", "--out-dir", str(out), "--batch-size", "2"]
+    sc.main(argv + ["--exclude", "x1", "--country", "KE", "--country", "JP"])
+
+    (published,) = out.glob("partition-*")
+    labels = ["atlas1", "cities", "jp1", "jp2", "other", "se"]
+    lines = (published / "rebuild_map.txt").read_text().splitlines()
+    cuts = {label: Path(cut) for label, cut in (line.split(" ", 1) for line in lines)}
+    assert list(cuts) == labels
+    assert all(cuts[label].parent == out for label in labels)
+    assert all(cuts[label].name.startswith(f"run-{label}_") for label in labels)
+    manifest = json.loads((published / "partition.json").read_text())
+    # JP splits by subdivision (Aichi first) with the fold j3 -> j4 whole. The
+    # FI rows fold into their SE successor: one unit of three rows, so one
+    # label whatever --batch-size. The excluded and blank rows go to other.
+    want = {"jp1": "j1 j2", "jp2": "j4 j3", "se": "f1 f2 s1", "other": "b1 x1 n1"}
+    assert manifest["mdb"] == {i: lb for lb, ids in want.items() for i in ids.split()}
+    # A feed two labels carry exactly goes to the first; an exact match outranks
+    # an earlier host match (f-a2); a realtime feed gets no label. Each country
+    # is owned by one label (countries.txt): its own, part 1 of a split, or
+    # cities, which holds no feeds.
+    held = {}
+    for label, cut in cuts.items():
+        feeds = atlas.parse(cut / "atlas_sample.tar.gz")["feeds"]
+        owned = (cut / "countries.txt").read_text().split()
+        held[label] = (owned, sorted(feed["onestop_id"] for feed in feeds))
+    assert held == {
+        "atlas1": ([], ["f-lonely", "f-nourl"]),
+        "cities": (["KE"], []),
+        "jp1": (["JP"], ["f-j1"]),
+        "jp2": ([], ["f-shared"]),
+        "other": ([], ["f-a2"]),
+        "se": (["SE"], []),
+    }
+    assert manifest["atlas"] == {f: lb for lb, (_, ids) in held.items() for f in ids}
+    assert len((cuts["cities"] / "mdb_sample.csv").read_text().splitlines()) == 1
+    digest = hashlib.sha256((cuts["jp1"] / "mdb_sample.csv").read_bytes())
+    assert manifest["labels"]["jp1"]["mdb_sha256"] == digest.hexdigest()
 
 
 def test_stats_keys_gbfs_systems_sharing_id_and_country_by_ordinal():

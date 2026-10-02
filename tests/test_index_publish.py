@@ -388,7 +388,7 @@ def _build_index(
 
 
 def test_an_atlas_only_sample_builds_and_publishes(tmp_path):
-    # The --atlas-unmatched sampler emits zero MDB/GBFS rows; that empty-source
+    # A partition's Atlas-only cut emits zero MDB/GBFS rows; that empty-source
     # build (mdb.ingest allow_empty) must still ingest, crosswalk and publish,
     # with the Atlas feed reaching the index.
     cache = tmp_path / "cache"

@@ -39,13 +39,19 @@ interrupted run leaves no half-written set anything would consume. Nothing
 here is committed. The cut requires at least one MDB feed for each requested
 country; GBFS systems and Atlas overlap are optional, so a country served by a
 single national feed with no Atlas crosswalk still yields an MDB-only sample.
+
+``--partition`` cuts the whole catalogue instead, every MDB row and Atlas GTFS
+feed in exactly one ``run-<label>_*`` cut, and publishes ``rebuild_map.txt``
+and ``partition.json`` last, in a ``partition-*`` directory.
 """
 
 import argparse
 import collections
 import csv
+import hashlib
 import io
 import json
+import os
 import re
 import shlex
 import sys
@@ -54,9 +60,11 @@ import tempfile
 from pathlib import Path
 
 from transitio_index import atlas, csv_source, gbfs, mdb, store
-from transitio_index.crosswalk import ATLAS_STATIC_URL, _host, _match_url
+from transitio_index.crosswalk import ATLAS_STATIC_URL, _host, _match_url, _successors
 
 DEFAULT_COUNTRIES = ("FI", "EE")
+# The partition's default --batch-size: a country of more MDB rows is split.
+PARTITION_BATCH_SIZE = 600
 
 # ISO country_code lives in these columns of the two CSV exports.
 MDB_ID = "id"
@@ -257,7 +265,7 @@ def _touches(box, boxes):
 
 def _warn_foreign_boxes(rows, countries, out=sys.stderr):
     """Warn per kept MDB row whose bounding box touches none of the requested
-    ``countries``' boxes, naming the ``--exclude`` that drops it; return the
+    ``countries``' boxes, naming the ``--exclude`` that takes it out; return the
     flagged ids. Rows without a valid box are not judged. Skipped, with a note,
     when a requested country has no curated box."""
     without = sorted(code for code in countries if code not in COUNTRY_BOXES)
@@ -279,7 +287,7 @@ def _warn_foreign_boxes(rows, countries, out=sys.stderr):
             f"lon {box['min_lon']}..{box['max_lon']} "
             f"lat {box['min_lat']}..{box['max_lat']} lies outside "
             f"{', '.join(sorted(countries))}; "
-            f"--exclude {shlex.quote(row_id)} drops it",
+            f"--exclude {shlex.quote(row_id)} takes it out of the cut",
             file=out,
         )
     return flagged
@@ -343,8 +351,9 @@ def _download(work, commit):
 
 
 def _select_csv(src, country_field, required, countries, include_ids=frozenset()):
-    """``(fieldnames, rows)`` for rows whose country is in ``countries``, plus
-    the rows whose ``id`` is in ``include_ids`` whatever their country.
+    """``(fieldnames, rows)`` for rows whose country is in ``countries`` (every
+    row when it is None), plus the rows whose ``id`` is in ``include_ids``
+    whatever their country.
 
     A missing required column is upstream schema drift, not an empty result, so
     it stops the cut rather than silently matching nothing.
@@ -358,7 +367,8 @@ def _select_csv(src, country_field, required, countries, include_ids=frozenset()
         kept = [
             row
             for row in reader
-            if (row.get(country_field) or "").strip().upper() in countries
+            if countries is None
+            or (row.get(country_field) or "").strip().upper() in countries
             or (row.get(MDB_ID) or "").strip() in include_ids
         ]
     return fieldnames, kept
@@ -568,75 +578,6 @@ def _emit(
     print(f"run: {command}")
 
 
-def _mdb_url_countries(mdb_src):
-    """``{MDB download URL in match form: set of country codes declaring it}`` over
-    every GTFS row — the evidence for whether some ``--country`` cut could pull
-    an Atlas feed on that URL. Only GTFS rows count (a realtime endpoint is never
-    a static feed a country cut keeps), and the country is canonicalised to its
-    code so a code and its curated full name are the one country a cut selects."""
-    out = collections.defaultdict(set)
-    with open(mdb_src, newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for column in ("data_type", MDB_COUNTRY, MDB_DOWNLOAD):
-            if column not in (reader.fieldnames or []):
-                raise SystemExit(f"{mdb_src}: missing column {column!r}")
-        for row in reader:
-            if (row.get("data_type") or "").strip().lower() != "gtfs":
-                continue
-            url = _match_url(row.get(MDB_DOWNLOAD))
-            token = (row.get(MDB_COUNTRY) or "").strip()
-            if url is None or not token:
-                continue
-            code = _country_code(token.upper())
-            # Only a country a --country cut could select counts toward
-            # reachability; a value that is neither an ISO code nor a curated
-            # name names no selectable cut, so it makes nothing reachable.
-            if _is_iso_code(code):
-                out[url].add(code)
-    return out
-
-
-def _select_atlas_unmatched(archive, url_to_countries):
-    """Flat ``[(source_file, payload, feed)]`` for every Atlas GTFS feed that no
-    country cut would pull: not exact-matched by an MDB URL, and not on a host a
-    single country reaches. Reachability is the union of the per-country cuts, so
-    a host is reachable only when one country's exact matches on it clear
-    ``HOST_MATCH_SHARE`` — a pooled count across countries never decides it.
-    Non-GTFS specs and feeds with no static URL are skipped.
-    """
-    urls = set(url_to_countries)
-    host_total = collections.Counter()
-    exact_by_country = collections.defaultdict(collections.Counter)
-    files = []
-    for source_file, payload in atlas.iter_dmfr(archive):
-        feeds = []
-        for feed in payload.get("feeds") or []:
-            url = _feed_url(feed)
-            host = _host(url) if url is not None else None
-            if host is not None:
-                host_total[host] += 1
-                for country in url_to_countries.get(url, ()):
-                    exact_by_country[host][country] += 1
-            feeds.append((feed, url, host))
-        files.append((source_file, payload, feeds))
-    matched_hosts = {
-        host
-        for host, total in host_total.items()
-        if total
-        and not _is_shared(host)
-        and max(exact_by_country[host].values(), default=0) >= HOST_MATCH_SHARE * total
-    }
-    kept = []
-    for source_file, payload, feeds in files:
-        for feed, url, host in feeds:
-            if (feed.get("spec") or "").lower() != "gtfs" or url is None:
-                continue
-            if url in urls or host in matched_hosts:
-                continue
-            kept.append((source_file, payload, feed))
-    return kept
-
-
 def _group_atlas(flat):
     """Regroup ``[(source_file, payload, feed)]`` into the ``[(source_file,
     payload)]`` shape :func:`_write_atlas` expects — one DMFR file per source,
@@ -652,54 +593,214 @@ def _group_atlas(flat):
     ]
 
 
-def _run_atlas_unmatched(args):
-    """Cut the Atlas feeds no country cut reaches, in one set or --batch-size
-    sets, each with header-only MDB/GBFS CSVs and an Atlas-only tarball."""
+def _gtfs_row_ids(rows):
+    return [
+        (row.get(MDB_ID) or "").strip()
+        for row in rows
+        if (row.get("data_type") or "").strip().lower() == "gtfs"
+    ]
+
+
+def _is_gtfs_feed(feed):
+    return (feed.get("spec") or "").lower() == "gtfs"
+
+
+def _gtfs_feed_ids(files):
+    return [
+        feed.get("id")
+        for _, payload in files
+        for feed in payload.get("feeds") or []
+        if _is_gtfs_feed(feed)
+    ]
+
+
+def _sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _partition_units(rows, excluded):
+    """``[(country or None, anchor row, rows)]`` in the anchors' catalogue order.
+
+    A deprecated row is anchored on the live row the build folds it into, any
+    other row on itself, so a fold is never split across labels. A unit's
+    country is its anchor's ISO code or curated name; it is None (the ``other``
+    label) when that is blank or neither, or when ``excluded`` names any of its
+    rows.
+    """
+    records, _ = mdb.parse_rows(rows, "feeds_v2.csv")
+    successors = _successors(records)
+    members = collections.defaultdict(list)
+    for row, record in zip(rows, records):
+        members[successors.get(record["mdb_id"], record["mdb_id"])].append(row)
+    units = []
+    for row, record in zip(rows, records):
+        unit = members.get(record["mdb_id"])
+        if unit is None:
+            continue
+        token = record["location"]["country_code"] or ""
+        code = _country_code(token.upper()) if token.isascii() else ""
+        moved = any((member.get(MDB_ID) or "").strip() in excluded for member in unit)
+        units.append((code if _is_iso_code(code) and not moved else None, row, unit))
+    return units
+
+
+def _partition_labels(units, extra, size):
+    """``{label: (countries, rows)}`` in label order: ``<cc>`` per country with
+    a unit, ``other`` for the units without one, and ``cities``, without rows,
+    for the ``extra`` countries without a label. A country of more than
+    ``size`` rows is split into ``<cc>1..<cc>k``, k = ceil(rows / size), by its
+    units sorted by the anchor's subdivision. A unit is never split, so k is at
+    most the number of units. ``countries`` names the countries a label owns,
+    each in one label: ``<cc>`` or ``<cc>1``, or ``cities``."""
+    by_country = collections.defaultdict(list)
+    for code, anchor, rows in units:
+        by_country[code].append((anchor, rows))
+    remainder = by_country.pop(None, [])
+    labels = {"other": ([], [row for _, rows in remainder for row in rows])}
+    cities = sorted(set(extra) - set(by_country))
+    if cities:
+        labels["cities"] = (cities, [])
+    for code, country_units in by_country.items():
+        count = sum(len(rows) for _, rows in country_units)
+        parts = min(-(-count // size), len(country_units))
+        if parts > 1:
+            country_units = sorted(
+                country_units,
+                key=lambda unit: (unit[0].get(MDB_SUBDIVISION) or "").strip(),
+            )
+        split = _even_split(country_units, parts)
+        for number, part in enumerate(split, 1):
+            label = code.lower() + (str(number) if len(split) > 1 else "")
+            owned = [code] if number == 1 else []
+            labels[label] = (owned, [row for _, rows in part for row in rows])
+    return dict(sorted(labels.items()))
+
+
+def _partition_atlas(archive, files, labels, size):
+    """``{label: (countries, mdb rows, atlas files)}`` in label order.
+
+    Each label keeps the Atlas GTFS feeds ``_select_atlas`` picks for its
+    rows. A feed several labels pick goes to the first whose rows carry its
+    URL exactly, else to the first that picked it. The GTFS feeds of the
+    archive's ``files`` no label picks fill ``atlas1..atlasK`` of at most
+    ``size`` feeds each; other specs get no label.
+    """
+    picked, exact = {}, {}
+    for label, (_, rows) in labels.items():
+        urls, hosts = _mdb_targets(rows)
+        for _, payload in _select_atlas(archive, urls, hosts):
+            for feed in filter(_is_gtfs_feed, payload["feeds"]):
+                picked.setdefault(feed.get("id"), label)
+                if _feed_url(feed) in urls:
+                    exact.setdefault(feed.get("id"), label)
+    owner = {**picked, **exact}
+    owned, rest = collections.defaultdict(list), []
+    for source_file, payload in files:
+        for feed in filter(_is_gtfs_feed, payload.get("feeds") or []):
+            entry = (source_file, payload, feed)
+            if feed.get("id") in owner:
+                owned[owner[feed.get("id")]].append(entry)
+            else:
+                rest.append(entry)
+    planned = {
+        label: (countries, rows, _group_atlas(owned[label]))
+        for label, (countries, rows) in labels.items()
+    }
+    if rest:
+        for number, part in enumerate(_even_split(rest, -(-len(rest) // size)), 1):
+            planned[f"atlas{number}"] = ([], [], _group_atlas(part))
+    return dict(sorted(planned.items()))
+
+
+def _check_partition(planned, mdb_rows, files):
+    """Refuse the cut unless every MDB and Atlas GTFS id is in exactly one label."""
+    mdb_placed = [i for _, rows, _ in planned.values() for i in _gtfs_row_ids(rows)]
+    atlas_placed = [i for _, _, kept in planned.values() for i in _gtfs_feed_ids(kept)]
+    for kind, wanted, placed in (
+        ("MDB", _gtfs_row_ids(mdb_rows), mdb_placed),
+        ("Atlas", _gtfs_feed_ids(files), atlas_placed),
+    ):
+        counts = collections.Counter(placed)
+        wrong = sorted(f"{i} in {counts[i]}" for i in set(wanted) if counts[i] != 1)
+        if wrong:
+            raise SystemExit(
+                f"{len(wrong)} {kind} GTFS id(s) not in exactly one label: "
+                f"{', '.join(wrong[:10])}"
+            )
+
+
+def _write_partition(out_dir, planned, mdb_fields, gbfs_fields, manifest):
+    """Write one cut per label, then publish ``rebuild_map.txt`` and
+    ``partition.json`` together by renaming their staging directory, so a run
+    stopped earlier leaves no ``partition-*`` directory."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    labels, mdb_map, atlas_map = {}, {}, {}
+    for label, (countries, rows, files) in planned.items():
+        cut = out_dir / Path(tempfile.mkdtemp(prefix=f"run-{label}_", dir=out_dir)).name
+        _write_csv(cut / "mdb_sample.csv", mdb_fields, rows)
+        _write_csv(cut / "gbfs_sample.csv", gbfs_fields, [])
+        _write_atlas(cut / "atlas_sample.tar.gz", files)
+        (cut / "countries.txt").write_text(
+            "".join(f"{code}\n" for code in countries), encoding="utf-8"
+        )
+        feeds = [feed for _, payload in files for feed in payload["feeds"]]
+        labels[label] = {
+            "cut": str(cut),
+            "countries": countries,
+            "mdb_rows": len(rows),
+            "atlas_feeds": len(feeds),
+            "mdb_sha256": _sha256(cut / "mdb_sample.csv"),
+            "atlas_sha256": _sha256(cut / "atlas_sample.tar.gz"),
+        }
+        mdb_map.update(dict.fromkeys(_gtfs_row_ids(rows), label))
+        atlas_map.update(dict.fromkeys(_gtfs_feed_ids(files), label))
+        print(f"{label}: {len(rows)} MDB rows, {len(feeds)} Atlas feeds -> {cut}")
+    staging = Path(tempfile.mkdtemp(prefix=".partition-", dir=out_dir))
+    (staging / "rebuild_map.txt").write_text(
+        "".join(f"{label} {entry['cut']}\n" for label, entry in labels.items()),
+        encoding="utf-8",
+    )
+    manifest = {**manifest, "labels": labels, "mdb": mdb_map, "atlas": atlas_map}
+    (staging / "partition.json").write_text(
+        json.dumps(manifest, indent=1), encoding="utf-8"
+    )
+    final = out_dir / ("partition-" + staging.name[len(".partition-") :])
+    os.rename(staging, final)
+    print(f"labels: {len(labels)}")
+    print(f"map: {final / 'rebuild_map.txt'}")
+    print(f"manifest: {final / 'partition.json'}")
+
+
+def _run_partition(args, extra, excluded):
+    """Cut every MDB row and every Atlas GTFS feed into exactly one label."""
+    size = args.batch_size or PARTITION_BATCH_SIZE
     with tempfile.TemporaryDirectory(prefix="sample-catalogues-") as tmp:
         atlas_full, mdb_full, gbfs_full = _download(Path(tmp), args.commit)
-        mdb_fields, _ = _select_csv(
-            mdb_full, MDB_COUNTRY, (MDB_ID, MDB_COUNTRY, MDB_DOWNLOAD), set()
+        mdb_fields, rows = _select_csv(
+            mdb_full, MDB_COUNTRY, sorted(mdb.REQUIRED_HEADERS), None
         )
         gbfs_fields, _ = _select_csv(
             gbfs_full, GBFS_COUNTRY, (GBFS_ID, GBFS_COUNTRY), set()
         )
-        flat = _select_atlas_unmatched(atlas_full, _mdb_url_countries(mdb_full))
-        if args.limit is not None:
-            flat = flat[: args.limit]
-        if not flat:
-            raise SystemExit("no unmatched Atlas GTFS feeds to sample")
-        batches = [flat] if args.batch_size is None else _chunks(flat, args.batch_size)
-        planned = [_group_atlas(chunk) for chunk in batches]
-        args.out_dir.mkdir(parents=True, exist_ok=True)
-        run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=args.out_dir))
-        print(f"atlas feeds: {len(flat)} (unmatched by any country cut)")
-        if args.batch_size is None:
-            _emit(
-                run_dir,
-                mdb_fields,
-                gbfs_fields,
-                ([], [], planned[0]),
-                set(),
-                args.commit,
-                allow_empty_mdb=True,
-                no_golden=True,
-            )
-        else:
-            print(f"batches: {len(planned)} (up to {args.batch_size} atlas feeds each)")
-            for index, files in enumerate(planned):
-                batch_dir = run_dir / f"batch-{index:03d}"
-                batch_dir.mkdir()
-                print(f"[batch {index}]")
-                _emit(
-                    batch_dir,
-                    mdb_fields,
-                    gbfs_fields,
-                    ([], [], files),
-                    set(),
-                    args.commit,
-                    allow_empty_mdb=True,
-                    no_golden=True,
-                )
+        _drop_excluded(rows, [], excluded)
+        units = _partition_units(rows, excluded)
+        for code in sorted(COUNTRY_BOXES):
+            country_rows = [row for cc, _, unit in units if cc == code for row in unit]
+            if country_rows:
+                _warn_foreign_boxes(country_rows, {code})
+        labels = _partition_labels(units, extra, size)
+        files = list(atlas.iter_dmfr(atlas_full))
+        planned = _partition_atlas(atlas_full, files, labels, size)
+        _check_partition(planned, rows, files)
+        manifest = {
+            "catalogues": {
+                "atlas_commit": args.commit,
+                "mdb_sha256": _sha256(mdb_full),
+                "atlas_sha256": _sha256(atlas_full),
+            },
+            "batch_size": size,
+        }
+    _write_partition(args.out_dir, planned, mdb_fields, gbfs_fields, manifest)
     return 0
 
 
@@ -715,7 +816,8 @@ def main(argv=None):
         metavar="CC",
         help="ISO country code to keep (repeatable; default: "
         + " ".join(DEFAULT_COUNTRIES)
-        + ")",
+        + "; with --partition, a country to list in the feedless 'cities' label "
+        "when it has no label of its own, none by default)",
     )
     parser.add_argument(
         "--out-dir",
@@ -755,7 +857,8 @@ def main(argv=None):
         metavar="ID",
         help="drop this catalogue row — an MDB id (mdb-1090) or a GBFS System ID "
         "whose declared country is wrong; repeatable; an id matching no selected "
-        "row is refused",
+        "row is refused; with --partition the MDB row and the rows folded with "
+        "it move to 'other'",
     )
     parser.add_argument(
         "--include",
@@ -774,34 +877,37 @@ def main(argv=None):
         help="split the sample into consecutive batches of this many MDB feeds "
         "(GBFS systems split evenly, Atlas trimmed to each batch's matching "
         "feeds), each a self-contained set built on its own — process a large "
-        "country in memory-safe pieces rather than all at once",
+        "country in memory-safe pieces rather than all at once; with "
+        "--partition, the row count above which a country is split (default "
+        f"{PARTITION_BATCH_SIZE}) and the most feeds an Atlas-only label holds",
     )
     parser.add_argument(
-        "--atlas-unmatched",
+        "--partition",
         action="store_true",
-        help="ignore --country and cut every Atlas GTFS feed that no country cut "
-        "could pull (its URL is on no MDB row's host); the build gives each a home "
-        "country from its crawled stops. Combine with --batch-size to split it.",
+        help="cut every MDB row and every Atlas GTFS feed into exactly one label "
+        "(per country, split by subdivision when large; 'other'; atlas1..K; "
+        "'cities' for --country codes without a label) and write "
+        "rebuild_map.txt and partition.json last",
     )
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
     if args.batch_size is not None and args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
-    if args.atlas_unmatched:
+    if args.partition:
         conflicts = {
-            "--country": args.countries,
+            "--limit": args.limit,
             "--subdivision": args.subdivisions,
             "--include": args.includes,
-            "--exclude": args.excludes,
         }
-        named = sorted(name for name, value in conflicts.items() if value)
+        named = sorted(name for name, value in conflicts.items() if value is not None)
         if named:
-            parser.error(
-                f"--atlas-unmatched cannot be combined with {', '.join(named)}"
-            )
-        return _run_atlas_unmatched(args)
-    raw = [c.strip() for c in (args.countries or DEFAULT_COUNTRIES)]
+            parser.error(f"--partition cannot be combined with {', '.join(named)}")
+        if any(char in str(args.out_dir) for char in "\r\n"):
+            # rebuild_map.txt holds one "<label> <cut>" line per label.
+            parser.error("--out-dir must not contain a line break")
+    default = () if args.partition else DEFAULT_COUNTRIES
+    raw = [c.strip() for c in (args.countries or default)]
     # Requests may be ISO codes or full names; a token that is neither an ASCII
     # alpha-2 code nor a curated full name is refused before any download,
     # rather than passed through as a literal match value. Checked on the raw
@@ -823,6 +929,8 @@ def main(argv=None):
     excluded = {e.strip() for e in args.excludes or ()}
     if "" in excluded:
         parser.error("--exclude must name a catalogue id")
+    if args.partition:
+        return _run_partition(args, sorted(countries), excluded)
     included = {i.strip() for i in args.includes or ()}
     if "" in included:
         parser.error("--include must name a catalogue or Atlas id")

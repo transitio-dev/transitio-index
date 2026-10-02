@@ -180,6 +180,21 @@ its geometry, a `served` flag and the feeds serving it — to `cache/index-layer
 countries straight from public Overture data, for checking the geography before
 a build.
 
+### Cut the whole catalogue
+
+`python scripts/sample_catalogues.py --partition` cuts every MDB row and every
+Atlas GTFS feed into exactly one label: one per country, a country of more
+than `--batch-size` rows (600 by default) split by subdivision, `other` for
+rows without a country code or moved there with `--exclude`, and `atlas1..K`
+for the Atlas feeds no label picks. A deprecated row stays with the live row
+it folds into. Each cut's `countries.txt` names the countries its label owns:
+`<cc>`, or `<cc>1` for a split country, and `cities`, a label without feeds,
+for the `--country` codes that have no label of their own. The cuts go to
+`cache/sample/run-<label>_*`; once all are written, a `partition-*` directory
+gets `rebuild_map.txt` (a `<label> <cut>` line per label) and
+`partition.json` (each label's cut, countries and digests, and the label of
+every GTFS id).
+
 ### Inspect a build in the browser
 
 `scripts/index_viewer.py` serves the built index — `cache/index` and every

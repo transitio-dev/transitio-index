@@ -6,6 +6,7 @@ these cover the pure cutting logic — country filtering, the Atlas URL/host
 match, header validation and the tar-member safety guard.
 """
 
+import csv
 import importlib.util
 import io
 import json
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from transitio_index import atlas
+from transitio_index import atlas, mdb
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "sample_catalogues.py"
 _spec = importlib.util.spec_from_file_location("sample_catalogues", _SCRIPT)
@@ -238,7 +239,7 @@ def test_foreign_bounding_boxes_are_flagged_with_the_exclude_that_drops_them():
     err = io.StringIO()
     flagged = sc._warn_foreign_boxes(rows, {"FI", "EE"}, out=err)
     assert flagged == ["mdb-1090", "mdb-cross"]
-    assert "--exclude mdb-1090 drops it" in err.getvalue()
+    assert "--exclude mdb-1090 takes it out of the cut" in err.getvalue()
     # A crossing box is judged on both of its longitude ranges (Aleutians, US).
     aleutians = {"min_lon": 170.0, "max_lon": -160.0, "min_lat": 51.0, "max_lat": 55.0}
     assert sc._touches(aleutians, [sc.COUNTRY_BOXES["US"]])
@@ -342,136 +343,100 @@ def _payload(*feeds):
     return {"feeds": list(feeds)}
 
 
-def test_atlas_unmatched_selects_the_complement(tmp_path):
-    exact_url = "https://ex.example/gtfs.zip"
-    h1 = "https://h.example/1.zip"
-    h2 = "https://h.example/2.zip"
-    archive = tmp_path / "atlas.tar.gz"
-    _archive(
-        archive,
-        [
-            (
-                "r/feeds/a.dmfr.json",
-                _payload(
-                    _feed("f-exact", exact_url),
-                    _feed("f-host1", h1),
-                    _feed("f-host2", h2),
-                    _feed("f-lonely", "https://lonely.example/g.zip"),
-                    _feed("f-rt", "https://rt.example/x.pb", spec="gtfs-rt"),
-                    _feed("f-nourl", None),
-                ),
-            )
-        ],
-    )
-    # h.example: 2 feeds, one (f-host1) exact-matches an MDB URL -> 1/2 = 0.5,
-    # clears HOST_MATCH_SHARE, so the whole host is reachable.
-    url_to_countries = {exact_url: {"AA"}, h1: {"AA"}}
-    kept = sc._select_atlas_unmatched(archive, url_to_countries)
-    assert [feed["id"] for _, _, feed in kept] == ["f-lonely"]
+def _mdb_gtfs(row_id, country, url, subdivision="", redirect=""):
+    return {
+        "id": row_id,
+        "data_type": "gtfs",
+        "status": "deprecated" if redirect else "active",
+        "redirect.id": redirect,
+        sc.MDB_COUNTRY: country,
+        sc.MDB_SUBDIVISION: subdivision,
+        sc.MDB_DOWNLOAD: url,
+    }
 
 
-def test_atlas_unmatched_host_threshold_is_per_country(tmp_path):
-    u1 = "https://p.example/1.zip"
-    u2 = "https://p.example/2.zip"
-    u3 = "https://p.example/3.zip"
-    archive = tmp_path / "atlas.tar.gz"
-    _archive(
-        archive,
-        [
-            (
-                "r/feeds/p.dmfr.json",
-                _payload(_feed("f-c1", u1), _feed("f-c2", u2), _feed("f-c3", u3)),
-            )
-        ],
-    )
-    # p.example has 3 feeds; two exact-match, but each to a DIFFERENT country, so
-    # no single country reaches the 0.5*3 threshold. Pooled it would (2/3); the
-    # per-country rule must not, so the unmatched f-c3 stays kept.
-    url_to_countries = {u1: {"C1"}, u2: {"C2"}}
-    kept = sc._select_atlas_unmatched(archive, url_to_countries)
-    assert [feed["id"] for _, _, feed in kept] == ["f-c3"]
-
-
-@pytest.mark.parametrize(
-    "extra",
-    [
-        ["--country", "FI"],
-        ["--include", "f-x"],
-        ["--exclude", "mdb-1"],
-        ["--subdivision", "Uusimaa"],
-    ],
-)
-def test_atlas_unmatched_rejects_conflicting_flags(extra, monkeypatch):
-    monkeypatch.setattr(sc, "_download", lambda *a, **k: pytest.fail("downloaded"))
-    with pytest.raises(SystemExit):
-        sc.main(["--atlas-unmatched", *extra])
-
-
-def test_atlas_unmatched_cut_writes_empty_csvs_and_batches(
-    tmp_path, monkeypatch, capsys
-):
-    matched = "https://m.example/gtfs.zip"
-    atlas_path = tmp_path / "atlas.tar.gz"
-    _archive(
-        atlas_path,
-        [
-            (
-                "r/feeds/a.dmfr.json",
-                _payload(
-                    _feed("f-m", matched),
-                    _feed("f-1", "https://a.example/1.zip"),
-                    _feed("f-2", "https://b.example/2.zip"),
-                    _feed("f-3", "https://c.example/3.zip"),
-                ),
-            )
-        ],
-    )
+def _partition_inputs(tmp_path, monkeypatch, rows, files):
+    """Point ``_download`` at an MDB CSV of ``rows`` with every column the
+    ingest reads, an empty GBFS CSV and an Atlas archive of ``files``."""
     mdb_path = tmp_path / "feeds_v2.csv"
-    mdb_path.write_text(
-        "id,data_type,location.country_code,urls.direct_download\n"
-        f"mdb-1,gtfs,AA,{matched}\n",
-        encoding="utf-8",
-    )
+    with open(mdb_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, sorted(mdb.REQUIRED_HEADERS), restval="")
+        writer.writeheader()
+        writer.writerows(rows)
     gbfs_path = tmp_path / "systems.csv"
     gbfs_path.write_text("System ID,Country Code\n", encoding="utf-8")
+    atlas_path = tmp_path / "atlas.tar.gz"
+    _archive(atlas_path, files)
     monkeypatch.setattr(
         sc, "_download", lambda work, commit: (atlas_path, mdb_path, gbfs_path)
     )
 
+
+def test_a_partition_stopped_mid_write_publishes_no_map(tmp_path, monkeypatch):
+    rows = [
+        _mdb_gtfs("m1", "FI", "https://a.fi/1.zip"),
+        _mdb_gtfs("m2", "SE", "https://a.se/2.zip"),
+    ]
+    _partition_inputs(tmp_path, monkeypatch, rows, [])
+    calls, write = [], sc._write_atlas
+
+    def write_atlas(out, files):
+        calls.append(out)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        write(out, files)
+
+    monkeypatch.setattr(sc, "_write_atlas", write_atlas)
     out = tmp_path / "out"
-    sc.main(["--atlas-unmatched", "--out-dir", str(out), "--batch-size", "2"])
-
-    run_dir = next(out.iterdir())
-    batches = sorted(p for p in run_dir.iterdir() if p.is_dir())
-    assert len(batches) == 2  # three unmatched feeds, two per batch
-    seen = []
-    for batch in batches:
-        mdb_lines = (batch / "mdb_sample.csv").read_text().splitlines()
-        assert mdb_lines == [
-            "id,data_type,location.country_code,urls.direct_download"
-        ]  # header only
-        assert (batch / "gbfs_sample.csv").read_text().splitlines() == [
-            "System ID,Country Code"
-        ]  # GBFS header only too
-        with tarfile.open(batch / "atlas_sample.tar.gz") as tar:
-            for member in tar.getmembers():
-                payload = json.loads(tar.extractfile(member).read())
-                seen += [f["id"] for f in payload["feeds"]]
-    assert sorted(seen) == ["f-1", "f-2", "f-3"]  # the matched feed is excluded
-    out = capsys.readouterr().out
-    assert "--allow-empty-mdb" in out and "--no-golden" in out
+    with pytest.raises(OSError, match="disk full"):
+        sc.main(["--partition", "--out-dir", str(out)])
+    assert len(calls) == 2
+    assert [p.name for p in out.iterdir() if "partition-" in p.name] == []
 
 
-def test_mdb_url_countries_maps_only_gtfs_and_canonical_codes(tmp_path):
-    src = tmp_path / "feeds.csv"
-    src.write_text(
-        "id,data_type,location.country_code,urls.direct_download\n"
-        "mdb-1,gtfs,FI,https://a.example/g.zip\n"
-        "mdb-2,gtfs,FINLAND,https://a.example/g.zip\n"  # full name folds to FI
-        "mdb-3,gtfs-rt,SE,https://rt.example/x.pb\n"  # realtime is ignored
-        "mdb-4,gtfs,NOTACODE,https://b.example/g.zip\n",  # unselectable country
-        encoding="utf-8",
-    )
-    mapped = sc._mdb_url_countries(src)
-    assert len(mapped) == 1  # only the one selectable GTFS URL
-    assert list(mapped.values()) == [{"FI"}]  # FINLAND -> FI; the bogus one dropped
+@pytest.mark.parametrize(
+    "mdb_labels, atlas_labels, message",
+    [
+        ("ab", "a", r"1 MDB GTFS id\(s\) not in exactly one label: m1 in 2"),
+        ("a", "", r"1 Atlas GTFS id\(s\) not in exactly one label: f-1 in 0"),
+    ],
+    ids=["mdb-in-two-labels", "atlas-in-none"],
+)
+def test_the_partition_refuses_an_id_not_in_exactly_one_label(
+    mdb_labels, atlas_labels, message
+):
+    # The realtime row r1 shares m1's labels but is not checked.
+    rows = [
+        _mdb_gtfs("m1", "FI", "https://a.fi/1.zip"),
+        {**_mdb_gtfs("r1", "FI", ""), "data_type": "gtfs_rt"},
+    ]
+    files = [("a.dmfr.json", _payload(_feed("f-1", "https://a.fi/1.zip")))]
+    planned = {
+        label: (
+            [],
+            rows if label in mdb_labels else [],
+            files if label in atlas_labels else [],
+        )
+        for label in "ab"
+    }
+    with pytest.raises(SystemExit, match=message):
+        sc._check_partition(planned, rows, files)
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--limit", "5"], "cannot be combined with --limit"),
+        (["--subdivision", "Uusimaa"], "cannot be combined with --subdivision"),
+        (["--include", "f-x"], "cannot be combined with --include"),
+        (["--out-dir", "cache/a\nb"], "--out-dir must not contain a line break"),
+    ],
+    ids=["limit", "subdivision", "include", "line-break"],
+)
+def test_the_partition_refuses_bad_flags_before_any_download(
+    extra, message, monkeypatch, capsys
+):
+    monkeypatch.setattr(sc, "_download", lambda *a, **k: pytest.fail("downloaded"))
+    with pytest.raises(SystemExit):
+        sc.main(["--partition", *extra])
+    assert message in capsys.readouterr().err
