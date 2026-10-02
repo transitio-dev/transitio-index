@@ -31,6 +31,7 @@ from transitio_index import (  # noqa: E402
     crosswalk,
     fetch,
     geometry,
+    metros,
     names,
     overture,
     registry,
@@ -1639,3 +1640,45 @@ def test_wikidata_aliases_are_kept_in_the_places_own_languages(place, entry, exp
     languages do, and so does an own-language label Overture replaced."""
     names._merge(place, entry)
     assert place["aliases"] == expected
+
+
+NOT_MAPPED = (None, "the centre's country is not mapped")
+
+
+@pytest.mark.parametrize(
+    "region_id, ucdb_country, iso3, countries, expected",
+    [
+        ("1", "Switzerland", "DEU", ["FR", "FR", "CH"], ("CH", None)),
+        ("1", None, "DEU", ["PL", "PL", "DE"], ("DE", None)),
+        ("293", "China", "CHN", ["HK"], ("HK", None)),
+        ("293", "China", "CHN", ["CN", "CN", "HK"], ("HK", None)),
+        ("9114", "China", "CHN", ["MO"], ("MO", None)),
+        ("165", "Palestine", "PSE", ["XW"], ("XW", None)),
+        ("151", "Syria", "SYR", ["XH"], (None, "no city in the centre's country")),
+        ("1", "Palestine", "PSE", ["XW"], NOT_MAPPED),
+    ],
+    ids=[
+        "ucdb over fao",
+        "fao without a name",
+        "hong kong",
+        "hong kong among china",
+        "macao",
+        "west bank",
+        "no city there",
+        "unmapped",
+    ],
+)
+def test_a_fao_metros_country_is_its_centres_whatever_cities_a_build_holds(
+    region_id, ucdb_country, iso3, countries, expected
+):
+    """A FAO metro took the country most of a build's cities in its region
+    were in, so builds holding different towns filed one region under
+    different countries (Ljubljana's under AT, Copenhagen's under SE)."""
+    by_id = {
+        f"c{i}": {"place_id": f"c{i}", "kind": "city", "country_code": country}
+        for i, country in enumerate(countries)
+    }
+    names = {region_id: {"country": ucdb_country}} if ucdb_country else {}
+    regions = {region_id: {"country": iso3}}
+    country = metros.fao_country(region_id, sorted(by_id), by_id, names, regions)
+    assert country == expected

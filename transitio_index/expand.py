@@ -444,14 +444,16 @@ def _attach_fao_metros(
         metro = codes.get((metros.FAO_SUBTYPE, region_id))
         members = grouped[region_id]
         if metro is None:
-            # A region the seed left unpublished — for want of a majority
-            # country, say — is minted over every city in it, the
+            # A region the seed left unpublished — for want of a city in its
+            # centre's country, say — is minted over every city in it, the
             # seeded ones included, so its partition, name and members do
             # not depend on which cities the crawl found first.
             members = sorted({*members, *seeded.cities(region_id)})
-            country = metros._majority_country(members, places_by_id)
+            country, reason = metros.fao_country(
+                region_id, members, places_by_id, names, regions
+            )
             if country is None:
-                metros._report_fao(report, region_id, "no majority country")
+                metros._report_fao(report, region_id, reason)
                 continue
             key = f"fao_city_region:{region_id}"
             name = metros._fao_name(
@@ -471,7 +473,13 @@ def _attach_fao_metros(
         # A discovered region may hold the centre of a metro no discovered
         # city joined.
         changed = metros.settle_fao_cores(
-            places_by_id, places_by_id, _shipped_footprint, regions, patches, centres
+            places_by_id,
+            places_by_id,
+            _shipped_footprint,
+            regions,
+            patches,
+            centres,
+            names,
         )
         for key in changed:
             # Redrawn from the members it now has, never kept around a core
@@ -737,7 +745,11 @@ def _discover(
         centres,
     )
     dropped |= metros.partition(
-        {key: places_by_id[key] for key in fao_touched}, places_by_id, codes, report
+        {key: places_by_id[key] for key in fao_touched},
+        places_by_id,
+        codes,
+        report,
+        fao=None if fao_inputs is None else (names, fao_inputs[0]),
     )
     minted = [key for key in eurostat_metros + fao_metros if key not in dropped]
     new_metros = [key for key in new_metros if key not in dropped] + minted

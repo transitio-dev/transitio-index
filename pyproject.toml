@@ -51,6 +51,9 @@ viewer = ["fastapi>=0.110", "uvicorn>=0.29"]
 [tool.setuptools]
 packages = ["transitio_index"]
 
+[tool.setuptools.package-data]
+transitio_index = ["country_codes.csv"]
+
 [tool.black]
 include = '(transitio_index|tests|scripts)/.*\.py$'
 

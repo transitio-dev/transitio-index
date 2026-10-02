@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import re
 import urllib.request
 
 import pytest
@@ -12,6 +13,8 @@ import overture_fixture as fx  # noqa: E402
 import shapely  # noqa: E402
 
 from transitio_index import (  # noqa: E402
+    country_codes,
+    csv_source,
     eurostat,
     expand,
     geometry,
@@ -1039,6 +1042,59 @@ def test_a_metro_without_a_majority_country_is_left_unpublished():
     ]
 
 
+def test_a_fao_metro_is_partitioned_by_its_centres_country():
+    def city(qid, country, metro):
+        return {
+            "place_id": qid,
+            "kind": "city",
+            "country_code": country,
+            "metro_ids": [metro],
+        }
+
+    def fao_metro(key, region_id, members):
+        return {
+            "place_id": key,
+            "source_subtype": metros.FAO_SUBTYPE,
+            "statistical_area_id": region_id,
+            "country_code": "AT",
+            "member_ids": members,
+        }
+
+    by_id = {
+        "Q1": city("Q1", "AT", "lj"),
+        "Q2": city("Q2", "AT", "lj"),
+        "Q3": city("Q3", "SI", "lj"),
+        "Q4": city("Q4", "XH", "dam"),
+        "Q5": city("Q5", "US", "msa"),
+        "Q6": city("Q6", "US", "msa"),
+        "Q7": city("Q7", "CA", "msa"),
+    }
+    rows = {
+        "lj": fao_metro("lj", "1164", ["Q1", "Q2", "Q3"]),
+        "dam": fao_metro("dam", "151", ["Q4"]),
+        "msa": {
+            "place_id": "msa",
+            "country_code": None,
+            "member_ids": ["Q5", "Q6", "Q7"],
+        },
+    }
+    codes = {(metros.FAO_SUBTYPE, "151"): rows["dam"]}
+    names = {"1164": {"country": "Slovenia"}, "151": {"country": "Syria"}}
+    report = []
+    # Ljubljana's region is Slovenian with Austrian towns in the majority;
+    # Damascus's, holding only a Golan locality, has no city in Syria.
+    assert metros.partition(rows, by_id, codes, report, fao=(names, {})) == {"dam"}
+    assert rows["lj"]["country_code"] == "SI" and rows["msa"]["country_code"] == "US"
+    assert by_id["Q4"]["metro_ids"] == [] and codes == {}
+    assert report == [
+        {
+            "kind": "metro",
+            "metro_id": "dam",
+            "reason": "no city in the centre's country",
+        }
+    ]
+
+
 @pytest.mark.parametrize("alias_first", [False, True])
 @pytest.mark.parametrize("code", ["16980", "99999"], ids=["same code", "other code"])
 def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, code):
@@ -1077,8 +1133,9 @@ def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, co
     )
 
 
-def _fao_inputs(tmp_path, patch=CHICAGO_PATCH):
-    """One FAO region, 50, whose single ``patch`` holds Chicago's land area."""
+def _fao_inputs(tmp_path, patch=CHICAGO_PATCH, iso3="USA"):
+    """One FAO region, 50, of FAO's country ``iso3``, whose single ``patch``
+    holds Chicago's land area."""
     import hashlib
 
     import fao_fixture as ffx
@@ -1086,7 +1143,7 @@ def _fao_inputs(tmp_path, patch=CHICAGO_PATCH):
 
     payloads = {
         fao.PATCHES_FILE: ffx.patches_zip([(7, (50, 0, 0, 0), patch)]),
-        fao.REGIONS_FILE: ffx.regions_csv([("50", "USA", 1, ["7"], "S")]),
+        fao.REGIONS_FILE: ffx.regions_csv([("50", iso3, 1, ["7"], "S")]),
     }
     files = {}
     for name, data in payloads.items():
@@ -1096,9 +1153,9 @@ def _fao_inputs(tmp_path, patch=CHICAGO_PATCH):
     return files, expected
 
 
-def _ucdb_inputs(tmp_path, centre=CHICAGO_PATCH):
+def _ucdb_inputs(tmp_path, centre=CHICAGO_PATCH, country="United States"):
     """A UCDB fixture that names FAO region 50's centre, drawn as ``centre``,
-    'Chicago' where the two overlap."""
+    'Chicago' in ``country`` where the two overlap."""
     import hashlib
 
     import fao_fixture as ffx
@@ -1112,7 +1169,7 @@ def _ucdb_inputs(tmp_path, centre=CHICAGO_PATCH):
                     1,
                     "Chicago",
                     "Chicago",
-                    "United States",
+                    country,
                     shapely.box(-88.5, 41.2, -87.0, 42.5),
                 )
             ],
@@ -1128,27 +1185,39 @@ def _ucdb_inputs(tmp_path, centre=CHICAGO_PATCH):
     return files, expected
 
 
-def _fao_run(tmp_path, **kw):
+def _fao_run(tmp_path, country="United States", **kw):
     tmp_path.mkdir(parents=True, exist_ok=True)
     return _run(
-        tmp_path, {}, fao=_fao_inputs(tmp_path), ucdb=_ucdb_inputs(tmp_path), **kw
+        tmp_path,
+        {},
+        fao=_fao_inputs(tmp_path),
+        ucdb=_ucdb_inputs(tmp_path, country=country),
+        **kw,
     )
 
 
+UNLISTED = "a derived input is not allowlisted"
+
+
 @pytest.mark.parametrize(
-    "missing",
-    [None, metros.FAO_DERIVED[0], geometry.FAO_DERIVED],
-    ids=["allowed", "no overture", "no fao"],
+    "missing, country, reason",
+    [
+        (None, "United States", None),
+        (metros.FAO_DERIVED[0], "United States", UNLISTED),
+        (geometry.FAO_DERIVED, "United States", UNLISTED),
+        (None, "Canada", "no city in the centre's country"),
+    ],
+    ids=["allowed", "no overture", "no fao", "centre abroad"],
 )
 def test_a_fao_metro_auto_publishes_under_the_derived_gate(
-    tmp_path, monkeypatch, missing
+    tmp_path, monkeypatch, missing, country, reason
 ):
     if missing is not None:
         allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {missing}
         monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
     from transitio_index import ucdb
 
-    manifest, places = _fao_run(tmp_path)
+    manifest, places = _fao_run(tmp_path, country)
     # One inventory row per source the branches read: Overture once, though
     # the Eurostat and FAO branches both place cities by it, and the UCDB the
     # FAO metros are named from.
@@ -1156,7 +1225,7 @@ def test_a_fao_metro_auto_publishes_under_the_derived_gate(
     assert len(inventory) == len(manifest["derived_inventory"]) == 5
     fao_rows = [inventory[geometry.FAO_DERIVED[0]], inventory[ucdb.DERIVED[0]]]
     report = _artefact(tmp_path, "metro_report.jsonl")
-    if missing is None:
+    if reason is None:
         # Helsinki and Espoo assigned by Eurostat, Chicago placed by FAO.
         assert inventory["Overture Maps divisions"]["memberships"] == 3
         # Chicago's land area lies in region 50's patch, so the region
@@ -1188,12 +1257,11 @@ def test_a_fao_metro_auto_publishes_under_the_derived_gate(
             notice = generation.read_bytes("NOTICE").decode("utf-8")
         assert "Multi-Tier City-Regions" in notice
     else:
-        # A closed gate ships nothing FAO-derived: the region is reported.
+        # A closed gate ships nothing FAO-derived, nor does a region centred
+        # in a country none of its cities is in: the region is reported.
         assert "fao_city_region:50" not in places
         assert manifest["fao"] == {"published": 0, "memberships": 0, "cores": 0}
-        assert [r["reason"] for r in report if r.get("branch") == "fao"] == [
-            "a derived input is not allowlisted"
-        ]
+        assert [r["reason"] for r in report if r.get("branch") == "fao"] == [reason]
 
 
 def test_members_for_a_fao_metro_this_build_mints_are_refused(tmp_path):
@@ -1237,6 +1305,36 @@ def test_the_fao_derived_version_covers_every_input(patches, centres):
         return metros._fao_version({"digests": digests}, centres)
 
     assert version("a" * 64, "d" * 64) != version(patches, centres)
+
+
+def test_the_country_table_maps_each_input_to_one_code():
+    rows = csv_source.read_rows(
+        country_codes.TABLE.read_text(encoding="utf-8"), country_codes.COLUMNS
+    )
+    codes = [row["code"] for row in rows]
+    assert len(set(codes)) == len(codes)
+    assert all(
+        re.fullmatch("[A-Z]{2}", c)
+        for c in [*codes, *country_codes.FAO_REGIONS.values()]
+    )
+    for column in ("iso3", "ucdb"):
+        values = [row[column] for row in rows if row[column]]
+        assert len(set(values)) == len(values)
+    assert (
+        country_codes.by_iso3("USA") == country_codes.by_ucdb("United States") == "US"
+    )
+    # The UCDB's accented names as its source mis-decodes them.
+    accented = {
+        "México": "MX",
+        "Côte d'Ivoire": "CI",
+        "Curaçao": "CW",
+        "Réunion": "RE",
+        "São Tomé and Príncipe": "ST",
+    }
+    assert {
+        name: country_codes.by_ucdb(name.encode("utf-8").decode("latin-1"))
+        for name in accented
+    } == accented
 
 
 # A FAO region of 100 square degrees whose centre is at (5, 5), and one city
@@ -1316,8 +1414,8 @@ def test_a_sliver_fao_metro_takes_the_division_holding_its_centre(
 
 def test_a_core_that_no_longer_qualifies_leaves_its_metro():
     key = "fao_city_region:50"
-    city = {**SLIVER, "geom": shapely.box(0, 0, 5, 2), "country_code": "XX"}
-    old = {**_division("r", shapely.box(3, 3, 7, 7)), "metro_ids": [key]}
+    city = {**SLIVER, "geom": shapely.box(0, 0, 5, 2), "country_code": "SI"}
+    old = {**_division("r", shapely.box(3, 3, 7, 7), "SI"), "metro_ids": [key]}
     metro = {
         "place_id": key,
         "kind": "metro",
@@ -1330,13 +1428,43 @@ def test_a_core_that_no_longer_qualifies_leaves_its_metro():
         {key: metro},
         by_id,
         lambda place: place.get("geom"),
-        {"50": {"patches": ["7"]}},
+        {"50": {"patches": ["7"], "country": "SVN"}},
         {"7": {"geom": REGION}},
         {"50": CENTRE},
+        {},
     )
     # The city now covers 10% of the region: the core leaves, reciprocally.
     assert changed == {key}
     assert metro["member_ids"] == ["c"] and old["metro_ids"] == []
+
+
+def test_a_sliver_fao_metros_core_is_in_its_centres_country():
+    key = "fao_city_region:50"
+    by_id = {
+        f"c{i}": {**SLIVER, "place_id": f"c{i}", "country_code": country}
+        for i, country in enumerate(["AT", "AT", "SI"])
+    }
+    by_id["r"] = _division("r", shapely.box(3, 3, 7, 7), "SI")
+    metro = {
+        "place_id": key,
+        "kind": "metro",
+        "source_subtype": metros.FAO_SUBTYPE,
+        "statistical_area_id": "50",
+        "member_ids": ["c0", "c1", "c2"],
+    }
+    by_id[key] = metro
+    changed = metros.settle_fao_cores(
+        {key: metro},
+        by_id,
+        lambda place: place.get("geom"),
+        {"50": {"patches": ["7"], "country": "AUT"}},
+        {"7": {"geom": REGION}},
+        {"50": CENTRE},
+        {"50": {"country": "Slovenia"}},
+    )
+    # Most cities are Austrian, but the centre is Slovenian: so is the core.
+    assert changed == {key}
+    assert metro["member_ids"] == ["c0", "c1", "c2", "r"]
 
 
 @pytest.mark.parametrize("curated", [False, True], ids=["overture", "curated"])

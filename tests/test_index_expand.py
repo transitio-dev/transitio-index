@@ -668,14 +668,19 @@ def test_a_seeded_fao_metro_keeps_its_members_when_an_official_metro_grows(
     assert manifest["metros_added"] == 1
 
 
-def test_a_fao_region_the_seed_left_unpublished_is_minted_over_every_city(tmp_path):
+@pytest.mark.parametrize("iso3, country", [("FIN", "FI"), ("SWE", "SE"), ("NOR", None)])
+def test_a_fao_region_the_seed_left_unpublished_is_minted_over_every_city(
+    tmp_path, iso3, country
+):
     from test_index_metros import _fao_inputs
     from transitio_index import fao
 
     cache = tmp_path / "cache"
-    # Region 50 holds two seeded cities on either side of a border — a tie
-    # the metros stage could not partition — and Tampere, which the crawl finds.
-    files, pins = _fao_inputs(tmp_path, patch=shapely.box(21.0, 60.5, 25.0, 62.0))
+    # Region 50 holds two seeded cities on either side of a border, left
+    # unpublished by the seed, and Tampere, which the crawl finds.
+    files, pins = _fao_inputs(
+        tmp_path, patch=shapely.box(21.0, 60.5, 25.0, 62.0), iso3=iso3
+    )
     fao.prepare_inputs(cache, files=files, expected=pins)
 
     def city(qid, name, country, overture_id):
@@ -696,11 +701,20 @@ def test_a_fao_region_the_seed_left_unpublished_is_minted_over_every_city(tmp_pa
     derived = {"eurostat": None, "fao": pins, "ucdb": None}
     _publish_names(cache, SEED_PLACES + seeded, derived_inputs=derived)
     _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
-    manifest, places, _ = _expand(tmp_path, cache)
+    manifest, places, report = _expand(tmp_path, cache)
+    if country is None:
+        # Centred in Norway, where none of its cities is: reported, not minted.
+        assert "fao_city_region:50" not in places
+        assert [r["reason"] for r in report if r.get("branch") == "fao"] == [
+            "no city in the centre's country"
+        ]
+        assert manifest["metros_added"] == 0
+        return
     metro = places["fao_city_region:50"]
-    # Minted over the seeded cities too, so the partition and the name (no
-    # UCDB centre: the largest member's) come from the whole membership.
-    assert (metro["country_code"], metro["name"]) == ("FI", "Tampere")
+    # Minted over the seeded cities too, in its centre's country whatever
+    # most cities are in, the name (no UCDB centre: the largest member's)
+    # from the whole membership.
+    assert (metro["country_code"], metro["name"]) == (country, "Tampere")
     assert metro["member_ids"] == ["Q1", "Q2", "Q40840"]
     assert all(
         places[q]["metro_ids"] == ["fao_city_region:50"] for q in ("Q1", "Q2", "Q40840")
@@ -718,7 +732,9 @@ def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core)
     # whose centre lies in Pirkanmaa. A stop off every city discovers
     # Pirkanmaa, which joins as the core; or the seed gave the metro a core
     # and a stop discovers Badgeo, a city shipping no polygon, so it leaves.
-    files, pins = _fao_inputs(tmp_path, patch=shapely.box(21.0, 60.5, 29.0, 62.5))
+    files, pins = _fao_inputs(
+        tmp_path, patch=shapely.box(21.0, 60.5, 29.0, 62.5), iso3="FIN"
+    )
     fao.prepare_inputs(cache, files=files, expected=pins)
     centres, centre_pins = _ucdb_inputs(
         tmp_path, centre=shapely.box(23, 61.2, 24, 61.8)

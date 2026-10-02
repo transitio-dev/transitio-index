@@ -12,9 +12,10 @@ curator ``set_statistical_area`` crosswalk may instead merge it onto a chosen
 QID. Everywhere: the FAO city-region a
 city's Overture land area falls in is published as a ``metro`` keyed by its
 region id and named from its GHS-UCDB centre, one more definition of the
-city's area beside the others; one whose cities cover under ``CORE_SLIVER``
-of its region also takes the region-kind place holding the region's centre
-as a core member. The Eurostat and FAO branches publish only
+city's area beside the others, in its centre's country (:func:`fao_country`)
+when it holds a city there; one whose cities cover under ``CORE_SLIVER`` of
+its region also takes the region-kind place in that country holding the
+region's centre as a core member. The Eurostat and FAO branches publish only
 while their derived inputs are allowlisted. Every member carries its
 metros in ``metro_ids`` — one per definition it falls in. This stage adds
 membership only; the geometry stage draws a metro from its members' shipped
@@ -30,6 +31,7 @@ import hashlib
 import shapely
 
 from transitio_index import (
+    country_codes,
     csv_source,
     eurostat,
     geometry,
@@ -337,42 +339,52 @@ def _unjoin(metro, by_id):
             place["metro_ids"].remove(metro["place_id"])
 
 
-def _partition(metro, by_id):
+def _partition(metro, by_id, fao=None):
     """Give ``metro`` the country partition most of its members are in,
     recomputed over its full membership once every join and override is in,
     so a cross-border member list repartitions it; with members but no
     majority — none carries a country, or the leading countries tie — it
-    cannot publish, whichever stage finds it so. A metro with no member yet
-    (a crosswalked placeholder awaiting the cities the expand stage finds)
-    has only its source's country to be partitioned by, and keeps it.
-    Returns whether it can publish."""
+    cannot publish, whichever stage finds it so. With ``fao`` (the UCDB
+    names and FAO regions), a FAO metro instead takes :func:`fao_country`
+    over its city members. A metro with no member yet (a crosswalked
+    placeholder awaiting the cities the expand stage finds) has only its
+    source's country to be partitioned by, and keeps it. Returns None when
+    it can publish, else the reason it cannot."""
     members = metro.get("member_ids") or []
     if not members:
-        return bool(metro.get("country_code"))
-    country = _majority_country(members, by_id)
+        return None if metro.get("country_code") else "no majority country"
+    if fao is not None and metro.get("source_subtype") == FAO_SUBTYPE:
+        cities = [m for m in members if (by_id.get(m) or {}).get("kind") == "city"]
+        country, reason = fao_country(
+            metro.get("statistical_area_id"), cities, by_id, *fao
+        )
+    else:
+        country, reason = _majority_country(members, by_id), "no majority country"
     if country is None:
-        return False
+        return reason
     metro["country_code"] = country
-    return True
+    return None
 
 
-def partition(rows, by_id, codes, report):
-    """Partition every metro in ``rows`` (``{key: row}``) by country. One
-    that cannot publish — its members give no majority country, or it has
-    neither members nor a country — is unjoined from its members, reported
-    and removed from ``rows``, ``by_id`` and the code index ``codes``, so no
-    later join finds it; every place belongs to one country partition.
-    Returns the keys removed."""
+def partition(rows, by_id, codes, report, fao=None):
+    """Partition every metro in ``rows`` (``{key: row}``) by country, a FAO
+    metro by its centre's with ``fao`` given (see :func:`_partition`). One
+    that cannot publish — its members give it no country, or it has neither
+    members nor a country — is unjoined from its members, reported
+    with the reason and removed from ``rows``, ``by_id`` and the code index
+    ``codes``, so no later join finds it; every place belongs to one country
+    partition. Returns the keys removed."""
     dropped = set()
     for key, metro in list(rows.items()):
-        if _partition(metro, by_id):
+        reason = _partition(metro, by_id, fao)
+        if reason is None:
             continue
         _unjoin(metro, by_id)
         report.append(
             {
                 "kind": "metro",
                 "metro_id": metro["place_id"],
-                "reason": "no majority country",
+                "reason": reason,
             }
         )
         del rows[key]
@@ -629,6 +641,28 @@ def _majority_country(city_ids, by_id):
     return country if count * 2 > sum(counts.values()) else None
 
 
+def fao_country(region_id, city_ids, by_id, names, regions):
+    """``(country, reason)``: a FAO metro's country, its centre's — the
+    region's in ``country_codes.FAO_REGIONS``, else that of the GHS-UCDB
+    centre ``names`` matches it to, else that of FAO's code in ``regions``,
+    a function of the region alone — or None and the reason it cannot
+    publish: that country is not mapped, or none of ``city_ids`` is in it."""
+    country = country_codes.FAO_REGIONS.get(region_id)
+    if country is None:
+        named = names.get(region_id)
+        if named:
+            country = country_codes.by_ucdb(named.get("country"))
+        else:
+            country = country_codes.by_iso3(
+                (regions.get(region_id) or {}).get("country")
+            )
+    if country is None:
+        return None, "the centre's country is not mapped"
+    if any((by_id.get(c) or {}).get("country_code") == country for c in city_ids):
+        return country, None
+    return None, "no city in the centre's country"
+
+
 def _report_fao(report, region_id, reason):
     """One report row for a FAO city-region left unpublished."""
     report.append(
@@ -660,17 +694,17 @@ def _fao_name(names, region_id, members, by_id, footprint):
 def fao_core(cities, candidates, footprint, region, centre, country):
     """The region-kind place a FAO metro takes as its core member, or None.
 
-    None without a ``centre``, when a city has no footprint (a metro is
-    drawn only when every member ships one), or when the union of the
-    ``cities``' footprints covers at least ``CORE_SLIVER`` of ``region``
-    (the union of its patches). Otherwise the largest of ``candidates`` that
-    is in ``country``, covers ``centre``, is no larger than
+    None without a ``centre`` or a ``country``, when a city has no footprint
+    (a metro is drawn only when every member ships one), or when the union
+    of the ``cities``' footprints covers at least ``CORE_SLIVER`` of
+    ``region`` (the union of its patches). Otherwise the largest of
+    ``candidates`` that is in ``country``, covers ``centre``, is no larger than
     ``CORE_MAX_RATIO`` of the region and has at least ``CORE_MIN_INSIDE`` of
     its own area inside it; ties by place id. ``footprint(place)`` is a
     place's polygon, None for none. Areas are planar degrees: each
     comparison is between shapes at one place.
     """
-    if centre is None or not candidates:
+    if centre is None or country is None or not candidates:
         return None
     shapes = [footprint(city) for city in cities]
     if any(shape is None for shape in shapes):
@@ -697,14 +731,14 @@ def fao_core(cities, candidates, footprint, region, centre, country):
     return best[1] if best is not None else None
 
 
-def settle_fao_cores(rows, by_id, footprint, regions, patches, centres):
+def settle_fao_cores(rows, by_id, footprint, regions, patches, centres, names):
     """Settle the core of each FAO metro in ``rows`` (``{key: row}``): the
-    region-kind member :func:`fao_core` names over its city members and the
-    country most of them are in joins, and one it no longer names leaves. A
+    region-kind member :func:`fao_core` names over its city members and
+    their :func:`fao_country` joins, and one it no longer names leaves. A
     metro whose members are curated is left as it is. The candidates are
     ``by_id``'s region-kind places with a ``footprint``; ``regions`` and
-    ``patches`` are the loaded FAO inputs and ``centres`` the centre points
-    by id. Returns the keys changed."""
+    ``patches`` are the loaded FAO inputs, ``centres`` the centre points by
+    id and ``names`` the UCDB centre matches. Returns the keys changed."""
     settled = {
         key: metro
         for key, metro in rows.items()
@@ -742,7 +776,9 @@ def settle_fao_cores(rows, by_id, footprint, regions, patches, centres):
                 [patches[p]["geom"] for p in regions[region_id]["patches"]]
             ),
             centre,
-            _majority_country([city["place_id"] for city in cities], by_id),
+            fao_country(
+                region_id, [city["place_id"] for city in cities], by_id, names, regions
+            )[0],
         )
         for member in members:
             if member.get("kind") == "region" and member is not core:
@@ -794,8 +830,9 @@ def _apply_fao(
     ``inputs`` holding cities, whatever other metros those cities belong
     to. Each metro is keyed by its FAO region id, named from the
     region's GHS-UCDB centre match in ``names`` (empty unless the UCDB derived
-    input was read), its country the one most of its cities are in, and the
-    cities joined as members, with the core :func:`settle_fao_cores` names
+    input was read), its country its centre's (:func:`fao_country`) — a
+    region holding no city there is reported — and the cities joined as
+    members, with the core :func:`settle_fao_cores` names
     by the region ``centres`` (None when unread, else read from the file
     pinned at ``centre_pin``) over the polygons the places ship, curated
     ``boundaries`` included. It publishes only while
@@ -816,12 +853,11 @@ def _apply_fao(
     touched = {}
     for region_id in sorted(grouped):
         derived = sorted(grouped[region_id])
-        # A metro belongs to one country partition, so a cross-border region
-        # takes the country most of its cities are in; one with no majority is
-        # reported rather than published countryless.
-        country = _majority_country(derived, by_id)
+        # A metro belongs to one country partition, its centre's, whichever
+        # cities this build holds.
+        country, reason = fao_country(region_id, derived, by_id, names, regions)
         if country is None:
-            _report_fao(report, region_id, "no majority country")
+            _report_fao(report, region_id, reason)
             continue
         if not allowed:
             _report_fao(report, region_id, "a derived input is not allowlisted")
@@ -868,6 +904,7 @@ def _apply_fao(
             regions,
             patches,
             centres,
+            names,
         )
         for key in touched:
             members = (by_id.get(m) for m in metros[key]["member_ids"])
@@ -1283,9 +1320,14 @@ def attach_metros(
                     dataset=dataset,
                 )
                 # A seeded FAO metro joined here is repartitioned over its
-                # grown membership; one left without a majority is dropped.
+                # grown membership; one with no city in its centre's country
+                # is dropped.
                 fao_dropped = partition(
-                    {key: metros[key] for key in fao_touched}, by_id, codes, report
+                    {key: metros[key] for key in fao_touched},
+                    by_id,
+                    codes,
+                    report,
+                    fao=(names, fao_inputs[0]),
                 )
                 for key in fao_dropped:
                     metros.pop(key, None)
