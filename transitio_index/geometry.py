@@ -734,6 +734,39 @@ def _valid_polygon(geom):
     return bool(_valid_polygons(np.asarray([geom], dtype=object))[0])
 
 
+def settle_centres(places, shipped=None):
+    """Keep each place's ``centre`` (WKB hex) only when it is a point its
+    geometry covers — unchecked without one — and, for an Overture label
+    point (``centre_sources``, popped from every place), only when every
+    source is allowlisted; ``shipped`` gathers those sources. Returns how
+    many places keep a centre."""
+    places = list(places)
+    sources = [place.pop("centre_sources", None) for place in places]
+    held = [i for i, place in enumerate(places) if place.get("centre")]
+    if not held:
+        return 0
+    centres = shapely.from_wkb([places[i]["centre"] for i in held], on_invalid="ignore")
+    areas = shapely.from_wkb(
+        [places[i].get("geometry") for i in held], on_invalid="ignore"
+    )
+    good = (
+        (shapely.get_type_id(centres) == 0)
+        & ~shapely.is_empty(centres)
+        & np.isfinite(shapely.bounds(centres)).all(axis=1)
+        & (shapely.is_missing(areas) | shapely.covers(areas, centres))
+    )
+    kept = 0
+    for i, ok in zip(held, good):
+        audited = sources[i]
+        if ok and (audited is None or _is_shippable(audited)):
+            if audited and shipped is not None:
+                shipped.update(_source_key(source) for source in audited)
+            kept += 1
+        else:
+            places[i]["centre"] = None
+    return kept
+
+
 def _repaired_polygon(geom):
     """A valid, non-empty (multi)polygon for ``geom``, or None.
 
@@ -1076,6 +1109,7 @@ def attach_geometry(
                 curated += 1
             # A council area's curated boundary is its cities' too.
             _lend_council_boundaries(places, by_id, lent, absent)
+            centres = settle_centres(places, shipped)
             derived = metros_manifest.get("derived_inventory") or []
             from transitio_index import ucdb  # ucdb -> fao -> geometry
 
@@ -1101,6 +1135,7 @@ def attach_geometry(
                     p.get("geometry_source") == COUNCIL_AREA for p in places
                 ),
                 "ucdb_geometry": sum(p.get("geometry_source") == UCDB for p in places),
+                "centres": centres,
                 "places_overrides_sha256": places_digest,
                 "stale_overrides": len(override_report),
                 "stale_place_overrides": (

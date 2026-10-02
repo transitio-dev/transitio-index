@@ -16,6 +16,7 @@ ROWS = [
         wikidata="Q1508",
         name="Uusimaa",
         admin_level=1,
+        point=(24.9, 60.4),
         hierarchies=fx.chain(
             ("fi", "country", "Finland"), ("fi-uusimaa", "region", "Uusimaa")
         ),
@@ -456,6 +457,10 @@ def test_seed_places_a_city_with_its_ancestors(tmp_path):
     assert places["Q1508"]["kind"] == "region"
     assert places["Q33"]["kind"] == "country"
     assert places["Q1508"]["parent_id"] == "Q33"
+    # Each carries its label point and the division's sources to audit.
+    for key, point in (("Q1757", (24.94, 60.17)), ("Q1508", (24.9, 60.4))):
+        assert places[key]["centre"] == shapely.to_wkb(shapely.Point(point)).hex()
+        assert places[key]["centre_sources"] == []
 
 
 def test_a_gbfs_location_places_a_city(tmp_path):
@@ -1152,6 +1157,12 @@ def test_the_listed_countries_capitals_and_large_cities_are_seeded(
     assert places[solna]["name"] == "Solna" and places[solna]["kind"] == "city"
     assert places[solna]["parent_id"] == places["Q34"]["place_id"]
     assert places[solna]["resolution_method"] == "ghs_ucdb"
+    # Its centre is a point on its polygon; a matched row's is its division's.
+    assert shapely.from_wkb(places[solna]["centre"]).equals(
+        shapely.point_on_surface(shapely.from_wkb(places[solna]["ucdb_boundary"]))
+    )
+    assert places[solna]["centre_sources"] is None
+    assert shapely.from_wkb(stockholm["centre"]).equals(shapely.Point(18.07, 59.33))
     assert places[taby]["name"] == "Täby (curated)" and places[taby]["curated"]
     assert places[taby]["ucdb_id"] == 104 and places[taby]["boundary_wkt"]
     assert minted == {solna: "ghs_ucdb:99", taby: "places.yaml:ghs_ucdb:104"}

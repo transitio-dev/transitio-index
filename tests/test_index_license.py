@@ -431,16 +431,19 @@ def test_prohibited_hulls_are_nulled_and_the_judgement_ships(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "block, derived",
+    "block, derived, centre, kept",
     [
-        ({"spdx_identifier": "CC-BY-4.0"}, True),  # redistributable: contributes
-        ({}, False),  # unknown: ships, but builds no boundary
+        # Redistributable: contributes, and keeps a centre only inside it.
+        ({"spdx_identifier": "CC-BY-4.0"}, True, (25.0, 60.2), True),
+        ({"spdx_identifier": "CC-BY-4.0"}, True, (27.7, 62.9), False),
+        ({}, False, None, False),  # unknown: ships, but builds no boundary
     ],
 )
 def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
-    tmp_path, block, derived
+    tmp_path, block, derived, centre, kept
 ):
     shapely = pytest.importorskip("shapely")
+    point = shapely.to_wkb(shapely.Point(centre)).hex() if centre else None
     near = shapely.to_wkb(shapely.box(24.9, 60.1, 25.1, 60.3)).hex()
     far = shapely.to_wkb(shapely.box(27.6, 62.8, 27.8, 63.0)).hex()
     feeds = [
@@ -452,7 +455,8 @@ def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
         },
     ]
     edges = [_edge("Q1757", "f-a"), _edge("Q-metro", "f-a"), _edge("Q-metro", "f-p")]
-    cache = _cache(tmp_path, feeds, edges)
+    places = [PLACES[0], {**PLACES[1], "centre": point}]
+    cache = _cache(tmp_path, feeds, edges, places)
     manifest = licensing.license_index(cache)
     places, _ = store.read_jsonl(
         cache / "license", "licensed.json", "places_licensed.jsonl"
@@ -476,6 +480,7 @@ def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
     # not in it.
     assert boundary.covers(shapely.from_wkb(bytes.fromhex(near)))
     assert boundary.disjoint(shapely.from_wkb(bytes.fromhex(far)))
+    assert metro["centre"] == (point if kept else None)
     publish.publish(cache)
     index = transitio_index.read_index(cache / "index")
     rows = index.places.set_index("place_id")

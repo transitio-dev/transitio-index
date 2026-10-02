@@ -145,16 +145,21 @@ def write_area_dataset(path, rows, row_group_size=None):
 
 
 class StubWikidata:
-    """A Wikidata client stand-in: fixed P402 and metro maps, no network."""
+    """A Wikidata client stand-in: fixed P402, metro, label and coordinate
+    maps, no network."""
 
     endpoint = "stub://wikidata"
 
-    def __init__(self, mapping=None, metros=None, labels=None, candidates=None):
+    def __init__(
+        self, mapping=None, metros=None, labels=None, candidates=None, points=None
+    ):
         self.mapping = mapping or {}
         self.metros = metros or {}
         self.candidates = candidates or {}
         self.labels = labels or {}
+        self.points = points or {}
         self.queried = []
+        self.located = []
 
     def p402(self, osm_relation_ids):
         ids = sorted({str(i) for i in osm_relation_ids})
@@ -169,3 +174,7 @@ class StubWikidata:
 
     def labels_and_aliases(self, qids):
         return {q: self.labels[q] for q in qids if q in self.labels}
+
+    def coordinates(self, qids):
+        self.located.append(sorted(qids))
+        return {q: self.points[q] for q in qids if q in self.points}

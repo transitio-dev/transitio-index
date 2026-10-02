@@ -506,7 +506,7 @@ def license_index(cache_dir, *, overrides_dir=None):
     """Publish the ``license`` generation for the current build. Returns
     the manifest. Every lock publication holds is held here too, in the
     same order, then this stage's own, then the crawl's."""
-    from transitio_index import publish
+    from transitio_index import geometry, publish
 
     with contextlib.ExitStack() as stack:
         for subdir in publish.STAGE_LOCKS:
@@ -551,6 +551,8 @@ def license_index(cache_dir, *, overrides_dir=None):
             raise LicenseError("the build has edges but no places to publish")
         if places is not None and edges is not None:
             places, edges, rehoming = _rehome(places, edges)
+            # A boundary derived here holds the centre or drops it.
+            geometry.settle_centres(places)
         # The feed references are checked in every build; the place and
         # edge ones once the invariant has been applied.
         _assert_integrity(

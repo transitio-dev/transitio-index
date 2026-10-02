@@ -1,11 +1,11 @@
 """Overture divisions ingest and Wikidata QID resolution for the gazetteer.
 
 Reads the pinned Overture ``divisions`` release as projected GeoParquet, keeps
-the whole administrative skeleton (country, region, county, localadmin — geometry
-excluded), and resolves each division to a canonical Wikidata QID: the
-division's own ``wikidata`` property, else a reverse lookup
-from an OSM relation id it was built from (Wikidata ``P402``), else — for a
-named division — its Overture id as the identity; only a nameless division, or
+the whole administrative skeleton (country, region, county, localadmin — each
+with its label point, never its area), and resolves each division to a
+canonical Wikidata QID: the division's own ``wikidata`` property, else a reverse
+lookup from an OSM relation id it was built from (Wikidata ``P402``), else — for
+a named division — its Overture id as the identity; only a nameless division, or
 one whose signals conflict, goes to the resolution report, never a minted
 identity. Localities are feed-driven (3.5M rows, ~26% carry a QID) and are
 matched from feed municipalities in a later stage rather than bulk-resolved here.
@@ -84,6 +84,7 @@ PROJECT = [
     "wikidata",
     "sources",
     "hierarchies",
+    "geometry",
 ]
 
 # An OSM relation reference inside a source ``record_id`` (``relation/123`` or a
@@ -173,7 +174,8 @@ def overture_dataset(release=OVERTURE_RELEASE):
 
 
 def read_divisions(dataset, *, subtypes=SKELETON_SUBTYPES):
-    """The projected admin-skeleton divisions (whole world, geometry excluded).
+    """The projected admin-skeleton divisions (whole world), each with its label
+    point, not its area.
 
     Filtered to the skeleton subtypes only, never to a country set: a feed's
     country is not always known from catalogue metadata (Atlas locates by
@@ -270,7 +272,59 @@ def normalize_division(row):
         "osm_relation_ids": _osm_relation_ids(row.get("sources")),
         "sources": _source_licences(row.get("sources")),
         "ancestors": _ancestors(row.get("hierarchies")),
+        "point": _hex(row.get("geometry")),
     }
+
+
+def _hex(wkb):
+    """WKB bytes as hex, None for none."""
+    return wkb.hex() if wkb else None
+
+
+def division_points(dataset, ids, countries):
+    """``{id: point}``: the label points (WKB hex) of the divisions ``ids``, in
+    ``countries``, from one scan; a division without one is absent."""
+    ids = sorted({i for i in ids if i})
+    if not ids:
+        return {}
+    countries = sorted({c for c in countries if c})
+    predicate = ds.field("id").isin(ids) & ds.field("country").isin(countries)
+    found = {}
+    for batch in dataset.to_batches(columns=["id", "geometry"], filter=predicate):
+        for division_id, wkb in zip(
+            batch.column("id").to_pylist(), batch.column("geometry").to_pylist()
+        ):
+            if wkb:
+                found[division_id] = wkb.hex()
+    return found
+
+
+def _area_km2(value):
+    """A P2046 amount in square metres as km², None unless positive."""
+    try:
+        m2 = float(value)
+    except (TypeError, ValueError):
+        return None
+    return m2 / 1e6 if math.isfinite(m2) and m2 > 0 else None
+
+
+# A P625 value on Earth; another globe's is prefixed with that globe's IRI.
+_WKT_POINT = re.compile(r"\APoint\(\s*(\S+)\s+(\S+)\s*\)\Z")
+
+
+def _earth_point(value):
+    """A P625 ``Point(lon lat)`` literal as ``(lon, lat)``, None unless an
+    Earth point in range."""
+    match = _WKT_POINT.match(value or "")
+    if match is None:
+        return None
+    try:
+        lon, lat = float(match[1]), float(match[2])
+    except ValueError:
+        return None
+    if -180 <= lon <= 180 and -90 <= lat <= 90:
+        return lon, lat
+    return None
 
 
 def _transient(error):
@@ -291,9 +345,10 @@ class WikidataClient:
 
     Resolves OSM relations to QIDs (``p402``), a city's US metropolitan area
     (``statistical_metros``), its metro-like candidates (``metro_candidates``),
-    an entity's area (``areas``) and a place's labels and aliases
-    (``labels_and_aliases``), each in id-keyed batches. Only the Overture release
-    is pinned; these endpoints are live, so results track Wikidata at build time.
+    an entity's area (``areas``) and coordinates (``coordinates``) and a
+    place's labels and aliases (``labels_and_aliases``), each in id-keyed
+    batches. Only the Overture release is pinned; these endpoints are live, so
+    results track Wikidata at build time.
     Tests substitute a stub exposing the same methods rather than reaching the
     network.
     """
@@ -360,31 +415,43 @@ class WikidataClient:
         }
 
     def areas(self, qids):
-        """``{qid: [km², ...]}`` — each QID's area (P2046) values.
+        """``{qid: [km², ...]}`` — each QID's area (P2046) values, from the
+        amounts normalised to square metres. A QID without one is absent."""
+        return self._best_values(
+            qids,
+            "P2046",
+            "psn:P2046/wikibase:quantityAmount",
+            _area_km2,
+            "wikidata areas",
+        )
 
-        Only best-ranked statements, normalised to square metres, so a
-        deprecated or outranked area is never read as the entity's. A QID
-        without one is absent.
-        """
+    def coordinates(self, qids):
+        """``{qid: [(lon, lat), ...]}`` — each QID's coordinate locations
+        (P625) on Earth. A QID without one is absent."""
+        return self._best_values(
+            qids, "P625", "ps:P625", _earth_point, "wikidata coordinates"
+        )
+
+    def _best_values(self, qids, prop, path, parse, what):
+        """``{qid: sorted values}``: each QID's best-ranked ``prop`` statements
+        read through ``path``, so a deprecated or outranked one is never read
+        as the entity's; ``parse`` gives a value, or None to skip one."""
         ids = self._checked_qids(qids)
         found = {}
-        for start in progress(range(0, len(ids), self.batch_size), "wikidata areas"):
+        for start in progress(range(0, len(ids), self.batch_size), what):
             batch = " ".join(
                 f"wd:{qid}" for qid in ids[start : start + self.batch_size]
             )
             query = (
-                f"SELECT ?item ?m2 WHERE {{ VALUES ?item {{ {batch} }} "
-                "?item p:P2046 ?st . ?st a wikibase:BestRank ; "
-                "psn:P2046/wikibase:quantityAmount ?m2 . }"
+                f"SELECT ?item ?value WHERE {{ VALUES ?item {{ {batch} }} "
+                f"?item p:{prop} ?st . ?st a wikibase:BestRank ; "
+                f"{path} ?value . }}"
             )
             for binding in self._get(query):
                 qid = binding.get("item", {}).get("value", "").rsplit("/", 1)[-1]
-                try:
-                    m2 = float(binding.get("m2", {}).get("value"))
-                except (TypeError, ValueError):
-                    continue
-                if QID_PATTERN.match(qid) and math.isfinite(m2) and m2 > 0:
-                    found.setdefault(qid, set()).add(m2 / 1e6)
+                value = parse(binding.get("value", {}).get("value"))
+                if QID_PATTERN.match(qid) and value is not None:
+                    found.setdefault(qid, set()).add(value)
         return {qid: sorted(values) for qid, values in sorted(found.items())}
 
     @staticmethod

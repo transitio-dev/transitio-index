@@ -41,32 +41,56 @@ def _box(size):
     return shapely.box(0, 0, size, size)
 
 
-def test_areas_reads_best_ranked_values_in_square_kilometres(monkeypatch):
-    payload = {
-        "results": {
-            "bindings": [
-                {"item": {"value": ENTITY + "Q3826"}, "m2": {"value": "3500000000"}},
-                {"item": {"value": ENTITY + "Q3826"}, "m2": {"value": "3.9e9"}},
-                {"item": {"value": ENTITY + "not-a-qid"}, "m2": {"value": "1000000"}},
-            ]
-        }
-    }
+@pytest.mark.parametrize(
+    "method, values, expected, path",
+    [
+        (
+            "areas",
+            ["3500000000", "3.9e9", "-1", "many"],
+            {"Q3826": [3500.0, 3900.0]},
+            "psn:P2046/wikibase:quantityAmount ?value",
+        ),
+        (
+            "coordinates",
+            [
+                "Point(13.38 52.52)",
+                f"<{ENTITY}Q405> Point(13.38 52.52)",
+                "Point(200 52.52)",
+                "Point(13.38)",
+            ],
+            {"Q3826": [(13.38, 52.52)]},
+            "ps:P625 ?value",
+        ),
+    ],
+    ids=["areas", "coordinates"],
+)
+def test_best_ranked_values_are_parsed_and_checked(
+    monkeypatch, method, values, expected, path
+):
+    bindings = [
+        {"item": {"value": ENTITY + "Q3826"}, "value": {"value": value}}
+        for value in values
+    ]
+    bindings.append(
+        {"item": {"value": ENTITY + "not-a-qid"}, "value": {"value": values[0]}}
+    )
     queries = []
 
     def fake_urlopen(request, timeout=None):
         query = urllib.parse.urlsplit(request.full_url).query
         queries.append(urllib.parse.parse_qs(query)["query"][0])
+        payload = {"results": {"bindings": bindings}}
         return io.BytesIO(json.dumps(payload).encode("utf-8"))
 
     monkeypatch.setattr(overture.urllib.request, "urlopen", fake_urlopen)
-    client = overture.WikidataClient()
-    assert client.areas(["Q3826", "Q11568", None]) == {"Q3826": [3500.0, 3900.0]}
+    read = getattr(overture.WikidataClient(), method)
+    assert read(["Q3826", "Q11568", None]) == expected
     (query,) = queries
     assert "VALUES ?item { wd:Q11568 wd:Q3826 }" in query
     assert "?st a wikibase:BestRank" in query
-    assert "psn:P2046/wikibase:quantityAmount" in query
+    assert path in query
     with pytest.raises(overture.GazetteerError, match="not Wikidata QIDs"):
-        client.areas(["Q1 } UNION { ?x ?y ?z"])
+        read(["Q1 } UNION { ?x ?y ?z"])
     assert len(queries) == 1
 
 

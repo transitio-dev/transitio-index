@@ -38,14 +38,14 @@ log = logging.getLogger(__name__)
 # The Overture subtypes that stand in for a city, most specific first: a name
 # resolving to both prefers the locality (decision in the plan's subtype table).
 CITY_SUBTYPES = ("locality", "localadmin")
-# A city candidate's columns: the gazetteer's, its label point and population.
-CANDIDATE_COLUMNS = [*overture.PROJECT, "geometry", "population"]
+# A city candidate's columns: the gazetteer's and its population.
+CANDIDATE_COLUMNS = [*overture.PROJECT, "population"]
 
 # The GHS-UCDB centres seeded as places, matched to Overture once per release
 # and rules version (``prepare_centres``).
 CENTRES_POINTER = "ucdb-centres.json"
 CENTRES_FILE = "centres.jsonl"
-CENTRES_VERSION = 1
+CENTRES_VERSION = 2
 # How near (degrees) a label point outside a centre's polygon may lie when
 # none lies inside.
 NEAR_DEG = 0.05
@@ -196,7 +196,7 @@ def _subdivision_names(candidate, skeleton):
 
 def read_city_candidates(dataset, countries, wanted):
     """Normalised locality/localadmin records feeds actually name, each with
-    its label point (``point``, WKB) and Overture ``population``.
+    its label point (``point``, WKB hex) and Overture ``population``.
 
     Streamed with a country + subtype predicate so only the relevant partitions
     are scanned, and kept only where one of a division's ``(country, folded
@@ -220,7 +220,6 @@ def read_city_candidates(dataset, countries, wanted):
             names = _name_variants({"name": primary, "names": labels})
             if any((country, name) in wanted for name in names):
                 record = overture.normalize_division(row)
-                record["point"] = row["geometry"]
                 record["population"] = row["population"]
                 kept.append(record)
     return kept
@@ -406,7 +405,9 @@ def place_key(record):
 
 
 def _place(record, *, parent_id):
-    """A places_seed row from a resolved division (geometry added later)."""
+    """A places_seed row from a resolved division (geometry added later): its
+    label point is the ``centre``, its ``sources`` the ``centre_sources``
+    ``geometry.settle_centres`` audits."""
     relations = record.get("osm_relation_ids") or []
     return {
         "place_id": place_key(record),
@@ -422,6 +423,8 @@ def _place(record, *, parent_id):
         "curated": bool(record.get("curated")),
         "metro_ids": [],
         "member_ids": [],
+        "centre": record.get("point"),
+        "centre_sources": record.get("sources"),
     }
 
 
@@ -737,8 +740,6 @@ def centre_rows(centres, dataset):
     for centre, name, names, primary in progress(seeds, "seed centres"):
         found = {c["overture_id"]: c for n in names for c in index.get((None, n), [])}
         division = _choose(found.values(), centre["geom"])
-        if division is not None:
-            division = {k: v for k, v in division.items() if k != "point"}
         rows.append(
             {
                 "ucdb_id": centre["id"],
@@ -858,6 +859,9 @@ def _seed_centres(places, skeleton, countries, rows, report):
                     "names": {},
                     "resolution_method": "ghs_ucdb",
                     "country": country["country"],
+                    "point": shapely.to_wkb(
+                        shapely.point_on_surface(shapely.from_wkb(row["boundary"]))
+                    ).hex(),
                 }
                 place = _place(record, parent_id=place_key(country))
                 places[key] = {**place, "place_id": key}

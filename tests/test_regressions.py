@@ -1705,3 +1705,29 @@ def test_a_set_coverage_for_another_builds_feed_is_skipped(tmp_path, place_id, r
         return
     manifest, _, edges = ct._cover(tmp_path, overrides_dir=directory)
     assert manifest["overrides_applied"] == 0 and "f-elsewhere" not in edges
+
+
+def test_a_fao_metro_carries_its_fao_centre_not_its_members_centroid(tmp_path):
+    """CT-48: a place without a centre was routed from a point of its
+    polygon; a FAO metro from its member union, off its urban centre."""
+    import test_index_metros as mt
+
+    centre = shapely.box(-87.9, 41.9, -87.8, 42.0)
+    mt._run(
+        tmp_path,
+        {},
+        fao=mt._fao_inputs(tmp_path),
+        ucdb=mt._ucdb_inputs(tmp_path, centre=centre),
+    )
+    cache = tmp_path / "cache"
+    areas = fx.write_area_dataset(tmp_path / "areas-again.parquet", mt.AREAS)
+    manifest = geometry.attach_geometry(cache, dataset=areas)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    (metro,) = [p for p in places if p["place_id"] == "fao_city_region:50"]
+    point = shapely.from_wkb(metro["centre"])
+    union = shapely.from_wkb(metro["geometry"])
+    assert point.equals(shapely.point_on_surface(centre))
+    assert union.covers(point) and not point.equals(union.centroid)
+    assert manifest["centres"] == sum(bool(p.get("centre")) for p in places)

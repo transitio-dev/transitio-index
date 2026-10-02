@@ -95,8 +95,8 @@ matching registry together.
    declare their country; later stages place, crawl and fold them like
    catalogue feeds, and a catalogue feed with the same data keeps its own id.
 3. `gazetteer` — resolve Overture administrative divisions to Wikidata QIDs,
-   seed the cities the feeds declare, attach metros, boundary geometry and
-   names, and mint the place registry.
+   seed the cities the feeds declare, attach metros, boundary geometry, centre
+   points and names, and mint the place registry.
 4. `resolve` — settle each feed's identity, its access details and whether
    it is crawlable (from the overrides), before anything is fetched. A feed
    that needs a key takes its provider from `overrides/access_providers.yaml`;

@@ -790,6 +790,19 @@ def settle_fao_cores(rows, by_id, footprint, regions, patches, centres, names):
     return changed
 
 
+def fao_centres(rows, centres):
+    """Give each FAO metro among ``rows`` without a ``centre`` its region's
+    FAO centre point (``centres``, by region id) as WKB hex."""
+    for metro in rows:
+        point = centres.get(metro.get("statistical_area_id"))
+        if (
+            metro.get("source_subtype") == FAO_SUBTYPE
+            and not metro.get("centre")
+            and point is not None
+        ):
+            metro["centre"] = shapely.to_wkb(point).hex()
+
+
 def _shipped_area(areas, boundaries, place):
     """The polygon ``place`` ships: its curated boundary — a ``set_boundary``
     WKT in ``boundaries`` by place key, or its own — else the one its
@@ -835,7 +848,8 @@ def _apply_fao(
     members, with the core :func:`settle_fao_cores` names
     by the region ``centres`` (None when unread, else read from the file
     pinned at ``centre_pin``) over the polygons the places ship, curated
-    ``boundaries`` included. It publishes only while
+    ``boundaries`` included, and the region's centre point as its ``centre``
+    (:func:`fao_centres`). It publishes only while
     every FAO derived input is allowlisted; otherwise the regions are
     reported, not published. Returns ``(versions, touched, cores)`` — the
     derived inputs read, at their pinned versions, as ``{(dataset, licence):
@@ -911,6 +925,7 @@ def _apply_fao(
             if any(m is not None and m.get("kind") == "region" for m in members):
                 touched[key] += 1
                 cores.add(key)
+        fao_centres([metros[key] for key in touched], centres)
     versions = {
         OVERTURE_DERIVED: overture.OVERTURE_RELEASE,
         geometry.FAO_DERIVED: _fao_version(
