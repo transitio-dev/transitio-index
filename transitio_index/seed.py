@@ -29,7 +29,7 @@ import unicodedata
 import pyarrow.dataset as ds
 import shapely
 
-from transitio_index import country_codes, overrides, overture, pinned, store
+from transitio_index import country_codes, crosswalk, overrides, overture, pinned, store
 from transitio_index import registry as _registry
 from transitio_index.progress import progress
 
@@ -138,15 +138,16 @@ def council_area(city, area):
 def declared_locations(feeds):
     """One declared location per placeable feed, finest declared level first.
 
-    A feed is placed at the finest level its catalogues name: an MDB
-    municipality or subdivision, else a GBFS ``Location``, else a bare country
-    code — the plan treats each as valid declared coverage. A feed that names no
+    A feed is placed at the finest level its catalogues name: an MDB (or a
+    curated feed's) municipality or subdivision, else a GBFS ``Location``, else
+    a bare country code — the plan treats each as valid declared coverage. A
+    feed that names no
     country at all is skipped; it is placed geometrically in a later stage. The
     ``municipality`` and ``subdivision`` may both be ``None`` for a country-only
     feed.
     """
     for feed in feeds:
-        location = (feed.get("mdb") or {}).get("location") or {}
+        location = crosswalk.declared_location(feed)
         gbfs = feed.get("gbfs") or {}
         mdb_country = location.get("country_code")
         municipality = location.get("municipality")
@@ -1251,6 +1252,9 @@ def resolve_seed(
         # The catalogue versions the placements were derived from, carried
         # forward so coverage can refuse a mixed-lineage input set.
         "sources": crosswalk_manifest.get("sources"),
+        # The feed set placed, curated feeds included: coverage pairs these
+        # placements only with feeds resolved from the same generation.
+        "crosswalk_generation": crosswalk_manifest.get("generation"),
         "feeds_with_location": len(locations),
         "feeds_placed": len(placements),
         "places": len(places),

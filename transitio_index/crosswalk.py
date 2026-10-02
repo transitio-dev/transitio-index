@@ -22,6 +22,11 @@ else a minted ``f-mdb-<mdb_id>``. A record keeps the contributing source rows
 verbatim under ``atlas`` / ``mdb`` so nothing downstream must re-read raw. A
 deprecated MDB row that redirects to a live row of the ingest is no feed of its
 own: it is folded into that row's record, which keeps its minted id as an alias.
+
+After the catalogues, the curated feeds ``overrides/feeds.yaml`` adds with
+``add_feed`` join the feed set, source ``curated``, their entry kept under
+``curated``: each in the builds whose catalogue feeds declare its country, so
+later stages place, crawl and fold it like a catalogue feed.
 """
 
 import collections
@@ -31,7 +36,7 @@ import re
 import unicodedata
 import urllib.parse
 
-from transitio_index import store
+from transitio_index import overrides, store
 from transitio_index.progress import progress
 
 log = logging.getLogger(__name__)
@@ -41,6 +46,7 @@ FEEDS_ARTIFACT = "feeds.jsonl"
 GBFS_ARTIFACT = "gbfs_systems.jsonl"
 PROVISIONAL_ARTIFACT = "provisional_links.jsonl"
 GBFS_SPEC = "gbfs"
+CURATED_SOURCE = "curated"
 
 # url-exact identity is resolved for GTFS static feeds only. An Atlas GTFS-RT
 # feed bundles three endpoint URLs that MDB lists as three separate feeds, so
@@ -1035,6 +1041,65 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
     return records, summary
 
 
+def declared_location(feed):
+    """The location a feed record declares in the Mobility Database's shape:
+    its MDB row's, or a curated feed's own; empty when it has neither."""
+    return (feed.get("mdb") or feed.get("curated") or {}).get("location") or {}
+
+
+def declared_countries(feed):
+    """The country codes the catalogues claim for ``feed`` — MDB
+    ``location.country_code`` (a curated feed's own), GBFS ``country_code``;
+    Atlas records carry none — upper-cased and sorted."""
+    codes = {
+        declared_location(feed).get("country_code"),
+        (feed.get("gbfs") or {}).get("country_code"),
+    }
+    return sorted(code.strip().upper() for code in codes if code and code.strip())
+
+
+def curated_records(entries, records):
+    """The feeds ``add_feed`` entries (``feeds.yaml`` entries by feed
+    reference) add to a build of the transit feed ``records``: one record per
+    entry whose country one of them declares, its entry under ``curated``."""
+    countries = {code for record in records for code in declared_countries(record)}
+    curated = []
+    for ref, entry in sorted(entries.items()):
+        spec = entry.get("add_feed")
+        if spec is None or spec["location"]["country_code"] not in countries:
+            continue
+        curated.append(
+            {
+                "feed_id": ref,
+                "onestop_id": None,
+                "mdb_id": None,
+                "aliases": [],
+                "id_minted": False,
+                "source": CURATED_SOURCE,
+                "spec": spec["spec"],
+                "name": spec["name"],
+                "crosswalk_method": "none",
+                "crosswalk_confidence": 0.0,
+                "static_feed_id": None,
+                "static_link_method": None,
+                "curated": {
+                    "url": spec["url"],
+                    "license": dict(spec["license"]),
+                    "location": {
+                        key: spec["location"].get(key)
+                        for key in overrides.LOCATION_FIELDS
+                    },
+                    "access": spec.get("access", "open"),
+                    "registration_url": spec.get("registration_url"),
+                    "access_provider": spec.get("access_provider"),
+                    "auth_method": spec.get("auth_method"),
+                    "auth_params": spec.get("auth_params"),
+                },
+            }
+        )
+    return curated
+
+
 def split_transit(records):
     """``(transit, systems)``: the GTFS and GTFS-RT records, and the GBFS ones."""
     systems = [record for record in records if record["spec"] == GBFS_SPEC]
@@ -1042,9 +1107,13 @@ def split_transit(records):
     return transit, systems
 
 
-def crosswalk(cache_dir):
+def crosswalk(cache_dir, *, overrides_dir=None):
     """Run the crosswalk stage, publishing a ``feeds.json`` generation: the
-    transit feeds in ``feeds.jsonl``, the GBFS systems in their own artifact."""
+    transit feeds in ``feeds.jsonl``, the curated feeds of
+    ``overrides_dir``'s ``feeds.yaml`` after the catalogues' (see
+    :func:`curated_records`; an id another feed already uses is refused),
+    and the GBFS systems in their own artifact."""
+    feed_overrides, _ = overrides.load_feed_overrides(overrides_dir)
     atlas_feeds, atlas_operators, atlas_manifest = _read_atlas(cache_dir)
     mdb_feeds, mdb_manifest = store.read_jsonl(
         cache_dir / "raw", "mdb.json", "mdb_feeds.jsonl"
@@ -1057,6 +1126,8 @@ def crosswalk(cache_dir):
     # Empty catalogues are a label without feeds; rows that yield none are not.
     if not records and (atlas_feeds or mdb_feeds or systems):
         raise CrosswalkError("crosswalk produced no transit feeds")
+    records.extend(curated_records(feed_overrides, records))
+    _require_unique_namespace(records)
     # The summary's feed counts describe the transit feeds the stage ships;
     # the systems have their own count (the gbfs_* keys describe their linking).
     summary["feeds"] = len(records)
@@ -1071,6 +1142,10 @@ def crosswalk(cache_dir):
         "sources": _source_versions(atlas_manifest, mdb_manifest, gbfs_manifest),
         **summary,
         "provisional_links": len(provisional),
+        # The add_feed entries applied: resolve refuses another feeds.yaml's.
+        "feeds_add_sha256": overrides.phase_digest(
+            feed_overrides, overrides.CROSSWALK_OPERATIONS
+        ),
     }
 
     out = cache_dir / "crosswalk"

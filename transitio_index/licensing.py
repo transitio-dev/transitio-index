@@ -83,11 +83,16 @@ class LicenseError(RuntimeError):
     """The licence inventory could not be built, or sanitisation failed."""
 
 
+def _licence_block(record):
+    """The feed's Atlas licence block, or a curated feed's own."""
+    return (record.get("atlas") or record.get("curated") or {}).get("license") or {}
+
+
 def redistribution_allowed(record):
     """Whether the feed's licence permits redistributing data derived from
     it: the record's own declaration when it makes one, else True for a
     known-permissive licence, else None (unknown)."""
-    block = (record.get("atlas") or {}).get("license") or {}
+    block = _licence_block(record)
     declared = block.get("redistribution_allowed")
     if isinstance(declared, bool):
         return declared
@@ -384,7 +389,7 @@ def _feed_rows(records):
     redistribution = collections.defaultdict(collections.Counter)
     judgements = collections.defaultdict(collections.Counter)
     for record in records:
-        block = (record.get("atlas") or {}).get("license") or {}
+        block = _licence_block(record)
         # The Atlas declaration is taken whole; the Mobility Database's
         # licence URL stands in only for a feed with no Atlas declaration,
         # never combined with one.

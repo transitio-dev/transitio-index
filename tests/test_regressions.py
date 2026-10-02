@@ -1682,3 +1682,26 @@ def test_a_fao_metros_country_is_its_centres_whatever_cities_a_build_holds(
     regions = {region_id: {"country": iso3}}
     country = metros.fao_country(region_id, sorted(by_id), by_id, names, regions)
     assert country == expected
+
+
+@pytest.mark.parametrize("place_id, refused", [("Q404", False), ("Q-nowhere", True)])
+def test_a_set_coverage_for_another_builds_feed_is_skipped(tmp_path, place_id, refused):
+    """A set_coverage naming a feed the build does not hold raised "names no
+    feed", so a partitioned rebuild failed in every label but the feed's."""
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import overrides
+
+    entries = [
+        {
+            "feed": "f-elsewhere",
+            "set_coverage": {"level": "country", "place_id": place_id},
+        }
+    ]
+    directory = write_overrides(tmp_path, feeds=entries)
+    if refused:
+        with pytest.raises(overrides.OverrideError, match="names no feed"):
+            ct._cover(tmp_path, overrides_dir=directory)
+        return
+    manifest, _, edges = ct._cover(tmp_path, overrides_dir=directory)
+    assert manifest["overrides_applied"] == 0 and "f-elsewhere" not in edges

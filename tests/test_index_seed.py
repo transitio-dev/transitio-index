@@ -637,11 +637,14 @@ def test_declared_locations_prefers_mdb_and_skips_the_placeless():
             "gbfs": {"country_code": "fi", "location": "Espoo"},
         },
         {"feed_id": "c", "mdb": _mdb(None, None, None)},  # no country at all
+        # A curated feed declares its location in the MDB shape.
+        {"feed_id": "d", "curated": _mdb("FI", None, "Espoo")},
     ]
     located = list(seed.declared_locations(feeds))
-    assert [d["feed_id"] for d in located] == ["a", "b"]
+    assert [d["feed_id"] for d in located] == ["a", "b", "d"]
     assert located[0]["municipality"] == "Helsinki"  # MDB won over the GBFS block
     assert located[1]["country"] == "FI"  # country upper-cased
+    assert (located[2]["country"], located[2]["municipality"]) == ("FI", "Espoo")
 
 
 def test_norm_folds_accents_and_case():

@@ -140,6 +140,8 @@ def test_feed_licences_are_inventoried_per_declared_licence():
     rows = licensing._feed_rows(
         [
             {**_covered_feed("f-a"), "atlas": {"license": LICENSED}},
+            # A curated feed's licence is read as an Atlas one.
+            {**_covered_feed("f-curated-a"), "curated": {"license": LICENSED}},
             {
                 **_covered_feed("f-b"),
                 "atlas": {"license": {**LICENSED, "redistribution_allowed": False}},
@@ -162,13 +164,13 @@ def test_feed_licences_are_inventoried_per_declared_licence():
         (r["license"], r["url"], r["feeds"], r["redistribution_allowed"]) for r in rows
     ] == [
         ("CC-BY-4.0", "https://example.org/l", 1, {"yes": 1}),
-        ("CC-BY-4.0", "https://example.org/l", 2, {"false": 1, "yes": 1}),
+        ("CC-BY-4.0", "https://example.org/l", 3, {"false": 1, "yes": 2}),
         (None, None, 1, {"unknown": 1}),
         (None, "https://example.org/m", 1, {"unknown": 1}),
         ("ODbL-1.0", None, 1, {"unknown": 1}),
     ]
     notice = licensing._notice(None, {}, rows)
-    assert "  - CC-BY-4.0: 2\n      url: https://example.org/l" in notice
+    assert "  - CC-BY-4.0: 3\n      url: https://example.org/l" in notice
     assert "  - no identifier: 1\n      url: https://example.org/m" in notice
     assert "  - none declared: 1" in notice
     # A required attribution ships verbatim, grouped apart from feeds without it.
@@ -257,7 +259,8 @@ def _feedless_index(tmp_path, release="2026-08-19.0"):
     )
     gbfs.ingest(cache, csv_path=_write(tmp_path / "s.csv", _csv(GBFS_COLUMNS, [])))
     crosswalk.crosswalk(cache)
-    sources = resolve.resolve(cache, overrides_dir=None)["sources"]
+    resolved = resolve.resolve(cache, overrides_dir=None)
+    sources = resolved["sources"]
     crawl.crawl(cache, lookup=StubLookup({}))
     assert (cache / "crawl" / "crawl_log.jsonl").read_text() == ""
     seed = _publish_gen(
@@ -265,7 +268,12 @@ def _feedless_index(tmp_path, release="2026-08-19.0"):
         "seed.json",
         "feed_places.jsonl",
         [],
-        {"source": "seed", "sources": sources, "overture_release": release},
+        {
+            "source": "seed",
+            "sources": sources,
+            "crosswalk_generation": resolved["crosswalk_generation"],
+            "overture_release": release,
+        },
     )
     audit = _publish_audit(
         cache,

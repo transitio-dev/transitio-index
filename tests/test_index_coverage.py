@@ -97,6 +97,7 @@ def _cover(
     placements=PLACEMENTS,
     seed_sources=SOURCES,
     seed_release=RELEASE,
+    seed_crosswalk="crosswalk-1",
     crawls=None,
     lookup=None,
     tamper=None,
@@ -119,6 +120,7 @@ def _cover(
         {
             "source": "resolve",
             "sources": SOURCES,
+            "crosswalk_generation": "crosswalk-1",
             "feeds_resolve_sha256": resolve_digest,
         },
     )
@@ -128,7 +130,12 @@ def _cover(
         "seed.json",
         "feed_places.jsonl",
         placements,
-        {"source": "seed", "sources": seed_sources, "overture_release": seed_release},
+        {
+            "source": "seed",
+            "sources": seed_sources,
+            "crosswalk_generation": seed_crosswalk,
+            "overture_release": seed_release,
+        },
     )
     _publish(
         cache,
@@ -509,6 +516,23 @@ def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
     assert manifest["near_duplicate_groups"] == len(near)
 
 
+def test_a_catalogue_feed_keeps_its_id_over_a_curated_copy(tmp_path):
+    feeds = [
+        {**_feed("f-curated-a"), "source": "curated"},
+        {**_feed("f-mdb-9"), "source": "mdb", "mdb_id": "9"},
+    ]
+    manifest, covered, _ = _cover(
+        tmp_path,
+        feeds=feeds,
+        placements=[],
+        crawls={feed["feed_id"]: _rows(3, 10.0) for feed in feeds},
+        members={feed["feed_id"]: TABLES for feed in feeds},
+        lookup=LOOKUP,
+    )
+    assert manifest["folded_feeds"] == {"f-curated-a": "f-mdb-9"}
+    assert covered["f-mdb-9"]["aliases"] == ["f-curated-a"]
+
+
 def test_only_a_current_identity_counts():
     found = {"stops.txt": "s", "routes.txt": "r"}
     current = {"identity": found, "identity_version": fingerprint.IDENTITY_VERSION}
@@ -763,14 +787,19 @@ def test_the_manifest_carries_sources_release_and_counts(tmp_path):
     assert manifest["edges_by_place_kind"]["metro"] == 2
 
 
-def test_mixed_catalogue_lineage_is_refused(tmp_path):
-    with pytest.raises(coverage.CoverageError, match="catalogue versions"):
-        _cover(tmp_path, seed_sources={"atlas": {"commit": "other"}})
-
-
-def test_mixed_overture_releases_are_refused(tmp_path):
-    with pytest.raises(coverage.CoverageError, match="Overture releases"):
-        _cover(tmp_path, seed_release="2026-07-01.0")
+@pytest.mark.parametrize(
+    "inputs, message",
+    [
+        ({"seed_sources": {"atlas": {"commit": "other"}}}, "catalogue versions"),
+        ({"seed_release": "2026-07-01.0"}, "Overture releases"),
+        # A crosswalk run since the seed holds feeds it never placed.
+        ({"seed_crosswalk": "crosswalk-0"}, "crosswalk generations"),
+        ({"seed_crosswalk": None}, "crosswalk generations"),
+    ],
+)
+def test_mixed_lineage_is_refused(tmp_path, inputs, message):
+    with pytest.raises(coverage.CoverageError, match=message):
+        _cover(tmp_path, **inputs)
 
 
 def test_a_parent_cycle_cannot_loop_the_reach():
@@ -907,6 +936,34 @@ def test_set_coverage_wins_over_a_feeds_crawl(tmp_path):
             "crawled": {p: e["evidence"] for p, e in measured["f-city"].items()},
         }
     )
+
+
+def test_a_curated_feed_placed_in_another_build_is_dropped(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    curated = [
+        {**_feed(feed_id), "source": "curated"}
+        for feed_id in ("f-curated-here", "f-curated-away")
+    ]
+    # Q404 may be another build's place; this build lacks it.
+    places = {"f-curated-here": "Q-other", "f-curated-away": "Q404"}
+    entries = [
+        {"feed": ref, "set_coverage": {"level": "municipality", "place_id": place}}
+        for ref, place in places.items()
+    ]
+    away = {"feed_id": "f-curated-away", "place_id": "Q-c", "level": "country"}
+    manifest, covered, edges = _cover(
+        tmp_path,
+        feeds=[*FEEDS, *curated],
+        placements=[*PLACEMENTS, away],
+        crawls={"f-curated-away": _rows(3, 10.0)},
+        lookup=LOOKUP,
+        overrides_dir=write_overrides(tmp_path, feeds=entries),
+    )
+    assert set(edges["f-curated-here"]) == {"Q-other", "Q-reg", "Q-c"}
+    assert "f-curated-away" not in covered and "f-curated-away" not in edges
+    assert manifest["feeds_placed_elsewhere"] == ["f-curated-away"]
+    assert manifest["unmatched_crawl_ids"] == []
 
 
 def test_set_coverage_resolves_its_place_reference(tmp_path):

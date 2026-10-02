@@ -56,13 +56,45 @@ _NULLABLE_STR = ("onestop_id", "mdb_id", "name", "static_feed_id", "static_link_
 # set it to one of these or null, never an arbitrary string.
 _STATIC_LINK_METHODS = frozenset({"declared", "same_file", "same_host", "none"})
 
-# The operations a feed entry may carry. ``set_coverage`` is applied by the
-# coverage stage, not the resolve stage, but is a valid key here.
+# The operations a feed entry may carry. ``add_feed`` is applied by the
+# crosswalk and ``set_coverage`` by the coverage stage, not the resolve stage,
+# but both are valid keys here.
 _OPERATIONS = frozenset(
-    {"set_identity", "mark_uncrawlable", "set_coverage", "set_access"}
+    {"set_identity", "mark_uncrawlable", "set_coverage", "set_access", "add_feed"}
 )
-# The operations the resolve stage applies; set_coverage enters at coverage.
-RESOLVE_OPERATIONS = frozenset({"set_identity", "mark_uncrawlable", "set_access"})
+# The operation the crosswalk applies: a curated feed joins the feed set there.
+CROSSWALK_OPERATIONS = frozenset({"add_feed"})
+# The operations whose effect the resolve stage settles, a curated feed's
+# access among them; set_coverage enters at coverage.
+RESOLVE_OPERATIONS = frozenset(
+    {"set_identity", "mark_uncrawlable", "set_access", "add_feed"}
+)
+# A curated feed's id: ``f-curated-`` and lower-case words joined by hyphens.
+# The prefix is add_feed's alone; no catalogue mint or other override takes it.
+_CURATED_PREFIX = "f-curated-"
+_CURATED_ID = re.compile(re.escape(_CURATED_PREFIX) + r"[a-z0-9]+(-[a-z0-9]+)*")
+_ADD_FEED_REQUIRED = frozenset({"name", "url", "spec", "license", "location"})
+_ADD_FEED_ACCESS = frozenset({"access_provider", "auth_method", "auth_params"})
+_ADD_FEED_FIELDS = (
+    _ADD_FEED_REQUIRED | _ADD_FEED_ACCESS | {"access", "registration_url"}
+)
+# The licence fields of a Transitland Atlas record, which a curated feed's
+# licence is read as: text, and terms answered yes, no or unknown.
+_LICENCE_TEXT = frozenset(
+    {"spdx_identifier", "url", "attribution_text", "attribution_instructions"}
+)
+_LICENCE_TERMS = frozenset(
+    {
+        "use_without_attribution",
+        "create_derived_product",
+        "redistribution_allowed",
+        "commercial_use_allowed",
+        "share_alike_optional",
+    }
+)
+_LICENCE_FIELDS = _LICENCE_TEXT | _LICENCE_TERMS
+# A declared location in the Mobility Database's shape.
+LOCATION_FIELDS = ("country_code", "subdivision_name", "municipality")
 
 # How a request to a key-protected feed carries the credentials; catalogue
 # methods transitio does not send (a key in the path, a URL template) are
@@ -157,14 +189,19 @@ def _validate_identity(path, ref, identity):
             f"{path}: feed {ref!r} set_identity static_link_method {method!r} must "
             f"be one of {sorted(_STATIC_LINK_METHODS)} or null"
         )
+    for value in [identity.get("feed_id"), *(identity.get("aliases") or [])]:
+        if isinstance(value, str) and value.startswith(_CURATED_PREFIX):
+            raise OverrideError(
+                f"{path}: feed {ref!r} set_identity cannot take the curated id "
+                f"{value!r}"
+            )
 
 
-def _validate_access(path, ref, spec):
-    """Reject a ``set_access`` that is not a provider id, one whole,
+def _validate_access(where, spec):
+    """Reject access fields that are not a provider id, one whole,
     well-formed auth pair, or both: ``auth_params`` maps each query parameter
     (at least one) or the one header to a credential field, and is empty for
     basic auth and unsupported."""
-    where = f"{path}: feed {ref!r} set_access"
     keys = {"access_provider", "auth_method", "auth_params"}
     if not isinstance(spec, dict) or not spec or set(spec) - keys:
         raise OverrideError(
@@ -203,9 +240,85 @@ def _validate_access(path, ref, spec):
         )
 
 
+def _text(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_add_feed(path, ref, entry):
+    """Reject an ``add_feed`` that is not a whole curated feed: an
+    ``f-curated-<slug>`` id, a name, an http(s) URL, the spec ``gtfs``, a
+    licence in the Atlas fields, a location naming a country and optionally
+    its subdivision and municipality, and, for a feed that needs a key
+    (``access: key``), optionally its registration page, provider and auth
+    pair. Its identity and access are its own: no set_identity or
+    set_access."""
+    where = f"{path}: feed {ref!r} add_feed"
+    spec = entry["add_feed"]
+    if not (_CURATED_ID.fullmatch(ref) and _valid_feed_id(ref)):
+        raise OverrideError(f"{where} needs an id f-curated-<slug>")
+    if (
+        not isinstance(spec, dict)
+        or _ADD_FEED_REQUIRED - set(spec)
+        or set(spec) - _ADD_FEED_FIELDS
+    ):
+        raise OverrideError(
+            f"{where} must be a mapping of {sorted(_ADD_FEED_REQUIRED)} and the "
+            "optional access fields"
+        )
+    if {"set_identity", "set_access"} & set(entry):
+        raise OverrideError(f"{where} carries its own identity and access")
+    licence, location = spec["license"], spec["location"]
+    access = spec.get("access", "open")
+    problems = (
+        (not _text(spec["name"]), "name must be a non-empty string"),
+        (web_page(spec["url"]) is None, "url must be an http(s) URL"),
+        (spec["spec"] != "gtfs", "spec must be gtfs"),
+        (
+            not isinstance(licence, dict)
+            or not licence
+            or set(licence) - _LICENCE_FIELDS
+            or not all(
+                (
+                    _text(value)
+                    if key in _LICENCE_TEXT
+                    else isinstance(value, bool) or value in ("yes", "no", "unknown")
+                )
+                for key, value in licence.items()
+            )
+            or ("url" in licence and web_page(licence["url"]) is None),
+            f"license must be a mapping of {sorted(_LICENCE_FIELDS)}",
+        ),
+        (
+            not isinstance(location, dict)
+            or set(location) - set(LOCATION_FIELDS)
+            or not re.fullmatch(r"[A-Z]{2}", str(location.get("country_code")))
+            or not all(location.get(k) is None or _text(location[k]) for k in location),
+            "location must give a two-letter upper-case country_code, and may "
+            "name its subdivision_name and municipality",
+        ),
+        (access not in ("open", "key"), "access must be open or key"),
+        (
+            access == "open" and set(spec) & (_ADD_FEED_ACCESS | {"registration_url"}),
+            "an open feed takes no access fields",
+        ),
+        (
+            "registration_url" in spec and web_page(spec["registration_url"]) is None,
+            "registration_url must be an http(s) URL",
+        ),
+    )
+    for broken, message in problems:
+        if broken:
+            raise OverrideError(f"{where} {message}")
+    pair = {key: spec[key] for key in _ADD_FEED_ACCESS if key in spec}
+    if pair:
+        _validate_access(where, pair)
+
+
 def _validate_operations(path, ref, entry):
     if not set(entry) & _OPERATIONS:
         raise OverrideError(f"{path}: feed {ref!r} carries no operation")
+    if "add_feed" in entry:
+        _validate_add_feed(path, ref, entry)
     if "set_identity" in entry:
         _validate_identity(path, ref, entry["set_identity"])
     if "mark_uncrawlable" in entry:
@@ -215,7 +328,7 @@ def _validate_operations(path, ref, entry):
                 f"{path}: feed {ref!r} mark_uncrawlable must be true or a mapping"
             )
     if "set_access" in entry:
-        _validate_access(path, ref, entry["set_access"])
+        _validate_access(f"{path}: feed {ref!r} set_access", entry["set_access"])
     if "set_coverage" in entry:
         spec = entry["set_coverage"]
         if not isinstance(spec, dict) or set(spec) != {"level", "place_id"}:

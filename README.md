@@ -90,7 +90,10 @@ matching registry together.
    Mobility Database into one de-duplicated table. A deprecated Mobility
    Database row that redirects to a live row becomes an alias of that feed.
    The GBFS systems go to a table of their own, which the index does not
-   publish.
+   publish. The feeds no catalogue lists that `overrides/feeds.yaml` adds
+   with `add_feed` join the table in every build whose catalogue feeds
+   declare their country; later stages place, crawl and fold them like
+   catalogue feeds, and a catalogue feed with the same data keeps its own id.
 3. `gazetteer` — resolve Overture administrative divisions to Wikidata QIDs,
    seed the cities the feeds declare, attach metros, boundary geometry and
    names, and mint the place registry.
@@ -144,12 +147,15 @@ python -m transitio_index.build --stage ingest --downstream   # ingest -> stats
 
 To redo only part of a build, run the earliest stage you need to change with
 `--downstream`, reusing the cache the earlier stages already left. For example,
-after editing a curated override, re-apply it and rebuild the shipped index
-without re-crawling:
+after editing an edge override (`overrides/edges.yaml`), re-apply it and
+rebuild the shipped index without re-crawling:
 
 ```
 python -m transitio_index.build --stage curate --downstream   # curate -> stats
 ```
+
+An `add_feed` entry in `overrides/feeds.yaml` enters at the crosswalk, so a
+change to one starts there: `--stage crosswalk --downstream`.
 
 Running a single stage (no `--downstream`) is for iterating on that one stage
 once its inputs are built:

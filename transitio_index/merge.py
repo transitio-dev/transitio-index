@@ -618,7 +618,29 @@ def load_sources(sources, read_bytes=_read_file):
             }
         )
     loaded.sort(key=lambda source: source["label"])
+    _refuse_curated_clashes(loaded)
     return loaded
+
+
+def _refuse_curated_clashes(loaded):
+    """Refuse a feed id that is a curated feed in one source and a catalogue
+    feed, static or realtime, in another: each build checks a curated id
+    against its own catalogue cut only. A catalogue feed lists a curated id
+    as an alias only when it holds the same data (a content fold): catalogue
+    mints never take the curated prefix, and ``set_identity`` refuses it."""
+    curated = collections.defaultdict(set)
+    for source in loaded:
+        for name in ("feeds.parquet", "realtime.parquet"):
+            table = source["tables"].get(name)
+            if table is None or "source" not in table.column_names:
+                continue
+            for feed_id, origin in zip(
+                table["feed_id"].to_pylist(), table["source"].to_pylist()
+            ):
+                curated[feed_id].add(origin == "curated")
+    clashes = sorted(feed_id for feed_id, kinds in curated.items() if len(kinds) > 1)
+    if clashes:
+        raise MergeError(f"curated feed ids a catalogue feed also carries: {clashes}")
 
 
 def _without(table, names):

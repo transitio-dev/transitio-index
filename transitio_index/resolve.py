@@ -8,7 +8,8 @@ crawl half itself is a later stage, and ``set_coverage`` is left for the coverag
 stage. Each feed records its access details (``access``, ``access_provider``,
 ``auth_method``, ``auth_params``, the catalogue's ``auth_param_name`` and
 ``registration_url``), from a curated ``set_access`` or else the catalogue
-record supplying its URL. A feed that needs a key takes its provider from
+record supplying its URL; a curated feed (``add_feed``, which the crosswalk
+adds) from its own entry. A feed that needs a key takes its provider from
 ``set_access`` or else from the ``overrides/access_providers.yaml`` entry whose
 URL prefix covers its URL; ``access_report.jsonl`` lists the protected feeds
 no provider claims and the curation errors. A GTFS feed whose download URL
@@ -91,11 +92,25 @@ def _registration_page(feed):
 
 
 def _catalogue_access(feed):
-    """The feed's access details as its catalogues give them.
+    """The feed's access details as its catalogues, or a curated feed's own
+    entry, give them.
 
-    ``auth_params`` stays null: binding the catalogue's parameter or header
+    A catalogue's ``auth_params`` stay null: binding its parameter or header
     name (``auth_param_name``) to a credential field needs the provider.
     """
+    curated = feed.get("curated")
+    if curated is not None:
+        if curated["access"] != "key":
+            return dict(_OPEN)
+        params = curated["auth_params"]
+        return {
+            "access": "key",
+            "access_provider": curated["access_provider"],
+            "auth_method": curated["auth_method"],
+            "auth_params": None if params is None else dict(params),
+            "auth_param_name": None,
+            "registration_url": curated["registration_url"],
+        }
     catalogue, record = _access_source(feed)
     if not record.get("requires_auth"):
         return dict(_OPEN)
@@ -241,6 +256,12 @@ def resolve(cache_dir, *, overrides_dir=None):
         with store.exclusive_writer(directory):
             feeds, crosswalk_manifest = store.read_jsonl(
                 cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
+            )
+            overrides.expect_digest(
+                crosswalk_manifest.get("feeds_add_sha256"),
+                overrides.phase_digest(feed_overrides, overrides.CROSSWALK_OPERATIONS),
+                "feeds.yaml (add_feed)",
+                "crosswalk",
             )
             # Build the whole feed<->override match graph first, so neither an
             # override matching several feeds nor several overrides matching one

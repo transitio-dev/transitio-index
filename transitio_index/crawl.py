@@ -28,10 +28,11 @@ the log record say which was read (``fetched_from``) and keep the producer's
 failure.
 
 ``crawl_log.jsonl`` records, per feed, its catalogue source (mdb, atlas, both
-or systems_csv), the method taken, the bytes fetched, the bytes a range read
-saved and the reason any fallback happened — the plan's first-run
-instrumentation for judging whether the range machinery pays, and for tracing a
-crawled feed back to the catalogue it came from.
+or systems_csv; curated for a feed ``add_feed`` added), the method taken, the
+bytes fetched, the bytes a range read saved and the reason any fallback
+happened — the plan's first-run instrumentation for judging whether the range
+machinery pays, and for tracing a crawled feed back to the catalogue it came
+from.
 
 The stop_times predicate: the complete ``stop_times.txt`` is read for every
 feed except one whose routes are all settled by a geography-free tier rule AND
@@ -115,11 +116,14 @@ class HtmlPage(fetch.FetchError):
 
 
 def feed_url(feed):
-    """The URL to crawl: the Atlas static feed, else the MDB direct download."""
+    """The URL to crawl: a curated feed's own, else the Atlas static feed,
+    else the MDB direct download."""
     atlas = feed.get("atlas") or {}
     mdb = feed.get("mdb") or {}
-    return ((atlas.get("urls") or {}).get("static_current")) or (
-        (mdb.get("urls") or {}).get("direct_download")
+    return (
+        (feed.get("curated") or {}).get("url")
+        or (atlas.get("urls") or {}).get("static_current")
+        or (mdb.get("urls") or {}).get("direct_download")
     )
 
 

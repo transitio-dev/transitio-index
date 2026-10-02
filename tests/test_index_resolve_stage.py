@@ -265,6 +265,73 @@ def test_set_access_validation(tmp_path, spec, message):
         overrides.load_feed_overrides(overrides_dir)
 
 
+ADD_FEED = {
+    "name": "Colectivos",
+    "url": "https://api.example.org/feed-gtfs",
+    "spec": "gtfs",
+    "license": {"url": "https://api.example.org/terms", "spdx_identifier": "x"},
+    "location": {"country_code": "AR", "municipality": "Buenos Aires"},
+}
+DROP = object()
+KEY = {
+    "access": "key",
+    "registration_url": "https://register.example/",
+    "access_provider": "gcba",
+    "auth_method": "query_param",
+    "auth_params": {"client_id": "client_id"},
+}
+G = "f-curated-gcba"
+
+
+@pytest.mark.parametrize(
+    "ref, change, message",
+    [
+        (G, KEY, None),
+        (G, {"location": {"country_code": "AR"}}, None),
+        (
+            G,
+            {"license": {"spdx_identifier": "x", "redistribution_allowed": "no"}},
+            None,
+        ),
+        ("f-gcba", {}, "needs an id f-curated-<slug>"),
+        # A feed id is at most 512 characters.
+        ("f-curated-" + "a" * 502, {}, None),
+        ("f-curated-" + "a" * 503, {}, "needs an id f-curated-<slug>"),
+        (G, {"license": DROP}, "must be a mapping of"),
+        (G, {"extra": 1}, "must be a mapping of"),
+        (G, {"name": " "}, "name must be"),
+        (G, {"url": "ftp://x.example/g.zip"}, "url must be"),
+        (G, {"spec": "gtfs-rt"}, "spec must be gtfs"),
+        (G, {"license": {}}, "license must be"),
+        (G, {"license": {"spdx": "x"}}, "license must be"),
+        (G, {"license": {"url": "javascript:x()"}}, "license must be"),
+        (G, {"license": {"spdx_identifier": True}}, "license must be"),
+        (G, {"license": {"redistribution_allowed": "maybe"}}, "license must be"),
+        (G, {"location": {"country_code": "ar"}}, "location must"),
+        (G, {"location": {"municipality": "X"}}, "location must"),
+        (G, {"location": {"country_code": "AR", "city": "X"}}, "location must"),
+        (G, {"access": "free"}, "access must be open or key"),
+        (G, {"registration_url": "https://r.example/"}, "an open feed takes no"),
+        (G, {**KEY, "registration_url": "r.example"}, "registration_url must be"),
+        (G, {**KEY, "auth_params": {"id": "Id"}}, "add_feed auth_params must map"),
+    ],
+)
+def test_add_feed_validation(tmp_path, ref, change, message):
+    spec = {key: v for key, v in {**ADD_FEED, **change}.items() if v is not DROP}
+    entry = {"feed": ref, "add_feed": spec}
+    overrides_dir = _overrides_dir(tmp_path, [entry])
+    if message is None:
+        assert overrides.load_feed_overrides(overrides_dir)[0][ref]["add_feed"]
+        # A curated feed's identity and access are its own entry's.
+        for operation in ("set_identity", "set_access"):
+            other = {**entry, operation: {"access_provider": "gcba"}}
+            with pytest.raises(overrides.OverrideError, match="its own identity"):
+                overrides.load_feed_overrides(_overrides_dir(tmp_path, [other]))
+        return
+    with pytest.raises(overrides.OverrideError, match=message):
+        overrides.load_feed_overrides(overrides_dir)
+
+
 def _provider(provider_id, fields=("key",), prefixes=(), **kw):
     return {
         "provider_id": provider_id,
@@ -601,11 +668,20 @@ def test_an_override_matching_two_feeds_by_alias_is_a_build_error(tmp_path):
         resolve.resolve(cache, overrides_dir=overrides_dir)
 
 
-def test_a_malformed_feed_id_value_is_a_build_error(tmp_path):
+@pytest.mark.parametrize(
+    "identity, message",
+    [
+        ({"feed_id": "../escape"}, "not a valid feed id"),
+        # The curated prefix is add_feed's alone.
+        ({"feed_id": "f-curated-x"}, "cannot take the curated id"),
+        ({"aliases": ["f-a-old", "f-curated-x"]}, "cannot take the curated id"),
+    ],
+)
+def test_a_malformed_feed_id_value_is_a_build_error(tmp_path, identity, message):
     overrides_dir = _overrides_dir(
-        tmp_path, [{"feed": "f-a", "set_identity": {"feed_id": "../escape"}}]
+        tmp_path, [{"feed": "f-a", "set_identity": identity}]
     )
-    with pytest.raises(overrides.OverrideError, match="not a valid feed id"):
+    with pytest.raises(overrides.OverrideError, match=message):
         overrides.load_feed_overrides(overrides_dir)
 
 
