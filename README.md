@@ -251,12 +251,16 @@ python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache
     --partition cache/sample/partition-<id>/partition.json
 ```
 
-Every source must be a licensed schema-10 build, and the sources must agree on
+Every source must be a licensed schema-11 build, and the sources must agree on
 the Overture release, the simplification tolerance and the classifier. A feed
 comes from the newest build carrying it and its edges from that same build; a
-place comes from the build serving it most. The merged NOTICE credits every
-source once, names the catalogues by the digests each build read, and recounts
-the feed licences. The snapshot is read back through the reader before it is
+place comes from the build serving it most, with the largest population any
+build records for it. The access providers are the union of the sources',
+which must give a provider the same fields wherever they list it, and the
+build a merged feed comes from must list the provider the feed names. The
+merged NOTICE credits every source once, names the catalogues by the digests
+each build read, and recounts the feed licences. The snapshot is read back
+through the reader before it is
 committed into `cache/merged/index/`, and its manifest records each source by
 label, build id and digests, so the publisher can check the lineage. A label
 whose newest run is incomplete or holds no feeds is skipped and reported; an

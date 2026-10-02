@@ -13,6 +13,7 @@ import time
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import shapely
 
 from builds_fixture import (
     BOX,
@@ -56,6 +57,11 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     when = _run(archived, "when", 12, built_at="yesterday")
     nodate = _run(archived, "nodate", 13)
     _rewrite_snapshot(archived / nodate / "index", lambda s: s.pop("built_at"))
+    # Claiming schema 11 without the providers table it lists.
+    eleven = _run(archived, "eleven", 16)
+    _rewrite_snapshot(
+        archived / eleven / "index", lambda s: s.update(schema_version=11)
+    )
     _run(archived, "raw", 14, built_at=day(13))  # a run without its index yet
     (archived / "raw-000000000000000f").mkdir()
     write_build(archived / "old" / "index")
@@ -70,6 +76,7 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     assert all(path == archived / b / "index" for b, path, _ in sources)
     assert skipped == [
         {"id": bad, "reason": "incomplete"},
+        {"id": eleven, "reason": "incomplete"},
         {"id": gone, "reason": "incomplete"},
         {"id": nl, "reason": "no feeds"},
         {"id": nodate, "reason": "undated"},
@@ -390,9 +397,9 @@ def test_feeds_another_build_kept_with_the_same_content_fold(
     assert snapshot["content_folds"] == {"f-mdb-648": "f-wl"}
 
 
-# ---- loading a selection for a merge: the reader's schema-9 fixture ----
+# ---- loading a selection for a merge: the reader's schema-11 fixture ----
 
-# What a schema-9 build's manifest carries that a merge checks or copies.
+# What a build's manifest carries that a merge checks or copies.
 MANIFEST_9 = {
     "overture_release": "2026-08-19.0",
     "simplify_tolerance_deg": 0.0005,
@@ -409,8 +416,9 @@ MANIFEST_9 = {
 
 
 def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fields):
-    """A schema-10 run archived as ``<label>-<16 hex>``: the reader fixture's
-    partitioned index with the manifest fields a merge checks."""
+    """A schema-11 run archived as ``<label>-<16 hex>``: the reader fixture's
+    partitioned index (``access`` its providers, none by default) with the
+    manifest fields a merge checks."""
     path = archived / f"{label}-{digit:016x}" / "index"
     fx.write_partitioned_index(
         path,
@@ -419,6 +427,7 @@ def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fiel
         edges=fields.pop("edges"),
         realtime=fields.pop("realtime", []),
         contained=fields.pop("contained", {}),
+        access=fields.pop("access", {"providers": []}),
         snapshot_id=f"{digit:016x}",
         notice=notice,
     )
@@ -429,6 +438,17 @@ def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fiel
 
 
 HSL_LICENCE = {"spdx_identifier": "CC-BY-4.0", "url": "https://hsl.example/licence"}
+NAT_LICENCE = {"url": "https://nat.example/terms", "attribution_text": "Data by Nat"}
+FLIX = {
+    "provider_id": "flix",
+    "name": "FlixBus",
+    "registration_url": "https://flix.example/register",
+    "docs_url": None,
+    "terms_url": None,
+    "credential_fields": ["key"],
+    "free": None,
+}
+HEL_CENTRE = shapely.to_wkb(shapely.Point(24.94, 60.17), hex=True)
 DE_SOURCES = {
     "atlas": {"archive_sha256": "d" * 64},
     "mdb": {"csv_sha256": "e" * 64},
@@ -479,7 +499,14 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
                 "service_end": "2026-12-31",
                 "atlas": {"license": HSL_LICENCE},
             },
-            {**fx.covered_feed("nat"), "home_country": "FI", "scope": "domestic"},
+            # A curated feed: its licence rides in its Atlas block.
+            {
+                **fx.covered_feed("nat"),
+                "source": "curated",
+                "home_country": "FI",
+                "scope": "domestic",
+                "atlas": {"license": NAT_LICENCE},
+            },
         ],
         places=[
             fx.place("fi", "country", country_code="FI"),
@@ -499,8 +526,15 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         built_at=BUILT(15),
         notice=de_notice,
         sources=DE_SOURCES,
+        access={"providers": [FLIX]},
         feeds=[
-            {**fx.covered_feed("flix"), "home_country": "DE", "scope": "domestic"},
+            {
+                **fx.covered_feed("flix"),
+                "home_country": "DE",
+                "scope": "domestic",
+                "access": "key",
+                "access_provider": "flix",
+            },
             {
                 **fx.covered_feed("ferry"),
                 "home_country": None,
@@ -509,7 +543,9 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         ],
         places=[
             fx.place("ber", "city", country_code="DE"),
-            fx.place("hel", "city", country_code="FI", parent_id="fi"),
+            fx.place(
+                "hel", "city", country_code="FI", parent_id="fi", centre=HEL_CENTRE
+            ),
         ],
         edges=[
             fx.edge("ber", "flix", tier="local", relevance_category="primary"),
@@ -558,8 +594,8 @@ def _mixed_overture(archived, fi, de):
     )
 
 
-def _below_schema_10(archived, fi, de):
-    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(schema_version=9))
+def _below_schema_11(archived, fi, de):
+    _rewrite_snapshot(archived / fi / "index", lambda s: s.update(schema_version=10))
 
 
 def _without_a_release(archived, fi, de):
@@ -592,6 +628,10 @@ def _feeds_without_service_spans(archived, fi, de):
 
 def _feeds_without_containers(archived, fi, de):
     _drop_feed_columns(archived, fi, ["contained_in"])
+
+
+def _feeds_without_access_details(archived, fi, de):
+    _drop_feed_columns(archived, fi, ["download_url"])
 
 
 def _drop_feed_columns(archived, fi, columns):
@@ -627,13 +667,14 @@ def _rewritten_notice(archived, fi, de):
     [
         (_unlicensed, "not a licensed build"),
         (_mixed_overture, "overture_release differs"),
-        (_below_schema_10, "schema_version 9"),
+        (_below_schema_11, "schema_version 10"),
         (_without_a_release, "no usable overture_release"),
         (_another_classifier, "classifier differs"),
         (_a_malformed_classifier_everywhere, "no usable classifier"),
         (_a_negative_tolerance, "no usable simplify_tolerance_deg"),
         (_feeds_without_service_spans, "does not verify"),
         (_feeds_without_containers, "does not verify"),
+        (_feeds_without_access_details, "does not verify"),
         (_tampered_table, "does not verify"),
         (_rewritten_notice, "does not verify"),
     ],
@@ -645,6 +686,59 @@ def test_a_selection_a_merge_cannot_ship_is_refused(tmp_path, tamper, message):
     sources, _ = merge.select_sources(tmp_path)
     with pytest.raises(merge.MergeError, match=message):
         merge.load_sources(sources)
+
+
+def _provider_runs(fx, archived, fi_providers, de_providers):
+    """An older Finnish and a newer German run listing the given providers;
+    the German feed takes ``flix``."""
+    for label, digit, providers in (("fi", 1, fi_providers), ("de", 2, de_providers)):
+        code = label.upper()
+        _archive(
+            fx,
+            archived,
+            label,
+            digit,
+            built_at=BUILT(13 + digit),
+            access={"providers": providers},
+            feeds=[
+                {
+                    **fx.covered_feed(f"{label}-bus"),
+                    "home_country": code,
+                    "access_provider": "flix" if label == "de" else None,
+                }
+            ],
+            places=[fx.place(label, "country", country_code=code)],
+            edges=[fx.edge(label, f"{label}-bus", tier="national")],
+        )
+
+
+TOKEN_FLIX = {**FLIX, "credential_fields": ["token"]}
+
+
+@pytest.mark.parametrize(
+    "fi_providers, de_providers, expected",
+    [
+        ([FLIX], [FLIX], [FLIX]),
+        # A label with no feed of the provider ships no row of it, so a newer
+        # definition elsewhere stands alone.
+        ([], [TOKEN_FLIX], [TOKEN_FLIX]),
+        # A feed's auth_params were bound to its own build's fields.
+        ([TOKEN_FLIX], [FLIX], "access provider flix differs between"),
+        # Another build's row cannot stand in for the feed's own.
+        ([FLIX], [], "their build does not list: \\[\\('flix', 'de-"),
+    ],
+)
+def test_the_sources_providers_merge_only_when_they_agree(
+    tmp_path, fi_providers, de_providers, expected
+):
+    fx = pytest.importorskip("index_fixture")
+    _provider_runs(fx, tmp_path, fi_providers, de_providers)
+    if isinstance(expected, str):
+        with pytest.raises(merge.MergeError, match=expected):
+            _merged(tmp_path)
+        return
+    _, tables = _merged(tmp_path)
+    assert tables["access_providers.parquet"].to_pylist() == expected
 
 
 def test_a_manifest_rewritten_after_selection_is_refused_even_when_equal_in_python(
@@ -731,6 +825,7 @@ def test_every_merged_row_lands_in_its_partition_sorted_without_the_merge_column
         ("international", "feeds"),
         ("international", "realtime"),
         ("links", "edges"),
+        (None, "access_providers"),
     ]
     # Feeds under their home country, ``international`` without one.
     assert routed[("FI", "feeds")]["feed_id"].to_pylist() == ["hsl", "nat"]
@@ -800,6 +895,10 @@ def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadat
     _two_runs(fx, tmp_path)
     _, tables = _merged(tmp_path)
     files, listing = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
+    # The providers table at the root, outside the listing.
+    root_bytes = files.pop((None, "access_providers"))
+    root = pq.read_table(io.BytesIO(root_bytes))
+    assert root.to_pylist() == [FLIX]
     assert set(files) == {(p, t) for p, tables_ in listing.items() for t in tables_}
     for (partition, table), data in files.items():
         read = pq.read_table(io.BytesIO(data))
@@ -810,10 +909,11 @@ def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadat
         }
     assert listing["links"]["edges"]["rows"] == 2
     assert listing["FI"]["realtime"]["rows"] == 1
-    assert b"geo" in pq.read_schema(io.BytesIO(files[("FI", "places")])).metadata
+    geo = pq.read_schema(io.BytesIO(files[("FI", "places")])).metadata[b"geo"]
+    assert json.loads(geo)["columns"]["centre"]["geometry_types"] == ["Point"]
     # The same tables give the same bytes again.
     again, _ = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
-    assert again == files
+    assert again.pop((None, "access_providers")) == root_bytes and again == files
 
 
 # ---- the merged snapshot: its id and its manifest ----
@@ -834,14 +934,14 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
     read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
     assert set(read["snapshot"].to_pylist()) == {snapshot_id}
-    assert manifest["schema_version"] == 10
+    assert manifest["schema_version"] == 11
     assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
-    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[10]
+    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[11]
     assert manifest["built_with"] == transitio.__version__
     assert manifest["built_at"] == BUILT(15)  # the newest source's, not the clock
     assert manifest["counts"] == {
         "feeds": 4,
-        "by_source": {"atlas": 4},
+        "by_source": {"atlas": 3, "curated": 1},
         "feeds_dated": 1,
         "realtime": 2,
         "realtime_linked": 1,
@@ -850,6 +950,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         "places_by_kind": {"city": 2, "country": 1},
         "edges": 5,
         "edges_by_tier": {"international": 2, "local": 2, "national": 1},
+        "access_providers": 1,
     }
     assert {
         p: {t: e["rows"] for t, e in ts.items()}
@@ -861,10 +962,12 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         "links": {"edges": 2},
     }
     for (partition, table), data in files.items():
-        assert (
-            manifest["partitions"][partition][table]["sha256"]
-            == hashlib.sha256(data).hexdigest()
+        entry = (
+            manifest["partitions"][partition][table]
+            if partition is not None
+            else {"sha256": manifest["access_providers_sha256"]}
         )
+        assert entry["sha256"] == hashlib.sha256(data).hexdigest()
     assert manifest["licensed"] is True
     assert manifest["notice_sha256"] == hashlib.sha256(b"NOTICE\n").hexdigest()
     assert manifest["overture_release"] == "2026-08-19.0"
@@ -1140,7 +1243,11 @@ def test_the_merged_notice_credits_every_source_once_and_recounts_the_licences(
                 "Feed licences declared by the catalogues (feeds per licence):",
                 "  - CC-BY-4.0: 1",
                 "      url: https://hsl.example/licence",
-                "  - none declared: 3",
+                "  - none declared: 2",
+                # The curated feed's licence and the attribution it requires.
+                "  - no identifier: 1",
+                "      url: https://nat.example/terms",
+                "      attribution: Data by Nat",
             ],
         ]
     )
@@ -1370,6 +1477,9 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
     assert len(index.feeds) == 4 and len(index.places) == 3 and len(index.edges) == 5
     assert len(index.links) == 2 and len(index.realtime) == 2
     assert set(index.feeds["snapshot"]) == {index.snapshot["snapshot_id"]}
+    assert index.access_provider("flix").name == "FlixBus"
+    centre = index.places.set_index("place_id").loc["hel", "centre"]
+    assert centre.equals(shapely.from_wkb(HEL_CENTRE))
     notice = (cache / "index" / "NOTICE").read_bytes()
     assert notice.startswith(b"This index includes place boundary geometry")
     assert hashlib.sha256(notice).hexdigest() == index.snapshot["notice_sha256"]
@@ -1415,18 +1525,26 @@ def compose_notice_for(loaded, tables):
     return merge.compose_notice(loaded, tables["feeds.parquet"])
 
 
-def test_a_published_build_is_of_a_schema_the_merge_refuses(tmp_path):
+def test_a_build_of_places_without_feeds_merges_with_fed_ones(tmp_path):
     fx = pytest.importorskip("index_fixture")
     pytest.importorskip("geopandas")
     from test_index_license import _feedless_index
 
+    from transitio_index import geometry, ucdb
+
+    read_index = _reader()
     builds, merged = tmp_path / "builds", tmp_path / "merged"
     _two_runs(fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM]))
     feedless = _feedless_index(tmp_path)
     shutil.copytree(feedless / "index", builds / "cities-0000000000000003" / "index")
-    with pytest.raises(merge.MergeError, match="schema_version 11; the merge takes"):
-        merge.merge_builds(builds, merged, log=lambda line: None)
-    assert not (merged / "index").exists()
+    manifest = merge.merge_builds(builds, merged, log=lambda line: None)
+    assert len(manifest["merged"]) == 3
+    credit = geometry.DERIVED_SOURCES[ucdb.DERIVED]["credit"]
+    assert (merged / "index" / "NOTICE").read_text().count(credit) == 1
+    index = read_index(merged / "index")
+    assert len(index.feeds) == 4 and len(index.places) == 5
+    peru = read_index(merged / "index", country="PE")
+    assert sorted(peru.places["place_id"]) == ["tp_lima", "tp_pe"]
 
 
 def test_a_second_merge_replaces_the_live_index_and_drops_what_it_lacks(tmp_path):

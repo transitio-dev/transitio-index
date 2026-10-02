@@ -1113,7 +1113,8 @@ def test_a_feeds_own_crawl_outranks_one_filed_under_its_alias(tmp_path):
     assert states["f-new"][1]["feed_id"] == "f-new" and not unmatched
 
 
-def test_a_flat_build_claiming_schema_10_needs_its_columns(tmp_path):
+@pytest.mark.parametrize("version", [10, 11])
+def test_a_flat_build_claiming_schema_10_needs_its_columns(tmp_path, version):
     """The schema's required columns were checked on partitioned builds only,
     so a flat manifest claiming schema 10 loaded without contained_in."""
     import json
@@ -1126,8 +1127,11 @@ def test_a_flat_build_claiming_schema_10_needs_its_columns(tmp_path):
     write_build(path)
     assert builds.load_tables(path) is not None
     snapshot = json.loads((path / "snapshot.json").read_text())
-    (path / "snapshot.json").write_text(json.dumps({**snapshot, "schema_version": 10}))
+    snapshot["schema_version"] = version
+    (path / "snapshot.json").write_text(json.dumps(snapshot))
     assert builds.load_tables(path) is None
+    # Whatever its columns: a schema-11 build ships its providers at the root.
+    assert (builds.snapshot_files(snapshot) is None) == (version == 11)
 
 
 def test_a_dropped_download_resumes_from_the_bytes_that_arrived(tmp_path):
@@ -1731,3 +1735,37 @@ def test_a_fao_metro_carries_its_fao_centre_not_its_members_centroid(tmp_path):
     assert point.equals(shapely.point_on_surface(centre))
     assert union.covers(point) and not point.equals(union.centroid)
     assert manifest["centres"] == sum(bool(p.get("centre")) for p in places)
+
+
+def test_a_seeded_citys_population_survives_the_merge(tmp_path):
+    """Only the build seeding a city records its urban centre's population,
+    and the merge took the place row of the build serving it most, so a city
+    another build fed lost its population."""
+    fx = pytest.importorskip("index_fixture")
+    from test_index_merge import BUILT, _archive, _merged
+
+    # The seeding build serves only the country; the newer one feeds Lima.
+    for label, digit, lima, served in (
+        ("seed", 1, {"population": 10**7}, "pe"),
+        ("fed", 2, {"name": "Lima (fed)"}, "lima"),
+    ):
+        _archive(
+            fx,
+            tmp_path,
+            label,
+            digit,
+            built_at=BUILT(13 + digit),
+            feeds=[{**fx.covered_feed(f"{label}-bus"), "home_country": "PE"}],
+            places=[
+                fx.place("pe", "country", country_code="PE"),
+                fx.place("lima", "city", country_code="PE", **lima),
+            ],
+            edges=[fx.edge(served, f"{label}-bus", tier="local")],
+        )
+    _, tables = _merged(tmp_path)
+    places = tables["places.parquet"].select(["place_id", "name", "population"])
+    assert {row["place_id"]: row for row in places.to_pylist()}["lima"] == {
+        "place_id": "lima",
+        "name": "Lima (fed)",
+        "population": 10**7,
+    }

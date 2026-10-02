@@ -11,8 +11,9 @@ disagree on what the merged index holds. ``load_sources`` verifies and
 loads the selection for a merge, refusing what a merged snapshot could
 not ship, ``compose_notice`` writes the merged index's NOTICE from the
 sources' NOTICEs and the merged feeds, and ``assemble`` turns the merged
-tables into a schema-9 snapshot: the partition tables, their manifest and
-a snapshot id that names exactly the sources, the merge format and the
+tables into a schema-11 snapshot: the partition tables, the providers
+table at the root, their manifest and a snapshot id that names exactly the
+sources, the merge format and the
 toolchain they were merged with. ``write_snapshot`` reads the assembled
 snapshot back through the reader before committing it into the cache's
 ``index/`` as publish commits its own. Given the ``partition.json`` of the
@@ -63,6 +64,7 @@ OVERRIDE_FIELDS = (
     "overrides_sha256",
     "feeds_overrides_sha256",
     "places_overrides_sha256",
+    "access_providers_overrides_sha256",
 )
 
 
@@ -75,10 +77,8 @@ OVERRIDE_FIELDS = (
 # companions linked to it. 6: feeds of different builds with one content
 # identity fold. 7: relevance is rescored over the merged edges. 8: the
 # manifest records the catalogue check. 9: the check covers the curated feeds.
-MERGE_FORMAT = 9
-# The schema the merge takes and writes: a schema-11 build carries a
-# providers table at its root, which the merge does not carry.
-SCHEMA_VERSION = 10
+# 10: schema 11, the providers table and the places' populations.
+MERGE_FORMAT = 10
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -476,6 +476,14 @@ def merge_tables(sources, skipped=()):
         tables["feeds.parquet"] = _companion_lists(
             tables["feeds.parquet"], tables["realtime.parquet"]
         )
+    if "population" in tables["places.parquet"].column_names:
+        tables["places.parquet"] = _populations(
+            tables["places.parquet"], merged["places.parquet"]
+        )
+    if "access_providers.parquet" in merged:
+        tables["access_providers.parquet"] = _providers(
+            merged["access_providers.parquet"], tables["feeds.parquet"]
+        )
     tables["edges.parquet"], relevance = _rescored(
         tables["edges.parquet"], tables["places.parquet"]
     )
@@ -518,6 +526,46 @@ def merge_tables(sources, skipped=()):
     return snapshot, tables
 
 
+def _populations(places, stacked):
+    """``places`` with each place's population the largest any source row of
+    it records, null when none does: only the build seeding a city records
+    its urban centre's population, and another build may serve it more."""
+    largest = stacked.group_by("place_id").aggregate([("population", "max")])
+    by_id = dict(
+        zip(largest["place_id"].to_pylist(), largest["population_max"].to_pylist())
+    )
+    values = [by_id.get(place_id) for place_id in places["place_id"].to_pylist()]
+    return _replaced(places, "population", values, publish._PLACES_SCHEMA)
+
+
+def _providers(stacked, feeds):
+    """The merged providers table: one row per provider id, which every
+    source listing it must give alike. A feed's ``auth_params`` were bound
+    to its own build's provider, so the build each merged feed comes from
+    must list the provider it names."""
+    columns = publish._ACCESS_PROVIDERS_SCHEMA.names
+    rows, listed = {}, set()
+    for row in stacked.select([*columns, "build_id"]).to_pylist():
+        build_id = row.pop("build_id")
+        listed.add((row["provider_id"], build_id))
+        first, kept = rows.setdefault(row["provider_id"], (build_id, row))
+        if kept != row:
+            raise MergeError(
+                f"access provider {row['provider_id']} differs between {first} "
+                f"and {build_id}"
+            )
+    named = zip(feeds["access_provider"].to_pylist(), feeds["build_id"].to_pylist())
+    unlisted = sorted({pair for pair in named if pair[0] is not None} - listed)
+    if unlisted:
+        raise MergeError(
+            f"merged feeds name access providers their build does not list: {unlisted}"
+        )
+    return pa.Table.from_pylist(
+        [rows[provider_id][1] for provider_id in sorted(rows)],
+        schema=publish._ACCESS_PROVIDERS_SCHEMA,
+    )
+
+
 def _check_sources(snapshots):
     """Refuse a selection the merge cannot ship: a source below schema 9, an
     unlicensed one, one without a field of ``AGREED_FIELDS``, or sources
@@ -525,10 +573,10 @@ def _check_sources(snapshots):
     agreed = {}
     for build_id, snapshot in snapshots:
         version = snapshot.get("schema_version")
-        if version != SCHEMA_VERSION:
+        if version != publish.SCHEMA_VERSION:
             raise MergeError(
                 f"{build_id}: schema_version {version!r}; the merge takes schema "
-                f"{SCHEMA_VERSION} builds only"
+                f"{publish.SCHEMA_VERSION} builds only"
             )
         if snapshot.get("licensed") is not True or not isinstance(
             snapshot.get("notice_sha256"), str
@@ -683,7 +731,8 @@ def _route(tables):
     home country when the place lies there, else under ``links`` with
     ``feed_partition``. The columns the merge and the viewer's join added
     (``build_id``, ``partition``, a domestic edge's ``feed_partition``) go,
-    and every table is sorted by its ids.
+    and every table is sorted by its ids. The providers table goes to the
+    root, under the partition ``None``.
     """
     feeds = _without(tables["feeds.parquet"], ("partition", "build_id"))
     feeds = feeds.sort_by("feed_id")
@@ -731,23 +780,30 @@ def _route(tables):
         partition = partition.fillna(publish.INTERNATIONAL_PARTITION)
         for name, rows in _split(realtime, partition).items():
             routed[(name, "realtime")] = rows
-    return dict(sorted(routed.items()))
+    routed = dict(sorted(routed.items()))
+    if "access_providers.parquet" in tables:
+        routed[(None, "access_providers")] = tables["access_providers.parquet"]
+    return routed
 
 
 def _partition_files(routed, snapshot_id):
     """``(files, listing)``: every routed table with its ``snapshot`` column
     set to the merged id, as Parquet bytes keyed ``(partition, table)``, and
-    the manifest listing of each table's rows and digest."""
+    the manifest listing of each table's rows and digest; a root table
+    (partition ``None``) has neither."""
     files, listing = {}, {}
     for (partition, table), rows in routed.items():
-        column = pa.array([snapshot_id] * len(rows), pa.string())
-        rows = rows.set_column(
-            rows.schema.get_field_index("snapshot"), "snapshot", column
-        )
+        if partition is not None:
+            column = pa.array([snapshot_id] * len(rows), pa.string())
+            rows = rows.set_column(
+                rows.schema.get_field_index("snapshot"), "snapshot", column
+            )
         sink = io.BytesIO()
         pq.write_table(rows, sink)
         data = sink.getvalue()
         files[(partition, table)] = data
+        if partition is None:
+            continue
         listing.setdefault(partition, {})[table] = {
             "rows": len(rows),
             "sha256": hashlib.sha256(data).hexdigest(),
@@ -767,7 +823,7 @@ def _merged_id(loaded, partition_sha256=None, curated_sha256=None):
     from transitio import __version__ as transitio_version
 
     parts = [
-        SCHEMA_VERSION,
+        publish.SCHEMA_VERSION,
         MERGE_FORMAT,
         transitio_version,
         pa.__version__,
@@ -800,10 +856,10 @@ def _json_records(edges, column):
     return values
 
 
-def _replaced(table, name, values):
+def _replaced(table, name, values, schema=publish._EDGES_SCHEMA):
     """``table`` with column ``name`` set to ``values``, typed as publish
-    writes it."""
-    field = publish._EDGES_SCHEMA.field(name)
+    writes it in ``schema``."""
+    field = schema.field(name)
     column = pa.array(values, field.type)
     index = table.schema.get_field_index(name)
     if index < 0:
@@ -944,6 +1000,7 @@ def _recount(tables):
         "places_by_kind": _value_counts(places["kind"]),
         "edges": len(edges),
         "edges_by_tier": _value_counts(edges["tier"]),
+        "access_providers": len(tables["access_providers.parquet"]),
     }
 
 
@@ -1112,16 +1169,19 @@ def assemble(loaded, tables, notice, alias_conflicts=(), catalogue_check=None):
         for field in STALE_FIELDS
     }
     manifest = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": publish.SCHEMA_VERSION,
         "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
         "min_reader_version": MIN_READER_VERSIONS.get(
-            SCHEMA_VERSION, publish.MIN_READER_VERSION
+            publish.SCHEMA_VERSION, publish.MIN_READER_VERSION
         ),
         "built_with": built_with,
         "snapshot_id": snapshot_id,
         "built_at": newest["snapshot"]["built_at"],
         "counts": _recount(tables),
         "partitions": listing,
+        "access_providers_sha256": hashlib.sha256(
+            files[(None, "access_providers")]
+        ).hexdigest(),
         "licensed": True,
         "notice_sha256": hashlib.sha256(notice).hexdigest(),
         **{field: agreed.get(field) for field in AGREED_FIELDS},
