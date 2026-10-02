@@ -323,13 +323,15 @@ def test_a_stop_in_a_council_area_reaches_the_city_shipping_its_boundary(tmp_pat
     assert set(edges["f-city"]) == {"tp_council", "tp_city"}
 
 
-def test_a_stop_inside_a_curated_boundary_reaches_its_place(tmp_path):
+@pytest.mark.parametrize("source", [geometry.CURATED, geometry.UCDB])
+def test_a_stop_inside_a_curated_boundary_reaches_its_place(tmp_path, source):
     import shapely
 
-    # No Overture division stands for the curated place: its boundary does.
+    # No Overture division stands for a curated place or a seeded city's
+    # urban centre: its boundary does.
     drawn = {
         **_place("tp_drawn", "city"),
-        "geometry_source": geometry.CURATED,
+        "geometry_source": source,
         "geometry": shapely.to_wkb(shapely.box(49.0, 0.0, 51.0, 2.0)).hex(),
     }
     _, _, edges = _cover(

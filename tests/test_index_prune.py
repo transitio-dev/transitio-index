@@ -21,7 +21,7 @@ def _edge(place_id, feed_id="f"):
     return {"place_id": place_id, "feed_id": feed_id}
 
 
-def test_the_keep_set_is_edges_curation_ancestors_and_metros_of_kept_cities():
+def test_the_keep_set_is_edges_curation_seeds_ancestors_and_metros_of_kept_cities():
     places = {
         p["place_id"]: p
         for p in [
@@ -32,12 +32,24 @@ def test_the_keep_set_is_edges_curation_ancestors_and_metros_of_kept_cities():
             _place("Q-metro", "metro", member_ids=["Q-city"]),
             _place("Q-lone", "metro", member_ids=["Q-empty"]),
             {**_place("Q-hand", "city", parent_id="Q-reg"), "curated": True},
+            _place("Q-reg2", "region", parent_id="Q-c"),
+            {
+                **_place("Q-seed", "city", parent_id="Q-reg2", metro_ids=["Q-own"]),
+                "ucdb_id": 0,
+                "population": 250_000,
+            },
+            _place("Q-own", "metro", member_ids=["Q-seed"]),
         ]
     }
     kept = prune.keep_set(places, [_edge("Q-city")])
     # The city, its ancestors, its metro, and the curated city; not the
-    # empty city nor the metro only it belonged to.
-    assert kept == {"Q-city", "Q-reg", "Q-c", "Q-metro", "Q-hand"}
+    # empty city nor the metro only it belonged to. A seeded city stays
+    # without an edge, with its ancestors but not its metro.
+    assert kept == {"Q-city", "Q-reg", "Q-c", "Q-metro", "Q-hand", "Q-seed", "Q-reg2"}
+    survivors, report = prune.prune_places(list(places.values()), [_edge("Q-city")])
+    seeded = next(p for p in survivors if p["place_id"] == "Q-seed")
+    assert seeded["metro_ids"] == [] and seeded["population"] == 250_000
+    assert report["kept_seeded_without_edges"] == 1
 
 
 def test_removals_cascade_without_dangling_ids():

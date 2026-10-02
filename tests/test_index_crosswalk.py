@@ -1251,7 +1251,7 @@ def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
 
 @pytest.mark.parametrize("systems", [(), ({"System ID": "s"},)])
 def test_only_empty_catalogues_crosswalk_to_no_feeds(tmp_path, systems):
-    from transitio_index import atlas
+    from transitio_index import atlas, publish
 
     cache = tmp_path / "cache"
     archive = tmp_path / "atlas.tar.gz"
@@ -1265,6 +1265,9 @@ def test_only_empty_catalogues_crosswalk_to_no_feeds(tmp_path, systems):
             crosswalk.crosswalk(cache)
     else:
         assert crosswalk.crosswalk(cache)["feeds"] == 0
+        # Without places either, a build has nothing to publish.
+        with pytest.raises(publish.PublishError, match="no feeds to publish"):
+            publish.publish(cache)
 
 
 def test_crosswalk_stage_publishes_provisional_links(tmp_path):

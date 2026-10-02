@@ -138,8 +138,9 @@ def _atlas_archive(tmp_path, feeds):
     return path
 
 
-def _publish_audit(cache, notice="Boundary geometry from Overture.\n"):
-    """A geometry generation carrying the licence audit the license stage reads."""
+def _publish_audit(cache, notice="Boundary geometry from Overture.\n", **manifest):
+    """A geometry generation carrying the licence audit the license stage
+    reads, its manifest extended by ``manifest``."""
     directory = store.open_subdir(cache, "gazetteer")
     try:
         with store.exclusive_writer(directory):
@@ -153,7 +154,7 @@ def _publish_audit(cache, notice="Boundary geometry from Overture.\n"):
                     ),
                     "NOTICE": lambda: [notice],
                 },
-                {"source": "geometry", "places_overrides_sha256": None},
+                {"source": "geometry", "places_overrides_sha256": None, **manifest},
                 held=directory,
             )
     finally:

@@ -496,6 +496,97 @@ def test_a_city_without_an_area_ships_its_twins_or_council_areas_boundary(tmp_pa
     assert read["no-area-4"] is read["de-berlin"]
 
 
+def test_a_seeded_city_ships_its_urban_centre_only_without_another_boundary(
+    tmp_path,
+):
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import ucdb
+
+    def county(place_id, overture_id, name):
+        place = _place(place_id, "region", overture_id=overture_id, country="GB")
+        return {
+            **place,
+            "name": name,
+            "source_subtype": "county",
+            "resolution_method": "overture_id",
+        }
+
+    def seeded(place_id, overture_id, polygon=shapely.box(24.9, 60.1, 25.1, 60.3)):
+        return {
+            **_place(place_id, "city", overture_id=overture_id),
+            "ucdb_id": 1,
+            "ucdb_boundary": shapely.to_wkb(polygon).hex(),
+        }
+
+    def in_council(place, name, parent_id):
+        return {**place, "name": name, "country_code": "GB", "parent_id": parent_id}
+
+    bowtie = shapely.Polygon([(0, 0), (1, 1), (1, 0), (0, 1)])
+    records = [
+        county("overture:gb-man", "gb-man", "Manchester"),
+        county("overture:gb-lee", "gb-lee", "Leeds"),  # no area: curated below
+        seeded("Q_U", "no-area"),
+        seeded("Q_OWN", "fi-helsinki", shapely.box(23.0, 60.0, 24.0, 61.0)),
+        in_council(seeded("Q_MAN", "no-area-2"), "Manchester", "overture:gb-man"),
+        in_council(seeded("Q_LEE", "no-area-3"), "Leeds", "overture:gb-lee"),
+        seeded("Q_SET", "no-area-4"),
+        seeded("Q_BAD", "no-area-5", bowtie),
+        {**seeded("Q_BADWKB", "no-area-6"), "ucdb_boundary": "00ff"},
+    ]
+    wkt = "POLYGON((-1.6 53.7, -1.5 53.7, -1.5 53.8, -1.6 53.8, -1.6 53.7))"
+    overrides_dir = write_overrides(
+        tmp_path,
+        places=[
+            {"place": "overture:gb-lee", "set_boundary": wkt},
+            {"place": "Q_SET", "set_boundary": wkt},
+        ],
+    )
+    cache = tmp_path / "cache"
+    _publish(cache, records, overrides_dir)
+    dataset = fx.write_area_dataset(
+        tmp_path / "areas.parquet", AREAS + [fx.area("gb-man", OTHER, [_osm()])]
+    )
+    manifest = geometry.attach_geometry(
+        cache, dataset=dataset, overrides_dir=overrides_dir
+    )
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    places = {p["place_id"]: p for p in places}
+    # Its own area, a council area (a curated one too) and a curator's
+    # boundary come first; an invalid polygon or malformed WKB ships nothing.
+    expected = {
+        "Q_U": geometry.UCDB,
+        "Q_OWN": "overture",
+        "Q_MAN": geometry.COUNCIL_AREA,
+        "Q_LEE": geometry.COUNCIL_AREA,
+        "Q_SET": geometry.CURATED,
+        "Q_BAD": None,
+        "Q_BADWKB": None,
+    }
+    assert {key: places[key]["geometry_source"] for key in expected} == expected
+    assert places["Q_LEE"]["geometry"] == places["overture:gb-lee"]["geometry"]
+    assert shapely.from_wkb(places["Q_U"]["geometry"]).equals(
+        shapely.box(24.9, 60.1, 25.1, 60.3)
+    )
+    assert not any("ucdb_boundary" in place for place in places.values())
+    assert manifest["ucdb_geometry"] == 1 and manifest["invalid_geometry"] == 2
+    assert "|".join(ucdb.DERIVED) in manifest["licence_sources"]
+    rows, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    (row,) = [row for row in rows if row["dataset"] == ucdb.DERIVED[0]]
+    assert (row["role"], row["version"], row["allowed"]) == (
+        "component",
+        ucdb.RELEASE,
+        True,
+    )
+    assert row["geometries"] == 3  # Q_U, and Q_LEE and Q_SET before curation
+    credit = geometry.DERIVED_SOURCES[ucdb.DERIVED]["credit"]
+    assert _read_text(cache, "NOTICE").count(credit) == 1
+
+
 def test_area_chunking_matches_a_single_pass(tmp_path):
     # Resolving the seeded areas in small chunks (a memory-tight host's setting)
     # must produce exactly the same attached geometry as one full-set pass.

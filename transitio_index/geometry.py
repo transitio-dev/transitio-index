@@ -174,6 +174,10 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
 # The FAO city-regions as a derived input: a curated FAO metro publishes
 # only with this row and Overture's allowlisted.
 FAO_DERIVED = ("FAO city-regions 2024", "CC-BY-4.0")
+# The GHS-UCDB urban centres: a derived input, and the boundary a seeded city
+# with no other ships.
+UCDB_DERIVED = ("GHS-UCDB R2024A", "CC-BY-4.0")
+SOURCE_ALLOWLIST[UCDB_DERIVED] = DERIVED_SOURCES[UCDB_DERIVED]
 # The Urban Audit functional urban areas as a derived input, like the NUTS
 # boundaries: point-in-polygon at build time, never shipped.
 URAU_DERIVED = ("GISCO Urban Audit 2024", "EuroGeographics-NC")
@@ -193,6 +197,8 @@ CURATED = "curated"
 # The geometry source of a place that ships the area of another division its
 # QID names (a city whose county twin carries the boundary).
 QID_TWIN = "qid_twin"
+# The geometry source of a seeded city that ships its GHS-UCDB urban centre.
+UCDB = "ghs_ucdb"
 
 
 def division_area_dataset(release=overture.OVERTURE_RELEASE):
@@ -792,13 +798,14 @@ def _notice(shipped, release, derived=()):
     return "\n".join(lines) + "\n"
 
 
-def _inventory_rows(inventory, shipped_count, derived=()):
+def _inventory_rows(inventory, shipped_count, derived=(), releases=None):
     """The licence inventory: the Overture aggregator, each component source,
     then the derived-data rows an earlier stage recorded.
 
-    Every row carries the licence URL and the pinned release as its version, so
-    the record answers "what shipped, under what licence, from where, at which
-    version" without reading back the source data.
+    Every row carries the licence URL and the pinned release as its version
+    (a component's own from ``releases``, keyed by its pair, when it is not
+    Overture's), so the record answers "what shipped, under what licence, from
+    where, at which version" without reading back the source data.
     """
     rows = [
         {
@@ -823,7 +830,9 @@ def _inventory_rows(inventory, shipped_count, derived=()):
                 "dataset": dataset_name,
                 "license": licence,
                 "url": meta["url"] if meta else None,
-                "version": overture.OVERTURE_RELEASE,
+                "version": (releases or {}).get(
+                    (dataset_name, licence), overture.OVERTURE_RELEASE
+                ),
                 "allowed": allowed,
                 "geometries": count,
             }
@@ -833,12 +842,13 @@ def _inventory_rows(inventory, shipped_count, derived=()):
 
 def _lend_council_boundaries(places, by_id, lent, absent):
     """Give each city in ``lent`` that read no area of its own (``absent``),
-    and has no curated boundary, its council area's shipped boundary."""
+    and has no curated boundary, its council area's shipped boundary, over
+    its UCDB polygon."""
     for place in places:
         own = place.get("overture_id")
         if own not in absent or own not in lent:
             continue
-        if place.get("geometry_source") not in (None, COUNCIL_AREA):
+        if place.get("geometry_source") not in (None, COUNCIL_AREA, UCDB):
             continue
         parent = by_id[place["parent_id"]]
         if parent.get("geometry"):
@@ -997,6 +1007,26 @@ def attach_geometry(
             by_id = {p["place_id"]: p for p in places}
             lent = council_areas(places)
             _lend_council_boundaries(places, by_id, lent, absent)
+            # A seeded city with no boundary yet ships its urban centre.
+            urban = 0
+            for place in places:
+                polygon = place.pop("ucdb_boundary", None)
+                if polygon is None or place.get("geometry"):
+                    continue
+                try:
+                    geom = shapely.force_2d(shapely.from_wkb(polygon))
+                    simplified = _simplify(geom) if _valid_polygon(geom) else None
+                except Exception:  # noqa: B902 - shapely raises its own hierarchy
+                    simplified = None
+                if not _valid_polygon(simplified):
+                    invalid += 1
+                    continue
+                place["geometry"] = shapely.to_wkb(simplified).hex()
+                place["geometry_source"] = UCDB
+                urban += 1
+            if urban:
+                shipped.add(UCDB_DERIVED)
+                inventory[(*UCDB_DERIVED, True)] += urban
             member_union = 0
             for place in places:
                 if place.get("kind") != "metro" or place.get("geometry"):
@@ -1047,7 +1077,11 @@ def attach_geometry(
             # A council area's curated boundary is its cities' too.
             _lend_council_boundaries(places, by_id, lent, absent)
             derived = metros_manifest.get("derived_inventory") or []
-            inventory_rows = _inventory_rows(inventory, with_geometry, derived)
+            from transitio_index import ucdb  # ucdb -> fao -> geometry
+
+            inventory_rows = _inventory_rows(
+                inventory, with_geometry, derived, {UCDB_DERIVED: ucdb.RELEASE}
+            )
             notice = _notice(shipped, overture.OVERTURE_RELEASE, derived)
             manifest = {
                 "source": "geometry",
@@ -1066,6 +1100,7 @@ def attach_geometry(
                 "council_area_geometry": sum(
                     p.get("geometry_source") == COUNCIL_AREA for p in places
                 ),
+                "ucdb_geometry": sum(p.get("geometry_source") == UCDB for p in places),
                 "places_overrides_sha256": places_digest,
                 "stale_overrides": len(override_report),
                 "stale_place_overrides": (

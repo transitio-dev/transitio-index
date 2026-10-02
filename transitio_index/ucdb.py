@@ -15,7 +15,7 @@ import collections
 
 import shapely
 
-from transitio_index import fao, pinned, store
+from transitio_index import fao, geometry, pinned, store
 
 CENTRES_FILE = "Tier_1_Urban_Centres.shp.zip"  # every FAO centre, tiers 1 to 4
 UCDB_FILE = "GHS_UCDB_THEME_GENERAL_CHARACTERISTICS_GLOBE_R2024A_V1_2.zip"
@@ -38,7 +38,7 @@ NAMES_FILE = "centre_names.jsonl"
 RELEASE = "R2024A V1-2"
 DOI = "10.2905/1a338be6-7eaf-480c-9664-3a8ade88cbcd"
 LICENCE = "CC-BY-4.0"
-DERIVED = ("GHS-UCDB R2024A", "CC-BY-4.0")
+DERIVED = geometry.UCDB_DERIVED
 EQUAL_AREA = "EPSG:6933"
 MIN_SHARE = 0.1
 AMBIGUITY = 0.5

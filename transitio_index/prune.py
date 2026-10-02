@@ -5,8 +5,9 @@ A place stays when an edge names it, when a curator added or confirmed it
 (``curated``), or when something kept needs it: the administrative ancestors
 of a kept place, and the metros a kept city belongs to — a metro retained
 only through membership rather than administrative descent must not be
-pruned out from under a promotion. Everything else has no edge and no kept
-descendant and goes.
+pruned out from under a promotion. A seeded city (``ucdb_id``) stays with
+or without an edge, and so do its ancestors; its metros only as above.
+Everything else has no edge and no kept descendant and goes.
 
 Removals cascade rather than leave dangling ids, the same closure stage 7
 re-applies after licensing: a dropped parent re-points its children at the
@@ -36,6 +37,7 @@ KINDS = ("country", "region", "city", "metro")
 METRICS = (
     "kept",
     "kept_curated_without_edges",
+    "kept_seeded_without_edges",
     "reparented",
     "default_metro_cleared",
     "metro_ids_trimmed",
@@ -50,7 +52,8 @@ class PruneError(RuntimeError):
 
 def keep_set(places, edges):
     """The ids of the places that survive: edge-bearing or curated places,
-    their administrative ancestors, and the metros of kept cities."""
+    their administrative ancestors, and the metros of kept cities; then each
+    seeded city (``ucdb_id``) and its ancestors, not its metros."""
     kept = {edge["place_id"] for edge in edges if edge["place_id"] in places}
     kept |= {pid for pid, place in places.items() if place.get("curated")}
     queue = list(kept)
@@ -63,6 +66,11 @@ def keep_set(places, edges):
             if pid and pid in places and pid not in kept:
                 kept.add(pid)
                 queue.append(pid)
+    for pid, place in places.items():
+        ancestor = pid if place.get("ucdb_id") is not None else None
+        while ancestor in places and ancestor not in kept:
+            kept.add(ancestor)
+            ancestor = places[ancestor].get("parent_id")
     return kept
 
 
@@ -108,11 +116,13 @@ def prune_places(places, edges):
                 report[f"{key}_trimmed"] += 1
         survivors.append(place)
     report["kept"] = len(survivors)
+    with_edges = {edge["place_id"] for edge in edges}
+    unserved = [place for place in survivors if place["place_id"] not in with_edges]
     report["kept_curated_without_edges"] = sum(
-        1
-        for place in survivors
-        if place.get("curated")
-        and place["place_id"] not in {e["place_id"] for e in edges}
+        1 for place in unserved if place.get("curated")
+    )
+    report["kept_seeded_without_edges"] = sum(
+        1 for place in unserved if place.get("ucdb_id") is not None
     )
     return survivors, dict(report)
 

@@ -1,11 +1,13 @@
 import hashlib
 import json
+import tarfile
 
 import pytest
 
 import transitio.index as transitio_index  # noqa: E402
 from transitio_index import classify, licensing, prune, publish, store  # noqa: E402
 from test_index_publish import (  # noqa: E402
+    GEOM_HEX,
     PLACES,
     _build_index,
     _covered_feed,
@@ -232,6 +234,106 @@ def test_a_moved_geometry_audit_requires_the_gazetteer_to_rerun(tmp_path):
     # Publication refuses the same way rather than shipping the old licence.
     with pytest.raises(publish.PublishError, match="re-run the gazetteer stage"):
         publish.publish(cache)
+
+
+def _feedless_index(tmp_path, release="2026-08-19.0"):
+    """A build of seeded places from empty catalogues: crosswalked and
+    resolved to no feeds, then run from coverage on (no placements, the
+    empty log of a crawl of nothing) through publish; returns the cache."""
+    from test_index_coverage import StubLookup
+    from test_index_publish import GBFS_COLUMNS, MDB_COLUMNS, _csv, _write
+
+    from transitio_index import atlas, coverage, crawl, crosswalk, curate, gbfs
+    from transitio_index import geometry, mdb, rank, resolve
+
+    cache = tmp_path / "cache"
+    archive = tmp_path / "atlas.tar.gz"
+    tarfile.open(archive, "w:gz").close()  # no DMFR file
+    atlas.ingest(cache, archive=archive, commit="a" * 40)
+    mdb.ingest(
+        cache,
+        csv_path=_write(tmp_path / "m.csv", _csv(MDB_COLUMNS, [])),
+        allow_empty=True,
+    )
+    gbfs.ingest(cache, csv_path=_write(tmp_path / "s.csv", _csv(GBFS_COLUMNS, [])))
+    crosswalk.crosswalk(cache)
+    sources = resolve.resolve(cache, overrides_dir=None)["sources"]
+    crawl.crawl(cache, lookup=StubLookup({}))
+    assert (cache / "crawl" / "crawl_log.jsonl").read_text() == ""
+    seed = _publish_gen(
+        cache,
+        "seed.json",
+        "feed_places.jsonl",
+        [],
+        {"source": "seed", "sources": sources, "overture_release": release},
+    )
+    audit = _publish_audit(
+        cache,
+        notice=geometry._notice({geometry.UCDB_DERIVED}, release),
+        licence_sources=["|".join(geometry.UCDB_DERIVED)],
+    )
+    city = _place(
+        "tp_lima", "city", geometry=GEOM_HEX, parent_id="tp_pe", country_code="PE"
+    )
+    places = [
+        _place("tp_pe", "country", geometry=GEOM_HEX, country_code="PE"),
+        {**city, "geometry_source": geometry.UCDB, "ucdb_id": 7, "population": 10**7},
+        _place("tp_town", "city", geometry=GEOM_HEX, parent_id="tp_pe"),
+    ]
+    _publish_gen(
+        cache,
+        "expanded.json",
+        "places_expanded.jsonl",
+        places,
+        {
+            "source": "expand",
+            "sources": sources,
+            "overture_release": release,
+            "simplify_tolerance_deg": geometry.SIMPLIFY_TOLERANCE_DEG,
+            "places_overrides_sha256": None,
+            "seed_generation": seed["generation"],
+            "geometry_generation": audit["generation"],
+            "crawl_digest": crawl.states_digest(cache),
+        },
+    )
+    covered = coverage.cover(cache, lookup=StubLookup({}))
+    assert (covered["feeds"], covered["edges"]) == (0, 0)
+    classify.classify(cache)
+    curate.curate(cache, overrides_dir=None)
+    rank.rank(cache)
+    pruned = prune.prune(cache)
+    assert (pruned["kept_seeded_without_edges"], pruned["dropped_city"]) == (1, 1)
+    licensing.license_index(cache)
+    publish.publish(cache)
+    return cache
+
+
+def test_a_build_of_seeded_places_without_feeds_publishes_a_merge_source(tmp_path):
+    pytest.importorskip("geopandas")
+    import shutil
+
+    from transitio_index import builds, merge
+
+    cache = _feedless_index(tmp_path)
+    licensed, _ = store.read_jsonl(
+        cache / "license", "licensed.json", "places_licensed.jsonl"
+    )
+    # The seeded city and its country stay, the population with the city.
+    assert {p["place_id"]: p.get("population") for p in licensed} == {
+        "tp_pe": None,
+        "tp_lima": 10**7,
+    }
+    index = transitio_index.read_index(cache / "index")
+    assert (len(index.feeds), len(index.edges), len(index.places)) == (0, 0, 2)
+    lima = transitio_index.place("tp_lima", index=index)
+    assert list(lima.feeds(categories=None)) == [] and lima.validity is None
+    assert lima.service.feeds == 0
+    # Archived, the build is a merge source and loads verified.
+    archived = tmp_path / "builds" / "cities-0000000000000003"
+    shutil.copytree(cache / "index", archived / "index")
+    sources, skipped = merge.select_sources(tmp_path / "builds")
+    assert skipped == [] and [source[0] for source in sources] == [archived.name]
+    assert builds.load_tables(archived / "index", expected=sources[0][2]) is not None
 
 
 HULL = "0101000000" + "00" * 16  # a WKB point
