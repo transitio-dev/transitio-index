@@ -33,6 +33,7 @@ a whole download) rather than being papered over.
 import hashlib
 import ipaddress
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -164,6 +165,8 @@ def check_url(url):
             bare = idna.encode(bare, uts46=True).decode("ascii").rstrip(".")
         except idna.IDNAError:
             raise FetchError(f"{url}: host {host!r} does not encode")
+    if not bare:
+        raise FetchError(f"{url}: no host")
     if bare in _BLOCKED_NAMES or bare.endswith(_BLOCKED_SUFFIXES):
         raise FetchError(f"{url}: host {host!r} is not fetched")
     try:
@@ -177,6 +180,50 @@ def check_url(url):
     if not address.is_global:
         raise FetchError(f"{url}: address {host!r} is not fetched")
     return split, address.compressed
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+# A path a server may read as another one: an encoded slash, backslash or
+# percent sign (a second encoding layer), or a malformed escape.
+_AMBIGUOUS_PATH = re.compile(r"%(2f|5c|25)|%(?![0-9a-f]{2})|\\", re.IGNORECASE)
+_UNRESERVED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+_PATH_CHARACTERS = _UNRESERVED | frozenset("!$&'()*+,;=:@")
+
+
+def _normal_token(match):
+    """One escape or character of a path in RFC 3986 normal form: unreserved
+    characters decoded, other escapes upper-case, other characters encoded."""
+    token = match.group()
+    if len(token) == 3:
+        character = chr(int(token[1:], 16))
+        return character if character in _UNRESERVED else token.upper()
+    if token in _PATH_CHARACTERS or token == "/":
+        return token
+    return "".join(f"%{byte:02X}" for byte in token.encode("utf-8", "surrogatepass"))
+
+
+def url_scope(url):
+    """``(scheme, host, port, segments)`` a request to ``url`` reaches: the
+    host in its connect form, the effective port and the path segments in
+    RFC 3986 normal form. None for a URL :func:`check_url` refuses, one with
+    whitespace or a control character, or one whose path has a dot segment or
+    an ambiguous escape."""
+    if not isinstance(url, str) or re.search(r"[\x00-\x20\x7f]", url):
+        return None
+    try:
+        split, host = check_url(url)
+    except FetchError:
+        return None
+    if _AMBIGUOUS_PATH.search(split.path):
+        return None
+    path = re.sub(r"%[0-9a-f]{2}|.", _normal_token, split.path, flags=re.I | re.S)
+    segments = tuple(path.split("/")[1:])
+    if {".", ".."} & set(segments):
+        return None
+    port = _DEFAULT_PORTS[split.scheme] if split.port is None else split.port
+    return split.scheme, host, port, segments
 
 
 class HostBuckets:

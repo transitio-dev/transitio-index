@@ -94,8 +94,11 @@ matching registry together.
 3. `gazetteer` — resolve Overture administrative divisions to Wikidata QIDs,
    seed the cities the feeds declare, attach metros, boundary geometry and
    names, and mint the place registry.
-4. `resolve` — settle each feed's identity and whether it is crawlable (from
-   the overrides), before anything is fetched.
+4. `resolve` — settle each feed's identity, its access details and whether
+   it is crawlable (from the overrides), before anything is fetched. A feed
+   that needs a key takes its provider from `overrides/access_providers.yaml`;
+   the generation's `access_report.jsonl` lists the protected feeds no
+   provider claims and the access curation errors.
 5. `crawl` — fetch every crawlable feed.
 6. `expand` — add the places a feed's crawled stops actually fall in that the
    declared seed missed.

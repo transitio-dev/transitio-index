@@ -7,7 +7,10 @@ the stages that own them to apply; staleness detection belongs to those
 stages. Place overrides are added with the stage that applies them.
 """
 
+import collections
+import datetime
 import hashlib
+import itertools
 import json
 import os
 import pathlib
@@ -21,6 +24,7 @@ FEEDS_FILE = "feeds.yaml"
 EDGES_FILE = "edges.yaml"
 PLACES_FILE = "places.yaml"
 CATALOGUE_EXCEPTIONS_FILE = "catalogue_exceptions.yaml"
+ACCESS_PROVIDERS_FILE = "access_providers.yaml"
 PLACE_KINDS = ("country", "region", "city", "metro")
 COVERAGE_LEVELS = ("municipality", "subdivision", "country", "bbox", "geohash")
 TIERS = ("local", "regional", "national", "international", "unknown")
@@ -64,8 +68,9 @@ RESOLVE_OPERATIONS = frozenset({"set_identity", "mark_uncrawlable", "set_access"
 # methods transitio does not send (a key in the path, a URL template) are
 # ``unsupported``.
 AUTH_METHODS = ("query_param", "header", "basic_auth", "unsupported")
-# A provider's credential field; a header name (an RFC 9110 token); a query
-# parameter name, sent percent-encoded (``acl:consumerKey``, ``api[key]``).
+# A provider id; a provider's credential field; a header name (an RFC 9110
+# token); a query parameter name, sent percent-encoded (``acl:consumerKey``).
+PROVIDER_ID = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 _CREDENTIAL_FIELD = re.compile(r"[a-z][a-z0-9]*(_[a-z0-9]+)*")
 PARAM_NAMES = {
     "header": re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"),
@@ -155,12 +160,26 @@ def _validate_identity(path, ref, identity):
 
 
 def _validate_access(path, ref, spec):
-    """Reject a ``set_access`` that is not one whole, well-formed auth pair:
-    ``auth_params`` maps each query parameter (at least one) or the one header
-    to a credential field, and is empty for basic auth and unsupported."""
+    """Reject a ``set_access`` that is not a provider id, one whole,
+    well-formed auth pair, or both: ``auth_params`` maps each query parameter
+    (at least one) or the one header to a credential field, and is empty for
+    basic auth and unsupported."""
     where = f"{path}: feed {ref!r} set_access"
-    if not isinstance(spec, dict) or set(spec) != {"auth_method", "auth_params"}:
-        raise OverrideError(f"{where} must be a mapping of auth_method and auth_params")
+    keys = {"access_provider", "auth_method", "auth_params"}
+    if not isinstance(spec, dict) or not spec or set(spec) - keys:
+        raise OverrideError(
+            f"{where} must be a mapping of access_provider, auth_method and "
+            "auth_params"
+        )
+    if "access_provider" in spec and not (
+        isinstance(spec["access_provider"], str)
+        and PROVIDER_ID.fullmatch(spec["access_provider"])
+    ):
+        raise OverrideError(f"{where} access_provider must be a provider id")
+    if ("auth_method" in spec) != ("auth_params" in spec):
+        raise OverrideError(f"{where} sets auth_method and auth_params together")
+    if "auth_method" not in spec:
+        return
     method, params = spec["auth_method"], spec["auth_params"]
     if method not in AUTH_METHODS:
         raise OverrideError(f"{where} auth_method must be one of {list(AUTH_METHODS)}")
@@ -288,6 +307,201 @@ def load_catalogue_exceptions(overrides_dir):
         if not isinstance(reason, str) or not reason.strip():
             raise OverrideError(f"{path}: feed {ref!r} needs a reason")
     return {ref: entry["reason"] for ref, entry in entries.items()}
+
+
+# ---- access_providers.yaml ----
+
+_PROVIDER_REQUIRED = frozenset(
+    {"provider_id", "name", "registration_url", "credential_fields", "crawl_approved"}
+)
+_PROVIDER_OPTIONAL = frozenset(
+    {"docs_url", "terms_url", "url_prefixes", "free", "terms_checked", "terms_note"}
+)
+
+
+def web_page(value):
+    """``value`` when it is an http(s) URL the crawler would contact, with no
+    whitespace or control character, else None."""
+    from transitio_index import fetch
+
+    if not isinstance(value, str) or re.search(r"[\x00-\x20\x7f]", value):
+        return None
+    try:
+        fetch.check_url(value)
+    except fetch.FetchError:
+        return None
+    return value
+
+
+def prefix_scope(value):
+    """The :func:`fetch.url_scope` of a provider's URL prefix, without the
+    path's trailing empty segment; None unless ``value`` is an https URL with
+    no userinfo, query, fragment or empty path segment."""
+    from transitio_index import fetch
+
+    if not isinstance(value, str) or "?" in value or "#" in value:
+        return None
+    scope = fetch.url_scope(value)
+    if scope is None or scope[0] != "https":
+        return None
+    segments = scope[3][:-1] if scope[3][-1:] == ("",) else scope[3]
+    return None if "" in segments else scope[:3] + (segments,)
+
+
+def _covers(prefix, scope):
+    """Whether ``prefix`` covers ``scope``: the same scheme, host and port,
+    and the prefix's path segments leading the scope's."""
+    return prefix[:3] == scope[:3] and scope[3][: len(prefix[3])] == prefix[3]
+
+
+def claiming_provider(url, providers):
+    """The id of the provider with a URL prefix covering ``url``, or None."""
+    from transitio_index import fetch
+
+    scope = fetch.url_scope(url)
+    if scope is None:
+        return None
+    for provider_id, provider in providers.items():
+        for prefix in provider["url_prefixes"]:
+            if _covers(prefix_scope(prefix), scope):
+                return provider_id
+    return None
+
+
+def _date(value):
+    if isinstance(value, datetime.date) and not isinstance(value, datetime.datetime):
+        return value.isoformat()
+    try:
+        return datetime.date.fromisoformat(value).isoformat()
+    except (TypeError, ValueError):
+        raise OverrideError("terms_checked must be a date") from None
+
+
+def _provider(entry):
+    """``entry`` as an accepted provider, its URL prefixes in canonical form
+    (``https://host:port/path/``); :class:`OverrideError` naming the first
+    rule it breaks."""
+    if not isinstance(entry, dict):
+        raise OverrideError("an entry must be a mapping")
+    missing = _PROVIDER_REQUIRED - set(entry)
+    unknown = set(entry) - _PROVIDER_REQUIRED - _PROVIDER_OPTIONAL
+    if missing or unknown:
+        raise OverrideError(
+            f"missing keys {sorted(missing)}, unknown keys {sorted(unknown, key=str)}"
+        )
+    if not isinstance(entry["provider_id"], str) or not PROVIDER_ID.fullmatch(
+        entry["provider_id"]
+    ):
+        raise OverrideError("provider_id must be lower-case words joined by hyphens")
+    if not isinstance(entry["name"], str) or not entry["name"].strip():
+        raise OverrideError("name must be a non-empty string")
+    pages = {
+        key: entry.get(key) for key in ("registration_url", "docs_url", "terms_url")
+    }
+    for key, value in pages.items():
+        if (key == "registration_url" or value is not None) and not web_page(value):
+            raise OverrideError(f"{key} must be an http(s) URL")
+    fields = entry["credential_fields"]
+    if not (
+        isinstance(fields, list)
+        and fields
+        and all(isinstance(f, str) and _CREDENTIAL_FIELD.fullmatch(f) for f in fields)
+        and len(set(fields)) == len(fields)
+    ):
+        raise OverrideError(
+            "credential_fields must be a non-empty list of unique field names"
+        )
+    prefixes = entry.get("url_prefixes", [])
+    scopes = [prefix_scope(p) for p in prefixes] if isinstance(prefixes, list) else []
+    if not isinstance(prefixes, list) or None in scopes:
+        raise OverrideError(
+            "url_prefixes must be https URLs with a host and a path, without "
+            "userinfo, query or fragment"
+        )
+    if not isinstance(entry.get("free"), (bool, type(None))):
+        raise OverrideError("free must be true, false or null")
+    approved = entry["crawl_approved"]
+    if not isinstance(approved, bool):
+        raise OverrideError("crawl_approved must be true or false")
+    checked = entry.get("terms_checked")
+    checked = None if checked is None else _date(checked)
+    note = entry.get("terms_note")
+    if note is not None and (not isinstance(note, str) or not note.strip()):
+        raise OverrideError("terms_note must be a non-empty string")
+    if approved and (checked is None or note is None):
+        raise OverrideError("crawl_approved needs terms_checked and terms_note")
+    canonical = set()
+    for _, host, port, segments in scopes:
+        host = f"[{host}]" if ":" in host else host
+        canonical.add(f"https://{host}:{port}/" + "".join(f"{s}/" for s in segments))
+    return {
+        "provider_id": entry["provider_id"],
+        "name": entry["name"],
+        **pages,
+        "credential_fields": list(fields),
+        "url_prefixes": sorted(canonical),
+        "free": entry.get("free"),
+        "crawl_approved": approved,
+        "terms_checked": checked,
+        "terms_note": note,
+    }
+
+
+def load_access_providers(overrides_dir):
+    """``(providers, refused, digest)``: the accepted ``access_providers.yaml``
+    entries by ``provider_id``, a ``{"provider_id", "error"}`` row for each
+    entry refused, and the digest of the file's bytes — ``({}, [], None)``
+    when there is no file.
+
+    An entry carries its ``provider_id`` (lower-case words joined by hyphens,
+    unique in the file), ``name``, ``registration_url``, the
+    ``credential_fields`` its accounts issue (``key``, ``client_id``) and
+    ``crawl_approved``; optionally ``docs_url``, ``terms_url``, ``free``,
+    ``url_prefixes`` (the https URLs under which it claims feeds) and the
+    ``terms_checked`` date with a ``terms_note``, which an approval needs.
+    An entry breaking these rules is refused; two providers whose prefixes
+    cover one URL are a build error.
+    """
+    if overrides_dir is None:
+        return {}, [], None
+    path = pathlib.Path(overrides_dir) / ACCESS_PROVIDERS_FILE
+    data, digest = read_override(overrides_dir, ACCESS_PROVIDERS_FILE)
+    if data is None:
+        return {}, [], None
+    import yaml
+
+    raw = yaml.load(data.decode("utf-8"), Loader=_strict_loader())
+    if raw is None:
+        return {}, [], digest
+    if not isinstance(raw, list):
+        raise OverrideError(f"{path}: expected a list of provider entries")
+    ids = [entry.get("provider_id") for entry in raw if isinstance(entry, dict)]
+    counts = collections.Counter(i for i in ids if isinstance(i, str))
+    providers, refused = {}, []
+    for entry in raw:
+        provider_id = entry.get("provider_id") if isinstance(entry, dict) else None
+        try:
+            provider = _provider(entry)
+            if counts[provider_id] > 1:
+                raise OverrideError("provider_id is not unique")
+        except OverrideError as error:
+            if not isinstance(provider_id, str):
+                provider_id = None
+            refused.append({"provider_id": provider_id, "error": str(error)})
+            continue
+        providers[provider_id] = provider
+    claims = [
+        (prefix_scope(prefix), provider_id)
+        for provider_id, provider in providers.items()
+        for prefix in provider["url_prefixes"]
+    ]
+    for (one, owner), (other, rival) in itertools.combinations(claims, 2):
+        if owner != rival and (_covers(one, other) or _covers(other, one)):
+            raise OverrideError(
+                f"{path}: providers {owner!r} and {rival!r} have overlapping "
+                "url_prefixes"
+            )
+    return providers, refused, digest
 
 
 def read_override(overrides_dir, name):

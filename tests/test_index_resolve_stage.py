@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 
 pytest.importorskip("yaml")
@@ -229,7 +231,11 @@ def test_set_access_records_the_curated_pair_and_stops_the_crawl(tmp_path):
 @pytest.mark.parametrize(
     "spec, message",
     [
-        ({"auth_method": "query_param"}, "mapping of auth_method and auth_params"),
+        ({}, "mapping of access_provider"),
+        ({"access_provider": "x", "auth": "key"}, "mapping of access_provider"),
+        ({"access_provider": "Trafik_Lab"}, "access_provider must be a provider id"),
+        ({"auth_method": "query_param"}, "auth_method and auth_params together"),
+        ({"access_provider": "gcba-transporte"}, None),
         ({"auth_method": "cookie", "auth_params": {}}, "auth_method must be one of"),
         ({"auth_method": "query_param", "auth_params": {}}, "does not fit"),
         (
@@ -257,6 +263,234 @@ def test_set_access_validation(tmp_path, spec, message):
         return
     with pytest.raises(overrides.OverrideError, match=message):
         overrides.load_feed_overrides(overrides_dir)
+
+
+def _provider(provider_id, fields=("key",), prefixes=(), **kw):
+    return {
+        "provider_id": provider_id,
+        "name": provider_id.title(),
+        "registration_url": "https://register.example/",
+        "credential_fields": list(fields),
+        "url_prefixes": list(prefixes),
+        "crawl_approved": False,
+        **kw,
+    }
+
+
+def _providers_dir(tmp_path, entries):
+    directory = tmp_path / "overrides"
+    directory.mkdir(exist_ok=True)
+    (directory / overrides.ACCESS_PROVIDERS_FILE).write_text(
+        yaml.safe_dump(entries, sort_keys=False), encoding="utf-8"
+    )
+    return directory
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        ("trafiklab", "must be a mapping"),
+        (_provider("Trafik_Lab"), "provider_id must be"),
+        (dict(_provider("p"), extra=1), "unknown keys ['extra']"),
+        ({**_provider("p"), 1: "x", "y": 2}, "unknown keys [1, 'y']"),
+        (_provider("p", registration_url="javascript:x()"), "registration_url"),
+        (_provider("p", docs_url="https://r.example/\nX: y"), "docs_url"),
+        (_provider("p", terms_url="https://r.example:99999/"), "terms_url"),
+        (_provider("p", fields=()), "credential_fields"),
+        (_provider("p", fields=("key", "key")), "credential_fields"),
+        (_provider("p", fields=("Key",)), "credential_fields"),
+        (_provider("p", prefixes=["http://x.example/"]), "url_prefixes"),
+        (_provider("p", prefixes=["https://x.example/a?b=1"]), "url_prefixes"),
+        (_provider("p", prefixes=["https://u@x.example/"]), "url_prefixes"),
+        (_provider("p", prefixes=["https://x.example//a/"]), "url_prefixes"),
+        (_provider("p", prefixes=["https://./"]), "url_prefixes"),
+        (_provider("p", prefixes=["https://x.exa\tmple/"]), "url_prefixes"),
+        (_provider("p", free="yes"), "free must be"),
+        (_provider("p", crawl_approved=True), "needs terms_checked and terms_note"),
+        (_provider("p", terms_checked="last week"), "terms_checked must be a date"),
+        (_provider("dup"), "not unique"),
+    ],
+)
+def test_access_providers_refuse_a_broken_entry(tmp_path, entry, message):
+    accepted = _provider(
+        "dup",
+        prefixes=["HTTPS://Bücher.Example/gtfs", "https://x.example:8443/"],
+        crawl_approved=True,
+        terms_checked=datetime.date(2026, 10, 1),
+        terms_note="Crawling allowed.",
+        free=True,
+    )
+    entries = [dict(accepted, provider_id="ok"), entry]
+    providers, refused, digest = overrides.load_access_providers(
+        _providers_dir(tmp_path, entries)
+    )
+    assert digest is not None
+    if message == "not unique":
+        # A repeated id refuses every entry carrying it.
+        entries[0] = accepted
+        providers, refused, _ = overrides.load_access_providers(
+            _providers_dir(tmp_path, entries)
+        )
+        assert providers == {}
+        assert [row["provider_id"] for row in refused] == ["dup", "dup"]
+        assert all(message in row["error"] for row in refused)
+        return
+    assert providers["ok"]["url_prefixes"] == [
+        "https://x.example:8443/",
+        "https://xn--bcher-kva.example:443/gtfs/",
+    ]
+    assert providers["ok"]["terms_checked"] == "2026-10-01"
+    assert len(refused) == 1 and message in refused[0]["error"]
+
+
+@pytest.mark.parametrize(
+    "one, other, overlap",
+    [
+        ("https://a.example/gtfs/", "https://A.example:443/gtfs", True),
+        ("https://a.example/", "https://a.example/gtfs/feed.zip", True),
+        ("https://a.example/gtfs/", "https://a.example/%67tfs/x", True),
+        ("https://a.example/bücher/", "https://a.example/b%c3%bccher/", True),
+        ("https://a.example/gtfs/", "https://a.example/gtfs-other/", False),
+        ("https://a.example/gtfs/", "https://a.example:8443/gtfs/", False),
+    ],
+)
+def test_overlapping_provider_prefixes_are_a_build_error(tmp_path, one, other, overlap):
+    overrides_dir = _providers_dir(
+        tmp_path,
+        [_provider("one", prefixes=[one]), _provider("other", prefixes=[other])],
+    )
+    if overlap:
+        with pytest.raises(overrides.OverrideError, match="overlapping url_prefixes"):
+            overrides.load_access_providers(overrides_dir)
+    else:
+        assert len(overrides.load_access_providers(overrides_dir)[0]) == 2
+
+
+@pytest.mark.parametrize(
+    "url, claimed",
+    [
+        ("https://api.example.com/gtfs/feed.zip?key=1", True),
+        ("https://API.example.com:443/gtfs", True),
+        ("https://api.example.com.evil/gtfs/feed.zip", False),
+        ("https://api.example.com:8443/gtfs/feed.zip", False),
+        ("https://api.example.com/gtfs-other/feed.zip", False),
+        ("http://api.example.com/gtfs/feed.zip", False),
+        ("https://user@api.example.com/gtfs/feed.zip", False),
+        ("https://api.example.com/gtfs/../other/feed.zip", False),
+        ("https://api.example.com/gtfs/%2E%2E/other/feed.zip", False),
+        ("https://api.example.com/gtfs/%252e%252e/other/feed.zip", False),
+        ("https://api.example.com/gtfs/%zz", False),
+        ("https://api.example.com/%67tfs/feed.zip", True),
+        (None, False),
+    ],
+)
+def test_a_provider_claims_urls_by_origin_and_whole_path_segments(url, claimed):
+    providers = {"p": {"url_prefixes": ["https://api.example.com:443/gtfs/"]}}
+    assert overrides.claiming_provider(url, providers) == ("p" if claimed else None)
+
+
+def test_resolve_binds_protected_feeds_to_providers_and_reports_the_rest(tmp_path):
+    page = "https://register.example/"
+
+    def mdb(kind, name, url):
+        record = {"authentication_type": kind, "api_key_parameter_name": name}
+        record.update(requires_auth=kind != "0", authentication_info=page)
+        return {"mdb": dict(record, urls={"direct_download": url})}
+
+    def atlas(kind, url, name=None):
+        block = {"type": kind, "param_name": name}
+        urls = {"static_current": url}
+        return {"atlas": {"requires_auth": True, "authorization": block, "urls": urls}}
+
+    one, two, basic = (
+        "https://one.example/",
+        "https://two.example/",
+        "https://b.example/",
+    )
+    pair = {"client_id": "client_id", "client_secret": "client_secret"}
+    unsupported = ("one", "unsupported", {})
+    unresolved = (None, "query_param", None)
+    cases = {
+        "f-q": (
+            mdb("1", "token", one + "q.zip"),
+            ("one", "query_param", {"token": "key"}),
+        ),
+        "f-h": (
+            atlas("header", one + "h.zip", "x-key"),
+            ("one", "header", {"x-key": "key"}),
+        ),
+        "f-path": (atlas("path_segment", one + "p.zip"), unsupported),
+        "f-basic": (atlas("basic_auth", basic + "b.zip"), ("basic", "basic_auth", {})),
+        # A curated provider and pair stand whatever the URL.
+        "f-curated": (
+            mdb("2", "x", "https://c.example/"),
+            ("two", "query_param", pair),
+        ),
+        "f-open": (mdb("0", None, one + "o.zip"), (None, None, None)),
+        "f-none": (mdb("1", "key", "https://n.example/"), unresolved),
+    }
+    errors = {
+        "f-multi": (mdb("1", "client_id", two + "m.zip"), ("two", "unsupported", {})),
+        "f-noname": (mdb("2", None, one + "x.zip"), unsupported),
+        "f-basic-key": (atlas("basic_auth", one + "b.zip"), unsupported),
+        "f-undeclared": (mdb("1", "key", one + "u.zip"), unsupported),
+        "f-ghost": (mdb("1", "key", "https://g.example/"), unresolved),
+    }
+    cases.update(errors)
+    cache = tmp_path / "cache"
+    _crosswalk(
+        cache, [dict(_feed(ref), **records) for ref, (records, _) in cases.items()]
+    )
+    overrides_dir = _overrides_dir(
+        tmp_path,
+        [
+            {
+                "feed": "f-curated",
+                "set_access": {
+                    "access_provider": "two",
+                    "auth_method": "query_param",
+                    "auth_params": pair,
+                },
+            },
+            {
+                "feed": "f-undeclared",
+                "set_access": {"auth_method": "header", "auth_params": {"X": "token"}},
+            },
+            {"feed": "f-ghost", "set_access": {"access_provider": "ghost"}},
+        ],
+    )
+    _providers_dir(
+        tmp_path,
+        [
+            _provider("one", prefixes=[one]),
+            _provider("two", fields=("client_id", "client_secret"), prefixes=[two]),
+            _provider("basic", fields=("username", "password"), prefixes=[basic]),
+            _provider("broken", fields=()),
+        ],
+    )
+    resolve.resolve(cache, overrides_dir=overrides_dir)
+    feeds, manifest = _resolved(cache)
+    for ref, (_, expected) in cases.items():
+        fields = ("access_provider", "auth_method", "auth_params")
+        assert tuple(feeds[ref][field] for field in fields) == expected, ref
+    report, _ = store.read_jsonl(
+        cache / "resolve", resolve.RESOLVE_POINTER, resolve.ACCESS_REPORT
+    )
+    rows = {}
+    for row in report:
+        rows.setdefault(row["kind"], []).append(row)
+    assert [row["provider_id"] for row in rows["refused_provider"]] == ["broken"]
+    assert sorted(row["feed_id"] for row in rows["curation_error"]) == sorted(errors)
+    assert rows["unresolved"] == [
+        {"kind": "unresolved", "feed_id": ref, "url": url, "registration_url": page}
+        for ref, url in (
+            ("f-none", "https://n.example/"),
+            ("f-ghost", "https://g.example/"),
+        )
+    ]
+    assert manifest["access_providers"] == 3
+    assert manifest["access_unresolved"] == 2
+    assert manifest["access_curation_errors"] == len(errors) + 1
 
 
 def test_set_identity_rewrites_the_named_fields(tmp_path):
