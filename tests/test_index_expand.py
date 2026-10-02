@@ -187,6 +187,60 @@ DIVISIONS = [
             ("gb-edi", "locality", "Edinburgh"),
         ),
     ),
+    # Stockholm: a locality with no area inside its municipality, a county
+    # with a QID of its own.
+    fx.division(
+        "se-sto-county",
+        "SE",
+        "county",
+        wikidata="Q506250",
+        name="Stockholms kommun",
+        common={"en": "Stockholm Municipality"},
+        hierarchies=fx.chain(("se-sto-county", "county", "Stockholms kommun")),
+    ),
+    fx.division(
+        "se-sto",
+        "SE",
+        "locality",
+        wikidata="Q1754",
+        name="Stockholm",
+        hierarchies=fx.chain(
+            ("se-sto-county", "county", "Stockholms kommun"),
+            ("se-sto", "locality", "Stockholm"),
+        ),
+    ),
+    # Oslo: the region shares its QID with the locality, which has no area
+    # and sits in the municipality, a county in the region.
+    fx.division(
+        "no-osl",
+        "NO",
+        "region",
+        wikidata="Q585",
+        name="Oslo",
+        hierarchies=fx.chain(("no-osl", "region", "Oslo")),
+    ),
+    fx.division(
+        "no-osl-county",
+        "NO",
+        "county",
+        wikidata="Q5245991",
+        name="Oslo",
+        hierarchies=fx.chain(
+            ("no-osl", "region", "Oslo"), ("no-osl-county", "county", "Oslo")
+        ),
+    ),
+    fx.division(
+        "no-osl-loc",
+        "NO",
+        "locality",
+        wikidata="Q585",
+        name="Oslo",
+        hierarchies=fx.chain(
+            ("no-osl", "region", "Oslo"),
+            ("no-osl-county", "county", "Oslo"),
+            ("no-osl-loc", "locality", "Oslo"),
+        ),
+    ),
 ]
 
 AREAS = [
@@ -206,6 +260,9 @@ AREAS = [
     fx.area("se-hap", _wkb(24.1, 61.7, 24.2, 61.8), GOOD, country="SE"),
     fx.area("gb-edi-county", _wkb(-3.4, 55.85, -3.0, 56.0), GOOD, country="GB"),
     fx.area("gb-edi-ward", _wkb(-3.2, 55.94, -3.18, 55.96), GOOD, country="GB"),
+    fx.area("se-sto-county", _wkb(17.8, 59.2, 18.2, 59.45), GOOD, country="SE"),
+    fx.area("no-osl", _wkb(10.4, 59.8, 11.0, 60.1), GOOD, country="NO"),
+    fx.area("no-osl-county", _wkb(10.5, 59.85, 10.9, 60.0), GOOD, country="NO"),
 ]
 
 
@@ -270,11 +327,11 @@ def _expand(tmp_path, cache, registry=None, labels=None, overrides_dir=None):
         {
             "Q40840": {
                 "labels": {"en": "Tampere", "fi": "Tampere"},
-                "aliases": ["Manse"],
+                "aliases": {"fi": ["Manse"]},
             },
             "Q912579": {
                 "labels": {"fi": "Springfieldin metropolialue"},
-                "aliases": ["Greater Springfield"],
+                "aliases": {"en": ["Greater Springfield"]},
             },
             **(labels or {}),
         },
@@ -390,6 +447,34 @@ def test_a_stop_in_a_council_area_discovers_its_city(tmp_path, kind):
     assert places["Q999005"]["geometry_source"] == "overture"
     index = coverage.place_index({p["place_id"]: p for p in places.values()})
     assert sorted(index["gb-edi-county"]) == sorted([council_id, edinburgh["place_id"]])
+
+
+def test_a_stop_in_a_municipality_discovers_its_city(tmp_path):
+    from transitio_index import coverage
+
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES)
+    _write_crawl(cache, "f-sto", ["s1,59.33,18.07\n"])
+    _write_crawl(cache, "f-osl", ["s1,59.91,10.75\n"])
+    _, places, _ = _expand(tmp_path, cache)
+    by_id = {p["place_id"]: p for p in places.values()}
+    # Stockholm sits in its municipality and ships the municipality's area.
+    stockholm = places["Q1754"]
+    assert stockholm["kind"] == "city" and stockholm["parent_id"] == "Q506250"
+    assert stockholm["geometry_source"] == geometry.COUNCIL_AREA
+    index = coverage.place_index(by_id)
+    assert sorted(index["se-sto-county"]) == ["Q1754", "Q506250"]
+    # Oslo is its own region; its municipality stays a district inside it.
+    oslo = places["Q585"]
+    assert oslo["kind"] == "city" and oslo["overture_id"] == "no-osl"
+    assert oslo["parent_id"] is None
+    assert places["Q5245991"]["parent_id"] == "Q585"
+    for key in by_id:
+        chain = []
+        while key is not None:
+            assert key not in chain
+            chain.append(key)
+            key = by_id[key].get("parent_id")
 
 
 def test_an_already_seeded_place_is_not_re_added(tmp_path):
@@ -583,14 +668,19 @@ def test_a_seeded_fao_metro_keeps_its_members_when_an_official_metro_grows(
     assert manifest["metros_added"] == 1
 
 
-def test_a_fao_region_the_seed_left_unpublished_is_minted_over_every_city(tmp_path):
+@pytest.mark.parametrize("iso3, country", [("FIN", "FI"), ("SWE", "SE"), ("NOR", None)])
+def test_a_fao_region_the_seed_left_unpublished_is_minted_over_every_city(
+    tmp_path, iso3, country
+):
     from test_index_metros import _fao_inputs
     from transitio_index import fao
 
     cache = tmp_path / "cache"
-    # Region 50 holds two seeded cities on either side of a border — a tie
-    # the metros stage could not partition — and Tampere, which the crawl finds.
-    files, pins = _fao_inputs(tmp_path, patch=shapely.box(21.0, 60.5, 25.0, 62.0))
+    # Region 50 holds two seeded cities on either side of a border, left
+    # unpublished by the seed, and Tampere, which the crawl finds.
+    files, pins = _fao_inputs(
+        tmp_path, patch=shapely.box(21.0, 60.5, 25.0, 62.0), iso3=iso3
+    )
     fao.prepare_inputs(cache, files=files, expected=pins)
 
     def city(qid, name, country, overture_id):
@@ -611,11 +701,20 @@ def test_a_fao_region_the_seed_left_unpublished_is_minted_over_every_city(tmp_pa
     derived = {"eurostat": None, "fao": pins, "ucdb": None}
     _publish_names(cache, SEED_PLACES + seeded, derived_inputs=derived)
     _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
-    manifest, places, _ = _expand(tmp_path, cache)
+    manifest, places, report = _expand(tmp_path, cache)
+    if country is None:
+        # Centred in Norway, where none of its cities is: reported, not minted.
+        assert "fao_city_region:50" not in places
+        assert [r["reason"] for r in report if r.get("branch") == "fao"] == [
+            "no city in the centre's country"
+        ]
+        assert manifest["metros_added"] == 0
+        return
     metro = places["fao_city_region:50"]
-    # Minted over the seeded cities too, so the partition and the name (no
-    # UCDB centre: the largest member's) come from the whole membership.
-    assert (metro["country_code"], metro["name"]) == ("FI", "Tampere")
+    # Minted over the seeded cities too, in its centre's country whatever
+    # most cities are in, the name (no UCDB centre: the largest member's)
+    # from the whole membership.
+    assert (metro["country_code"], metro["name"]) == (country, "Tampere")
     assert metro["member_ids"] == ["Q1", "Q2", "Q40840"]
     assert all(
         places[q]["metro_ids"] == ["fao_city_region:50"] for q in ("Q1", "Q2", "Q40840")
@@ -633,7 +732,9 @@ def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core)
     # whose centre lies in Pirkanmaa. A stop off every city discovers
     # Pirkanmaa, which joins as the core; or the seed gave the metro a core
     # and a stop discovers Badgeo, a city shipping no polygon, so it leaves.
-    files, pins = _fao_inputs(tmp_path, patch=shapely.box(21.0, 60.5, 29.0, 62.5))
+    files, pins = _fao_inputs(
+        tmp_path, patch=shapely.box(21.0, 60.5, 29.0, 62.5), iso3="FIN"
+    )
     fao.prepare_inputs(cache, files=files, expected=pins)
     centres, centre_pins = _ucdb_inputs(
         tmp_path, centre=shapely.box(23, 61.2, 24, 61.8)
@@ -1034,7 +1135,7 @@ def test_a_discovered_alias_qid_is_its_survivor(tmp_path, seeded):
         '"concordances": {"wikidata": ["Q40840"]}, "at": "2026-09-08", "reason": "dup"}\n'
     )
     _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
-    canonical = {"Q77777": {"labels": {"sv": "Tammerfors"}, "aliases": []}}
+    canonical = {"Q77777": {"labels": {"sv": "Tammerfors"}, "aliases": {}}}
     with registry.session(path) as reg:
         manifest, places, _ = _expand(tmp_path, cache, registry=reg, labels=canonical)
         # The survivor's registry row takes the crawled division's Overture

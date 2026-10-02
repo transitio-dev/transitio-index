@@ -85,6 +85,8 @@ def test_mdb_normalizes_and_maps_spec(tmp_path):
                 "data_type": "gtfs_rt",
                 "status": "active",
                 "urls.authentication_type": "1",
+                "urls.authentication_info": "https://example.org/register",
+                "urls.api_key_parameter_name": "key",
                 "static_reference": "mdb-1",
             },
             {
@@ -121,11 +123,14 @@ def test_mdb_normalizes_and_maps_spec(tmp_path):
     }
     assert static["features"] == ["Fares V1", "Headsigns"]
     assert static["requires_auth"] is False
+    assert static["api_key_parameter_name"] is None
 
     realtime = records[1]
     assert realtime["spec"] == "gtfs-rt"
     assert realtime["static_references"] == ["mdb-1"]
     assert realtime["requires_auth"] is True
+    assert realtime["authentication_info"] == "https://example.org/register"
+    assert realtime["api_key_parameter_name"] == "key"
     assert realtime["bounding_box"] is None
     assert records[2]["redirect_ids"] == ["mdb-1"]
     assert records[2]["official"] is False

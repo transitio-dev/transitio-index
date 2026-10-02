@@ -44,6 +44,8 @@ REQUIRED_HEADERS = {
     "urls.latest",
     "urls.license",
     "urls.authentication_type",
+    "urls.authentication_info",
+    "urls.api_key_parameter_name",
     "features",
     "static_reference",
     "redirect.id",
@@ -125,6 +127,13 @@ def normalize_row(row, source_file, position):
             "license": csv_source.blank_to_none(row.get("urls.license")),
         },
         "authentication_type": auth_type,
+        # The registration page and the key's query parameter or header name.
+        "authentication_info": csv_source.blank_to_none(
+            row.get("urls.authentication_info")
+        ),
+        "api_key_parameter_name": csv_source.blank_to_none(
+            row.get("urls.api_key_parameter_name")
+        ),
         "requires_auth": bool(auth_type) and auth_type != "0",
         "features": features.split("|") if features else [],
         "static_references": csv_source.id_list(

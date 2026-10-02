@@ -138,8 +138,9 @@ def _atlas_archive(tmp_path, feeds):
     return path
 
 
-def _publish_audit(cache, notice="Boundary geometry from Overture.\n"):
-    """A geometry generation carrying the licence audit the license stage reads."""
+def _publish_audit(cache, notice="Boundary geometry from Overture.\n", **manifest):
+    """A geometry generation carrying the licence audit the license stage
+    reads, its manifest extended by ``manifest``."""
     directory = store.open_subdir(cache, "gazetteer")
     try:
         with store.exclusive_writer(directory):
@@ -153,7 +154,7 @@ def _publish_audit(cache, notice="Boundary geometry from Overture.\n"):
                     ),
                     "NOTICE": lambda: [notice],
                 },
-                {"source": "geometry", "places_overrides_sha256": None},
+                {"source": "geometry", "places_overrides_sha256": None, **manifest},
                 held=directory,
             )
     finally:
@@ -388,7 +389,7 @@ def _build_index(
 
 
 def test_an_atlas_only_sample_builds_and_publishes(tmp_path):
-    # The --atlas-unmatched sampler emits zero MDB/GBFS rows; that empty-source
+    # A partition's Atlas-only cut emits zero MDB/GBFS rows; that empty-source
     # build (mdb.ingest allow_empty) must still ingest, crosswalk and publish,
     # with the Atlas feed reaching the index.
     cache = tmp_path / "cache"

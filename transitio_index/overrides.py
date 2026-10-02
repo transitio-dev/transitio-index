@@ -20,6 +20,7 @@ import re
 FEEDS_FILE = "feeds.yaml"
 EDGES_FILE = "edges.yaml"
 PLACES_FILE = "places.yaml"
+CATALOGUE_EXCEPTIONS_FILE = "catalogue_exceptions.yaml"
 PLACE_KINDS = ("country", "region", "city", "metro")
 COVERAGE_LEVELS = ("municipality", "subdivision", "country", "bbox", "geohash")
 TIERS = ("local", "regional", "national", "international", "unknown")
@@ -53,10 +54,25 @@ _STATIC_LINK_METHODS = frozenset({"declared", "same_file", "same_host", "none"})
 
 # The operations a feed entry may carry. ``set_coverage`` is applied by the
 # coverage stage, not the resolve stage, but is a valid key here.
-_OPERATIONS = frozenset({"set_identity", "mark_uncrawlable", "set_coverage"})
+_OPERATIONS = frozenset(
+    {"set_identity", "mark_uncrawlable", "set_coverage", "set_access"}
+)
 # The operations the resolve stage applies; set_coverage enters at coverage.
-RESOLVE_OPERATIONS = frozenset({"set_identity", "mark_uncrawlable"})
+RESOLVE_OPERATIONS = frozenset({"set_identity", "mark_uncrawlable", "set_access"})
+
+# How a request to a key-protected feed carries the credentials; catalogue
+# methods transitio does not send (a key in the path, a URL template) are
+# ``unsupported``.
+AUTH_METHODS = ("query_param", "header", "basic_auth", "unsupported")
+# A provider's credential field; a header name (an RFC 9110 token); a query
+# parameter name, sent percent-encoded (``acl:consumerKey``, ``api[key]``).
+_CREDENTIAL_FIELD = re.compile(r"[a-z][a-z0-9]*(_[a-z0-9]+)*")
+PARAM_NAMES = {
+    "header": re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"),
+    "query_param": re.compile(r"[^\x00-\x20\x7f]+"),
+}
 _METADATA = frozenset({"feed", "reason", "author", "date", "evidence_hash"})
+_EXCEPTION_KEYS = frozenset({"feed", "reason", "author", "date"})
 
 
 class OverrideError(RuntimeError):
@@ -138,6 +154,36 @@ def _validate_identity(path, ref, identity):
         )
 
 
+def _validate_access(path, ref, spec):
+    """Reject a ``set_access`` that is not one whole, well-formed auth pair:
+    ``auth_params`` maps each query parameter (at least one) or the one header
+    to a credential field, and is empty for basic auth and unsupported."""
+    where = f"{path}: feed {ref!r} set_access"
+    if not isinstance(spec, dict) or set(spec) != {"auth_method", "auth_params"}:
+        raise OverrideError(f"{where} must be a mapping of auth_method and auth_params")
+    method, params = spec["auth_method"], spec["auth_params"]
+    if method not in AUTH_METHODS:
+        raise OverrideError(f"{where} auth_method must be one of {list(AUTH_METHODS)}")
+    if method == "query_param":
+        fits = isinstance(params, dict) and bool(params)
+    elif method == "header":
+        fits = isinstance(params, dict) and len(params) == 1
+    else:
+        fits = params == {}
+    if not fits:
+        raise OverrideError(f"{where} auth_params does not fit auth_method {method!r}")
+    if not all(
+        isinstance(name, str)
+        and PARAM_NAMES[method].fullmatch(name)
+        and isinstance(field, str)
+        and _CREDENTIAL_FIELD.fullmatch(field)
+        for name, field in params.items()
+    ):
+        raise OverrideError(
+            f"{where} auth_params must map parameter names to credential fields"
+        )
+
+
 def _validate_operations(path, ref, entry):
     if not set(entry) & _OPERATIONS:
         raise OverrideError(f"{path}: feed {ref!r} carries no operation")
@@ -149,6 +195,8 @@ def _validate_operations(path, ref, entry):
             raise OverrideError(
                 f"{path}: feed {ref!r} mark_uncrawlable must be true or a mapping"
             )
+    if "set_access" in entry:
+        _validate_access(path, ref, entry["set_access"])
     if "set_coverage" in entry:
         spec = entry["set_coverage"]
         if not isinstance(spec, dict) or set(spec) != {"level", "place_id"}:
@@ -167,6 +215,43 @@ def _validate_operations(path, ref, entry):
             )
 
 
+def _feed_entries(overrides_dir, name, allowed):
+    """``(path, entries, digest)`` of the feed-keyed override file ``name``:
+    its entries by ``feed`` reference and the digest of its bytes, with no
+    entries and no digest when there is no directory or file. Every entry
+    must be a mapping of ``allowed`` keys whose ``feed`` is a non-empty
+    string no other entry repeats."""
+    if overrides_dir is None:
+        return None, {}, None
+    path = pathlib.Path(overrides_dir) / name
+    data, digest = read_override(overrides_dir, name)
+    if data is None:
+        return path, {}, None
+    import yaml
+
+    raw = yaml.load(data.decode("utf-8"), Loader=_strict_loader())
+    if raw is None:
+        return path, {}, digest
+    if not isinstance(raw, list):
+        raise OverrideError(f"{path}: expected a list of override entries")
+    by_feed = {}
+    for entry in raw:
+        if not isinstance(entry, dict) or "feed" not in entry:
+            raise OverrideError(f"{path}: every entry needs a 'feed' key")
+        ref = entry["feed"]
+        if not isinstance(ref, str) or not ref:
+            raise OverrideError(f"{path}: a 'feed' key must be a non-empty string")
+        if ref in by_feed:
+            raise OverrideError(f"{path}: duplicate override for feed {ref!r}")
+        unknown = set(entry) - allowed
+        if unknown:
+            raise OverrideError(
+                f"{path}: feed {ref!r} has unknown keys {sorted(unknown)}"
+            )
+        by_feed[ref] = entry
+    return path, by_feed, digest
+
+
 def load_feed_overrides(overrides_dir, *, registry=None):
     """The ``feeds.yaml`` entries keyed by feed reference and the digest of
     the bytes they came from: ``({}, None)`` when absent.
@@ -175,34 +260,10 @@ def load_feed_overrides(overrides_dir, *, registry=None):
     with no ``feed`` key or no operation, an unknown operation, or a malformed
     operation value is a build error rather than a silent skip.
     """
-    if overrides_dir is None:
-        return {}, None
-    path = pathlib.Path(overrides_dir) / FEEDS_FILE
-    data, digest = read_override(overrides_dir, FEEDS_FILE)
-    if data is None:
-        return {}, None
-    import yaml
-
-    raw = yaml.load(data.decode("utf-8"), Loader=_strict_loader())
-    if raw is None:
-        return {}, digest
-    if not isinstance(raw, list):
-        raise OverrideError(f"{path}: expected a list of override entries")
-    entries = raw
-    by_feed = {}
-    for entry in entries:
-        if not isinstance(entry, dict) or "feed" not in entry:
-            raise OverrideError(f"{path}: every entry needs a 'feed' key")
-        ref = entry["feed"]
-        if not isinstance(ref, str) or not ref:
-            raise OverrideError(f"{path}: a 'feed' key must be a non-empty string")
-        if ref in by_feed:
-            raise OverrideError(f"{path}: duplicate override for feed {ref!r}")
-        unknown = set(entry) - _OPERATIONS - _METADATA
-        if unknown:
-            raise OverrideError(
-                f"{path}: feed {ref!r} has unknown keys {sorted(unknown)}"
-            )
+    path, by_feed, digest = _feed_entries(
+        overrides_dir, FEEDS_FILE, _OPERATIONS | _METADATA
+    )
+    for ref, entry in by_feed.items():
         _validate_operations(path, ref, entry)
         if registry is not None and "set_coverage" in entry:
             entry["set_coverage"]["place_id"] = _key(
@@ -211,8 +272,22 @@ def load_feed_overrides(overrides_dir, *, registry=None):
                 f"{path}: feed {ref!r}",
                 strict=True,
             )
-        by_feed[ref] = entry
     return by_feed, digest
+
+
+def load_catalogue_exceptions(overrides_dir):
+    """``{catalogue id: reason}`` from ``catalogue_exceptions.yaml``: the MDB
+    and Atlas GTFS ids a merged index may lack, each entry naming the id as
+    ``feed`` with a non-empty ``reason`` (and optionally an ``author`` and a
+    ``date``). No file means no exceptions."""
+    path, entries, _ = _feed_entries(
+        overrides_dir, CATALOGUE_EXCEPTIONS_FILE, _EXCEPTION_KEYS
+    )
+    for ref, entry in entries.items():
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise OverrideError(f"{path}: feed {ref!r} needs a reason")
+    return {ref: entry["reason"] for ref, entry in entries.items()}
 
 
 def read_override(overrides_dir, name):

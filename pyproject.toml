@@ -15,9 +15,9 @@ license = { text = "MIT" }
 requires-python = ">=3.10"
 version = "0.1.0"
 dependencies = [
-    # The reader the build writes for: its release contract, schema floors
-    # and fingerprint. Released to PyPI; schema 6 ships from 0.11.
-    "transitio>=0.16",
+    # The reader the build writes for: its release contract, schema floors,
+    # fingerprint and country languages. Released to PyPI; schema 6 ships from 0.11.
+    "transitio>=0.18",
     # The build's own libraries, owned here rather than through transitio's
     # extra: GeoParquet and geometry, the crawl's HTTP, the Eurostat workbook
     # and the override YAML. Floors match transitio's.
@@ -50,6 +50,9 @@ viewer = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [tool.setuptools]
 packages = ["transitio_index"]
+
+[tool.setuptools.package-data]
+transitio_index = ["country_codes.csv"]
 
 [tool.black]
 include = '(transitio_index|tests|scripts)/.*\.py$'

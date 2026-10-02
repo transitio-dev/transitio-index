@@ -760,7 +760,8 @@ def partition(records, places, edges, realtime=()):
     under the feed's home country when the place lies there, else into
     ``links`` with ``feed_partition``. Nothing is dropped: the partitions and
     the links together are the flat tables (``static_edges`` has already
-    left the companions' edges out).
+    left the companions' edges out). A build without feeds gives each
+    partition of places empty feeds and edges tables.
     """
     home = {record["feed_id"]: record.get("home_country") for record in records}
     parts = collections.defaultdict(dict)
@@ -783,6 +784,9 @@ def partition(records, places, edges, realtime=()):
             )
         country[place["place_id"]] = code
         parts[code].setdefault("places", []).append(place)
+        if not records:
+            parts[code].setdefault("feeds", [])
+            parts[code].setdefault("edges", [])
     for edge in edges or ():
         if edge["feed_id"] not in home:
             raise PublishError(f"edge of a feed the index lacks: {edge['feed_id']}")
@@ -1212,8 +1216,6 @@ def read_inputs(cache_dir, overrides_dir):
             cache_dir / "crosswalk", "feeds.json", "feeds.jsonl"
         )
         sources = crosswalk.get("sources")
-    if not records:
-        raise PublishError("no feeds to publish")
     if not sources:
         raise PublishError("the feed manifest records no source versions")
     # A gazetteer that ran but produced no places is a places index of zero
@@ -1222,6 +1224,8 @@ def read_inputs(cache_dir, overrides_dir):
     places, overture_release, places_generation, places_manifest = _read_places(
         cache_dir, coverage, overrides_dir
     )
+    if not records and not places:
+        raise PublishError("no feeds to publish")
     generations, leaves = _generations(
         cache_dir, coverage, resolve_manifest, places_manifest
     )

@@ -533,9 +533,9 @@ def place_qids(places):
 
 
 def curated_boundaries(places):
-    """``(tree, place_ids)`` over the boundaries curators drew, or None: no
-    Overture division stands for such a place, so a stop reaches it by lying
-    inside its boundary."""
+    """``(tree, place_ids)`` over the boundaries curators drew and the
+    seeded cities' urban centres, or None: no Overture division stands for
+    such a boundary, so a stop reaches its place by lying inside it."""
     import shapely
 
     from transitio_index import geometry
@@ -543,7 +543,8 @@ def curated_boundaries(places):
     ids = [
         place_id
         for place_id, place in places.items()
-        if place.get("geometry_source") == geometry.CURATED and place.get("geometry")
+        if place.get("geometry_source") in (geometry.CURATED, geometry.UCDB)
+        and place.get("geometry")
     ]
     if not ids:
         return None

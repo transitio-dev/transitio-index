@@ -8,6 +8,7 @@ import http.client
 import json
 import logging
 import os
+from pathlib import Path
 
 import httpx
 import pytest
@@ -30,6 +31,8 @@ from transitio_index import (  # noqa: E402
     crosswalk,
     fetch,
     geometry,
+    metros,
+    names,
     overture,
     registry,
     seed,
@@ -138,7 +141,7 @@ def test_wikidata_labels_bisect_a_failing_batch_and_skip_a_bad_entity(boom):
             if len(batch) > 3 or "Q666" in batch:
                 raise boom()
             for qid in batch:
-                out[qid] = {"labels": {"en": qid}, "aliases": []}
+                out[qid] = {"labels": {"en": qid}, "aliases": {}}
 
     client = Flaky()
     qids = [f"Q{n}" for n in range(1, 11)] + ["Q666"]
@@ -808,9 +811,8 @@ def test_an_http_atlas_url_is_sampled_and_paired_with_its_https_mdb_twin(tmp_pat
         src, sc.MDB_COUNTRY, (sc.MDB_COUNTRY, sc.MDB_DOWNLOAD), {"CA"}
     )
     kept = sc._select_atlas(archive, *sc._mdb_targets(mdb_rows))
-    # The CA cut keeps the Atlas feed, so the unmatched cut leaves it out.
+    # The CA cut keeps the Atlas feed.
     assert [feed["id"] for _, payload in kept for feed in payload["feeds"]] == ["f-stm"]
-    assert sc._select_atlas_unmatched(archive, sc._mdb_url_countries(src)) == []
 
     sample = tmp_path / "atlas_sample.tar.gz"
     sc._write_atlas(sample, kept)
@@ -821,6 +823,91 @@ def test_an_http_atlas_url_is_sampled_and_paired_with_its_https_mdb_twin(tmp_pat
     assert [(r["source"], r["feed_id"], r["mdb_id"]) for r in records] == [
         ("both", "f-stm", "mdb-1")
     ]
+
+
+def test_a_partition_cut_places_every_static_feed_in_exactly_one_label(
+    tmp_path, monkeypatch
+):
+    """The rebuild's label map was assembled from country cuts: Japan's was
+    capped at 80 rows, some countries, rows without a country and misfiled
+    rows had no label, and the Atlas-only cut assumed every Atlas feed sharing
+    a URL with an MDB row was reached. 574 MDB and 385 Atlas GTFS feeds of
+    the 2026-10-02 catalogues were in no cut. The partition cuts every row and
+    feed into exactly one label, keeping each fold in one label.
+    """
+    import test_sample_catalogues as sct
+
+    sc = sct.sc
+    shared = "https://shared.example/g.zip"
+    rows = [
+        sct._mdb_gtfs("j2", "JP", "https://t.jp/2.zip", "Tokyo"),
+        sct._mdb_gtfs("j4", "JP", shared, "Tokyo"),
+        sct._mdb_gtfs("j1", "JP", "https://a.jp/1.zip", "Aichi"),
+        sct._mdb_gtfs("j3", "JP", "https://t.jp/3.zip", "Tokyo", redirect="j4"),
+        sct._mdb_gtfs("f1", "FI", "https://f.fi/1.zip", redirect="s1"),
+        sct._mdb_gtfs("f2", "FI", "https://f.fi/2.zip", redirect="s1"),
+        sct._mdb_gtfs("s1", "SE", shared),
+        sct._mdb_gtfs("b1", "", "https://a.jp/2.zip"),
+        sct._mdb_gtfs("x1", "SA", "https://x.tr/1.zip"),
+        sct._mdb_gtfs("n1", "ß", "https://n.example/1.zip"),  # not "SS"
+    ]
+    files = [
+        (
+            "r/feeds/a.jp.dmfr.json",
+            sct._payload(
+                sct._feed("f-j1", "https://a.jp/1.zip"),
+                sct._feed("f-a2", "https://a.jp/2.zip"),
+            ),
+        ),
+        ("r/feeds/shared.dmfr.json", sct._payload(sct._feed("f-shared", shared))),
+        (
+            "r/feeds/x.dmfr.json",
+            sct._payload(
+                sct._feed("f-lonely", "https://lonely.example/g.zip"),
+                sct._feed("f-nourl", None),
+                sct._feed("f-rt", "https://t.jp/2.zip", spec="gtfs-rt"),
+            ),
+        ),
+    ]
+    sct._partition_inputs(tmp_path, monkeypatch, rows, files)
+    out = tmp_path / "out"
+    argv = ["--partition", "--out-dir", str(out), "--batch-size", "2"]
+    sc.main(argv + ["--exclude", "x1", "--country", "KE", "--country", "JP"])
+
+    (published,) = out.glob("partition-*")
+    labels = ["atlas1", "cities", "jp1", "jp2", "other", "se"]
+    lines = (published / "rebuild_map.txt").read_text().splitlines()
+    cuts = {label: Path(cut) for label, cut in (line.split(" ", 1) for line in lines)}
+    assert list(cuts) == labels
+    assert all(cuts[label].parent == out for label in labels)
+    assert all(cuts[label].name.startswith(f"run-{label}_") for label in labels)
+    manifest = json.loads((published / "partition.json").read_text())
+    # JP splits by subdivision (Aichi first) with the fold j3 -> j4 whole. The
+    # FI rows fold into their SE successor: one unit of three rows, so one
+    # label whatever --batch-size. The excluded and blank rows go to other.
+    want = {"jp1": "j1 j2", "jp2": "j4 j3", "se": "f1 f2 s1", "other": "b1 x1 n1"}
+    assert manifest["mdb"] == {i: lb for lb, ids in want.items() for i in ids.split()}
+    # A feed two labels carry exactly goes to the first; an exact match outranks
+    # an earlier host match (f-a2); a realtime feed gets no label. Each country
+    # is owned by one label (countries.txt): its own, part 1 of a split, or
+    # cities, which holds no feeds.
+    held = {}
+    for label, cut in cuts.items():
+        feeds = atlas.parse(cut / "atlas_sample.tar.gz")["feeds"]
+        owned = (cut / "countries.txt").read_text().split()
+        held[label] = (owned, sorted(feed["onestop_id"] for feed in feeds))
+    assert held == {
+        "atlas1": ([], ["f-lonely", "f-nourl"]),
+        "cities": (["KE"], []),
+        "jp1": (["JP"], ["f-j1"]),
+        "jp2": ([], ["f-shared"]),
+        "other": ([], ["f-a2"]),
+        "se": (["SE"], []),
+    }
+    assert manifest["atlas"] == {f: lb for lb, (_, ids) in held.items() for f in ids}
+    assert len((cuts["cities"] / "mdb_sample.csv").read_text().splitlines()) == 1
+    digest = hashlib.sha256((cuts["jp1"] / "mdb_sample.csv").read_bytes())
+    assert manifest["labels"]["jp1"]["mdb_sha256"] == digest.hexdigest()
 
 
 def test_stats_keys_gbfs_systems_sharing_id_and_country_by_ordinal():
@@ -1441,3 +1528,157 @@ def test_set_boundary_applies_to_a_place_expand_discovers(tmp_path, stale, joine
         ("Q40840", "set_boundary")
     ] * stale
     assert manifest["stale_place_overrides"] == stale
+
+
+def _council(country, subtype, name, qid=None, **names):
+    """A division record as ``seed.council_area`` reads it."""
+    return {
+        "country": country,
+        "source_subtype": subtype,
+        "qid": qid,
+        "resolution_method": "overture_wikidata" if qid else "overture_id",
+        "name": name,
+        "names": names,
+    }
+
+
+@pytest.mark.parametrize(
+    ("city", "area", "expected"),
+    [
+        (
+            "Stockholm",
+            _council(
+                "SE",
+                "county",
+                "Stockholms kommun",
+                "Q506250",
+                en="Stockholm Municipality",
+            ),
+            True,
+        ),
+        ("Göteborg", _council("SE", "county", "Göteborgs Stad", "Q52502"), True),
+        ("København", _council("DK", "county", "Københavns Kommune", "Q999101"), True),
+        ("Bergen", _council("NO", "county", "Bergen", "Q10428388"), True),
+        # A place row keys its country as ``country_code``.
+        (
+            "Ljubljana",
+            {
+                "country_code": "SI",
+                **_council(None, "region", "Ljubljana", "Q3434113"),
+            },
+            True,
+        ),
+        (
+            "Stockholm",
+            _council("SE", "region", "Stockholms län", "Q999102", sv="Stockholm"),
+            False,
+        ),
+        ("Oslo", _council("NO", "county", "Bergen", "Q10428388"), False),
+        ("Turku", _council("FI", "county", "Turku", "Q999103"), False),
+        ("Leeds", _council("GB", "county", "Leeds", "Q999104"), False),
+        ("Edinburgh", _council("GB", "county", "City of Edinburgh"), True),
+    ],
+    ids=[
+        "municipality",
+        "stad",
+        "kommune",
+        "bare",
+        "place-row",
+        "not-the-subtype",
+        "other-town",
+        "other-country",
+        "gb-with-qid",
+        "gb-council-area",
+    ],
+)
+def test_a_municipality_named_after_its_town_is_its_council_area(city, area, expected):
+    """Stockholm, Göteborg, Bergen and Ljubljana were found only as their
+    municipalities: a stop reaches the municipality's area alone, and the
+    council-area rule knew only the QID-less counties of GB, CA and CO, with
+    only a "City" affix stripped. A municipality in DK, NO, SE or SI, with
+    its own QID and its town's name, a suffix or a genitive "s" aside, is
+    now its town's council area."""
+    assert seed.council_area({"name": city, "names": {}}, area) is expected
+
+
+@pytest.mark.parametrize(
+    "place, entry, expected",
+    [
+        (
+            {"country_code": "DE", "names": {"en": "Munich"}},
+            {
+                "labels": {},
+                "aliases": {
+                    "it": ["Monaco"],
+                    "de": ["MUC"],
+                    "de-at": ["LHM"],
+                    "mul": ["München"],
+                    "en": ["Muenchen"],
+                },
+            },
+            ["LHM", "MUC", "Muenchen", "München"],
+        ),
+        (
+            {"country_code": "US", "names": {"en": "New York"}},
+            {
+                "labels": {"en": "New York City", "fr": "New York"},
+                "aliases": {"mul": ["NYC"], "eo": ["Gotham"]},
+            },
+            ["NYC", "New York City"],
+        ),
+        (
+            {"names": {"en": "Z"}},
+            {"labels": {}, "aliases": {"en": ["Y"], "fr": ["X"]}},
+            ["Y"],
+        ),
+    ],
+    ids=["foreign-alias", "replaced-label", "no-country"],
+)
+def test_wikidata_aliases_are_kept_in_the_places_own_languages(place, entry, expected):
+    """A Wikidata alias in a language not the place's own ("Monaco", Italian for
+    Munich) does not join its aliases; English, ``mul`` and the country's
+    languages do, and so does an own-language label Overture replaced."""
+    names._merge(place, entry)
+    assert place["aliases"] == expected
+
+
+NOT_MAPPED = (None, "the centre's country is not mapped")
+
+
+@pytest.mark.parametrize(
+    "region_id, ucdb_country, iso3, countries, expected",
+    [
+        ("1", "Switzerland", "DEU", ["FR", "FR", "CH"], ("CH", None)),
+        ("1", None, "DEU", ["PL", "PL", "DE"], ("DE", None)),
+        ("293", "China", "CHN", ["HK"], ("HK", None)),
+        ("293", "China", "CHN", ["CN", "CN", "HK"], ("HK", None)),
+        ("9114", "China", "CHN", ["MO"], ("MO", None)),
+        ("165", "Palestine", "PSE", ["XW"], ("XW", None)),
+        ("151", "Syria", "SYR", ["XH"], (None, "no city in the centre's country")),
+        ("1", "Palestine", "PSE", ["XW"], NOT_MAPPED),
+    ],
+    ids=[
+        "ucdb over fao",
+        "fao without a name",
+        "hong kong",
+        "hong kong among china",
+        "macao",
+        "west bank",
+        "no city there",
+        "unmapped",
+    ],
+)
+def test_a_fao_metros_country_is_its_centres_whatever_cities_a_build_holds(
+    region_id, ucdb_country, iso3, countries, expected
+):
+    """A FAO metro took the country most of a build's cities in its region
+    were in, so builds holding different towns filed one region under
+    different countries (Ljubljana's under AT, Copenhagen's under SE)."""
+    by_id = {
+        f"c{i}": {"place_id": f"c{i}", "kind": "city", "country_code": country}
+        for i, country in enumerate(countries)
+    }
+    names = {region_id: {"country": ucdb_country}} if ucdb_country else {}
+    regions = {region_id: {"country": iso3}}
+    country = metros.fao_country(region_id, sorted(by_id), by_id, names, regions)
+    assert country == expected

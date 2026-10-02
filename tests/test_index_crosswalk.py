@@ -1249,6 +1249,27 @@ def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
     assert sorted(s["feed_id"] for s in systems) == ["f-gbfs-s", "f-gbfs-t"]
 
 
+@pytest.mark.parametrize("systems", [(), ({"System ID": "s"},)])
+def test_only_empty_catalogues_crosswalk_to_no_feeds(tmp_path, systems):
+    from transitio_index import atlas, publish
+
+    cache = tmp_path / "cache"
+    archive = tmp_path / "atlas.tar.gz"
+    tarfile.open(archive, "w:gz").close()  # no DMFR file
+    atlas.ingest(cache, archive=archive, commit="a" * 40)
+    mdb.ingest(cache, csv_path=_write(tmp_path / "m.csv", mdb_csv()), allow_empty=True)
+    gbfs.ingest(cache, csv_path=_write(tmp_path / "s.csv", gbfs_csv(*systems)))
+    if systems:
+        # GBFS systems alone are no transit feeds.
+        with pytest.raises(crosswalk.CrosswalkError, match="no transit feeds"):
+            crosswalk.crosswalk(cache)
+    else:
+        assert crosswalk.crosswalk(cache)["feeds"] == 0
+        # Without places either, a build has nothing to publish.
+        with pytest.raises(publish.PublishError, match="no feeds to publish"):
+            publish.publish(cache)
+
+
 def test_crosswalk_stage_publishes_provisional_links(tmp_path):
     from transitio_index import atlas
 

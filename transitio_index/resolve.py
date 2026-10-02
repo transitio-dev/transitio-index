@@ -1,22 +1,24 @@
-"""Stage 3, resolve half: settle feed identity and crawlability from overrides.
+"""Stage 3, resolve half: settle feed identity, access and crawlability.
 
-Applies the ``set_identity`` and ``mark_uncrawlable`` operations from
-``overrides/feeds.yaml`` to the crosswalk feeds and writes
-``feeds_resolved.jsonl``. These two are settled before any crawl because identity
+Applies the ``set_identity``, ``mark_uncrawlable`` and ``set_access``
+operations from ``overrides/feeds.yaml`` to the crosswalk feeds and writes
+``feeds_resolved.jsonl``. These are settled before any crawl because identity
 is the crawl cache key and an uncrawlable feed must never be fetched at all; the
 crawl half itself is a later stage, and ``set_coverage`` is left for the coverage
-stage. A GTFS feed whose download URL needs a key (the catalogue's
-``requires_auth``) is uncrawlable from the start, so the crawl never spends a
-request to learn the 401. It fetches nothing. An override references a feed by
-its ``feed_id`` or any of its aliases — the crosswalk keeps superseded ids in
-``aliases`` for exactly this — so a correction filed against a pre-crosswalk id
-still lands.
+stage. Each feed records its access details (``access``, ``auth_method``,
+``auth_params``, the catalogue's ``auth_param_name`` and ``registration_url``),
+from a curated ``set_access`` or else the catalogue record supplying its URL.
+A GTFS feed whose download URL needs a key is uncrawlable from the start, so
+the crawl never spends a request to learn the 401. It fetches nothing. An
+override references a feed by its ``feed_id`` or any of its aliases — the
+crosswalk keeps superseded ids in ``aliases`` for exactly this — so a
+correction filed against a pre-crosswalk id still lands.
 """
 
 import collections
 import datetime
 
-from transitio_index import crawl, overrides, store
+from transitio_index import crawl, crosswalk, overrides, store
 
 RESOLVE_POINTER = "feeds_resolved.json"
 RESOLVE_ARTIFACT = "feeds_resolved.jsonl"
@@ -47,6 +49,75 @@ def _check_namespace(feeds):
         )
 
 
+AUTH_REASON = "requires authentication"
+# The catalogue methods a request can carry as they are; MDB numbers its
+# authentication types (0 is open).
+_ATLAS_METHODS = ("query_param", "header", "basic_auth")
+_MDB_METHODS = {"1": "query_param", "2": "header"}
+_OPEN = {
+    "access": "open",
+    "auth_method": None,
+    "auth_params": None,
+    "auth_param_name": None,
+    "registration_url": None,
+}
+
+
+def _access_source(feed):
+    """``(catalogue, record)`` whose access details apply: the record
+    supplying the crawl URL, or, for a feed without one, the Atlas record
+    when it needs a key, else the MDB one."""
+    atlas = feed.get("atlas") or {}
+    url = crawl.feed_url(feed)
+    if url is None:
+        from_atlas = bool(atlas.get("requires_auth"))
+    else:
+        from_atlas = url == (atlas.get("urls") or {}).get("static_current")
+    return ("atlas", atlas) if from_atlas else ("mdb", feed.get("mdb") or {})
+
+
+def _web_page(value):
+    url = crosswalk._clean_url(value)
+    return url if url and url.lower().startswith(("http://", "https://")) else None
+
+
+def _registration_page(feed):
+    """The Atlas ``info_url``, else the MDB registration page."""
+    atlas_auth = (feed.get("atlas") or {}).get("authorization") or {}
+    return _web_page(atlas_auth.get("info_url")) or _web_page(
+        (feed.get("mdb") or {}).get("authentication_info")
+    )
+
+
+def _catalogue_access(feed):
+    """The feed's access details as its catalogues give them.
+
+    ``auth_params`` stays null: binding the catalogue's parameter or header
+    name (``auth_param_name``) to a credential field needs the provider.
+    """
+    catalogue, record = _access_source(feed)
+    if not record.get("requires_auth"):
+        return dict(_OPEN)
+    if catalogue == "atlas":
+        block = record.get("authorization") or {}
+        method = block.get("type")
+        method = method if method in _ATLAS_METHODS else "unsupported"
+        name = block.get("param_name")
+    else:
+        method = _MDB_METHODS.get(record.get("authentication_type"), "unsupported")
+        name = record.get("api_key_parameter_name")
+    names = overrides.PARAM_NAMES.get(method)
+    if names is None or not isinstance(name, str) or not names.fullmatch(name):
+        name = None
+    return {
+        "access": "key",
+        "auth_method": method,
+        "auth_params": None,
+        "auth_param_name": name,
+        "registration_url": _registration_page(feed),
+    }
+
+
 def _apply(feed, entry):
     identity = entry.get("set_identity") or {}
     old_id = feed["feed_id"]
@@ -63,6 +134,18 @@ def _apply(feed, entry):
         aliases = feed.setdefault("aliases", [])
         if old_id not in aliases:
             aliases.append(old_id)
+    if "set_access" in entry:
+        spec = entry["set_access"]
+        feed.update(
+            access="key",
+            auth_method=spec["auth_method"],
+            auth_params=dict(spec["auth_params"]),
+            auth_param_name=None,
+            registration_url=_registration_page(feed),
+        )
+        if feed.get("spec") == "gtfs":
+            feed["crawlable"] = False
+            feed["uncrawlable_reason"] = AUTH_REASON
     if "mark_uncrawlable" in entry:
         spec = entry["mark_uncrawlable"]
         feed["crawlable"] = False
@@ -71,22 +154,9 @@ def _apply(feed, entry):
         )
 
 
-AUTH_REASON = "requires authentication"
-
-
-def _requires_auth(feed):
-    """Whether the catalogue record supplying the crawl URL is key-gated."""
-    atlas = feed.get("atlas") or {}
-    url = crawl.feed_url(feed)
-    from_atlas = url is not None and url == (atlas.get("urls") or {}).get(
-        "static_current"
-    )
-    supplier = atlas if from_atlas else (feed.get("mdb") or {})
-    return bool(supplier.get("requires_auth"))
-
-
 def resolve(cache_dir, *, overrides_dir=None):
-    """Resolve feed identity and crawlability; publish the ``feeds_resolved`` gen.
+    """Resolve feed identity, access and crawlability; publish the
+    ``feeds_resolved`` gen.
 
     Reads the crosswalk feeds, applies matching feed overrides, stamps every feed
     with a ``crawlable`` flag (and any ``uncrawlable_reason``), and republishes
@@ -104,10 +174,11 @@ def resolve(cache_dir, *, overrides_dir=None):
             # feed can slip through a first-match shortcut.
             ref_to_feeds = collections.defaultdict(list)
             for feed in feeds:
+                feed.update(_catalogue_access(feed))
                 # Only static GTFS is crawled in v1; GTFS-RT and GBFS are
                 # indexed but never fetched.
                 if "crawlable" not in feed:
-                    gated = feed.get("spec") == "gtfs" and _requires_auth(feed)
+                    gated = feed.get("spec") == "gtfs" and feed["access"] == "key"
                     feed["crawlable"] = feed.get("spec") == "gtfs" and not gated
                     feed["uncrawlable_reason"] = AUTH_REASON if gated else None
                 feed.setdefault("uncrawlable_reason", None)
@@ -146,7 +217,7 @@ def resolve(cache_dir, *, overrides_dir=None):
                     for feed in feeds
                     if not feed["crawlable"]
                     and feed.get("spec") == "gtfs"
-                    and _requires_auth(feed)
+                    and feed["access"] == "key"
                 ),
                 "unmatched_overrides": sorted(set(feed_overrides) - matched),
                 # The exact feeds.yaml applied, and its identity and

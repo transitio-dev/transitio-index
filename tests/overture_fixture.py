@@ -8,6 +8,7 @@ read the pinned release — no live network, no live counts.
 import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
+import shapely
 
 NAMES = pa.struct(
     [("primary", pa.string()), ("common", pa.map_(pa.string(), pa.string()))]
@@ -34,6 +35,8 @@ SCHEMA = pa.schema(
         ("wikidata", pa.string()),
         ("sources", pa.list_(SOURCE)),
         ("hierarchies", pa.list_(pa.list_(STEP))),
+        ("geometry", pa.binary()),
+        ("population", pa.int32()),
     ]
 )
 
@@ -62,8 +65,11 @@ def division(
     admin_level=0,
     sources=None,
     hierarchies=None,
+    point=None,
+    population=None,
 ):
-    """One division row with sensible defaults for the fields a test omits."""
+    """One division row with sensible defaults for the fields a test omits;
+    ``point`` is the label point's ``(x, y)``."""
     label = name if name is not None else id
     return {
         "id": id,
@@ -77,6 +83,8 @@ def division(
         "hierarchies": (
             hierarchies if hierarchies is not None else chain((id, subtype, label))
         ),
+        "geometry": shapely.to_wkb(shapely.Point(point)) if point else None,
+        "population": population,
     }
 
 
@@ -115,8 +123,6 @@ def area(division_id, wkb, sources, *, is_land=True, country=None):
     filters on); it is derived from the WKB, zeroed when that is malformed.
     """
     try:
-        import shapely
-
         xmin, ymin, xmax, ymax = shapely.from_wkb(wkb).bounds
     except Exception:
         xmin = ymin = xmax = ymax = 0.0

@@ -56,9 +56,14 @@ def centres_zip(rows, crs="EPSG:4326"):
 
 def ucdb_zip(rows, member, layer, crs="EPSG:4326", columns=UCDB_COLUMNS):
     """A zipped GeoPackage (``member``, one ``layer``) of UCDB centres:
-    ``(id, name, names, country, geometry)`` rows under ``columns``."""
+    ``(id, name, names, country, geometry[, population, capital])`` rows
+    under ``columns``, the population and capital flag 0 where omitted."""
     frame = geopandas.GeoDataFrame(
-        {column: [row[i] for row in rows] for i, column in enumerate(columns)},
+        {
+            **{column: [row[i] for row in rows] for i, column in enumerate(columns)},
+            "GC_POP_TOT_2025": [float((row[5:] or [0])[0]) for row in rows],
+            "GC_UCM_CAP": [(row[6:] or [0])[0] for row in rows],
+        },
         geometry=[row[4] for row in rows],
         crs=crs,
     )

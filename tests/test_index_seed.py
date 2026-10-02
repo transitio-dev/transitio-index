@@ -2,6 +2,7 @@ import pytest
 
 pytest.importorskip("pyarrow")
 import overture_fixture as fx  # noqa: E402
+import shapely  # noqa: E402
 
 from transitio_index import coverage, overture, registry, seed, store  # noqa: E402
 
@@ -36,6 +37,7 @@ ROWS = [
         wikidata="Q1757",
         name="Helsinki",
         common={"en": "Helsinki", "sv": "Helsingfors"},
+        point=(24.94, 60.17),
         admin_level=2,
         hierarchies=fx.chain(
             ("fi", "country", "Finland"),
@@ -77,6 +79,7 @@ ROWS = [
         "locality",
         wikidata="Q13291",
         name="Espoo",
+        point=(24.65, 60.2),
         admin_level=2,
         hierarchies=fx.chain(
             ("fi", "country", "Finland"),
@@ -103,6 +106,7 @@ ROWS = [
         "locality",
         wikidata="Q54089",
         name="Springfield",
+        point=(-93.3, 37.2),
         admin_level=2,
         hierarchies=fx.chain(
             ("us", "country", "United States"),
@@ -351,9 +355,11 @@ def _publish(cache, subdir, pointer, artifact, records):
         directory.close()
 
 
-def _seed(tmp_path, feeds=FEEDS, overrides_dir=None, registry=None):
+def _seed(
+    tmp_path, feeds=FEEDS, overrides_dir=None, registry=None, rows=ROWS, **options
+):
     cache = tmp_path / "cache"
-    dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
+    dataset = fx.write_dataset(tmp_path / "divisions.parquet", rows)
     _publish(cache, "crosswalk", "feeds.json", "feeds.jsonl", feeds)
     overture.resolve(cache, dataset=dataset, wikidata=fx.StubWikidata())
     manifest = seed.resolve_seed(
@@ -362,6 +368,7 @@ def _seed(tmp_path, feeds=FEEDS, overrides_dir=None, registry=None):
         wikidata=fx.StubWikidata(),
         overrides_dir=overrides_dir,
         registry=registry,
+        **options,
     )
     places, _ = store.read_jsonl(cache / "gazetteer", "seed.json", "places_seed.jsonl")
     report, _ = store.read_jsonl(cache / "gazetteer", "seed.json", "seed_report.jsonl")
@@ -602,6 +609,8 @@ def test_a_feed_with_no_declared_place_is_skipped(tmp_path):
     assert "f-nolocation" not in {r["feed_id"] for r in report}
     # Every feed but f-nolocation carries a declared location.
     assert manifest["feeds_with_location"] == len(FEEDS) - 1
+    # A build that seeds no countries reads no centres.
+    assert manifest["centre_sources"] is manifest["centre_rows_unplaced"] is None
 
 
 def test_a_locality_is_preferred_over_a_localadmin_of_the_same_qid(tmp_path):
@@ -898,12 +907,17 @@ def test_rekey_folds_the_links_of_rows_the_registry_merged():
             "metro_ids": ["Q9"],
             "member_ids": [],
             "wikidata_id": "Q1",
+            "ucdb_id": 3,
+            "population": 250000,
         },
         "Q2": {
             "tp_id": "tp_1",
             "metro_ids": ["Q8"],
             "member_ids": [],
             "wikidata_id": "Q1",
+            "ucdb_id": 7,
+            "ucdb_boundary": "01",
+            "population": 100000,
         },
         "Q8": {
             "tp_id": "tp_8",
@@ -920,8 +934,11 @@ def test_rekey_folds_the_links_of_rows_the_registry_merged():
     }
     out = seed.rekey(rows, by="tp_id", canonical={"tp_1": "Q1"})
     assert set(out) == {"tp_1", "tp_8", "tp_9"}
-    # The survivor keeps both metros; each metro's member list names it.
+    # The survivor keeps both metros, the centre mark with a polygon and the
+    # larger population; each metro's member list names it.
     assert out["tp_1"]["metro_ids"] == ["tp_8", "tp_9"]
+    mark = [out["tp_1"][k] for k in ("ucdb_id", "ucdb_boundary", "population")]
+    assert mark == [7, "01", 250000]
     assert out["tp_8"]["member_ids"] == out["tp_9"]["member_ids"] == ["tp_1"]
 
 
@@ -937,3 +954,256 @@ def test_only_a_plainly_unresolved_division_is_a_place_without_a_qid():
     assert seed._unique_identity([plain]) == (plain, None)
     division, reason = seed._unique_identity([conflicting])
     assert division is None and "conflict" in reason
+
+
+def _city(id, x, subtype="locality", wikidata=None, population=None, name="Lima"):
+    """A same-name city candidate whose label point is ``(x, 0.5)``."""
+    return fx.division(
+        id,
+        "XX",
+        subtype,
+        wikidata=wikidata,
+        name=name,
+        point=(x, 0.5),
+        population=population,
+    )
+
+
+UNIT = shapely.box(0, 0, 1, 1)
+
+
+@pytest.mark.parametrize(
+    ("name", "divisions", "chosen"),
+    [
+        ("Lima", [("a", 0.5)], "a"),
+        # A namesake beyond NEAR_DEG of the polygon is another place.
+        ("Lima", [("a", 1.06)], None),
+        ("Lima", [("a", 1.04)], "a"),
+        # Near counts only when none is inside, whatever its precedence.
+        ("Lima", [("a", 1.02, "locality", "Q1", 9), ("b", 0.5, "localadmin")], "b"),
+        ("Lima", [("a", 0.5, "localadmin", "Q1"), ("b", 0.9)], "b"),
+        ("Lima", [("a", 0.5, "locality", None, 9), ("b", 0.9, "locality", "Q2")], "b"),
+        (
+            "Lima",
+            [("a", 0.5, "locality", "Q1", 5), ("b", 0.9, "locality", "Q2", 9)],
+            "b",
+        ),
+        ("Lima", [("a", 0.9), ("b", 0.6)], "b"),
+        # Any of a centre's names finds its division.
+        ("Lima / Rímac", [("a", 0.5, "locality", None, None, "Rimac")], "a"),
+    ],
+)
+def test_a_centre_takes_the_same_name_division_its_polygon_holds(
+    tmp_path, name, divisions, chosen
+):
+    dataset = fx.write_dataset(tmp_path / "d.parquet", [_city(*d) for d in divisions])
+    centre = {"id": 1, "name": name, "capital": False, "population": 3e5, "geom": UNIT}
+    (row,) = seed.centre_rows([{**centre, "country": None}], dataset)
+    assert (row["division"] or {}).get("overture_id") == chosen
+    assert row["primary"] and shapely.from_wkb(row["boundary"]).equals(UNIT)
+
+
+@pytest.mark.parametrize(
+    ("name", "capital", "seeds"),
+    [
+        (
+            "Bayamón [San Juan]",
+            True,
+            [("Bayamón", {"bayamon"}), ("San Juan", {"san juan"})],
+        ),
+        (
+            "Colombo [Sri Jayawardenepura Kotte]",
+            True,
+            [
+                ("Colombo", {"colombo"}),
+                (
+                    "Sri Jayawardenepura Kotte",
+                    {"sri jayawardenepura kotte", "sri jayewardenepura kotte"},
+                ),
+            ],
+        ),
+        (
+            "North Canberra [Canberra]",
+            True,
+            [("North Canberra", {"north canberra"}), ("Canberra", {"canberra"})],
+        ),
+        (
+            "Pyinmana [Nay Pyi Taw]",
+            True,
+            [("Pyinmana", {"pyinmana"}), ("Nay Pyi Taw", {"nay pyi taw"})],
+        ),
+        (
+            "Strovolos [Nicosia]",
+            True,
+            [("Strovolos", {"strovolos"}), ("Nicosia", {"nicosia"})],
+        ),
+        # A non-capital's bracket names no row.
+        ("Rotterdam [The Hague]", False, [("Rotterdam", {"rotterdam"})]),
+        ("Oviedo / Uviéu", False, [("Oviedo / Uviéu", {"oviedo", "uvieu"})]),
+        ("New York City", False, [("New York City", {"new york city", "new york"})]),
+    ],
+)
+def test_a_centre_name_parses_into_its_seed_rows(name, capital, seeds):
+    rows = seed.centre_seeds({"name": name, "capital": capital})
+    assert rows == [
+        (seed_name, names, index == 0) for index, (seed_name, names) in enumerate(seeds)
+    ]
+
+
+SEEDED = [
+    fx.division(
+        "se-sthlm",
+        "SE",
+        "region",
+        wikidata="Q104231",
+        name="Stockholm County",
+        admin_level=1,
+        hierarchies=fx.chain(("se", "country", "Sweden"), ("se-sthlm", "region", "S")),
+    ),
+    fx.division(
+        "se-stockholm",
+        "SE",
+        "locality",
+        wikidata="Q1754",
+        name="Stockholm",
+        point=(18.07, 59.33),
+        hierarchies=fx.chain(
+            ("se", "country", "Sweden"),
+            ("se-sthlm", "region", "S"),
+            ("se-stockholm", "locality", "Stockholm"),
+        ),
+    ),
+]
+CENTRES = [
+    (101, "Helsinki", "", "Finland", shapely.box(24.8, 60.1, 25.1, 60.3), 600000.4),
+    (102, "Stockholm", "", "Sweden", shapely.box(17.8, 59.2, 18.3, 59.5), 900000),
+    (107, "Stockholm", "", "Sweden", shapely.box(18, 59.3, 18.2, 59.4), 1200000),
+    # A capital: seeded below 200,000 people, its bracket on no division.
+    (99, "Solna [Atlantis]", "", "Sweden", shapely.box(17.9, 59.35, 18, 59.38), 1e5, 1),
+    (104, "Täby", "", "Sweden", shapely.box(18, 59.4, 18.1, 59.5), 250000),
+    (105, "Gaza", "", "Palestine", shapely.box(34.4, 31.4, 34.5, 31.6), 700000),
+    (106, "Springfield", "", "United States", shapely.box(-94, 37, -93, 38), 3e5),
+    (108, "Espoo", "", "Finland", shapely.box(24.5, 60.1, 24.75, 60.3), 150000),
+]
+
+
+def test_the_listed_countries_capitals_and_large_cities_are_seeded(
+    tmp_path, monkeypatch
+):
+    import fao_fixture as ffx
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import ucdb
+
+    rows = ROWS + SEEDED
+    files, pins = ffx.pinned_files(
+        tmp_path / "ucdb",
+        {
+            ucdb.CENTRES_FILE: ffx.centres_zip([(1, 1, shapely.box(0, 0, 1, 1))]),
+            ucdb.UCDB_FILE: ffx.ucdb_zip(CENTRES, ucdb.UCDB_MEMBER, ucdb.UCDB_LAYER),
+        },
+    )
+    cache = tmp_path / "cache"
+    ucdb.prepare_inputs(cache, files=files, expected=pins)
+    curated = [
+        # Held through the region only the Stockholm centre seeds.
+        {
+            "place": "Q1754",
+            "add_place": {"kind": "city", "name": "Stockholm", "parent_id": "Q104231"},
+        },
+        {
+            "place": "ghs_ucdb:104",
+            "add_place": {
+                "kind": "city",
+                "name": "Täby (curated)",
+                "parent_id": "Q34",
+                "boundary": "POLYGON((18 59.4, 18.1 59.4, 18.1 59.5, 18 59.4))",
+            },
+        },
+    ]
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    options = {"rows": rows, "ucdb_pins": pins, "seed_countries": ["FI", "SE"]}
+    with registry.session(path) as reg:
+        manifest, places, report = _seed(
+            tmp_path,
+            overrides_dir=write_overrides(tmp_path, places=curated),
+            registry=reg,
+            **options,
+        )
+        solna, taby = (reg.resolve(f"ghs_ucdb:{i}") for i in (99, 104))
+        minted = {i: reg.rows[i]["minted_from"] for i in (solna, taby)}
+    # A declared city is marked, not repeated; a new one comes with its
+    # ancestors; one two centres land on keeps the first's id and polygon
+    # and the larger population.
+    assert places["Q1757"]["ucdb_id"] == 101 and places["Q1757"]["population"] == 600000
+    stockholm = places["Q1754"]
+    assert (stockholm["ucdb_id"], stockholm["population"]) == (102, 1200000)
+    assert stockholm["curated"] and stockholm["overture_id"] == "se-stockholm"
+    assert shapely.from_wkb(stockholm["ucdb_boundary"]).equals(CENTRES[1][4])
+    assert stockholm["parent_id"] == places["Q104231"]["place_id"]
+    assert places["Q104231"]["parent_id"] == places["Q34"]["place_id"]
+    assert sum(p.get("name") == "Stockholm" for p in places.values()) == 1
+    # A main name on no division is a city of its own, minted from the
+    # centre; a curated row of its key stays curated.
+    assert places[solna]["name"] == "Solna" and places[solna]["kind"] == "city"
+    assert places[solna]["parent_id"] == places["Q34"]["place_id"]
+    assert places[solna]["resolution_method"] == "ghs_ucdb"
+    assert places[taby]["name"] == "Täby (curated)" and places[taby]["curated"]
+    assert places[taby]["ucdb_id"] == 104 and places[taby]["boundary_wkt"]
+    assert minted == {solna: "ghs_ucdb:99", taby: "places.yaml:ghs_ucdb:104"}
+    # A bracket on no division is reported; centres outside the listed
+    # countries, below the threshold or without a country seed nothing.
+    assert {"ucdb_id": 99, "name": "Atlantis"}.items() <= report[-1].items()
+    assert "Q54089" not in places and "ucdb_id" not in places["Q13291"]
+    assert manifest["seed_countries"] == ["FI", "SE"]
+    assert manifest["centre_sources"]["rules"] == seed.CENTRES_VERSION
+    counts = [
+        manifest[f"centre_rows{key}"]
+        for key in ("", "_matched", "_existing", "_urban", "_reported", "_unplaced")
+    ]
+    assert counts == [6, 3, 2, 2, 1, 1]
+    # Derived once per rules version.
+    dataset = fx.write_dataset(tmp_path / "divisions.parquet", rows)
+    first = seed.prepare_centres(cache, dataset, expected=pins)[1]["generation"]
+    assert seed.prepare_centres(cache, dataset, expected=pins)[1]["generation"] == first
+    monkeypatch.setattr(seed, "CENTRES_VERSION", seed.CENTRES_VERSION + 1)
+    assert seed.prepare_centres(cache, dataset, expected=pins)[1]["generation"] != first
+    with pytest.raises(overture.GazetteerError, match="ZZ"):
+        _seed(tmp_path, rows=rows, seed_countries=["FI", "ZZ"])
+
+
+def test_a_centre_locality_outranks_an_admin_place_of_its_key():
+    # A city-state: its country and its locality carry one QID.
+    country = {
+        "qid": "Q5",
+        "overture_id": "mc",
+        "kind": "country",
+        "source_subtype": "country",
+        "name": "Monaco",
+        "names": {},
+        "resolution_method": "qid",
+        "country": "MC",
+    }
+    city = {
+        **country,
+        "overture_id": "mc-l",
+        "kind": "city",
+        "source_subtype": "locality",
+    }
+    places = {"Q5": seed._place(country, parent_id=None)}
+    row = {"ucdb_id": 1, "primary": True, "division": city, "boundary": "01"}
+    counts, marks = seed._seed_centres(places, {}, {}, [row], [])
+    assert places["Q5"]["source_subtype"] == "locality" and counts["existing"] == 1
+    assert marks == [("Q5", row)]
+
+
+def test_seed_countries_are_given_as_two_capital_codes():
+    from transitio_index import build
+
+    options = ["--stage", "gazetteer", "--seed-countries"]
+    assert build.parse_args(options + ["FI,SE"]).seed_countries == ["FI", "SE"]
+    assert build.parse_args(options[:2]).seed_countries == []
+    for value in ("fi", "FIN", "FI,", "F1"):
+        with pytest.raises(SystemExit):
+            build.parse_args(options + [value])

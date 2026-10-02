@@ -9,7 +9,9 @@ the skeleton's regions and counties instead — catalogues name districts there 
 and placed at that division. A feed that declares only a subdivision resolves to
 that region. A feed whose location does not resolve to a single place — a
 QID-bearing division, or a named one no QID names, identified by its Overture
-id — is reported, never minted.
+id — is reported, never minted. The capitals and the cities of at least
+200,000 people (GHS-UCDB urban centres) of the countries a build lists are
+seeded too, with or without feeds.
 
 Matching folds accents and case and considers every language label a division
 carries, so a feed naming a place in a local language still resolves. Only feeds
@@ -21,11 +23,13 @@ declare, so the 3.5M-row locality universe is never materialised.
 
 import datetime
 import logging
+import re
 import unicodedata
 
 import pyarrow.dataset as ds
+import shapely
 
-from transitio_index import overrides, overture, store
+from transitio_index import country_codes, overrides, overture, pinned, store
 from transitio_index import registry as _registry
 from transitio_index.progress import progress
 
@@ -34,6 +38,20 @@ log = logging.getLogger(__name__)
 # The Overture subtypes that stand in for a city, most specific first: a name
 # resolving to both prefers the locality (decision in the plan's subtype table).
 CITY_SUBTYPES = ("locality", "localadmin")
+# A city candidate's columns: the gazetteer's, its label point and population.
+CANDIDATE_COLUMNS = [*overture.PROJECT, "geometry", "population"]
+
+# The GHS-UCDB centres seeded as places, matched to Overture once per release
+# and rules version (``prepare_centres``).
+CENTRES_POINTER = "ucdb-centres.json"
+CENTRES_FILE = "centres.jsonl"
+CENTRES_VERSION = 1
+# How near (degrees) a label point outside a centre's polygon may lie when
+# none lies inside.
+NEAR_DEG = 0.05
+# Overture's spelling of a name the UCDB spells otherwise.
+UCDB_SPELLINGS = {"Sri Jayawardenepura Kotte": "Sri Jayewardenepura Kotte"}
+_BRACKET = re.compile(r"\A(.*?)\s*\[(.*)\]\s*\Z")
 
 
 def _norm(name):
@@ -63,11 +81,21 @@ def _name_variants(record):
 # sub-county).
 COUNCIL_AREA_COUNTRIES = frozenset({"CA", "CO", "GB"})
 
+# The countries whose municipality carries its own QID and is named after its
+# town, which has no area of its own; the value is the municipality's subtype.
+MUNICIPALITY_SUBTYPES = {"DK": "county", "NO": "county", "SE": "county", "SI": "region"}
+
+# The suffixes a municipality's name adds to its town's, which may take a
+# genitive "s": "Stockholms kommun", "Göteborgs Stad", "Københavns Kommune".
+_MUNICIPALITY_SUFFIXES = (" municipality", " kommun", " kommune", " stad")
+
 
 def _area_names(record):
     """The folded names a division carries as a city's council area: each
     label, and each without a ``City`` affix — "City of Edinburgh" and
-    "Glasgow City" carry Edinburgh's and Glasgow's names."""
+    "Glasgow City" carry Edinburgh's and Glasgow's names — or a municipality
+    suffix, its genitive "s" taken off too: "Stockholms kommun" carries
+    Stockholm's."""
     names = set()
     for name in _name_variants(record):
         names.add(name)
@@ -75,21 +103,36 @@ def _area_names(record):
             names.add(name[len("city of ") :])
         if name.endswith(" city"):
             names.add(name[: -len(" city")])
+        for suffix in _MUNICIPALITY_SUFFIXES:
+            if name.endswith(suffix):
+                town = name[: -len(suffix)]
+                names.add(town)
+                if town.endswith("s"):
+                    names.add(town[:-1])
+    names.discard("")
     return names
 
 
-def council_area(city, area):
-    """Whether ``area`` is ``city``'s own council area: a county no QID names
-    that carries the city's name (Manchester's Manchester, Edinburgh's City of
-    Edinburgh), in a country where such a county is the city's own unit. A
+def council_unit(area):
+    """Whether ``area`` may be a city's own council area: a county no QID
+    names in ``COUNCIL_AREA_COUNTRIES``, or a municipality of the subtype
+    ``MUNICIPALITY_SUBTYPES`` gives its country, with or without a QID. A
     candidate record and a place row answer alike."""
     country = area.get("country") or area.get("country_code")
+    subtype = area.get("source_subtype")
+    if country in COUNCIL_AREA_COUNTRIES:
+        return subtype == "county" and area.get("resolution_method") == "overture_id"
     return (
-        country in COUNCIL_AREA_COUNTRIES
-        and area.get("source_subtype") == "county"
-        and area.get("resolution_method") == "overture_id"
-        and bool(_name_variants(city) & _area_names(area))
+        country in MUNICIPALITY_SUBTYPES and subtype == MUNICIPALITY_SUBTYPES[country]
     )
+
+
+def council_area(city, area):
+    """Whether ``area`` is ``city``'s own council area: a council unit
+    (``council_unit``) that carries the city's name — Manchester's
+    Manchester, Edinburgh's City of Edinburgh, Stockholm's Stockholms kommun.
+    A candidate record and a place row answer alike."""
+    return council_unit(area) and bool(_name_variants(city) & _area_names(area))
 
 
 def declared_locations(feeds):
@@ -151,28 +194,33 @@ def _subdivision_names(candidate, skeleton):
 
 
 def read_city_candidates(dataset, countries, wanted):
-    """Normalised locality/localadmin records feeds actually name.
+    """Normalised locality/localadmin records feeds actually name, each with
+    its label point (``point``, WKB) and Overture ``population``.
 
     Streamed with a country + subtype predicate so only the relevant partitions
     are scanned, and kept only where one of a division's ``(country, folded
     name)`` labels is one a feed declared, so the working set is bounded by the
-    feeds, not the theme.
+    feeds, not the theme. ``countries=None`` scans every country for
+    ``(None, folded name)`` labels.
     """
-    if not countries or not wanted:
+    if (countries is not None and not countries) or not wanted:
         return []
-    predicate = ds.field("subtype").isin(list(CITY_SUBTYPES)) & ds.field(
-        "country"
-    ).isin(sorted(countries))
+    predicate = ds.field("subtype").isin(list(CITY_SUBTYPES))
+    if countries is not None:
+        predicate &= ds.field("country").isin(sorted(countries))
     kept = []
     for batch in progress(
-        dataset.to_batches(columns=overture.PROJECT, filter=predicate),
+        dataset.to_batches(columns=CANDIDATE_COLUMNS, filter=predicate),
         "seed localities",
     ):
         for row in batch.to_pylist():
-            record = overture.normalize_division(row)
-            if any(
-                (record["country"], name) in wanted for name in _name_variants(record)
-            ):
+            primary, labels = overture._names(row["names"])
+            country = None if countries is None else row["country"]
+            names = _name_variants({"name": primary, "names": labels})
+            if any((country, name) in wanted for name in names):
+                record = overture.normalize_division(row)
+                record["point"] = row["geometry"]
+                record["population"] = row["population"]
                 kept.append(record)
     return kept
 
@@ -235,12 +283,14 @@ def _resolve_candidates(candidates, wikidata):
         record["resolution_method"] = method
 
 
-def _index(records):
-    """``{(country, folded label): [record, ...]}`` over every name variant."""
+def _index(records, by_country=True):
+    """``{(country, folded label): [record, ...]}`` over every name variant;
+    the country is None unless ``by_country``."""
     index = {}
     for record in records:
+        country = record["country"] if by_country else None
         for name in _name_variants(record):
-            index.setdefault((record["country"], name), []).append(record)
+            index.setdefault((country, name), []).append(record)
     return index
 
 
@@ -248,8 +298,8 @@ def _principal_qid(candidates):
     """The one QID of a city that is its own district, while the other
     same-name divisions are hamlets — or ``None`` when no QID is, or more than
     one. Such a city appears at both levels under its QID (Augsburg, Karlsruhe,
-    Ulm), or its district is its council area, a county no QID names
-    (Manchester, Cardiff)."""
+    Ulm), or its district is its council area (``council_area``: Manchester,
+    Cardiff, Bergen)."""
     levels = {}
     for candidate in candidates:
         if candidate["qid"]:
@@ -627,6 +677,203 @@ def _add_place_overrides(places, entries, report, statistical=frozenset()):
             place_id = (places.get(place_id) or {}).get("parent_id")
 
 
+def centre_seeds(centre):
+    """``[(name, folded names, primary)]``: a UCDB centre's seed rows. The
+    main name, less a bracket, is matched by each part of a "/" pair, each
+    also without a ``City`` affix and in Overture's spelling; a capital's
+    bracket names its capital, a second row."""
+    found = _BRACKET.match(centre["name"])
+    main, bracket = found.groups() if found else (centre["name"], None)
+    rows = [(main, main.split("/"), True)]
+    if bracket and centre["capital"]:
+        rows.append((bracket, [bracket], False))
+    seeds = []
+    for name, parts, primary in rows:
+        names = set()
+        for part in map(str.strip, parts):
+            for spelling in (part, UCDB_SPELLINGS.get(part)):
+                if spelling:
+                    names |= _area_names({"name": spelling})
+        seeds.append((name, names, primary))
+    return seeds
+
+
+def _choose(candidates, polygon):
+    """The candidate a centre's ``polygon`` holds the label point of — or,
+    when none, the one within ``NEAR_DEG`` — by precedence: a locality over a
+    localadmin, a QID over none, the larger population, the point nearest
+    the polygon's own, the Overture id. None when no point is near."""
+    located = [(c, shapely.from_wkb(c["point"])) for c in candidates if c["point"]]
+    held = [item for item in located if shapely.covers(polygon, item[1])] or [
+        item for item in located if shapely.dwithin(item[1], polygon, NEAR_DEG)
+    ]
+    if not held:
+        return None
+    centre = shapely.point_on_surface(polygon)
+    best, _ = min(
+        held,
+        key=lambda item: (
+            CITY_SUBTYPES.index(item[0]["subtype"]),
+            not item[0]["wikidata"],
+            -(item[0]["population"] or 0),
+            shapely.distance(item[1], centre),
+            item[0]["overture_id"],
+        ),
+    )
+    return best
+
+
+def centre_rows(centres, dataset):
+    """One row per seed row of the UCDB ``centres`` (polygons in WGS84): the
+    centre's ``ucdb_id``, the row's ``name``, ``primary``, ``population``,
+    ``capital``, ``gadm_country``, ``boundary`` (the polygon as WKB hex, a
+    main name's only) and ``division``, the same-name Overture locality or
+    localadmin ``_choose`` takes, or None. One scan of the theme."""
+    seeds = [(centre, *seed) for centre in centres for seed in centre_seeds(centre)]
+    wanted = {(None, name) for _, _, names, _ in seeds for name in names}
+    index = _index(read_city_candidates(dataset, None, wanted), by_country=False)
+    rows = []
+    for centre, name, names, primary in progress(seeds, "seed centres"):
+        found = {c["overture_id"]: c for n in names for c in index.get((None, n), [])}
+        division = _choose(found.values(), centre["geom"])
+        if division is not None:
+            division = {k: v for k, v in division.items() if k != "point"}
+        rows.append(
+            {
+                "ucdb_id": centre["id"],
+                "name": name,
+                "primary": primary,
+                "population": centre["population"],
+                "capital": centre["capital"],
+                "gadm_country": centre["country"],
+                "boundary": (
+                    shapely.to_wkb(centre["geom"], hex=True) if primary else None
+                ),
+                "division": division,
+            }
+        )
+    return rows
+
+
+def centre_country(row):
+    """A centre row's country: its division's, else its GADM name's."""
+    if row["division"]:
+        return row["division"]["country"]
+    return country_codes.by_ucdb(row["gadm_country"])
+
+
+def prepare_centres(cache_dir, dataset, *, expected=None):
+    """``(rows, manifest)``: the ``centre_rows`` of the UCDB centres that
+    qualify, derived once into ``raw/ucdb-centres.json`` and reused while the
+    UCDB pins, the Overture release and the rules stay the same."""
+    from transitio_index import ucdb  # ucdb -> fao -> geometry -> seed
+
+    expected = dict(expected or ucdb.PINS)
+    inputs = ucdb.prepare_inputs(cache_dir, expected=expected)
+    sources = {
+        **inputs["digests"],
+        "overture": overture.OVERTURE_RELEASE,
+        "rules": CENTRES_VERSION,
+        "min_population": ucdb.MIN_POPULATION,
+        "near_deg": NEAR_DEG,
+    }
+
+    def build():
+        generation, _ = pinned.resolve(
+            cache_dir, pointer=ucdb.POINTER, expected=expected, error=ucdb.UcdbError
+        )
+        with generation:
+            data = generation.read_bytes(ucdb.UCDB_FILE)
+        centres, _ = ucdb.read_ucdb(data, "EPSG:4326")
+        rows = centre_rows([c for c in centres if ucdb.qualifies(c)], dataset)
+        return {CENTRES_FILE: store.jsonl_chunks(rows)}, {
+            "source": "ghs-ucdb-centres",
+            "release": ucdb.RELEASE,
+            "doi": ucdb.DOI,
+            "license": ucdb.LICENCE,
+            "rows": len(rows),
+            "matched": sum(row["division"] is not None for row in rows),
+            # Without a country no build seeds them.
+            "unplaced": [
+                {"ucdb_id": row["ucdb_id"], "gadm_country": row["gadm_country"]}
+                for row in rows
+                if centre_country(row) is None
+            ],
+        }
+
+    pinned.derive(cache_dir, pointer=CENTRES_POINTER, sources=sources, build=build)
+    rows, manifest = store.read_jsonl(cache_dir / "raw", CENTRES_POINTER, CENTRES_FILE)
+    if manifest.get("sources") != sources:
+        raise ucdb.UcdbError(
+            f"raw/{CENTRES_POINTER} derives from other inputs than this build's"
+        )
+    return rows, manifest
+
+
+def _mark(place, row):
+    """Mark a place a centre row lands on: of all its rows, the one with a
+    polygon, then the lowest id, gives ``ucdb_id`` and the polygon
+    (``ucdb_boundary``); the largest ``population`` is kept."""
+    rank = (not row.get("boundary"), row["ucdb_id"])
+    if "ucdb_id" not in place or rank < (
+        "ucdb_boundary" not in place,
+        place["ucdb_id"],
+    ):
+        place["ucdb_id"] = row["ucdb_id"]
+        if row.get("boundary"):
+            place["ucdb_boundary"] = row["boundary"]
+    if (row.get("population") or 0) > (place.get("population") or 0):
+        place["population"] = row["population"]
+
+
+def _seed_centres(places, skeleton, countries, rows, report):
+    """Seed the centre ``rows`` as places, main names first, then by id: a
+    row on a division adds it with its ancestors as a feed's city is, so a
+    place of its key stays unless the division outranks it; a main name on
+    none is a city of its own, ``ghs_ucdb:<id>``, under its country
+    (``countries``, by code); a bracket on none is reported.
+    ``(counts, marks)``: the ``(key, row)`` pairs to ``_mark``."""
+    counts = dict.fromkeys(("matched", "existing", "urban", "reported"), 0)
+    marks = []
+    for row in sorted(rows, key=lambda row: (not row["primary"], row["ucdb_id"])):
+        division = row["division"]
+        if division and (division["qid"] or overture.qidless_place(division)):
+            key = place_key(division)
+            counts["matched"] += 1
+            counts["existing"] += key in places
+            _add_place(places, skeleton, division)
+        elif row["primary"]:
+            key = f"ghs_ucdb:{row['ucdb_id']}"
+            counts["urban"] += 1
+            if key not in places:
+                country = countries[centre_country(row)]
+                _add_place(places, skeleton, country)
+                record = {
+                    "qid": None,
+                    "overture_id": None,
+                    "kind": "city",
+                    "source_subtype": "urban centre",
+                    "name": row["name"],
+                    "names": {},
+                    "resolution_method": "ghs_ucdb",
+                    "country": country["country"],
+                }
+                place = _place(record, parent_id=place_key(country))
+                places[key] = {**place, "place_id": key}
+        else:
+            counts["reported"] += 1
+            report.append(
+                {
+                    "ucdb_id": row["ucdb_id"],
+                    "name": row["name"],
+                    "reason": "no same-name locality in the capital's urban centre",
+                }
+            )
+            continue
+        marks.append((key, row))
+    return counts, marks
+
+
 def _key_concordance(key, registry):
     """The concordances a stage's key states: a QID; ``namespace:value``
     for a curated place minted from another concordance; or, for an own id
@@ -650,6 +897,8 @@ def _identify_places(places, registry, places_digest, report=None):
     aborts the gazetteer. Returns the number identified."""
     if registry is None:
         return 0
+    from transitio_index import ucdb  # ucdb -> fao -> geometry -> seed
+
     skipped = []
     for place_id in sorted(places):
         row = places[place_id]
@@ -658,6 +907,9 @@ def _identify_places(places, registry, places_digest, report=None):
             concordances["overture"] = [row["overture_id"]]
             minted_from = f"overture:{row['overture_id']}"
             minted_in = f"overture {overture.OVERTURE_RELEASE}"
+        elif row.get("resolution_method") == "ghs_ucdb":
+            minted_from = place_id
+            minted_in = f"GHS-UCDB {ucdb.RELEASE}"
         else:
             minted_from = f"places.yaml:{place_id}"
             minted_in = f"places.yaml {places_digest}"
@@ -766,6 +1018,8 @@ def rekey(rows, *, by, records=(), canonical=None):
                 survivor[field] = sorted(
                     set(survivor.get(field) or []) | set(row.get(field) or [])
                 )
+            if "ucdb_id" in row:
+                _mark(survivor, {**row, "boundary": row.get("ucdb_boundary")})
             continue
         row["place_id"] = target
         for field in ("parent_id", "default_metro_id"):
@@ -811,6 +1065,8 @@ def resolve_seed(
     strict=False,
     registry=None,
     run=None,
+    seed_countries=(),
+    ucdb_pins=None,
 ):
     """Build ``places_seed.jsonl`` from the feeds' declared locations.
 
@@ -819,10 +1075,13 @@ def resolve_seed(
     when no locality carries the name, to a skeleton region or county, placed at
     level ``district`` — (its subdivision to a region, or its country to a
     country, when no finer level is declared), and emits that place with its
-    administrative ancestors; unmatched feeds go to ``seed_report.jsonl``. With a
-    ``registry`` session every place
-    also gets its registry id (``tp_id``) and ``wikidata_id``. Returns the
-    generation manifest.
+    administrative ancestors; unmatched feeds go to ``seed_report.jsonl``. The
+    capitals and the cities of at least ``ucdb.MIN_POPULATION`` people in
+    ``seed_countries`` (codes the skeleton has a country for) are seeded too,
+    from the GHS-UCDB centres ``prepare_centres`` matches (``ucdb_pins`` the
+    UCDB inputs', the module's by default; see ``_seed_centres``). With a
+    ``registry`` session every place also gets its registry id (``tp_id``)
+    and ``wikidata_id``. Returns the generation manifest.
     """
     if wikidata is None:
         wikidata = overture.WikidataClient()
@@ -841,6 +1100,12 @@ def resolve_seed(
     country_index = {
         r["country"]: r for r in skeleton.values() if r["kind"] == "country"
     }
+    seed_countries = set(seed_countries)
+    unknown = sorted(seed_countries - set(country_index))
+    if unknown:
+        raise overture.GazetteerError(
+            f"no Overture country or dependency for seed countries {unknown}"
+        )
 
     locations = list(declared_locations(feeds))
     city_locations = [loc for loc in locations if loc["municipality"]]
@@ -850,13 +1115,23 @@ def resolve_seed(
     if dataset is None:
         dataset = overture.overture_dataset()
     candidates = read_city_candidates(dataset, countries, wanted)
-    _resolve_candidates(candidates, wikidata)
+    centres, centres_manifest = [], {}
+    if seed_countries:
+        rows, centres_manifest = prepare_centres(cache_dir, dataset, expected=ucdb_pins)
+        centres = [row for row in rows if centre_country(row) in seed_countries]
+    # One record per division, so an override applies to it once.
+    divisions = {c["overture_id"]: c for c in candidates}
+    for row in centres:
+        if row["division"]:
+            key = row["division"]["overture_id"]
+            row["division"] = divisions.setdefault(key, row["division"])
+    _resolve_candidates(list(divisions.values()), wikidata)
     place_overrides, places_digest = overrides.load_place_overrides(
         overrides_dir, registry=registry, internal=True
     )
     override_report = []
     resolved_by_hand, unmatched = _resolve_place_overrides(
-        candidates,
+        list(divisions.values()),
         overrides.by_operation(place_overrides, "resolve_place"),
         override_report,
     )
@@ -928,6 +1203,8 @@ def resolve_seed(
             }
         )
         _add_place(places, skeleton, division)
+    fed = set(places)
+    counts, marks = _seed_centres(places, skeleton, country_index, centres, report)
     added = _held_add_places(
         overrides.by_operation(place_overrides, "add_place"), places
     )
@@ -935,7 +1212,16 @@ def resolve_seed(
         e["place"]
         for e in overrides.by_operation(place_overrides, "set_statistical_area")
     }
+    # An entry defining a place only a centre seeded replaces the centre's row.
+    for entry in added:
+        spec, key = entry["add_place"], entry["place"]
+        if key not in fed and (
+            "boundary" in spec or "member_ids" in spec or key in statistical
+        ):
+            places.pop(key, None)
     _add_place_overrides(places, added, override_report, statistical)
+    for key, row in marks:
+        _mark(places[key], row)
     for entry in unmatched:
         # A place this build holds names a candidate that is gone.
         if entry["place"] in places:
@@ -969,6 +1255,13 @@ def resolve_seed(
         "feeds_placed": len(placements),
         "places": len(places),
         "reported": len(report),
+        "seed_countries": sorted(seed_countries),
+        "centre_sources": centres_manifest.get("sources"),
+        "centre_rows": len(centres),
+        **{f"centre_rows_{outcome}": count for outcome, count in counts.items()},
+        "centre_rows_unplaced": (
+            len(centres_manifest["unplaced"]) if centres_manifest else None
+        ),
         "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     directory = store.open_subdir(cache_dir, "gazetteer")

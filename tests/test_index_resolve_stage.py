@@ -102,6 +102,163 @@ def test_only_open_static_gtfs_defaults_to_crawlable(tmp_path):
     assert manifest["requires_auth"] == 3
 
 
+def test_access_details_come_from_the_record_supplying_the_url(tmp_path):
+    def mdb(kind, name=None, info=None):
+        return {
+            "requires_auth": kind != "0",
+            "authentication_type": kind,
+            "api_key_parameter_name": name,
+            "authentication_info": info,
+            "urls": {"direct_download": "https://m/a.zip"},
+        }
+
+    def atlas(block, url="https://a/a.zip"):
+        urls = {"static_current": url} if url else {}
+        return {"requires_auth": bool(block), "authorization": block, "urls": urls}
+
+    page = "https://register.example/"
+    open_ = ("open", None, None, None)
+    cases = {
+        "f-open": ({"mdb": mdb("0")}, open_),
+        "f-q": ({"mdb": mdb("1", "key", page)}, ("key", "query_param", "key", page)),
+        "f-h": ({"mdb": mdb("2", "ApiKey")}, ("key", "header", "ApiKey", None)),
+        "f-other": ({"mdb": mdb("3", "key")}, ("key", "unsupported", None, None)),
+        # The Atlas registration page comes first.
+        "f-both": (
+            {
+                "atlas": atlas(
+                    {"type": "header", "param_name": "x-key", "info_url": page}
+                ),
+                "mdb": mdb("1", "key", "https://elsewhere.example/"),
+            },
+            ("key", "header", "x-key", page),
+        ),
+        "f-basic": (
+            {"atlas": atlas({"type": "basic_auth"}), "mdb": mdb("1", "k", page)},
+            ("key", "basic_auth", None, page),
+        ),
+        "f-template": (
+            {"atlas": atlas({"type": "replace_url", "info_url": "javascript:x()"})},
+            ("key", "unsupported", None, None),
+        ),
+        "f-path": (
+            {"atlas": atlas({"type": "path_segment", "param_name": "key"})},
+            ("key", "unsupported", None, None),
+        ),
+        "f-new-type": (
+            {"atlas": atlas({"type": "cookie", "param_name": "key"})},
+            ("key", "unsupported", None, None),
+        ),
+        # A name that cannot be sent as a header is dropped.
+        "f-bad-name": (
+            {"atlas": atlas({"type": "header", "param_name": "X-Key\r\nHost: x"})},
+            ("key", "header", None, None),
+        ),
+        # The open Atlas URL is the one crawled, whatever the MDB row says.
+        "f-atlas-open": ({"atlas": atlas({}), "mdb": mdb("1", "key")}, open_),
+        # Without a static URL the record that needs a key speaks for the feed.
+        "f-rt": (
+            {"atlas": atlas({"type": "query_param", "param_name": "t"}, url=None)},
+            ("key", "query_param", "t", None),
+        ),
+        "f-rt-mdb": (
+            {"atlas": atlas({}, url=None), "mdb": dict(mdb("2", "h"), urls={})},
+            ("key", "header", "h", None),
+        ),
+    }
+    cache = tmp_path / "cache"
+    _crosswalk(
+        cache, [dict(_feed(ref), **records) for ref, (records, _) in cases.items()]
+    )
+    resolve.resolve(cache, overrides_dir=None)
+    feeds, _ = _resolved(cache)
+    for ref, (_, expected) in cases.items():
+        fields = ("access", "auth_method", "auth_param_name", "registration_url")
+        assert tuple(feeds[ref][field] for field in fields) == expected, ref
+        assert feeds[ref]["auth_params"] is None
+
+
+def test_set_access_records_the_curated_pair_and_stops_the_crawl(tmp_path):
+    page = "https://register.example/"
+    gated = {
+        "requires_auth": True,
+        "authentication_type": "1",
+        "api_key_parameter_name": "key",
+        "authentication_info": page,
+        "urls": {"direct_download": "https://x/a.zip"},
+    }
+    # The open Atlas URL makes the catalogues call the feed open.
+    open_atlas = {"requires_auth": False, "urls": {"static_current": "https://y/a.zip"}}
+    cache = tmp_path / "cache"
+    _crosswalk(
+        cache,
+        [
+            dict(_feed("f-open"), atlas=open_atlas, mdb=gated),
+            dict(_feed("f-key"), mdb=gated),
+        ],
+    )
+    pair = {"client_id": "client_id", "client_secret": "client_secret"}
+    overrides_dir = _overrides_dir(
+        tmp_path,
+        [
+            {
+                "feed": "f-open",
+                "set_access": {"auth_method": "query_param", "auth_params": pair},
+            },
+            {
+                "feed": "f-key",
+                "set_access": {
+                    "auth_method": "header",
+                    "auth_params": {"Authorization": "key"},
+                },
+            },
+        ],
+    )
+    resolve.resolve(cache, overrides_dir=overrides_dir)
+    feeds, manifest = _resolved(cache)
+    assert feeds["f-open"]["access"] == "key"
+    assert feeds["f-open"]["auth_params"] == pair
+    assert feeds["f-open"]["uncrawlable_reason"] == resolve.AUTH_REASON
+    assert feeds["f-open"]["registration_url"] == page
+    assert feeds["f-key"]["auth_method"] == "header"
+    assert feeds["f-key"]["auth_params"] == {"Authorization": "key"}
+    assert feeds["f-key"]["auth_param_name"] is None
+    assert manifest["requires_auth"] == 2
+
+
+@pytest.mark.parametrize(
+    "spec, message",
+    [
+        ({"auth_method": "query_param"}, "mapping of auth_method and auth_params"),
+        ({"auth_method": "cookie", "auth_params": {}}, "auth_method must be one of"),
+        ({"auth_method": "query_param", "auth_params": {}}, "does not fit"),
+        (
+            {"auth_method": "header", "auth_params": {"A": "key", "B": "key"}},
+            "does not fit",
+        ),
+        (
+            {"auth_method": "basic_auth", "auth_params": {"u": "username"}},
+            "does not fit",
+        ),
+        ({"auth_method": "query_param", "auth_params": {"key": "Key"}}, "auth_params"),
+        ({"auth_method": "query_param", "auth_params": {"a b": "key"}}, "auth_params"),
+        ({"auth_method": "header", "auth_params": {"acl:key": "key"}}, "auth_params"),
+        # A query parameter name is sent percent-encoded.
+        (
+            {"auth_method": "query_param", "auth_params": {"acl:consumerKey": "key"}},
+            None,
+        ),
+    ],
+)
+def test_set_access_validation(tmp_path, spec, message):
+    overrides_dir = _overrides_dir(tmp_path, [{"feed": "f-a", "set_access": spec}])
+    if message is None:
+        assert overrides.load_feed_overrides(overrides_dir)[0]["f-a"]["set_access"]
+        return
+    with pytest.raises(overrides.OverrideError, match=message):
+        overrides.load_feed_overrides(overrides_dir)
+
+
 def test_set_identity_rewrites_the_named_fields(tmp_path):
     cache = tmp_path / "cache"
     _crosswalk(cache, [_feed("f-a", name="Old", onestop_id="o-old")])

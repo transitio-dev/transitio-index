@@ -180,6 +180,21 @@ its geometry, a `served` flag and the feeds serving it — to `cache/index-layer
 countries straight from public Overture data, for checking the geography before
 a build.
 
+### Cut the whole catalogue
+
+`python scripts/sample_catalogues.py --partition` cuts every MDB row and every
+Atlas GTFS feed into exactly one label: one per country, a country of more
+than `--batch-size` rows (600 by default) split by subdivision, `other` for
+rows without a country code or moved there with `--exclude`, and `atlas1..K`
+for the Atlas feeds no label picks. A deprecated row stays with the live row
+it folds into. Each cut's `countries.txt` names the countries its label owns:
+`<cc>`, or `<cc>1` for a split country, and `cities`, a label without feeds,
+for the `--country` codes that have no label of their own. The cuts go to
+`cache/sample/run-<label>_*`; once all are written, a `partition-*` directory
+gets `rebuild_map.txt` (a `<label> <cut>` line per label) and
+`partition.json` (each label's cut, countries and digests, and the label of
+every GTFS id).
+
 ### Inspect a build in the browser
 
 `scripts/index_viewer.py` serves the built index — `cache/index` and every
@@ -222,7 +237,8 @@ The index is built one label at a time and each build is archived under
 the newest complete run of every label and writes one snapshot from them:
 
 ```
-python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache-dir cache/merged
+python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache-dir cache/merged \
+    --partition cache/sample/partition-<id>/partition.json
 ```
 
 Every source must be a licensed schema-10 build, and the sources must agree on
@@ -235,6 +251,14 @@ committed into `cache/merged/index/`, and its manifest records each source by
 label, build id and digests, so the publisher can check the lineage. A label
 whose newest run is incomplete or holds no feeds is skipped and reported; an
 older run never stands in for it.
+
+With `--partition`, the merge looks up every MDB and Atlas GTFS id of the cut
+among the merged feed ids and aliases, logs each one missing, each label not
+merged, outside the partition or built from another cut, and records the
+result in the manifest. The publisher refuses a merged snapshot without that
+check, with a label outside the partition or from another cut, or with a
+missing id that `overrides/catalogue_exceptions.yaml` does not list (entries
+of `feed` and `reason`, optionally `author` and `date`).
 
 ### Publish a snapshot
 
