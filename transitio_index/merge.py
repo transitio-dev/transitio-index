@@ -77,8 +77,9 @@ OVERRIDE_FIELDS = (
 # companions linked to it. 6: feeds of different builds with one content
 # identity fold. 7: relevance is rescored over the merged edges. 8: the
 # manifest records the catalogue check. 9: the check covers the curated feeds.
-# 10: schema 11, the providers table and the places' populations.
-MERGE_FORMAT = 10
+# 10: schema 11, the providers table and the places' populations. 11: the
+# NOTICE's credential providers' paragraph.
+MERGE_FORMAT = 11
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -568,8 +569,9 @@ def _providers(stacked, feeds):
 
 def _check_sources(snapshots):
     """Refuse a selection the merge cannot ship: a source below schema 9, an
-    unlicensed one, one without a field of ``AGREED_FIELDS``, or sources
-    disagreeing on one. Returns the agreed values."""
+    unlicensed one or one licensed under another policy (whose NOTICE the
+    merge cannot compose from), one without a field of ``AGREED_FIELDS``, or
+    sources disagreeing on one. Returns the agreed values."""
     agreed = {}
     for build_id, snapshot in snapshots:
         version = snapshot.get("schema_version")
@@ -582,6 +584,12 @@ def _check_sources(snapshots):
             snapshot.get("notice_sha256"), str
         ):
             raise MergeError(f"{build_id}: not a licensed build")
+        policy = snapshot.get("license_policy")
+        if policy != licensing.POLICY_VERSION:
+            raise MergeError(
+                f"{build_id}: licensed under policy {policy!r}; the merge takes "
+                f"policy {licensing.POLICY_VERSION} builds only"
+            )
         for field in AGREED_FIELDS:
             value = snapshot.get(field)
             if not _well_formed(field, value):
@@ -1184,6 +1192,7 @@ def assemble(loaded, tables, notice, alias_conflicts=(), catalogue_check=None):
         ).hexdigest(),
         "licensed": True,
         "notice_sha256": hashlib.sha256(notice).hexdigest(),
+        "license_policy": licensing.POLICY_VERSION,
         **{field: agreed.get(field) for field in AGREED_FIELDS},
         "coverage_mode": (
             "crawled"
@@ -1218,12 +1227,17 @@ def assemble(loaded, tables, notice, alias_conflicts=(), catalogue_check=None):
 # The paragraphs of a NOTICE as the license stage writes it, by their
 # opening words: the geometry credit with its derived sources, the ODbL
 # terms when OpenStreetMap is among them, the metro credits, the
-# catalogues read and the feed-licence inventory.
+# catalogues read, the credential providers and the feed-licence inventory.
 GEOMETRY_OPENING = "This index includes place boundary geometry"
 ODBL_OPENING = "Geometry derived from OpenStreetMap"
 METRO_OPENING = "Metro memberships were derived"
 CATALOGUE_OPENING = "Feed identities and coverage were compiled from:"
 LICENCE_OPENING = "Feed licences declared by the catalogues"
+# A credential provider's entry: its head line, then its notice and feed lines.
+PROVIDER_HEAD = re.compile(
+    r"  - ([a-z0-9-]+): (.*?)(?:; data obtained ([0-9-]{10}) to ([0-9-]{10}))?"
+)
+PROVIDER_LINES = ("      notice: ", "      feed: ")
 # The catalogue lines of a merged NOTICE: the dataset in the license
 # stage's words, the pin the merge names it by, and what the line calls
 # that pin. The Atlas is named by the archive digest each build read, not
@@ -1237,8 +1251,9 @@ NOTICE_CATALOGUES = (
 
 def _notice_sections(notice, build_id):
     """A source NOTICE parsed into its paragraphs, keyed ``geometry``,
-    ``odbl``, ``metro``, ``catalogue`` and ``licence`` (the middle two
-    optional), each a list of lines; refused when it is not UTF-8, holds
+    ``odbl``, ``metro``, ``catalogue``, ``provider`` and ``licence`` (the
+    ``odbl``, ``metro`` and ``provider`` ones optional), each a list of
+    lines; refused when it is not UTF-8, holds
     a paragraph the merge does not know or repeats one, or lacks the
     geometry, catalogue or licence paragraph."""
     try:
@@ -1250,6 +1265,7 @@ def _notice_sections(notice, build_id):
         ("odbl", ODBL_OPENING),
         ("metro", METRO_OPENING),
         ("catalogue", CATALOGUE_OPENING),
+        ("provider", licensing.PROVIDER_OPENING),
         ("licence", LICENCE_OPENING),
     )
     sections = {}
@@ -1318,6 +1334,23 @@ def _catalogue_lines(loaded):
     ]
 
 
+def _provider_entries(lines, build_id):
+    """A source's credential-provider paragraph, after its opening, as
+    ``{provider_id: (name, notice lines, dates, feed lines)}``; a line of
+    no known kind is refused."""
+    entries, current = {}, None
+    for line in lines:
+        head = PROVIDER_HEAD.fullmatch(line)
+        if head is not None:
+            provider_id, name, *dates = head.groups()
+            current = entries[provider_id] = (name, [], set(dates) - {None}, [])
+        elif current is not None and line.startswith(PROVIDER_LINES):
+            current[1 if line.startswith(PROVIDER_LINES[0]) else 3].append(line)
+        else:
+            raise MergeError(f"{build_id}: NOTICE provider line unknown: {line!r}")
+    return entries
+
+
 def _licence_records(feeds):
     """The merged feeds as the records ``licensing._feed_rows`` inventories:
     their catalogue blocks decoded and the licence judgement the stage
@@ -1362,10 +1395,12 @@ def compose_notice(loaded, feeds):
     across the sources) with the union of their derived source lines, the
     ODbL terms when any source carries them, the metro credits once with
     the union of their lines, the catalogues named by every archive and
-    CSV digest the sources read, and the feed-licence inventory recounted
-    over the merged ``feeds``."""
+    CSV digest the sources read, each credential provider once (its name and
+    notice must agree across the sources) with the widest span of days its
+    data were obtained and the union of its feed lines, and the
+    feed-licence inventory recounted over the merged ``feeds``."""
     opening = odbl = metro = None
-    derived, credits = set(), set()
+    derived, credits, providers = set(), set(), {}
     for source in loaded:
         sections = _notice_sections(source["notice"], source["build_id"])
         text, items = _items(sections["geometry"])
@@ -1377,12 +1412,27 @@ def compose_notice(loaded, feeds):
             header, items = _items(sections["metro"])
             metro = _agree(metro, header, "metro notice", source["build_id"])
             credits.update(items)
+        entries = _provider_entries(
+            sections.get("provider", [])[1:], source["build_id"]
+        )
+        for provider_id, (name, notice, dates, feeds_read) in entries.items():
+            kept = providers.setdefault(provider_id, (name, notice, set(), set()))
+            what = f"provider {provider_id} notice"
+            _agree(kept[:2], (name, notice), what, source["build_id"])
+            kept[2].update(dates)
+            kept[3].update(feeds_read)
     paragraphs = [[*opening, *sorted(derived)]]
     if odbl is not None:
         paragraphs.append(odbl)
     if metro is not None:
         paragraphs.append([*metro, *sorted(credits)])
     paragraphs.append([CATALOGUE_OPENING, *_catalogue_lines(loaded)])
+    if providers:
+        lines = [licensing.PROVIDER_OPENING]
+        for provider_id, (name, notice, dates, feeds_read) in sorted(providers.items()):
+            head = licensing.provider_head(provider_id, name, dates)
+            lines += [head, *notice, *sorted(feeds_read)]
+        paragraphs.append(lines)
     paragraphs.append(licensing._licence_lines(_licence_rows(feeds)))
     return ("\n\n".join("\n".join(lines) for lines in paragraphs) + "\n").encode(
         "utf-8"

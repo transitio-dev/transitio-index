@@ -5,7 +5,7 @@ import tarfile
 import pytest
 
 import transitio.index as transitio_index  # noqa: E402
-from transitio_index import classify, geometry, licensing, prune  # noqa: E402
+from transitio_index import classify, crawl, geometry, licensing, prune  # noqa: E402
 from transitio_index import publish, store  # noqa: E402
 from test_index_publish import (  # noqa: E402
     GEOM_HEX,
@@ -125,6 +125,7 @@ def test_the_stage_licenses_what_publication_reads_and_publication_ships_it(tmp_
     with generation:
         notice = generation.read_bytes("NOTICE").decode()
     assert notice.startswith("Boundary geometry from Overture.")
+    assert licensing.PROVIDER_OPENING not in notice  # no provider's data
     assert "Transitland Atlas, commit " in notice and "none declared" in notice
     # Publication reads the licensed artifacts and ships the NOTICE.
     snapshot = publish.publish(cache)
@@ -135,6 +136,71 @@ def test_the_stage_licenses_what_publication_reads_and_publication_ships_it(tmp_
     assert snapshot["notice_sha256"] == hashlib.sha256(notice.encode()).hexdigest()
     index = transitio_index.read_index(cache / "index")
     assert len(index.feeds) == len(feeds) and len(index.edges) == len(edges)
+
+
+def test_the_notice_credits_the_providers_whose_feeds_data_it_holds():
+    def read(feed_id, host, fetched_from, day, **fields):
+        url = f"https://{host}/{feed_id}.zip"
+        last = f"2026-10-0{day}T08:00:00+00:00"
+        record = {"feed_id": feed_id, "atlas": {"urls": {"static_current": url}}}
+        record.update(fetched_from=fetched_from, crawled_url=url, last_crawled=last)
+        return {**record, **fields}
+
+    key, odpt = crawl.MAINTAINER_KEY, "o.example"
+    providers = {
+        "odpt": {"name": "ODPT", "notice": "Open Data Center\nCC BY 4.0"},
+        "nsw": {"name": "TfNSW", "notice": None},
+        "tl": {"name": "Trafiklab", "notice": None},
+    }
+    for provider_id, provider in providers.items():
+        claims = {"odpt": [f"https://{odpt}:443/"]}.get(provider_id, [])
+        provider["url_prefixes"] = claims
+    cc_by = {"spdx_identifier": "CC-BY-4.0"}
+    records = [
+        read("k1", odpt, key, 1, key_provider="odpt", name="Toei"),
+        read("k2", odpt, key, 3, key_provider="odpt", last_modified="Wed, 1 Oct"),
+        # Rebound since: credited to the provider whose key read it.
+        read("k3", odpt, key, 2, key_provider="odpt", access_provider="nsw"),
+        read("n1", "n.example", key, 1, key_provider="nsw"),
+        # Read without a key: its own URL when a provider claims it, the
+        # hosted copy of a feed bound to one.
+        read("own", odpt, crawl.PRODUCER, 2),
+        # Credited by the URL its held data were read from.
+        read("moved", "x.example", crawl.PRODUCER, 2, crawled_url=f"https://{odpt}/m"),
+        read("open", "x.example", crawl.PRODUCER, 2),
+        read("copy", "t.example", crawl.HOSTED_COPY, 2, access_provider="tl"),
+        read("unbound", odpt, crawl.HOSTED_COPY, 2, crawled_url="https://mdb/u"),
+        read("none", odpt, None, 2),
+    ]
+    records[0]["atlas"]["license"] = cc_by
+    records[1]["mdb"] = {"license_url": "https://l.example/"}
+    lines = licensing._provider_lines(records, providers)
+    assert lines == [
+        licensing.PROVIDER_OPENING,
+        "  - nsw: TfNSW; data obtained 2026-10-01 to 2026-10-01",
+        "      feed: n1; no licence declared; https://n.example/n1.zip",
+        "  - odpt: ODPT; data obtained 2026-10-01 to 2026-10-03",
+        "      notice: Open Data Center",
+        "      notice: CC BY 4.0",
+        "      feed: k1 (Toei); CC-BY-4.0; https://o.example/k1.zip",
+        "      feed: k2; https://l.example/; https://o.example/k2.zip; last modified "
+        "Wed, 1 Oct",
+        "      feed: k3; no licence declared; https://o.example/k3.zip",
+        "      feed: moved; no licence declared; https://o.example/m",
+        "      feed: own; no licence declared; https://o.example/own.zip",
+        "      feed: unbound; no licence declared; https://o.example/unbound.zip",
+        "  - tl: Trafiklab; data obtained 2026-10-02 to 2026-10-02",
+        "      feed: copy; no licence declared; https://t.example/copy.zip",
+    ]
+    # Between the catalogues and the licences; none without a credited feed.
+    notice = licensing._notice(None, {}, [], lines)
+    assert notice.index("compiled from") < notice.index(lines[0])
+    assert notice.index(lines[0]) < notice.index("Feed licences")
+    unread = [r for r in records if r["feed_id"] in ("open", "none")]
+    assert licensing._provider_lines(unread, providers) == []
+    # Coverage that predates the crawl provenance is refused, not read.
+    with pytest.raises(licensing.LicenseError, match="re-run the coverage stage"):
+        licensing._provider_lines([{"feed_id": "f", "crawl_status": "ok"}], providers)
 
 
 def test_feed_licences_are_inventoried_per_declared_licence():
@@ -680,3 +746,9 @@ def test_a_changed_judgement_is_a_new_snapshot_even_for_feeds_only(
     licensing.license_index(cache)
     after = publish.publish(cache)
     assert after["snapshot_id"] != before["snapshot_id"]
+    # So is a new licensing policy, whatever the NOTICE says.
+    monkeypatch.setattr(licensing, "POLICY_VERSION", licensing.POLICY_VERSION + 1)
+    licensing.license_index(cache)
+    newer = publish.publish(cache)
+    assert newer["license_policy"] == licensing.POLICY_VERSION
+    assert newer["snapshot_id"] != after["snapshot_id"]

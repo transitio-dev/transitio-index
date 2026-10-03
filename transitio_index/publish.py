@@ -1365,6 +1365,12 @@ def read_inputs(cache_dir, overrides_dir):
     }
 
 
+def _license_policy():
+    from transitio_index import licensing
+
+    return licensing.POLICY_VERSION
+
+
 def _read_providers(overrides_dir, resolve_manifest):
     """The accepted ``access_providers.yaml`` entries by id. The file must
     be the one the resolve stage applied: one no resolve generation applied
@@ -1578,8 +1584,10 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
         if edges is not None:
             digests.append(_content_digest(edges))
         if licensed is not None:
-            # The NOTICE ships too: a corrected attribution is a new snapshot.
+            # The NOTICE ships too, and the policy it was written under: a
+            # corrected attribution is a new snapshot.
             digests.append(hashlib.sha256(licensed).hexdigest())
+            digests.append(f"license policy {_license_policy()}")
         digests.append(_content_digest(providers))
         snapshot_id = _snapshot_id(sources, overture_release, digests)
         partitions = partition(records, places, edges, realtime)
@@ -1643,6 +1651,8 @@ def publish(cache_dir, *, golden_path=None, overrides_dir=None, registry=None):
             "notice_sha256": (
                 None if licensed is None else hashlib.sha256(licensed).hexdigest()
             ),
+            # The licensing policy the NOTICE was written under.
+            "license_policy": None if licensed is None else _license_policy(),
         }
 
         if places is not None:

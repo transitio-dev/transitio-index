@@ -62,3 +62,81 @@
     auth_params: {api_key: api_key}
   reason: The current Muni GTFS; the Mobility Database feed's service ended 2026-08-28.
   date: 2026-10-02
+
+# The catalogue URL carries another account's app_id and names only app_key.
+- feed: f-sp3e-tmb
+  set_access:
+    auth_method: query_param
+    auth_params: {app_id: app_id, app_key: app_key}
+  reason: The TMB API takes an app_id and an app_key.
+  date: 2026-10-03
+
+- feed: f-transport~for~west~midlands
+  set_access:
+    auth_method: query_param
+    auth_params: {app_id: app_id, app_key: app_key}
+  reason: The TfWM API takes an app_id and an app_key.
+  date: 2026-10-03
+
+# The Mobility Database lists Transport Canberra's realtime feeds with an
+# authorization header; Atlas lists the same URLs with basic auth.
+- feed: f-mdb-2676
+  set_access: {auth_method: basic_auth, auth_params: {}}
+  reason: Transport Canberra's API takes basic auth.
+  date: 2026-10-03
+
+- feed: f-mdb-2677
+  set_access: {auth_method: basic_auth, auth_params: {}}
+  reason: Transport Canberra's API takes basic auth.
+  date: 2026-10-03
+
+- feed: f-mdb-2678
+  set_access: {auth_method: basic_auth, auth_params: {}}
+  reason: Transport Canberra's API takes basic auth.
+  date: 2026-10-03
+
+# The catalogue's kd_transitland path does not take KD's public login; the
+# kd_sample path does.
+- feed: f-curated-koleje-dolnoslaskie
+  add_feed:
+    name: Koleje Dolnośląskie
+    url: https://kd.kiedyprzyjedzie.pl/gtfs/kd_sample/google_transit.zip
+    spec: gtfs
+    license:
+      spdx_identifier: CC0-1.0
+      url: https://creativecommons.org/publicdomain/zero/1.0/legalcode.pl
+    location:
+      country_code: PL
+      subdivision_name: Lower Silesian Voivodeship
+    access: key
+    registration_url: https://kolejedolnoslaskie.pl/rozklady-gtfs/
+    access_provider: koleje-dolnoslaskie
+    auth_method: basic_auth
+    auth_params: {}
+  reason: The Koleje Dolnośląskie GTFS at the path KD's public login opens.
+  date: 2026-10-03
+
+# The catalogue's PRIM URL needs a key; IDFM publishes the same GTFS without
+# one.
+- feed: f-curated-idfm
+  add_feed:
+    name: Île-de-France Mobilités
+    url: https://eu.ftp.opendatasoft.com/stif/GTFS/IDFM-gtfs.zip
+    spec: gtfs
+    license:
+      url: https://cloud.fabmob.io/s/eYWWJBdM3fQiFNm
+      use_without_attribution: "no"
+      create_derived_product: "yes"
+      redistribution_allowed: "yes"
+      commercial_use_allowed: "yes"
+      attribution_text: Île-de-France Mobilités
+      attribution_instructions: >-
+        Contient des informations de « Horaires prévus sur les lignes de
+        transport en commun d'Ile-de-France (GTFS Datahub) », présentement
+        mises à disposition aux conditions de la « Licence Mobilités ».
+    location:
+      country_code: FR
+      subdivision_name: Île-de-France
+      municipality: Paris
+  reason: The official keyless copy of the Île-de-France Mobilités GTFS.
+  date: 2026-10-03

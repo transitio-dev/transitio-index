@@ -29,7 +29,7 @@ from builds_fixture import (
 )
 from transitio.index import fingerprint
 
-from transitio_index import builds, classify, merge, store
+from transitio_index import builds, classify, licensing, merge, store
 
 BUILT = "2026-09-{:02d}T00:00:00+00:00".format
 
@@ -412,6 +412,7 @@ MANIFEST_9 = {
     "overrides_sha256": None,
     "feeds_overrides_sha256": None,
     "places_overrides_sha256": None,
+    "license_policy": licensing.POLICY_VERSION,
 }
 
 
@@ -648,6 +649,10 @@ def _drop_feed_columns(archived, fi, columns):
     )
 
 
+def _an_older_licence_policy(archived, fi, de):
+    _rewrite_snapshot(archived / de / "index", lambda s: s.update(license_policy=5))
+
+
 def _with_an_override_digest(archived, fi, de):
     _rewrite_snapshot(archived / de / "index", lambda s: s.update(overrides_sha256="x"))
 
@@ -666,6 +671,7 @@ def _rewritten_notice(archived, fi, de):
     "tamper, message",
     [
         (_unlicensed, "not a licensed build"),
+        (_an_older_licence_policy, "licensed under policy 5"),
         (_mixed_overture, "overture_release differs"),
         (_below_schema_11, "schema_version 10"),
         (_without_a_release, "no usable overture_release"),
@@ -969,6 +975,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         )
         assert entry["sha256"] == hashlib.sha256(data).hexdigest()
     assert manifest["licensed"] is True
+    assert manifest["license_policy"] == licensing.POLICY_VERSION
     assert manifest["notice_sha256"] == hashlib.sha256(b"NOTICE\n").hexdigest()
     assert manifest["overture_release"] == "2026-08-19.0"
     assert manifest["simplify_tolerance_deg"] == 0.0005
@@ -1200,7 +1207,16 @@ def _paragraphs(paragraphs):
     return ("\n\n".join("\n".join(lines) for lines in paragraphs) + "\n").encode()
 
 
-def _notice_text(derived=(), odbl=ODBL, metro=(), geometry=GEOMETRY):
+PROVIDERS = "Feeds from credential providers, under their terms:"
+ODPT = ["      notice: CC BY 4.0", "      notice: feed: a notice reading like a feed"]
+
+
+def _odpt(first, last, feed):
+    head = f"  - odpt: ODPT; data obtained {first} to {last}"
+    return [head, *ODPT, f"      feed: {feed}; CC-BY-4.0; https://o.example/{feed}"]
+
+
+def _notice_text(derived=(), odbl=ODBL, metro=(), geometry=GEOMETRY, providers=()):
     """A NOTICE as the license stage writes it for one build: the geometry
     credit's source list is a block of its own after a blank line, the way
     the geometry audit formats it."""
@@ -1211,7 +1227,10 @@ def _notice_text(derived=(), odbl=ODBL, metro=(), geometry=GEOMETRY):
         paragraphs.append(odbl)
     if metro:
         paragraphs.append([*METRO, *metro])
-    return _paragraphs([*paragraphs, CATALOGUES, LICENCES])
+    paragraphs.append(CATALOGUES)
+    if providers:
+        paragraphs.append([PROVIDERS, *providers])
+    return _paragraphs([*paragraphs, LICENCES])
 
 
 def test_the_merged_notice_credits_every_source_once_and_recounts_the_licences(
@@ -1221,8 +1240,20 @@ def test_the_merged_notice_credits_every_source_once_and_recounts_the_licences(
     _two_runs(
         fx,
         tmp_path,
-        fi_notice=_notice_text(odbl=None, metro=[EUROSTAT]),  # a feeds-only style run
-        de_notice=_notice_text([OSM, ESRI, GEOB], metro=[GHS, EUROSTAT]),
+        fi_notice=_notice_text(
+            odbl=None,
+            metro=[EUROSTAT],
+            providers=_odpt("2026-10-02", "2026-10-03", "a"),
+        ),  # a feeds-only style run
+        de_notice=_notice_text(
+            [OSM, ESRI, GEOB],
+            metro=[GHS, EUROSTAT],
+            providers=[
+                "  - nsw: TfNSW; data obtained 2026-09-30 to 2026-09-30",
+                "      feed: n; no licence declared; https://n.example/n",
+                *_odpt("2026-10-01", "2026-10-02", "b"),
+            ],
+        ),
     )
     loaded, tables = _merged(tmp_path)
     notice = merge.compose_notice(loaded, tables["feeds.parquet"])
@@ -1238,6 +1269,14 @@ def test_the_merged_notice_credits_every_source_once_and_recounts_the_licences(
                 "  - Mobility Database catalog, sha256 " + "b" * 64,
                 "  - Mobility Database catalog, sha256 " + "e" * 64,
                 "  - GBFS systems.csv, sha256 " + "f" * 64,
+            ],
+            # Each provider once: the widest span, the union of its feeds.
+            [
+                PROVIDERS,
+                "  - nsw: TfNSW; data obtained 2026-09-30 to 2026-09-30",
+                "      feed: n; no licence declared; https://n.example/n",
+                *_odpt("2026-10-01", "2026-10-03", "a"),
+                "      feed: b; CC-BY-4.0; https://o.example/b",
             ],
             [
                 "Feed licences declared by the catalogues (feeds per licence):",
@@ -1279,6 +1318,11 @@ def test_the_merged_notice_credits_every_source_once_and_recounts_the_licences(
             "geometry notice differs",
         ),
         (_notice_text(odbl=[*ODBL[:2], "other terms"]), "ODbL notice differs"),
+        (
+            _notice_text(providers=[*_odpt("2026-10-01", "2026-10-01", "a")[:2]]),
+            "provider odpt notice differs",
+        ),
+        (_notice_text(providers=["  * odpt"]), "provider line unknown"),
         (b"\xff\xfe", "not UTF-8"),
     ],
 )
@@ -1286,7 +1330,10 @@ def test_a_source_notice_the_merge_cannot_compose_from_is_refused(
     tmp_path, de_notice, message
 ):
     fx = pytest.importorskip("index_fixture")
-    _two_runs(fx, tmp_path, fi_notice=_notice_text([ESRI, OSM]), de_notice=de_notice)
+    fi_notice = _notice_text(
+        [ESRI, OSM], providers=_odpt("2026-10-01", "2026-10-01", "a")
+    )
+    _two_runs(fx, tmp_path, fi_notice=fi_notice, de_notice=de_notice)
     loaded, tables = _merged(tmp_path)
     with pytest.raises(merge.MergeError, match=message):
         merge.compose_notice(loaded, tables["feeds.parquet"])

@@ -428,7 +428,16 @@ _PROVIDER_REQUIRED = frozenset(
     {"provider_id", "name", "registration_url", "credential_fields", "crawl_approved"}
 )
 _PROVIDER_OPTIONAL = frozenset(
-    {"docs_url", "terms_url", "url_prefixes", "free", "terms_checked", "terms_note"}
+    {
+        "docs_url",
+        "terms_url",
+        "url_prefixes",
+        "free",
+        "terms_checked",
+        "terms_note",
+        "crawl_budget",
+        "notice",
+    }
 )
 
 
@@ -543,6 +552,13 @@ def _provider(entry):
         raise OverrideError("terms_note must be a non-empty string")
     if approved and (checked is None or note is None):
         raise OverrideError("crawl_approved needs terms_checked and terms_note")
+    budget = entry.get("crawl_budget")
+    if budget is not None and (type(budget) is not int or budget < 1):
+        raise OverrideError("crawl_budget must be a whole number of at least 1")
+    notice = entry.get("notice")
+    lines = notice.strip("\n").split("\n") if isinstance(notice, str) else [""]
+    if notice is not None and not all(line.strip() for line in lines):
+        raise OverrideError("notice must be a non-empty string without blank lines")
     canonical = set()
     for _, host, port, segments in scopes:
         host = f"[{host}]" if ":" in host else host
@@ -557,6 +573,8 @@ def _provider(entry):
         "crawl_approved": approved,
         "terms_checked": checked,
         "terms_note": note,
+        "crawl_budget": budget,
+        "notice": None if notice is None else "\n".join(lines),
     }
 
 
@@ -570,8 +588,10 @@ def load_access_providers(overrides_dir):
     unique in the file), ``name``, ``registration_url``, the
     ``credential_fields`` its accounts issue (``key``, ``client_id``) and
     ``crawl_approved``; optionally ``docs_url``, ``terms_url``, ``free``,
-    ``url_prefixes`` (the https URLs under which it claims feeds) and the
-    ``terms_checked`` date with a ``terms_note``, which an approval needs.
+    ``url_prefixes`` (the https URLs under which it claims feeds), the
+    ``terms_checked`` date with a ``terms_note``, which an approval needs,
+    ``crawl_budget``, the keyed requests a month the crawl may make, and
+    ``notice``, the attribution its terms ask for, which the NOTICE carries.
     An entry breaking these rules is refused; two providers whose prefixes
     cover one URL are a build error.
     """

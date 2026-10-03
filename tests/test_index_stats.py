@@ -8,7 +8,7 @@ import pytest
 pytest.importorskip("pyarrow")
 import pyarrow.parquet as pq  # noqa: E402
 
-from transitio_index import stats, store  # noqa: E402
+from transitio_index import crawl, stats, store  # noqa: E402
 
 
 def _mdb(mdb_id, status="active", **kw):
@@ -472,6 +472,7 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
                 atlas={"license": {"url": "https://far.example/terms"}},
             ),
             "download_url": "https://far.example/g.zip",
+            "access_provider": "far-key",
         },
         _feed("lost", mdb_id="mdb-5", home="FI", scope="domestic"),
         _feed(
@@ -511,7 +512,8 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
             "feed_id": "far",
             "method": "not_modified",
             "url": "https://far.example/g.zip",
-            "fetched_from": "producer",
+            "fetched_from": "maintainer_key",
+            "key_crawl": "read",
         },
         {"feed_id": "lost", "method": "range"},
         {"feed_id": "bikes", "method": "skipped", "fallback_reason": "boom"},
@@ -561,6 +563,7 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
     assert by_id["far"]["licence_state"] == "declared"
     assert by_id["far"]["download_url"] == "https://far.example/g.zip"
     assert by_id["far"]["crawl_outcome"] == "not_modified"
+    assert by_id["far"]["key_crawl"] == "read" and by_id["hsl"]["key_crawl"] is None
     assert by_id["lost"]["municipality_outcome"] == "unplaceable"
     assert by_id["lost"]["country_agreement"] == "undeclared"
     bikes = by_id["bikes"]
@@ -569,8 +572,8 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
     # A published download_url wins over the blocks; a realtime companion's
     # row, which has none, gives its MDB endpoint.
     mdb = {"urls": {"direct_download": "https://rt.example/vp"}}
-    assert stats._download_url({"download_url": None, "mdb": mdb}) is None
-    assert stats._download_url({"mdb": mdb}) == "https://rt.example/vp"
+    assert crawl.feed_url({"download_url": None, "mdb": mdb}) is None
+    assert crawl.feed_url({"mdb": mdb}) == "https://rt.example/vp"
     sections = stats.feed_sections(rows)
     assert sections["availability"]["by_outcome"] == {
         "ok": 2,
@@ -581,6 +584,7 @@ def test_feed_rows_join_the_crawl_log_placements_and_edges():
     }
     assert sections["availability"]["failures_by_class"] == {"404": 1}
     assert sections["availability"]["hosted_copy_by_host"] == {"hsl.fi": 1}
+    assert sections["availability"]["key_crawl_by_provider"] == {"far-key": {"read": 1}}
     assert sections["availability"]["outcome_by_catalogue_status"] == {
         "active": {"ok": 1},
         "deprecated": {"failed": 1},

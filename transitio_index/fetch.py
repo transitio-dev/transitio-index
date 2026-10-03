@@ -30,6 +30,7 @@ body, a body short of its Content-Length, or an over-ceiling stream all raise
 a whole download) rather than being papered over.
 """
 
+import contextlib
 import hashlib
 import ipaddress
 import os
@@ -41,6 +42,7 @@ import zlib
 
 import httpx
 import idna
+from transitio.exceptions import DownloadError
 
 from transitio_index import overture, store
 
@@ -70,7 +72,8 @@ _REDIRECTS = (301, 302, 303, 307, 308)
 
 # Hostnames that always mean "not the internet", whatever DNS says. Literal
 # addresses are judged by ipaddress below; hostname-based DNS tricks are out of
-# scope for a maintainer batch tool that never sends credentials.
+# scope for a maintainer batch tool, which sends credentials only to the https
+# access origins of the providers it approves.
 _BLOCKED_NAMES = ("localhost",)
 _BLOCKED_SUFFIXES = (".localhost", ".local", ".internal")
 
@@ -296,6 +299,62 @@ def _attempt_error(url, first, last):
     return _failure(f"GET {url}: {first}; last attempt: {last}", **kind)
 
 
+def _retried(error, keyed):
+    """Whether a failed download attempt is tried again: any without a key,
+    a keyed one (whose errors are all :class:`FetchError`) only after a
+    transport failure or a 5xx, as providers limit keyed requests."""
+    return keyed is None or error.transport or (error.status or 0) >= 500
+
+
+@contextlib.contextmanager
+def _keyed_errors():
+    """transitio's refusals as a :class:`FetchError` with their message,
+    which names no URL; an httpx error as its class name alone."""
+    try:
+        yield
+    except DownloadError as error:
+        raise FetchError(str(error)) from None
+    except httpx.TransportError as error:
+        raise _failure(type(error).__name__, transport=True) from None
+    except httpx.HTTPError as error:
+        raise FetchError(type(error).__name__) from None
+
+
+class _Guarded(httpx.BaseTransport):
+    """The hops of a keyed download, each through the fetcher's checks
+    before ``inner`` sends it: the URL check (on the URL without its query,
+    where a query credential travels), the host breaker and rate, the
+    request count and ``spend``, which counts the request against its
+    provider's budget or refuses it. ``refuse``, when given, refuses a URL
+    holding a secret."""
+
+    def __init__(self, fetcher, inner, spend, refuse):
+        self._fetcher = fetcher
+        self._inner = inner
+        self._spend = spend
+        self._refuse = refuse
+
+    def handle_request(self, request):
+        fetcher, method = self._fetcher, request.method
+        url = str(request.url.copy_with(query=None))
+        if self._refuse is not None and self._refuse(str(request.url)):
+            raise FetchError(f"{method}: the request URL holds a credential")
+        _, host = check_url(url)
+        fetcher._admit(method, url, host)
+        fetcher._throttle(host)
+        fetcher._admit(method, url, host)
+        self._spend()
+        fetcher.requests += 1
+        try:
+            response = self._inner.handle_request(request)
+        except httpx.TransportError:
+            fetcher._note(host, url, failed=True)
+            raise
+        if response.status_code in _REDIRECTS:
+            fetcher._note(host, url, failed=False)
+        return response
+
+
 def _refuse_encoding(response, url, *, gzip_ok=False):
     """Refuse a content-encoded answer: offsets and lengths mean raw bytes.
 
@@ -327,6 +386,7 @@ class Fetcher:
         # Redirects are followed manually in _hops, so every hop is checked,
         # throttled and counted. Identity encoding keeps byte counts, ranges
         # and Content-Length in one currency: raw bytes on the wire.
+        self._transport = transport
         self._client = httpx.Client(
             transport=transport,
             follow_redirects=False,
@@ -453,6 +513,21 @@ class Fetcher:
             return url, response
         raise FetchError(f"{method} {url}: more than {REDIRECT_LIMIT} redirects")
 
+    @contextlib.contextmanager
+    def keyed(self, access, proxy, spend, refuse=None):
+        """transitio's walk session for one download with the credentials of
+        ``access`` (a transitio ``_Access``), each hop through
+        :class:`_Guarded` over this fetcher's transport, else one through
+        ``proxy(access.url)``, the proxy for credentialed requests."""
+        inner = self._transport or httpx.HTTPTransport(proxy=proxy(access.url))
+        try:
+            guarded = _Guarded(self, inner, spend, refuse)
+            with access.session(self._client, guarded) as session:
+                yield session
+        finally:
+            if inner is not self._transport:
+                inner.close()
+
     def head(self, url):
         """Size, range support and validators, from a ``HEAD`` probe."""
         _, response = self._hops("HEAD", url, {})
@@ -569,6 +644,7 @@ class Fetcher:
         etag=None,
         last_modified=None,
         max_bytes=MAX_DOWNLOAD_BYTES,
+        keyed=None,
     ):
         """Stream ``url`` into ``name`` under ``directory``; return the outcome.
 
@@ -586,7 +662,8 @@ class Fetcher:
         ``status``, ``sha256``, ``bytes``, the ``content_type`` and the response
         validators (kept from the responses that supplied them, so a resumed
         download still records the validators for the next crawl's
-        conditional request).
+        conditional request). ``keyed`` opens a keyed walk session
+        (:meth:`keyed`) for each attempt, whose requests ask for gzip.
         """
         conditional = {}
         if etag:
@@ -602,7 +679,7 @@ class Fetcher:
         # A host that answers 406 to identity encoding gets one more chance
         # with gzip; its body is decoded as it streams and never resumed by
         # range (offsets into the encoded body mean nothing to the file).
-        encoded = False
+        encoded = keyed is not None
         # The first failure is the informative one: a later attempt refused
         # by the host breaker would otherwise replace it in the record.
         first_error = None
@@ -646,13 +723,16 @@ class Fetcher:
                             written,
                             max_bytes,
                             gzip_ok=encoded,
+                            keyed=keyed,
                         )
                     except (httpx.HTTPError, FetchError) as error:
                         first_error = first_error or error
                         if not isinstance(error, _Dropped) or error.written <= written:
                             opened_file.seek(written)
                             opened_file.truncate()
-                            if attempt == DOWNLOAD_ATTEMPTS:
+                            if attempt == DOWNLOAD_ATTEMPTS or not _retried(
+                                error, keyed
+                            ):
                                 raise _attempt_error(url, first_error, error)
                             continue
                         last = error
@@ -732,10 +812,25 @@ class Fetcher:
                 os.close(handle)
             store.unlink(directory, partial)
 
-    def _stream_once(
-        self, url, headers, opened_file, digest, written, max_bytes, *, gzip_ok=False
+    def _stream_once(self, url, headers, *args, gzip_ok=False, keyed=None):
+        """One streaming attempt (:meth:`_read_once`), through a session
+        ``keyed`` opens when given."""
+        if keyed is None:
+            final, response = self._hops("GET", url, headers, stream=True)
+            _, host = check_url(final)
+            return self._read_once(url, host, response, *args, gzip_ok=gzip_ok)
+        with (
+            _keyed_errors(),
+            keyed() as session,
+            session.stream("GET", url, headers=headers) as response,
+        ):
+            _, host = check_url(str(response.url))
+            return self._read_once(url, host, response, *args, gzip_ok=gzip_ok)
+
+    def _read_once(
+        self, url, host, response, opened_file, digest, written, max_bytes, *, gzip_ok
     ):
-        """One streaming attempt; returns what happened rather than raising.
+        """One attempt's response; returns what happened rather than raising.
 
         Network errors propagate (the caller retries); protocol answers are
         returned so the caller can distinguish 304, a refused resume, 406 to
@@ -747,8 +842,6 @@ class Fetcher:
         gzip trailer does, and a body cut before it is an error.
         """
         expected = None
-        final, response = self._hops("GET", url, headers, stream=True)
-        _, host = check_url(final)
         try:
             if response.status_code not in (200, 206) or (
                 written and response.status_code != 206
