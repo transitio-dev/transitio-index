@@ -78,8 +78,13 @@
   reason: The TfWM API takes an app_id and an app_key.
   date: 2026-10-03
 
-# The Mobility Database lists Transport Canberra's realtime feeds with an
-# authorization header; Atlas lists the same URLs with basic auth.
+# The Mobility Database lists Transport Canberra's static and realtime feeds
+# with an authorization header; Atlas lists the same URLs with basic auth.
+- feed: f-mdb-2675
+  set_access: {auth_method: basic_auth, auth_params: {}}
+  reason: Transport Canberra's API takes basic auth.
+  date: 2026-10-03
+
 - feed: f-mdb-2676
   set_access: {auth_method: basic_auth, auth_params: {}}
   reason: Transport Canberra's API takes basic auth.
