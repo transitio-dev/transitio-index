@@ -528,7 +528,9 @@ class Registry:
         payload = _serialize(self.header, self.rows)
         directory = store.open_directory(self.path.parent)
         try:
-            self.digest = store.write_bytes(directory, self.path.name, payload)
+            self.digest = store.write_bytes(
+                directory, self.path.name, payload, limit=MAX_REGISTRY_BYTES
+            )
             directory.sync()
         finally:
             directory.close()

@@ -97,10 +97,11 @@ LOG_FILE = "crawl_log.jsonl"
 STATE_FILE = "state.json"
 ARCHIVE_FILE = "feed.zip"
 
-# The ranged path buffers a member in memory, so it takes one only up to the
-# store's artifact ceiling and hands larger ones to the whole download, which
+# The ranged path buffers a member in memory, so it takes one only up to
+# RANGED_MEMBER_BYTES and hands larger ones to the whole download, which
 # streams each member to disk; that path's ceiling bounds disk alone, and a
 # national aggregate's stop_times.txt runs to several GiB.
+RANGED_MEMBER_BYTES = 256 * 1024 * 1024
 DOWNLOAD_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 
 # Where a crawl read the feed from: its producer URL, or the MDB-hosted copy.
@@ -694,9 +695,7 @@ def _write_ranged(fetcher, url, probe, feed_dir, decide, fragment=None):
         entry = directory.get(root + name)
         if entry is None:
             return
-        data = ziprange.read_member(
-            read, entry, max_member_bytes=store.MAX_ARTIFACT_BYTES
-        )
+        data = ziprange.read_member(read, entry, max_member_bytes=RANGED_MEMBER_BYTES)
         store.write_bytes(feed_dir, name, data)
         digests[name] = hashlib.sha256(data).hexdigest()
 

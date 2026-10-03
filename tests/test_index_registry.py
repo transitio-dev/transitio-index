@@ -218,11 +218,11 @@ def test_the_lock_refuses_a_second_writer_and_a_changed_file_is_not_overwritten(
         # arrives between the re-read and the replacement is refused.
         real = registry.store.write_bytes
 
-        def paused(directory, name, data):
+        def paused(directory, name, data, **kwargs):
             with pytest.raises(registry.RegistryError, match="another build"):
                 with registry.session(path):
                     pass
-            return real(directory, name, data)
+            return real(directory, name, data, **kwargs)
 
         monkeypatch.setattr(registry.store, "write_bytes", paused)
         reg.minted += 1
