@@ -541,10 +541,10 @@ def test_an_oversized_member_fails_without_leaving_the_archive(tmp_path, monkeyp
 
 
 def test_a_member_over_the_ranged_buffer_downloads_whole(tmp_path, monkeypatch):
-    # The ranged reader buffers a member in memory, so one over the store's
-    # artifact ceiling is left to the whole download, which streams it.
+    # The ranged reader buffers a member in memory, so one over its ceiling
+    # is left to the whole download, which streams it.
     cache = tmp_path / "cache"
-    monkeypatch.setattr(store, "MAX_ARTIFACT_BYTES", 2000)  # stop_times alone is over
+    monkeypatch.setattr(crawl, "RANGED_MEMBER_BYTES", 2000)  # stop_times alone is over
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
     _, log = _crawl(
         cache, _server({"/a.zip": (_zip_bytes(), '"v1"')}), range_threshold=1

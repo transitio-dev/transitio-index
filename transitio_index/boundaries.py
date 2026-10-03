@@ -38,8 +38,8 @@ from transitio_index.progress import progress
 # The single-file memo written before parts existed; read as one part.
 DIVISIONS_FILE = "divisions.parquet"
 PART_PATTERN = re.compile(r"divisions-(\d{4,})\.parquet")
-# A part is split until it is well under the store's artifact ceiling.
-PART_BYTES = store.MAX_ARTIFACT_BYTES // 2
+# Parts are split at about 128 MB; a single row larger than that stays whole.
+PART_BYTES = 128 * 1024 * 1024
 COVERED_FILE = "covered.jsonl"
 MEMO_CRS = "EPSG:4326"
 

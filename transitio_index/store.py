@@ -43,12 +43,11 @@ RUN_POINTER = "run.json"
 RUN_LOCK = "run.lock"
 GENERATION_ATTEMPTS = 8
 
-# Artifacts are JSONL of a few MB. `resolve` holds the verified bytes in
-# memory, so this ceiling also bounds what one resolution can retain.
-MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
+# Per artifact: room for a label's expanded places with boundary geometry.
+MAX_ARTIFACT_BYTES = 1536 * 1024 * 1024
 # `resolve` retains every artifact in memory at once, so the whole set is
 # bounded as well as each file.
-MAX_RESOLUTION_BYTES = 512 * 1024 * 1024
+MAX_RESOLUTION_BYTES = 3 * 1024 * 1024 * 1024
 
 O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
