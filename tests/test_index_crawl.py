@@ -875,28 +875,24 @@ HOSTED = "https://files.example/mdb-1/latest.zip"
     [
         ("open", httpx.ConnectTimeout, HOSTED, "download", "mdb_latest", "stub"),
         ("open", None, None, "failed", None, None),  # a 404 with no hosted copy
-        ("open", 410, HOSTED, "download", "mdb_latest", "HTTP 410"),
         ("open", 403, HOSTED, "download", "mdb_latest", "HTTP 403"),
-        ("open", 401, HOSTED, "download", "mdb_latest", "HTTP 401"),
+        ("open", 503, HOSTED, "download", "mdb_latest", "HTTP 503"),
         ("open", HTML, HOSTED, "download", "mdb_latest", "an HTML page"),
-        ("open", 503, HOSTED, "failed", None, None),  # the server's failure
+        # A body that is neither the archive nor a page fails the read too.
+        ("open", b"\x08\x01\x12\x04data", HOSTED, "download", "mdb_latest", "zip"),
         ("open", _zip_bytes(), HOSTED, "download", "producer", None),
-        # A feed flagged as needing a key: its URL is read without one first,
-        # and any failure of that read falls back.
+        # A feed flagged as needing a key: its URL is read without one first.
         ("key", _zip_bytes(), HOSTED, "download", "producer", None),
-        ("key", 503, HOSTED, "download", "mdb_latest", "HTTP 503"),
     ],
     ids=[
         "timeout",
         "404-no-hosted-copy",
-        "410",
         "403",
-        "401",
-        "html",
         "5xx",
+        "html",
+        "not-an-archive",
         "producer-ok",
         "key-served-without-one",
-        "key-5xx",
     ],
 )
 def test_a_dead_producer_link_falls_back_to_the_hosted_copy(
@@ -937,6 +933,31 @@ def test_a_dead_producer_link_falls_back_to_the_hosted_copy(
         expected,
         fetched_from,
     )
+
+
+def test_the_crawlers_own_limit_is_not_retried_from_the_hosted_copy(
+    tmp_path, monkeypatch
+):
+    # A member over the crawler's byte ceiling fails the read on this side:
+    # the hosted copy would hit the same ceiling, so it is never requested.
+    monkeypatch.setattr(crawl, "DOWNLOAD_MEMBER_BYTES", 1)
+    cache = tmp_path / "cache"
+    feed = _feed("f-a", PRODUCER_URL)
+    feed["mdb"] = {"urls": {"latest": HOSTED}}
+    _publish_resolved(cache, [feed])
+    served = {
+        "/a.zip": (_zip_bytes(), '"p1"'),
+        "/mdb-1/latest.zip": (_zip_bytes(), '"h1"'),
+    }
+    inner, paths = _server(served), []
+    transport = httpx.MockTransport(
+        lambda request: paths.append(request.url.path) or inner.handler(request)
+    )
+    _, log = _crawl(cache, transport)
+    record = log["f-a"]
+    assert (record["method"], record["fetched_from"]) == ("failed", None)
+    assert "member ceiling" in record["fallback_reason"]
+    assert "/mdb-1/latest.zip" not in paths
 
 
 @pytest.mark.parametrize(

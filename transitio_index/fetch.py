@@ -118,6 +118,11 @@ class RangeUnsupported(FetchError):
     """The server did not honour a range request; download the file whole."""
 
 
+class TooLarge(FetchError):
+    """A body, range or member over the caller's byte ceiling: the reader's
+    own limit rather than a failure of the server."""
+
+
 class _Dropped(FetchError):
     """An identity body cut off by the transport after ``written`` bytes, all
     of them whole chunks already written and hashed."""
@@ -563,7 +568,7 @@ class Fetcher:
         bytes plus one probe chunk, never whole.
         """
         if size > max_bytes:
-            raise FetchError(
+            raise TooLarge(
                 f"{url}: range of {size} bytes is over the {max_bytes}-byte ceiling"
             )
         headers = {"Range": f"bytes={start}-{start + size - 1}"}
@@ -887,7 +892,7 @@ class Fetcher:
                 nonlocal written
                 written += len(chunk)
                 if written > max_bytes:
-                    raise FetchError(f"download exceeds the {max_bytes}-byte ceiling")
+                    raise TooLarge(f"download exceeds the {max_bytes}-byte ceiling")
                 digest.update(chunk)
                 opened_file.write(chunk)
 

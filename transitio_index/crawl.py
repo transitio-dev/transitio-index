@@ -21,14 +21,16 @@ cheap: a feed whose validators match the stored state — and whose cached
 members verify against their recorded digests — is skipped, except when
 ``cache/recrawl_requests.jsonl`` names it, which bypasses the skip so a
 requested complete read cannot be starved by an unchanged ETag. One feed's
-failure of any kind is logged, never fatal to the run. A producer link that
-times out, cannot connect, answers 401, 403, 404 or 410, or serves an HTML page
-is retried once from the feed's MDB-hosted copy (``urls.latest``), as is any
-failed producer read of a feed that needs a key, which is requested without
-one; the state and the log record say which was read (``fetched_from``) and
-keep the producer's failure. When both fail, it is read with the maintainer's
-key where its provider approves (:mod:`transitio_index.keys`), and the state
-names that provider (``key_provider``); ``key_crawl`` says how the key was used.
+failure of any kind is logged, never fatal to the run. A producer read that
+fails on the producer's side — a dead or moved link, a server error, a
+redirect loop, a body that is not the archive or a broken one — is retried once
+from the feed's MDB-hosted copy (``urls.latest``); the crawler's own byte
+ceilings, local I/O and memory failures are not. A feed that needs a key is
+requested without one first. The state and the log record say which was read
+(``fetched_from``) and keep the producer's failure. When both fail, it is read
+with the maintainer's key where its provider approves
+(:mod:`transitio_index.keys`), and the state names that provider
+(``key_provider``); ``key_crawl`` says how the key was used.
 
 ``crawl_log.jsonl`` records, per feed, its catalogue source (mdb, atlas, both
 or systems_csv; curated for a feed ``add_feed`` added), the method taken, the
@@ -108,10 +110,6 @@ DOWNLOAD_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 PRODUCER = "producer"
 HOSTED_COPY = "mdb_latest"
 MAINTAINER_KEY = "maintainer_key"  # its producer URL, with the maintainer's key
-# The producer answers that refuse or lose the link rather than fail the feed;
-# a 401 asks for credentials the catalogues did not mention, a 403 is often a
-# bot wall, or a storage bucket hiding a removed object.
-FALLBACK_STATUSES = (401, 403, 404, 410)
 # A body that is not a zip archive is an HTML page when served as one, or when
 # it opens with markup carrying one of these tags in its first 4 KiB.
 HTML_TYPES = ("text/html", "application/xhtml+xml")
@@ -143,15 +141,13 @@ def _hosted_url(feed):
     return ((feed.get("mdb") or {}).get("urls") or {}).get("latest")
 
 
-def _link_failed(error):
-    """Whether a producer failure is the link's rather than the feed's: a
-    timeout or failed connection, an HTTP 401, 403, 404 or 410, or an HTML
-    page."""
-    return isinstance(error, fetch.FetchError) and (
-        error.transport
-        or error.status in FALLBACK_STATUSES
-        or isinstance(error, HtmlPage)
-    )
+def _producer_failed(error):
+    """Whether a failed read is the producer's: its link, its answer or its
+    archive. The crawler's own byte ceilings, local I/O and memory are not."""
+    return isinstance(
+        error,
+        (fetch.FetchError, zipfile.BadZipFile, ziprange.RangeReadError, zlib.error),
+    ) and not isinstance(error, fetch.TooLarge)
 
 
 def _dir_name(feed_id):
@@ -712,7 +708,7 @@ def _write_member(feed_dir, archive, info):
     its declared size; return ``(temporary name, sha256)``. The caller owns
     the temporary."""
     if info.file_size > DOWNLOAD_MEMBER_BYTES:
-        raise fetch.FetchError(
+        raise fetch.TooLarge(
             f"{info.filename}: {info.file_size} bytes is over the member ceiling"
         )
     handle, partial = store.create_temporary(feed_dir)
@@ -822,16 +818,14 @@ def _extract_members(feed_dir, decide, fragment=None, check=None):
 def _crawl_keyless(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
     """Crawl one feed without a key; returns its log record.
 
-    The producer URL is read first, without credentials. When it fails the
-    way a dead, moved or unreachable link does (:func:`_link_failed`), or in
-    any way for a feed that needs a key, the MDB-hosted copy is read once in
-    its place; the record keeps the producer URL and its failure.
+    The producer URL is read first, without credentials. When that read fails
+    on the producer's side (:func:`_producer_failed`), the MDB-hosted copy is
+    read once in its place; the record keeps the producer URL and its failure.
     """
     options = {"force": force, "range_threshold": range_threshold, "lookup": lookup}
     record, error = _crawl_from(fetcher, cache_dir, feed, feed_url(feed), **options)
     hosted = _hosted_url(feed)
-    keyed = error is not None and feed.get("access") == "key"
-    if not (keyed or _link_failed(error)) or not hosted or hosted == record["url"]:
+    if not _producer_failed(error) or not hosted or hosted == record["url"]:
         return record
     retry, _ = _crawl_from(
         fetcher,

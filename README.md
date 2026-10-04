@@ -103,12 +103,13 @@ matching registry together.
    the generation's `access_report.jsonl` lists the protected feeds no
    provider claims and the access curation errors.
 5. `crawl` — fetch every crawlable feed, first without credentials. A feed's own
-   URL is read first; when it fails as a dead or refused link does, the
-   crawl reads the feed's copy hosted by the Mobility Database instead. A
-   GTFS feed the catalogues or overrides say needs a key is crawled the same
-   way, falling back to that copy on any failure and then to the
-   maintainer's key where its provider approves (see below); one without a
-   URL, or of which the crawl reads no copy, is marked uncrawlable,
+   URL is read first; when that read fails on the producer's side (a dead or
+   refused link, a server error, a redirect loop, a file that is not the
+   archive or a broken one), the crawl reads the feed's copy hosted by the
+   Mobility Database instead. A GTFS feed the catalogues or overrides say
+   needs a key is crawled the same way, and then with the maintainer's key
+   where its provider approves (see below); one without a URL, or of which
+   the crawl reads no copy, is marked uncrawlable,
    "requires authentication". Its access details stay as given either way.
 6. `expand` — add the places a feed's crawled stops actually fall in that the
    declared seed missed.
