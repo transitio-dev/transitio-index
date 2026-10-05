@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 pytest.importorskip("pyarrow")
+import pyarrow as pa  # noqa: E402
 import shapely  # noqa: E402
 
 import overture_fixture as fx  # noqa: E402
@@ -21,10 +22,12 @@ import test_index_boundaries as bt  # noqa: E402
 import test_index_coverage as ct  # noqa: E402
 import test_index_crawl as crt  # noqa: E402
 import test_index_fetch as ft  # noqa: E402
+import test_index_publish as pt  # noqa: E402
 import test_index_ziprange as zt  # noqa: E402
 from transitio_index import (  # noqa: E402
     atlas,
     boundaries,
+    builds,
     classify,
     coverage,
     crawl,
@@ -34,6 +37,7 @@ from transitio_index import (  # noqa: E402
     metros,
     names,
     overture,
+    publish,
     registry,
     resolve,
     seed,
@@ -1830,3 +1834,25 @@ def test_a_feed_needing_a_key_is_crawled_from_its_hosted_copy(tmp_path):
     )
     fields = ("crawlable", "access", "auth_method", "registration_url")
     assert [feeds[0][field] for field in fields] == [True, "key", "query_param", page]
+
+
+@pytest.mark.parametrize(
+    "records",
+    [[], [{"feed_id": "f-a", "home_country": None}]],
+    ids=["no-feeds", "feeds-placed-nowhere"],
+)
+def test_a_build_with_no_edges_still_loads_as_a_build_with_places(records):
+    """A build whose feeds reach no place, like one with no feeds at all,
+    gives each partition of places empty feeds and edges tables: the loader
+    refuses a partitioned build that lacks any of the three tables."""
+    places = [pt._place("riy", "city", country_code="SA")]
+    parts = publish.partition(records, places, [])
+    assert parts["SA"]["feeds"] == [] and parts["SA"]["edges"] == []
+    tables = {
+        f"{name}/{table}.parquet": pa.table(
+            {"id": pa.array([None] * len(rows), pa.string())}
+        )
+        for name, by_table in parts.items()
+        for table, rows in by_table.items()
+    }
+    assert builds._join_partitions(tables) is not None

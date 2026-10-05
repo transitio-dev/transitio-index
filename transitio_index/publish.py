@@ -829,8 +829,9 @@ def partition(records, places, edges, realtime=()):
     under the feed's home country when the place lies there, else into
     ``links`` with ``feed_partition``. Nothing is dropped: the partitions and
     the links together are the flat tables (``static_edges`` has already
-    left the companions' edges out). A build without feeds gives each
-    partition of places empty feeds and edges tables.
+    left the companions' edges out). A build with no edges at all — no feeds,
+    or no feed placed anywhere — gives each partition of places empty feeds
+    and edges tables, so it loads as a build with places.
     """
     home = {record["feed_id"]: record.get("home_country") for record in records}
     parts = collections.defaultdict(dict)
@@ -853,7 +854,8 @@ def partition(records, places, edges, realtime=()):
             )
         country[place["place_id"]] = code
         parts[code].setdefault("places", []).append(place)
-        if not records:
+    if not edges:
+        for code in set(country.values()):
             parts[code].setdefault("feeds", [])
             parts[code].setdefault("edges", [])
     for edge in edges or ():
