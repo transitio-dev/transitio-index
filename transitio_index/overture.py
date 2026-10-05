@@ -39,7 +39,8 @@ log = logging.getLogger(__name__)
 # read timeout, or one of those wrapped in ``URLError`` (how urllib surfaces a
 # connect-phase socket error). An HTTP status error (``HTTPError``, a URLError
 # subclass) is caught with them and sorted by ``_transient``: a 5xx is the
-# server's or a gateway's failure and is retried, a 4xx is ours and stays
+# server's or a gateway's failure and is retried, a 429 asks us to slow down
+# and is retried after its ``Retry-After``, any other 4xx is ours and stays
 # fatal. A truncated body (``IncompleteRead``) is not here either: it signals
 # an oversized response the batch loop bisects rather than re-reads whole.
 _TRANSIENT_ERRORS = (
@@ -48,6 +49,8 @@ _TRANSIENT_ERRORS = (
     socket.timeout,
     urllib.error.URLError,
 )
+# The longest ``Retry-After`` a 429 is waited for; a longer one waits this long.
+RETRY_AFTER_MAX = 120
 
 OVERTURE_RELEASE = "2026-08-19.0"
 OVERTURE_BUCKET = "overturemaps-us-west-2"
@@ -327,11 +330,35 @@ def _earth_point(value):
     return None
 
 
+def _rate_limited(error):
+    """Whether Wikidata answered 429 Too Many Requests."""
+    return isinstance(error, urllib.error.HTTPError) and error.code == 429
+
+
 def _transient(error):
     """Whether a Wikidata failure is the transport's or a gateway's rather than
-    our request's: every transient error, and an HTTP 5xx — a proxy's 502 on a
-    dropped tunnel included. A 4xx is a hard error."""
-    return not isinstance(error, urllib.error.HTTPError) or error.code >= 500
+    our request's: every transient error, an HTTP 5xx — a proxy's 502 on a
+    dropped tunnel included — and a 429. Any other 4xx is a hard error."""
+    return (
+        not isinstance(error, urllib.error.HTTPError)
+        or error.code >= 500
+        or _rate_limited(error)
+    )
+
+
+def _retry_delay(error, attempt):
+    """Seconds to wait before the next attempt: a 429's ``Retry-After`` in
+    seconds (at least 1, at most :data:`RETRY_AFTER_MAX`), or a longer back-off
+    when it gives none; otherwise the short exponential back-off."""
+    if _rate_limited(error):
+        try:
+            seconds = float(error.headers.get("Retry-After"))
+        except (AttributeError, TypeError, ValueError):
+            seconds = math.nan
+        if math.isnan(seconds):
+            return min(2 ** (attempt + 2), RETRY_AFTER_MAX)
+        return min(max(seconds, 1.0), RETRY_AFTER_MAX)
+    return min(2**attempt, 8)
 
 
 def _label(error):
@@ -551,9 +578,11 @@ class WikidataClient:
         try:
             apply(batch)
         except (http.client.IncompleteRead, *_TRANSIENT_ERRORS) as error:
-            if not _transient(error):
+            if not _transient(error) or _rate_limited(error):
                 # A 4xx is our request's fault, not a transport hiccup, and stays
-                # fatal even though HTTPError is a urllib.error.URLError subclass.
+                # fatal even though HTTPError is a urllib.error.URLError subclass;
+                # a 429 that outlasted the retries is too: bisecting would only
+                # send more requests to a server asking for fewer.
                 raise
             if len(batch) <= 1:
                 log.warning(
@@ -620,7 +649,8 @@ class WikidataClient:
         A transient transport failure (a dropped connection, reset or read
         timeout) or an HTTP 5xx — the server's or a gateway's failure to answer —
         is retried with a short back-off, so one network hiccup does not abort a
-        build; the last failure is raised once the attempts run out. A 4xx is
+        build; a 429 is retried after its ``Retry-After`` (:func:`_retry_delay`).
+        The last failure is raised once the attempts run out. Any other 4xx is
         our request's fault and is raised at once, and a truncated body
         (``IncompleteRead``) is left to the caller's batch bisection."""
         request = urllib.request.Request(
@@ -639,7 +669,7 @@ class WikidataClient:
                     attempt + 1,
                     self.attempts,
                 )
-                time.sleep(min(2**attempt, 8))
+                time.sleep(_retry_delay(error, attempt))
 
 
 def resolve_qid(record, p402_map):

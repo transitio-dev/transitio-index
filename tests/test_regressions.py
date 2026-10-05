@@ -151,12 +151,15 @@ def test_wikidata_labels_bisect_a_failing_batch_and_skip_a_bad_entity(boom):
     assert set(result) == {f"Q{n}" for n in range(1, 11)}
 
 
-@pytest.mark.parametrize("code, fatal", [(404, True), (502, False)], ids=["4xx", "5xx"])
+@pytest.mark.parametrize(
+    "code, fatal", [(404, True), (429, True), (502, False)], ids=["4xx", "429", "5xx"]
+)
 def test_wikidata_labels_treat_a_4xx_as_fatal_and_a_5xx_as_transient(code, fatal):
     """A 4xx during a label batch is our request's fault and stays fatal — not
     bisected and skipped — even though HTTPError is a urllib.error.URLError
-    subclass; a 5xx (a proxy's 502 on a dropped tunnel included) is the
-    transport's and degrades like one: bisected, then the ids skipped."""
+    subclass, and so is a 429 that outlasted the retries; a 5xx (a proxy's 502
+    on a dropped tunnel included) is the transport's and degrades like one:
+    bisected, then the ids skipped."""
 
     class Failing(overture.WikidataClient):
         def _entities_batch(self, batch, out):
@@ -173,28 +176,41 @@ def test_wikidata_labels_treat_a_4xx_as_fatal_and_a_5xx_as_transient(code, fatal
         assert client.labels_and_aliases(qids) == {}
 
 
+def _too_many(retry_after):
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return overture.urllib.error.HTTPError("u", 429, "too many", headers, None)
+
+
 @pytest.mark.parametrize(
-    "boom, retried",
+    "boom, retried, waited",
     [
-        (lambda: http.client.RemoteDisconnected("boom"), True),
+        (lambda: http.client.RemoteDisconnected("boom"), True, 1),
         (
             lambda: overture.urllib.error.HTTPError("u", 502, "gateway", None, None),
             True,
+            1,
         ),
+        # A 429 waits its Retry-After, capped; without one, a longer back-off.
+        (lambda: _too_many("7"), True, 7.0),
+        (lambda: _too_many("3600"), True, overture.RETRY_AFTER_MAX),
+        (lambda: _too_many(None), True, 4),
+        (lambda: _too_many("NaN"), True, 4),
         (
             lambda: overture.urllib.error.HTTPError("u", 404, "missing", None, None),
             False,
+            None,
         ),
     ],
-    ids=["disconnect", "5xx", "4xx"],
+    ids=["disconnect", "5xx", "429", "429-capped", "429-no-header", "429-nan", "4xx"],
 )
 def test_wikidata_get_json_retries_transport_failures_not_bad_requests(
-    monkeypatch, boom, retried
+    monkeypatch, boom, retried, waited
 ):
-    """A dropped Wikidata connection, or a 5xx from the server or a gateway, is
-    retried rather than fatal; a 4xx is our request's fault and is raised at
-    once."""
+    """A dropped Wikidata connection, a 5xx from the server or a gateway, or a
+    429 is retried rather than fatal; any other 4xx is our request's fault and
+    is raised at once."""
     calls = {"n": 0}
+    sleeps = []
 
     class FakeResponse:
         def __enter__(self):
@@ -213,15 +229,17 @@ def test_wikidata_get_json_retries_transport_failures_not_bad_requests(
         return FakeResponse()
 
     monkeypatch.setattr(overture.urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(overture.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(overture.time, "sleep", sleeps.append)
     client = overture.WikidataClient()
     if retried:
         assert client._get_json("https://example.invalid") == {"ok": 1}
         assert calls["n"] == 2
+        assert sleeps == [waited]
     else:
         with pytest.raises(overture.urllib.error.HTTPError):
             client._get_json("https://example.invalid")
         assert calls["n"] == 1
+        assert sleeps == []
 
 
 def test_a_stop_on_another_division_of_a_known_qid_is_not_stale():
