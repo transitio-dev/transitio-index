@@ -1896,3 +1896,54 @@ def test_a_release_asset_uploads_in_pieces_of_a_declared_length(tmp_path, monkey
     assert int(headers["Content-Length"]) == sum(map(len, pieces))
     assert "Transfer-Encoding" not in headers
     assert len(pieces) > 1 and max(map(len, pieces)) <= 1024
+
+
+@pytest.mark.parametrize("stale", [2, 99], ids=["catches-up", "stays-stale"])
+def test_the_round_trip_waits_out_a_cached_release_listing(
+    tmp_path, monkeypatch, stale
+):
+    """GitHub serves the anonymous release listing cached for up to 60 s, so
+    the round trip, asked once right after the flip, resolved the release
+    before the one just published and reported a good release as failed."""
+    fx = pytest.importorskip("index_fixture")
+    from test_index_publisher import _index
+
+    monkeypatch.setattr(publisher, "ROUND_TRIP_INTERVAL", 0)
+    fake = fx.FakeGitHub()
+    manifest = fx.manifest_bytes(snapshot_id="0000000000000001")
+    older = fake.seed("index-0000000000000001", {"manifest.json": manifest})
+    inner = fake.transport()
+    listings = []
+
+    class Cached(httpx.BaseTransport):
+        def handle_request(self, request):
+            response = inner.handle_request(request)
+            if (
+                request.url.path == "/repos/o/r/releases"
+                and request.method == "GET"
+                and "Authorization" not in request.headers
+            ):
+                listings.append(request)
+                if len(listings) <= stale:
+                    kept = [r for r in response.json() if r["id"] == older["id"]]
+                    return httpx.Response(200, json=kept)
+            return response
+
+    def publish():
+        return publisher.publish_index(
+            _index(tmp_path),
+            cache_dir=tmp_path / "cache",
+            repository="o/r",
+            token="secret",
+            api_url=fx.API,
+            out_dir=tmp_path / "out",
+            transport=Cached(),
+        )
+
+    if stale < publisher.ROUND_TRIP_ATTEMPTS:
+        assert publish()["snapshot_id"] != "0000000000000001"
+        assert len(listings) == stale + 1
+    else:
+        with pytest.raises(publisher.PublishIndexError, match="'0000000000000001'"):
+            publish()
+        assert len(listings) == publisher.ROUND_TRIP_ATTEMPTS

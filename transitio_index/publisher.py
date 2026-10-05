@@ -8,7 +8,8 @@ assets, downloads each one back and checks its digest, and only then flips
 the draft to published — a plain release is listable the moment it exists, so
 publishing the draft is the atomic commit. Last it lists the releases as an
 anonymous client would and confirms the newest compatible one is the snapshot
-just published.
+just published, asking again for up to two minutes while GitHub still serves
+an anonymous listing cached from before the release.
 
 The index is read through the reader first, so nothing the reader would
 refuse can ship. The token is only ever sent to the API host and the upload
@@ -25,6 +26,7 @@ import pathlib
 import shutil
 import tarfile
 import tempfile
+import time
 
 import httpx
 
@@ -36,6 +38,10 @@ TIMEOUT = 60.0
 # An asset is uploaded in pieces of this size, so TIMEOUT bounds each piece's
 # write, not the whole asset's.
 UPLOAD_CHUNK = 1 << 20
+# GitHub may serve the anonymous release listing up to 60 s old, so the round
+# trip asks again at this interval, this many times in all.
+ROUND_TRIP_INTERVAL = 10.0
+ROUND_TRIP_ATTEMPTS = 13
 # The stage locks the publish stage holds, in its order.
 STAGE_LOCKS = (
     "raw",
@@ -708,10 +714,15 @@ def publish_index(
     # must be the one just published. From here on the release is public.
     try:
         with _client(api_url, None, transport) as anonymous:
-            listing = contract.list_releases(anonymous, repository)
-            release, found, skipped = contract.newest_compatible(
-                listing, lambda asset: contract.read_manifest(anonymous, asset)
-            )
+            for attempt in range(max(1, ROUND_TRIP_ATTEMPTS)):
+                if attempt:
+                    time.sleep(ROUND_TRIP_INTERVAL)
+                listing = contract.list_releases(anonymous, repository)
+                release, found, skipped = contract.newest_compatible(
+                    listing, lambda asset: contract.read_manifest(anonymous, asset)
+                )
+                if found is not None and found.get("snapshot_id") == snapshot_id:
+                    break
     except Exception as error:  # noqa: B902 - the release is public: say so
         raise PublishIndexError(
             f"release {tag} is published, but the round trip failed: {error}"
