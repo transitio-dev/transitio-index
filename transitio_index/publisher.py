@@ -33,6 +33,9 @@ from transitio.index import read_index
 from transitio.index import release as contract
 
 TIMEOUT = 60.0
+# An asset is uploaded in pieces of this size, so TIMEOUT bounds each piece's
+# write, not the whole asset's.
+UPLOAD_CHUNK = 1 << 20
 # The stage locks the publish stage holds, in its order.
 STAGE_LOCKS = (
     "raw",
@@ -54,6 +57,11 @@ class PublishIndexError(RuntimeError):
 
 def _sha256(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def _pieces(data):
+    for start in range(0, len(data), UPLOAD_CHUNK):
+        yield data[start : start + UPLOAD_CHUNK]
 
 
 def _members(index_dir):
@@ -655,8 +663,11 @@ def publish_index(
                 client.post(
                     upload_url,
                     params={"name": asset},
-                    content=data,
-                    headers={"Content-Type": "application/octet-stream"},
+                    content=_pieces(data),
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": str(len(data)),
+                    },
                 ),
                 f"uploading {asset}",
             ).json()
