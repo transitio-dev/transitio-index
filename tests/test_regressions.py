@@ -38,11 +38,13 @@ from transitio_index import (  # noqa: E402
     names,
     overture,
     publish,
+    publisher,
     registry,
     resolve,
     seed,
     store,
 )
+from transitio.index import release as contract  # noqa: E402
 
 GOOD = [{"dataset": "OpenStreetMap", "license": "ODbL-1.0", "property": ""}]
 
@@ -1856,3 +1858,41 @@ def test_a_build_with_no_edges_still_loads_as_a_build_with_places(records):
         for table, rows in by_table.items()
     }
     assert builds._join_partitions(tables) is not None
+
+
+def test_a_release_asset_uploads_in_pieces_of_a_declared_length(tmp_path, monkeypatch):
+    """An asset went up as a single write, which the client's timeout bounded
+    as a whole, so an archive too large to send within it never uploaded."""
+    fx = pytest.importorskip("index_fixture")
+    from test_index_publisher import _index
+
+    monkeypatch.setattr(publisher, "UPLOAD_CHUNK", 1024)
+    inner = fx.FakeGitHub().transport()
+    uploads = {}
+
+    class Recording(httpx.BaseTransport):
+        def handle_request(self, request):
+            if request.method == "POST" and "name" in request.url.params:
+                pieces = list(request.stream)
+                uploads[request.url.params["name"]] = (request.headers, pieces)
+                request = httpx.Request(
+                    request.method,
+                    request.url,
+                    headers=request.headers,
+                    content=b"".join(pieces),
+                )
+            return inner.handle_request(request)
+
+    summary = publisher.publish_index(
+        _index(tmp_path),
+        cache_dir=tmp_path / "cache",
+        repository="o/r",
+        token="secret",
+        api_url=fx.API,
+        out_dir=tmp_path / "out",
+        transport=Recording(),
+    )
+    headers, pieces = uploads[contract.archive_name(summary["snapshot_id"])]
+    assert int(headers["Content-Length"]) == sum(map(len, pieces))
+    assert "Transfer-Encoding" not in headers
+    assert len(pieces) > 1 and max(map(len, pieces)) <= 1024
