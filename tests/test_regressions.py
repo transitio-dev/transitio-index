@@ -1760,6 +1760,50 @@ def test_set_boundary_applies_to_a_place_expand_discovers(tmp_path, stale, joine
     assert manifest["stale_place_overrides"] == stale
 
 
+@pytest.mark.parametrize("seeded", [False, True], ids=["discovered", "seeded"])
+def test_a_discovered_city_takes_its_councils_curated_boundary(tmp_path, seeded):
+    """Expand lent a discovered city with no area its council's Overture
+    area and never lent again, so the city kept that area when the council's
+    boundary was curated — in expand, or by the geometry stage for a seeded
+    council. It now takes the council's curated boundary."""
+    import test_index_expand as ex
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import overrides
+
+    curated = shapely.box(17.9, 59.25, 18.1, 59.4)
+    entry = {"place": "Q506250", "set_boundary": shapely.to_wkt(curated)}
+    directory = write_overrides(tmp_path, places=[entry])
+    rows = list(ex.SEED_PLACES)
+    if seeded:
+        # The municipality as the geometry stage left it.
+        rows.append(
+            {
+                "place_id": "Q506250",
+                "kind": "region",
+                "source_subtype": "county",
+                "resolution_method": "overture_wikidata",
+                "name": "Stockholms kommun",
+                "country_code": "SE",
+                "overture_id": "se-sto-county",
+                "geometry": shapely.to_wkb(curated).hex(),
+                "geometry_source": geometry.CURATED,
+                "metro_ids": [],
+                "member_ids": [],
+            }
+        )
+    cache = tmp_path / "cache"
+    ex._publish_names(
+        cache, rows, places_overrides_sha256=overrides.places_digest(directory)
+    )
+    ex._write_crawl(cache, "f-sto", ["s1,59.33,18.07\n"])
+    _, places, _ = ex._expand(tmp_path, cache, overrides_dir=directory)
+    stockholm = places["Q1754"]
+    assert stockholm["parent_id"] == "Q506250"
+    assert stockholm["geometry_source"] == geometry.COUNCIL_AREA
+    assert shapely.from_wkb(bytes.fromhex(stockholm["geometry"])).equals(curated)
+
+
 def _council(country, subtype, name, qid=None, **names):
     """A division record as ``seed.council_area`` reads it."""
     return {
