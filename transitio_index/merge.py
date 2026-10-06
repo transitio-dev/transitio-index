@@ -79,8 +79,8 @@ OVERRIDE_FIELDS = (
 # manifest records the catalogue check. 9: the check covers the curated feeds.
 # 10: schema 11, the providers table and the places' populations. 11: the
 # NOTICE's credential providers' paragraph. 12: stale pairs leave the place
-# shares.
-MERGE_FORMAT = 12
+# shares. 13: a place's service and validity are summed over the merged edges.
+MERGE_FORMAT = 13
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -375,9 +375,10 @@ def merge_tables(sources, skipped=()):
     companions follow the feed from the newest build carrying the id. A feed
     lists the companions linked to it. Every table gains ``build_id``. The
     edges' relevance is scored again over the merged edges (see
-    :func:`_rescored`). The snapshot recounts the merged tables and lists the
-    ``sources``, the ``skipped`` runs, the ``alias_conflicts``, the
-    ``content_folds`` and the ``relevance`` rescore.
+    :func:`_rescored`), and each place's ``service`` and ``validity`` summed
+    over them (see :func:`_place_aggregates`). The snapshot recounts the
+    merged tables and lists the ``sources``, the ``skipped`` runs, the
+    ``alias_conflicts``, the ``content_folds`` and the ``relevance`` rescore.
     """
     ranked = sorted(sources, key=lambda source: source[0])
     ranked.sort(key=lambda source: _built_at(source[1]) or _EPOCH, reverse=True)
@@ -482,6 +483,9 @@ def merge_tables(sources, skipped=()):
         tables["places.parquet"] = _populations(
             tables["places.parquet"], merged["places.parquet"]
         )
+    tables["places.parquet"] = _place_aggregates(
+        tables["places.parquet"], tables["edges.parquet"], tables["feeds.parquet"]
+    )
     if "access_providers.parquet" in merged:
         tables["access_providers.parquet"] = _providers(
             merged["access_providers.parquet"], tables["feeds.parquet"]
@@ -538,6 +542,30 @@ def _populations(places, stacked):
     )
     values = [by_id.get(place_id) for place_id in places["place_id"].to_pylist()]
     return _replaced(places, "population", values, publish._PLACES_SCHEMA)
+
+
+def _place_aggregates(places, edges, feeds):
+    """``places`` with each place's ``service`` and ``validity`` summed
+    again over the merged edges by publish's own helpers: a place's row comes
+    from one build, and other builds' feeds may serve it too. A place no
+    merged edge serves gets null. Edges without ``service`` or ``evidence``
+    leave the places as taken, and a places table without ``validity`` gains
+    none."""
+    if not {"service", "evidence"} <= set(edges.column_names):
+        return places
+    rows = edges.select(["place_id", "feed_id"]).to_pylist()
+    for column in ("service", "evidence"):
+        for row, value in zip(rows, _json_records(edges, column)):
+            row[column] = value
+    sums = {"service": publish._service_by_place(rows)}
+    if "validity" in places.column_names:
+        spans = feeds.select(["feed_id", "service_start", "service_end"])
+        sums["validity"] = publish._validity_by_place(rows, spans.to_pylist())
+    ids = places["place_id"].to_pylist()
+    for name, by_place in sums.items():
+        values = [publish._json_block(by_place.get(place_id)) for place_id in ids]
+        places = _replaced(places, name, values, publish._PLACES_SCHEMA)
+    return places
 
 
 def _providers(stacked, feeds):

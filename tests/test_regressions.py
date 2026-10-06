@@ -1391,6 +1391,77 @@ def test_an_expired_feed_leaves_the_place_shares_and_service():
     }
 
 
+def test_a_merged_places_service_and_validity_sum_every_builds_feeds(tmp_path):
+    """The merge kept a place's service and validity from the build serving
+    it most, so Prague stored 16 feeds and 822 departures a day against 42
+    feeds over the merged edges."""
+    from builds_fixture import BOX, _feed7, _place, _run
+
+    from transitio_index import merge
+
+    def edge(feed, stops, departures, **evidence):
+        service = {"stops": stops, "routes": 1, "departures_per_day": departures}
+        return {
+            "place_id": "prg",
+            "feed_id": feed,
+            "tier": "local",
+            "service": json.dumps(service),
+            "evidence": json.dumps({"share_of_feed": 1.0, **evidence}),
+            "needs_review": False,
+            "relevance_category": "primary",
+            "relevance": 1.0,
+            "cross_border": False,
+        }
+
+    places = [
+        _place(p, "city", p, None, BOX(14, 49, 17, 50), "CZ", validity="{}")
+        for p in ("prg", "brn")
+    ]
+    ended = {"stale_when_indexed": "2023-11-06"}
+    sources = []
+    for label, digit, feeds, edges in (
+        ("cz", 1, [("pid", "2026-10-01", "2026-12-12")], [edge("pid", 8000, 6e5)]),
+        (
+            "de",
+            2,
+            [
+                ("a", "2026-09-01", "2026-12-31"),
+                ("b", "2026-10-01", "2026-11-30"),
+                ("dpp", "2023-01-01", "2023-11-06"),
+            ],
+            [edge("a", 50, 800.0), edge("b", 23, 22.0), edge("dpp", 400, 5e5, **ended)],
+        ),
+    ):
+        run = _run(
+            tmp_path,
+            label,
+            digit,
+            places=places,
+            feeds=[_feed7(f, f, "CZ", "domestic", start=s, end=e) for f, s, e in feeds],
+            edges={"CZ": edges},
+            built_at=f"2026-09-1{digit}T00:00:00+00:00",
+        )
+        snapshot, _, tables = builds.load_tables(tmp_path / run / "index")
+        sources.append((run, snapshot, tables))
+    _, tables = merge.merge_tables(sources)
+    rows = {p["place_id"]: p for p in tables["places.parquet"].to_pylist()}
+    assert rows["prg"]["build_id"] == sources[1][0]
+    # The stale feed stays out of the service and in the validity.
+    assert json.loads(rows["prg"]["service"]) == {
+        "feeds": 3,
+        "stops": 8073,
+        "routes": 3,
+        "departures_per_day": 600822.0,
+    }
+    validity = json.loads(rows["prg"]["validity"])
+    assert (validity["feeds_dated"], validity["start"], validity["end"]) == (
+        4,
+        "2023-01-01",
+        "2026-12-31",
+    )
+    assert rows["brn"]["service"] is None and rows["brn"]["validity"] is None
+
+
 def _padded(text, width=150):
     """Every line of ``text`` padded with trailing spaces, as Renfe writes."""
     return "".join(line + " " * width + "\n" for line in text.splitlines()).encode()
