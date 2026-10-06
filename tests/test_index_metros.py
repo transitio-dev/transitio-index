@@ -744,12 +744,16 @@ def test_a_city_gets_a_metro_of_each_definition_it_falls_in(tmp_path):
     assert summary["edition"] == urau.EDITION and summary["covered_countries"] == ["FI"]
     assert summary["metros_published"] == 1 and summary["metros_reported"] == 0
     assert summary["assignments"] == {"assigned": 1, "unassigned": 1, "unplaceable": 1}
+    assert summary["min_share"] == urau.MIN_SHARE
     assert manifest["metros"] == 2 and manifest["cities_with_metro"] == 2
     assert set(manifest["derived_inputs"]["urau"]) == {urau.AREAS_FILE}
     inventory = {row["dataset"]: row for row in manifest["derived_inventory"]}
     assert inventory["GISCO Urban Audit 2024"]["allowed"] is True
     assert inventory["GISCO Urban Audit 2024"]["memberships"] == 1
     assert inventory["Overture Maps divisions"]["memberships"] == 3
+    # The area's land was measured in the NUTS-3 regions, credited for it too.
+    assert summary["land"] == "NUTS-3 regions"
+    assert inventory["GISCO NUTS 2021"]["memberships"] == 3
     rows = _artefact(tmp_path, "metro_assignments.jsonl")
     assert sorted((r["city_id"], r["subtype"], r["status"]) for r in rows) == [
         ("Q1757", "functional urban area", "assigned"),
@@ -774,6 +778,20 @@ def test_an_unavailable_urban_audit_input_leaves_the_other_definition(
     assert manifest["derived_inputs"]["urau"] is None
     datasets = {row["dataset"] for row in manifest["derived_inventory"]}
     assert "GISCO Urban Audit 2024" not in datasets
+
+
+def test_without_nuts_land_a_functional_urban_area_measures_the_footprint(
+    tmp_path, monkeypatch
+):
+    def unavailable(cache_dir, *, expected=eurostat.PINS):
+        raise eurostat.EurostatError("composition.xlsx: unavailable")
+
+    monkeypatch.setattr(eurostat, "load_inputs", unavailable)
+    manifest, places = _run(tmp_path, {}, urau=URAU_AREAS)
+    assert places["eurostat_fua:FI001F"]["member_ids"] == ["Q1757"]
+    assert manifest["urau"]["land"] == "footprint, NUTS-3 unavailable"
+    datasets = {row["dataset"] for row in manifest["derived_inventory"]}
+    assert "GISCO NUTS 2021" not in datasets
 
 
 def test_the_derived_gate_closes_the_urban_audit_definition_alone(

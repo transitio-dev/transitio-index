@@ -6,7 +6,8 @@ metro's CBSA code (P882), and each such metro is emitted as a ``metro`` place.
 Cities of the countries Eurostat's pinned inputs cover get a metro of each
 Eurostat definition they fall in: the NUTS-3 region containing the city's
 Overture land areas gives its metropolitan region, the Urban Audit polygon
-containing them its functional urban area, and every region or area with
+holding at least ``urau.MIN_SHARE`` of them (inside the NUTS-3 regions, when
+those are read) its functional urban area, and every region or area with
 member cities is published as a ``metro`` keyed by its Eurostat code; a
 curator ``set_statistical_area`` crosswalk may instead merge it onto a chosen
 QID. Everywhere: the FAO city-region a
@@ -46,12 +47,13 @@ from transitio_index.progress import progress
 
 # The Overture land areas every derived membership is placed by.
 OVERTURE_DERIVED = ("Overture Maps divisions", "CDLA-Permissive-2.0")
+NUTS_DERIVED = ("GISCO NUTS 2021", "EuroGeographics-NC")
 # The derived inputs the Eurostat branch needs approved, as allowlist keys;
 # any one missing runs the branch report-only.
 EUROSTAT_DERIVED = (
     OVERTURE_DERIVED,
     ("Eurostat metropolitan regions", "Eurostat-2011/833/EU"),
-    ("GISCO NUTS 2021", "EuroGeographics-NC"),
+    NUTS_DERIVED,
 )
 # A FAO city-region's members were placed by Overture land areas in FAO
 # regions, so both are derived inputs of the published membership.
@@ -70,10 +72,14 @@ URAU_DERIVED = (OVERTURE_DERIVED, geometry.URAU_DERIVED)
 # A definition of a metropolitan area the Eurostat branch derives: the
 # manifest key its inputs are recorded under, the subtype its rows carry, the
 # registry namespace (and crosswalk scheme) of its codes, the derived-source
-# keys a membership consumes, and the pinned files those are versioned by —
-# one per key after Overture's.
+# keys a membership consumes, the pinned files those are versioned by — one
+# per key after Overture's — and the share of a city's land a region must
+# hold for the city to join it (None: the region under its representative
+# point).
 Definition = collections.namedtuple(
-    "Definition", ["branch", "subtype", "namespace", "derived", "files"]
+    "Definition",
+    ["branch", "subtype", "namespace", "derived", "files", "min_share"],
+    defaults=(None,),
 )
 METROPOLITAN_REGION = Definition(
     "eurostat",
@@ -83,7 +89,12 @@ METROPOLITAN_REGION = Definition(
     (eurostat.COMPOSITION_FILE, eurostat.BOUNDARIES_FILE),
 )
 FUNCTIONAL_URBAN_AREA = Definition(
-    "urau", urau.SUBTYPE, urau.NAMESPACE, URAU_DERIVED, (urau.AREAS_FILE,)
+    "urau",
+    urau.SUBTYPE,
+    urau.NAMESPACE,
+    URAU_DERIVED,
+    (urau.AREAS_FILE,),
+    urau.MIN_SHARE,
 )
 DEFINITIONS = (METROPOLITAN_REGION, FUNCTIONAL_URBAN_AREA)
 # What a derived input raises when it is missing, altered, unreadable or
@@ -595,17 +606,22 @@ def _derived_inventory(consumed):
     return rows
 
 
-def _consumed(definition, inputs_manifest, memberships):
-    """A definition's derived inputs at their pinned versions."""
+def _consumed(definition, inputs_manifest, memberships, land=None):
+    """A definition's derived inputs at their pinned versions, with the NUTS-3
+    boundaries when ``land`` (the Eurostat inputs) measured its shares."""
     digests = inputs_manifest["digests"]
     versions = (
         overture.OVERTURE_RELEASE,
         *(digests[name] for name in definition.files),
     )
-    return {
+    consumed = {
         key: (version, memberships)
         for key, version in zip(definition.derived, versions)
     }
+    if land is not None:
+        version = land[2]["digests"][eurostat.BOUNDARIES_FILE]
+        consumed[NUTS_DERIVED] = (version, memberships)
+    return consumed
 
 
 def _fao_version(inputs_manifest, centres=None):
@@ -948,9 +964,12 @@ def _attach_definition(
     areas,
     wikidata,
     place_overrides,
+    land=None,
 ):
     """The Eurostat branch for one ``definition`` over its loaded ``inputs``
-    and the cities' land ``areas``; returns ``(assignments, consumed,
+    and the cities' land ``areas`` — measured, for a definition with a
+    ``min_share``, inside the NUTS-3 regions of ``land`` (the Eurostat
+    inputs, None for none); returns ``(assignments, consumed,
     summary, applied)`` — the assignment rows (each naming the definition's
     subtype), the derived inputs read as ``{(dataset, licence): (version,
     memberships)}``, the branch summary, and the crosswalk entries that
@@ -968,7 +987,16 @@ def _attach_definition(
     """
     composition, boundaries, inputs_manifest = inputs
     covered = eurostat.countries(composition)
-    assignments = eurostat.assign(places, areas, composition, boundaries)
+    if definition.min_share is None:
+        land = None
+    assignments = eurostat.assign(
+        places,
+        areas,
+        composition,
+        boundaries,
+        min_share=definition.min_share,
+        land=land[1] if land is not None else None,
+    )
     for row in assignments:
         row["subtype"] = definition.subtype
     members = {}
@@ -1042,10 +1070,15 @@ def _attach_definition(
             sorted(collections.Counter(row["status"] for row in assignments).items())
         ),
     }
+    if definition.min_share is not None:
+        summary["min_share"] = definition.min_share
+        summary["land"] = (
+            "NUTS-3 regions" if land is not None else "footprint, NUTS-3 unavailable"
+        )
     assigned = sum(1 for row in assignments if row["status"] == "assigned")
     return (
         assignments,
-        _consumed(definition, inputs_manifest, assigned),
+        _consumed(definition, inputs_manifest, assigned, land),
         summary,
         crosswalked,
     )
@@ -1252,6 +1285,9 @@ def attach_metros(
                 and p.get("overture_id")
             }
             areas = geometry.place_areas(cache_dir, dataset, places, wanted)
+            # Land shares are measured in the NUTS-3 regions of the Eurostat
+            # inputs the run records, so the expand stage measures them alike.
+            land = euro if _snapshot(euro, EUROSTAT_DERIVED) is not None else None
             assignments, crosswalked = [], 0
             summaries = {}
             for definition, inputs in branches:
@@ -1276,6 +1312,7 @@ def attach_metros(
                     areas=areas,
                     wikidata=wikidata,
                     place_overrides=place_overrides,
+                    land=land,
                 )
                 assignments.extend(rows)
                 consumed.append(consumed_by)

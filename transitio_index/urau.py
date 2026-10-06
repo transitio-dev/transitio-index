@@ -6,8 +6,11 @@ of the employed residents commute into it (the EC–OECD definition); the
 Urban Audit publishes one polygon per area. The GISCO shapefile is fetched
 once, checked against a pinned checksum and published as the ``raw/urau.json``
 generation; the reader parses the generation's verified bytes. Each area is
-the one region of a metro of its own, so ``eurostat.assign`` places a city in
-the area covering its footprint exactly as it places one in a NUTS-3 region.
+the one region of a metro of its own, in the shapes ``eurostat.assign``
+reads. A city joins the area holding at least ``MIN_SHARE`` of its land: its
+Overture footprint inside the NUTS-3 regions, whose coastline leaves out the
+sea a coastal footprint takes in, or the whole footprint where the NUTS-3
+boundaries are not read.
 """
 
 import re
@@ -35,6 +38,8 @@ CATEGORY = "F"  # the file's other categories are cities and greater cities
 AREA_CODE = re.compile(r"\A([A-Z]{2})[0-9]{3}F\Z")
 CROSS_BORDER = "CB"  # one country's part of an area astride a border
 NUTS3_CODE = re.compile(r"\A([A-Z]{2})[0-9A-Z]{3}\Z")
+# The share of a city's land an area must hold for the city to join it.
+MIN_SHARE = 0.5
 
 
 class UrauError(pinned.PinnedInputError):

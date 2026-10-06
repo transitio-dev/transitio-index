@@ -364,10 +364,13 @@ def _mint(places_by_id, codes, added, key, metro):
     return metro
 
 
-def _attach_eurostat_metros(places_by_id, codes, city_rows, areas, euro, definition):
+def _attach_eurostat_metros(
+    places_by_id, codes, city_rows, areas, euro, definition, land=None
+):
     """Eurostat metro membership of one ``definition`` for the discovered
     cities, mirroring the metros stage over the inputs it read (``euro``,
-    None for none): each city is assigned to its area, whose metro is found
+    None for none) and the Eurostat inputs it measured land shares in
+    (``land``): each city is assigned to its area, whose metro is found
     among the published places by its code (``codes``) or minted, and
     joined. Returns ``(added, touched, assignments)`` — the metro keys
     minted, every metro a city joined, and the assignment rows the FAO
@@ -379,7 +382,14 @@ def _attach_eurostat_metros(places_by_id, codes, city_rows, areas, euro, definit
     if euro is None:
         return added, touched, []
     composition, nuts_boundaries, _ = euro
-    assignments = eurostat.assign(city_rows, areas, composition, nuts_boundaries)
+    assignments = eurostat.assign(
+        city_rows,
+        areas,
+        composition,
+        nuts_boundaries,
+        min_share=definition.min_share,
+        land=land[1] if land is not None else None,
+    )
     for row in assignments:
         # Every assigned city's metro publishes here, found or minted.
         row["subtype"] = definition.subtype
@@ -734,7 +744,7 @@ def _discover(
         (metros.FUNCTIONAL_URBAN_AREA, urau_inputs),
     ):
         added, touched, rows = _attach_eurostat_metros(
-            places_by_id, codes, city_rows, areas, inputs, definition
+            places_by_id, codes, city_rows, areas, inputs, definition, land=euro
         )
         eurostat_metros += added
         eurostat_touched |= touched

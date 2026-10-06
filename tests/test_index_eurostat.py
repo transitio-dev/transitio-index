@@ -390,3 +390,41 @@ def test_a_boundary_point_is_settled_by_footprint_share():
     assert pick(["FI1B1", "FI1E1"], shapely.box(24.2, 59.9, 24.4, 60.1)) == (None, True)
     assert pick(["FI1B1", "FI1E1"], shapely.Point(24.3, 60.0)) == (None, True)
     assert pick([], shapely.Point(0.0, 0.0)) == (None, False)
+
+
+def test_a_city_joins_the_area_holding_half_its_land():
+    from transitio_index import urau
+
+    footprints = {
+        # Its point outside the area, 60% of its land inside.
+        "out": shapely.box(24.3, 60.0, 24.5, 60.3)
+        | shapely.box(24.5, 60.1, 24.9, 60.2),
+        # Its point inside, 40% of its land.
+        "in": shapely.box(24.1, 60.25, 24.5, 60.35)
+        | shapely.box(24.5, 60.0, 24.6, 60.6),
+        # Coastal: 70% of its footprint at sea, all of its land inside.
+        "coast": shapely.box(23.3, 60.1, 24.3, 60.2),
+    }
+    places = [_city(key, "FI", key) for key in footprints] + [_city("none", "FI", None)]
+    areas = {key: [{"geom": geom, "sources": []}] for key, geom in footprints.items()}
+    metros = {"FI001F": {"name": "Helsinki", "country": "FI", "nuts3": ["FI001F"]}}
+
+    def statuses(land):
+        rows = eurostat.assign(
+            places,
+            areas,
+            metros,
+            {"FI001F": shapely.box(24.0, 60.0, 24.5, 60.5)},
+            min_share=urau.MIN_SHARE,
+            land=land,
+        )
+        return {row["city_id"]: row["status"] for row in rows}
+
+    assert statuses({"FI1B1": WEST}) == {
+        "coast": "assigned",
+        "in": "unassigned",
+        "none": "unplaceable",
+        "out": "assigned",
+    }
+    # Without the NUTS-3 regions the share is of the whole footprint.
+    assert statuses(None)["coast"] == "unassigned"

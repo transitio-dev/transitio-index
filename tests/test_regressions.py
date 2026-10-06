@@ -33,6 +33,7 @@ from transitio_index import (  # noqa: E402
     coverage,
     crawl,
     crosswalk,
+    eurostat,
     fetch,
     geometry,
     metros,
@@ -1909,6 +1910,21 @@ def test_a_fao_metros_country_is_its_centres_whatever_cities_a_build_holds(
     regions = {region_id: {"country": iso3}}
     country = metros.fao_country(region_id, sorted(by_id), by_id, names, regions)
     assert country == expected
+
+
+def test_a_city_with_a_sliver_in_a_functional_urban_area_stays_out():
+    """A city whose representative point lay outside every functional urban
+    area joined any area its land overlapped: Weilheim, 0.001 of its area
+    inside München's, was a member, and the metro outgrew the official FUA."""
+    rows = eurostat.assign(
+        [{"place_id": "Q_W", "kind": "city", "country_code": "DE", "overture_id": "w"}],
+        {"w": [{"geom": shapely.box(10.51, 47.9, 11.01, 48.0), "sources": []}]},
+        {"DE003F": {"name": "München", "country": "DE", "nuts3": ["DE003F"]}},
+        {"DE003F": shapely.box(11.0, 47.8, 11.5, 48.2)},
+        min_share=metros.FUNCTIONAL_URBAN_AREA.min_share,
+        land={"DE21N": shapely.box(10.0, 47.0, 12.0, 49.0)},
+    )
+    assert [row["status"] for row in rows] == ["unassigned"]
 
 
 @pytest.mark.parametrize("place_id, refused", [("Q404", False), ("Q-nowhere", True)])
