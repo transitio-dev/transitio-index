@@ -17,13 +17,14 @@ MDB and GBFS rows carry a country field — usually an ISO ``country_code``,
 sometimes a full country name — so a requested country is matched on either
 form; a missing or renamed column stops the cut rather than silently matching
 nothing. Atlas feed records carry no country — the crosswalk places an Atlas
-feed by matching its GTFS download URL (http or https, then by host) against MDB — so
-the archive is trimmed to the Atlas feeds that share a download URL with a kept
-MDB feed, plus the other feeds of a host when at least half of that host's
-Atlas feeds match by exact URL (a platform host serving many agencies fails
-that test and contributes only its exact matches). Each DMFR file keeps only
-its matching feeds. That Atlas↔MDB overlap is kept when it exists; a country
-served by a single national feed with no Atlas match yields an MDB-only sample.
+feed by matching its GTFS download URL (http or https, then by host, then its
+past URLs) against MDB — so the archive is trimmed to the Atlas feeds whose
+current or past download URL a kept MDB feed carries, plus the other feeds of a
+host when at least half of that host's Atlas feeds match by exact current URL
+(a platform host serving many agencies fails that test and contributes only its
+exact matches). Each DMFR file keeps only its matching feeds. That Atlas↔MDB
+overlap is kept when it exists; a country served by a single national feed with
+no Atlas match yields an MDB-only sample.
 A catalogue row whose declared country is wrong is dropped with ``--exclude``;
 a record a country cut cannot reach — an Atlas feed, which carries no country,
 or an MDB row filed under another country — is pulled in with ``--include``;
@@ -60,7 +61,15 @@ import tempfile
 from pathlib import Path
 
 from transitio_index import atlas, csv_source, gbfs, mdb, store
-from transitio_index.crosswalk import ATLAS_STATIC_URL, _host, _match_url, _successors
+from transitio_index.crosswalk import (
+    _atlas_url,
+    _atlas_urls,
+    _historic_urls,
+    _host,
+    _match_url,
+    _successors,
+    _unique_url_index,
+)
 
 DEFAULT_COUNTRIES = ("FI", "EE")
 # The partition's default --batch-size: a country of more MDB rows is split.
@@ -407,38 +416,32 @@ def _mdb_targets(rows):
     return urls, hosts
 
 
-def _feed_url(feed):
-    """The static download URL of an Atlas feed record in the crosswalk's match
-    form — the field the crosswalk matches on; realtime endpoints carry no
-    identity — or None."""
-    return _match_url((feed.get("urls") or {}).get(ATLAS_STATIC_URL))
-
-
 def _select_atlas(archive, urls, hosts, includes=frozenset()):
     """``(member name, payload)`` for the DMFR files with a matching feed, each
     trimmed to its matching feeds.
 
-    A feed matches by exact download URL, or by sharing a non-shared host with a
-    kept MDB feed when at least ``HOST_MATCH_SHARE`` of that host's Atlas feeds
-    match by exact URL: a platform host serving many agencies would otherwise
-    pull every agency into the sample. Host totals and exact matches are
-    gathered over the whole archive in one pass before any feed is kept. A feed
-    whose Onestop id is in ``includes`` is kept whatever its URL: Atlas records
-    carry no country, so a national feed with no MDB twin is otherwise
-    unreachable from a country cut.
+    A feed matches by exact current or past download URL, or by sharing a
+    non-shared host with a kept MDB feed when at least ``HOST_MATCH_SHARE`` of
+    that host's Atlas feeds match by exact current URL: a platform host serving
+    many agencies would otherwise pull every agency into the sample. Host
+    totals and exact matches are gathered over the whole archive in one pass
+    before any feed is kept. A feed whose Onestop id is in ``includes`` is kept
+    whatever its URL: Atlas records carry no country, so a national feed with
+    no MDB twin is otherwise unreachable from a country cut.
     """
     files = []
     host_total, host_exact = collections.Counter(), collections.Counter()
     for source_file, payload in atlas.iter_dmfr(archive):
         feeds = []
         for feed in payload.get("feeds") or []:
-            url = _feed_url(feed)
+            url = _atlas_url(feed)
             host = _host(url) if url is not None else None
             exact = url in urls
             if host is not None:
                 host_total[host] += 1
                 host_exact[host] += exact
-            feeds.append((feed, exact, host))
+            past = not urls.isdisjoint(_historic_urls(feed))
+            feeds.append((feed, exact or past, host))
         files.append((source_file, payload, feeds))
     matched_hosts = {
         host
@@ -679,27 +682,50 @@ def _partition_labels(units, extra, size):
 def _partition_atlas(archive, files, labels, size):
     """``{label: (countries, mdb rows, atlas files)}`` in label order.
 
-    Each label keeps the Atlas GTFS feeds ``_select_atlas`` picks for its
-    rows. A feed several labels pick goes to the first whose rows carry its
-    URL exactly, else to the first that picked it. The GTFS feeds of the
-    archive's ``files`` no label picks fill ``atlas1..atlasK`` of at most
-    ``size`` feeds each; other specs get no label.
+    Each label keeps the Atlas GTFS feeds ``_select_atlas`` picks for its rows.
+    A feed several labels pick goes to the first whose rows carry its current
+    URL exactly, else to the one whose rows carry its past URLs, else to the
+    first that picked it. A feed whose current URL no label carries goes to no
+    label when the rows of several labels carry its past URLs, or when another
+    feed holds one of them too: the crosswalk pairs a feed two rows reach, or a
+    URL two feeds hold, with nothing. The GTFS feeds of the archive's ``files``
+    no label owns fill ``atlas1..atlasK`` of at most ``size`` feeds each; other
+    specs get no label.
     """
     picked, exact = {}, {}
+    historic = collections.defaultdict(list)
+    # The URLs one Atlas GTFS feed alone holds, as in the crosswalk's index.
+    unique = _unique_url_index(
+        (
+            feed
+            for _, payload in files
+            for feed in filter(_is_gtfs_feed, payload.get("feeds") or [])
+        ),
+        "gtfs",
+        _atlas_urls,
+    )
     for label, (_, rows) in labels.items():
         urls, hosts = _mdb_targets(rows)
         for _, payload in _select_atlas(archive, urls, hosts):
             for feed in filter(_is_gtfs_feed, payload["feeds"]):
                 picked.setdefault(feed.get("id"), label)
-                if _feed_url(feed) in urls:
+                carried = urls.intersection(_historic_urls(feed))
+                if carried:
+                    historic[feed.get("id")].append((label, carried.issubset(unique)))
+                if _atlas_url(feed) in urls:
                     exact.setdefault(feed.get("id"), label)
-    owner = {**picked, **exact}
+    past = {
+        feed_id: held[0][0] if len(held) == 1 and held[0][1] else None
+        for feed_id, held in historic.items()
+    }
+    owner = {**picked, **past, **exact}
     owned, rest = collections.defaultdict(list), []
     for source_file, payload in files:
         for feed in filter(_is_gtfs_feed, payload.get("feeds") or []):
             entry = (source_file, payload, feed)
-            if feed.get("id") in owner:
-                owned[owner[feed.get("id")]].append(entry)
+            label = owner.get(feed.get("id"))
+            if label is not None:
+                owned[label].append(entry)
             else:
                 rest.append(entry)
     planned = {

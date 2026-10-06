@@ -123,6 +123,7 @@ def test_url_exact_match_makes_one_both_record(tmp_path):
         "url_exact": 1,
         "same_host": 0,
         "geohash": 0,
+        "url_historic": 0,
         "systems_csv": 0,
         "none": 0,
     }
@@ -841,6 +842,56 @@ def test_provisional_drops_when_its_mdb_endpoint_is_geohash_resolved(tmp_path):
     assert summary["provisional_links"] == []
 
 
+# --- url-historic ---------------------------------------------------------
+
+
+def test_a_past_url_pairs_only_feeds_left_unpaired_one_to_one(tmp_path):
+    def with_past(feed_id, host, current, *past, name=None):
+        urls = {
+            "static_current": f"https://{host}/{current}",
+            "static_historic": [f"https://{host}/{path}" for path in past],
+        }
+        return atlas_feed(feed_id, urls=urls, name=name)
+
+    records, summary = crosswalk.build_records(
+        [
+            with_past("f-cur", "a.example", "new", "old"),
+            with_past("f-two", "b.example", "0", "1", "2"),
+            # A URL listed twice is still one feed's.
+            with_past("f-hist", "v.example", "now", "then", "then", name="Metro"),
+            atlas_feed("f-metro", url="https://v.example/other", name="Metro"),
+            atlas_feed("f-c", url="https://c.example/c", name="Cee"),
+            # Reached by mdb-c, which a name pairs, and by mdb-y.
+            with_past("f-y", "c.example", "0", "x", "y"),
+        ],
+        [
+            mdb_feed("mdb-cur", url="https://a.example/new"),
+            mdb_feed("mdb-old", url="https://a.example/old"),
+            mdb_feed("mdb-b1", url="https://b.example/1"),
+            mdb_feed("mdb-b2", url="https://b.example/2"),
+            mdb_feed("mdb-hist", url="https://v.example/then", provider="Metro"),
+            mdb_feed("mdb-c", url="https://c.example/x", provider="Cee"),
+            mdb_feed("mdb-y", url="https://c.example/y"),
+        ],
+    )
+    # mdb-hist was a same-host candidate of both Metro feeds. Each feed is one
+    # record: neither end of a historic pair is emitted again.
+    assert [(r["feed_id"], r["mdb_id"], r["crosswalk_method"]) for r in records] == [
+        ("f-cur", "mdb-cur", "url_exact"),
+        ("f-c", "mdb-c", "same_host"),
+        ("f-hist", "mdb-hist", "url_historic"),
+        ("f-y", "mdb-y", "url_historic"),
+        ("f-two", None, "none"),
+        ("f-metro", None, "none"),
+        ("f-mdb-old", "mdb-old", "none"),
+        ("f-mdb-b1", "mdb-b1", "none"),
+        ("f-mdb-b2", "mdb-b2", "none"),
+    ]
+    assert by_feed_id(records)["f-hist"]["crosswalk_confidence"] == 0.9
+    assert summary["url_historic_pairs"] == 2
+    assert summary["provisional_links"] == []
+
+
 # --- superseded MDB rows -------------------------------------------------
 
 
@@ -940,6 +991,7 @@ def test_the_full_cascade_over_one_fixture(tmp_path):
         "url_exact": 1,
         "same_host": 1,
         "geohash": 1,
+        "url_historic": 0,
         "systems_csv": 1,
         "none": 6,
     }
