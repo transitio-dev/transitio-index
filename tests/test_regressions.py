@@ -1310,6 +1310,87 @@ def test_the_merge_rescores_relevance_over_the_merged_edges(tmp_path):
     }
 
 
+def test_departures_per_day_average_over_the_days_the_timetable_covers(tmp_path):
+    """PID's calendar runs a year while its full timetable covers two weeks,
+    so dividing by the whole calendar put Prague at 28,270 departures a day
+    against about 690,000 on a weekday."""
+    from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
+
+    cache = tmp_path / "cache"
+    feeds = [
+        {"feed_id": "f-pid", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    trips = {"t1": "two", "t2": "two", "t3": "two", "t4": "two", "ty": "year"}
+    _write_crawl(
+        cache,
+        "f-pid",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": (
+                "trip_id,route_id,service_id\n"
+                + "".join(f"{t},tram,{s}\n" for t, s in trips.items())
+            ).encode(),
+            "calendar.txt": (
+                b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+                b"sunday,start_date,end_date\n"
+                b"two,1,1,1,1,1,1,1,20261003,20261016\n"
+                b"year,1,1,1,1,1,1,1,20251213,20261212\n"
+            ),
+            "stop_times.txt": (
+                "trip_id,stop_id,stop_sequence\n"
+                + "".join(f"{t},s1,1\n{t},s2,2\n" for t in trips)
+            ).encode(),
+        },
+        "complete",
+    )
+    _coverage(cache, feeds, [_candidate("Q-city", "f-pid", 2)])
+    classify.classify(cache, lookup=LOOKUP)
+    edges, _ = store.read_jsonl(
+        cache / "classify", "edges.json", classify.EDGES_ARTIFACT
+    )
+    (edge,) = edges
+    # Five trips a day over the fourteen days, two stop-events each.
+    assert edge["service"]["departures_per_day"] == pytest.approx(10.0)
+
+
+def test_an_expired_feed_leaves_the_place_shares_and_service():
+    """DPP's Prague feed ended in 2023 yet held 0.915 of Prague's departures
+    against PID's current timetable, and was summed into Prague's service."""
+    from transitio_index import rank
+
+    def edge(place, feed, departures, **evidence):
+        return {
+            "place_id": place,
+            "feed_id": feed,
+            "tier": "local",
+            "service": {"stops": 10, "routes": 1, "departures_per_day": departures},
+            "evidence": {"share_of_feed": 0.5, **evidence},
+        }
+
+    ended = {"stale_when_indexed": "2023-11-06"}
+    edges = [
+        edge("prg", "pid", 600_000.0),
+        edge("prg", "dpp", 500_000.0, **ended),
+        edge("brn", "dpp", None, **ended),
+    ]
+    places = {p: {"kind": "city", "country_code": "CZ"} for p in ("prg", "brn")}
+    scored, basis, _ = rank.score_edges(edges, places)
+    evidence = {(e["place_id"], e["feed_id"]): e["evidence"] for e in scored}
+    assert evidence["prg", "pid"]["share_of_place"] == 1.0
+    assert evidence["prg", "dpp"]["share_of_place"] == 0.0
+    # A place only stale feeds serve keeps their basis and has no service.
+    assert basis == {"prg": "departures", "brn": "stops"}
+    assert publish._service_by_place(edges) == {
+        "prg": {
+            "feeds": 1,
+            "stops": 10,
+            "routes": 1,
+            "departures_per_day": 600_000.0,
+        }
+    }
+
+
 def _padded(text, width=150):
     """Every line of ``text`` padded with trailing spaces, as Renfe writes."""
     return "".join(line + " " * width + "\n" for line in text.splitlines()).encode()
@@ -1344,9 +1425,9 @@ def test_a_padded_member_reads_as_the_clean_one(read, members):
     clean = read(*(io.BytesIO(m.encode()) for m in members))
     assert read(*(io.BytesIO(_padded(m)) for m in members)) == clean
     if members[0] == _CALENDAR:
-        active, _, span = clean
-        assert active == {"s1": 12}
-        assert [d.isoformat() for d in span] == ["2026-09-29", "2026-10-11"]
+        weights = classify._calendar_weights(clean, {"t1": "s1"})
+        assert weights == {"s1": pytest.approx(12 / 13)}
+        assert [d.isoformat() for d in clean.span] == ["2026-09-29", "2026-10-11"]
 
 
 def test_a_feed_with_spaced_header_names_keeps_its_fingerprint():

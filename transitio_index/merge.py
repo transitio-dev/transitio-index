@@ -78,8 +78,9 @@ OVERRIDE_FIELDS = (
 # identity fold. 7: relevance is rescored over the merged edges. 8: the
 # manifest records the catalogue check. 9: the check covers the curated feeds.
 # 10: schema 11, the providers table and the places' populations. 11: the
-# NOTICE's credential providers' paragraph.
-MERGE_FORMAT = 11
+# NOTICE's credential providers' paragraph. 12: stale pairs leave the place
+# shares.
+MERGE_FORMAT = 12
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
