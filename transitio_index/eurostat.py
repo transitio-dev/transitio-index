@@ -16,6 +16,8 @@ import io
 import math
 import re
 
+import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shapely
@@ -225,11 +227,11 @@ def countries(metros):
 
 
 class Containment:
-    """Which NUTS-3 regions a point falls in, over an STRtree of the boundaries."""
+    """Which NUTS-3 regions a point or footprint falls in, over an STRtree of
+    the boundaries."""
 
     def __init__(self, boundaries):
         self._ids = sorted(boundaries)
-        self._geoms = boundaries
         self._tree = STRtree([boundaries[nuts_id] for nuts_id in self._ids])
 
     def regions_at(self, point):
@@ -240,12 +242,19 @@ class Containment:
     def regions_over(self, footprint):
         """The NUTS-3 ids whose region overlaps the footprint with some area,
         sorted; a region only touched at its edge does not count."""
-        found = self._tree.query(footprint, predicate="intersects")
-        return sorted(
-            nuts_id
-            for nuts_id in (self._ids[index] for index in found)
-            if footprint.intersection(self._geoms[nuts_id]).area > 0
+        _, nuts_ids, _ = self.overlaps(np.array([footprint], dtype=object))
+        return sorted(nuts_ids.tolist())
+
+    def overlaps(self, footprints):
+        """``(positions, nuts_ids, pieces)`` arrays: each footprint (by
+        position in the array ``footprints``, None for none) and region
+        overlapping with some area, and the overlap itself."""
+        positions, found = self._tree.query(footprints, predicate="intersects")
+        pieces = shapely.intersection(
+            footprints[positions], self._tree.geometries[found]
         )
+        kept = shapely.area(pieces) > 0
+        return positions[kept], np.asarray(self._ids)[found[kept]], pieces[kept]
 
 
 def _footprint(rows):
@@ -292,7 +301,49 @@ def _pick(candidates, footprint, boundaries, by_nuts3):
     return best, False
 
 
-def assign(places, areas, metros, boundaries):
+def _by_share(containment, footprints, min_share, land):
+    """Per footprint (None for none), the region holding the largest share of
+    its land, at least ``min_share``, or None; equal shares go to the lower
+    id. The land is the footprint inside the ``land`` regions, or the whole
+    footprint without them or outside them all."""
+    footprints = np.array(footprints, dtype=object)
+    # The land in pieces, each owned by its footprint: the land regions do not
+    # overlap, so the pieces' overlaps with a region sum to the land's.
+    owners = np.flatnonzero(~shapely.is_missing(footprints))
+    pieces = footprints[owners]
+    if land is not None:
+        inside, _, clipped = Containment(land).overlaps(footprints)
+        outside = np.setdiff1d(owners, inside)
+        owners = np.concatenate([inside, outside])
+        pieces = np.concatenate([clipped, footprints[outside]])
+    extent = np.bincount(
+        owners, weights=shapely.area(pieces), minlength=len(footprints)
+    )
+    held, nuts_ids, overlaps = containment.overlaps(pieces)
+    shares = (
+        pd.DataFrame(
+            {
+                "position": owners[held],
+                "nuts_id": nuts_ids,
+                "area": shapely.area(overlaps),
+            }
+        )
+        .groupby(["position", "nuts_id"], as_index=False)["area"]
+        .sum()
+    )
+    shares["share"] = shares["area"] / extent[shares["position"].to_numpy()]
+    best = (
+        shares[shares["share"] >= min_share]
+        .sort_values(["position", "share", "nuts_id"], ascending=[True, False, True])
+        .drop_duplicates("position")
+    )
+    chosen = [None] * len(footprints)
+    for position, nuts_id in zip(best["position"], best["nuts_id"]):
+        chosen[position] = nuts_id
+    return chosen
+
+
+def assign(places, areas, metros, boundaries, *, min_share=None, land=None):
     """One assignment row per city of a covered country, by ``city_id``.
 
     ``status`` is ``"assigned"`` with the ``metro_code`` whose composition
@@ -306,19 +357,33 @@ def assign(places, areas, metros, boundaries):
     coastline-clipped NUTS boundaries — the regions its land overlaps are
     the candidates instead. ``areas`` is ``geometry.read_areas`` output
     keyed by Overture id.
+
+    With ``min_share``, the city's region is instead the one holding the
+    largest share of its land, if at least ``min_share``: its footprint
+    inside the ``land`` regions (``{nuts_id: polygon}``, the NUTS-3
+    boundaries, which leave out the sea a coastal footprint takes in), or
+    the whole footprint without them or outside them all.
     """
     by_nuts3 = {
         nuts_id: code for code, metro in metros.items() for nuts_id in metro["nuts3"]
     }
     covered = countries(metros)
     containment = Containment(boundaries)
+    cities = [
+        place
+        for place in places
+        if place.get("kind") == "city" and place.get("country_code") in covered
+    ]
+    footprints = [place_footprint(areas, place) for place in cities]
+    if min_share is not None:
+        shared = _by_share(containment, footprints, min_share, land)
     rows = []
-    for place in places:
-        if place.get("kind") != "city" or place.get("country_code") not in covered:
-            continue
-        footprint = place_footprint(areas, place)
+    for position, (place, footprint) in enumerate(zip(cities, footprints)):
         if footprint is None:
             status, nuts_id = "unplaceable", None
+        elif min_share is not None:
+            nuts_id = shared[position]
+            status = "assigned" if by_nuts3.get(nuts_id) else "unassigned"
         else:
             candidates = containment.regions_at(footprint.representative_point())
             if not candidates:

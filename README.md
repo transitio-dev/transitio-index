@@ -290,7 +290,8 @@ Every source must be a licensed schema-11 build, and the sources must agree on
 the Overture release, the simplification tolerance and the classifier. A feed
 comes from the newest build carrying it and its edges from that same build; a
 place comes from the build serving it most, with the largest population any
-build records for it. The access providers are the union of the sources',
+build records for it and its service and validity summed over the merged
+edges. The access providers are the union of the sources',
 which must give a provider the same fields wherever they list it, and the
 build a merged feed comes from must list the provider the feed names. The
 merged NOTICE credits every source once, names the catalogues by the digests

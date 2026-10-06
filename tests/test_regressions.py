@@ -7,6 +7,7 @@ import hashlib
 import http.client
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from transitio_index import (  # noqa: E402
     coverage,
     crawl,
     crosswalk,
+    eurostat,
     fetch,
     geometry,
     metros,
@@ -597,6 +599,51 @@ def test_the_metros_read_warms_the_area_cache_for_every_seeded_division(tmp_path
         countries={"FI"},
     )
     assert set(later) == {"region"} and scans["n"] == 1  # served from the warmed cache
+
+
+def test_an_area_read_for_a_recorded_release_uses_that_releases_cache(tmp_path):
+    """Expansion redraws metros from the seed's recorded Overture release; the
+    shared area read keyed its cache by the pinned release instead, so a cache
+    the pinned release had warmed answered for the recorded one."""
+    places = [{"overture_id": "city", "kind": "city", "country_code": "FI"}]
+    cache_dir = tmp_path / "cache"
+    pinned = fx.write_area_dataset(
+        tmp_path / "pinned.parquet",
+        [fx.area("city", _wkb(0, 0, 1, 1), GOOD, country="FI")],
+    )
+    recorded = fx.write_area_dataset(
+        tmp_path / "recorded.parquet",
+        [fx.area("city", _wkb(0, 0, 2, 2), GOOD, country="FI")],
+    )
+    geometry.place_areas(cache_dir, pinned, places, {"city"})
+    areas = geometry.place_areas(
+        cache_dir, recorded, places, {"city"}, release="2020-01-01.0"
+    )
+    assert shapely.area(areas["city"][0]["geom"]) == 4.0
+
+
+def test_expansion_places_seeded_cities_from_the_recorded_release(monkeypatch):
+    """The FAO placement of seeded cities during expansion read their areas
+    through the pinned release's cache, not the seed's recorded release."""
+    from transitio_index import expand, fao
+
+    calls = []
+
+    def read(*args, **kwargs):
+        calls.append(kwargs)
+        return {}
+
+    def reopen():
+        return None
+
+    monkeypatch.setattr(geometry, "place_areas", read)
+    monkeypatch.setattr(fao, "place_cities", lambda *args: ({}, None, None, None))
+    places = {"c": {"kind": "city", "overture_id": "a"}}
+    seeded = expand._SeededPlacement(
+        "cache", None, places, [], None, None, release="2020-01-01.0", reopen=reopen
+    )
+    assert seeded.cities("region") == []
+    assert calls == [{"release": "2020-01-01.0", "reopen": reopen}]
 
 
 @pytest.mark.parametrize("proxied", [True, False], ids=["proxy", "direct"])
@@ -1310,6 +1357,158 @@ def test_the_merge_rescores_relevance_over_the_merged_edges(tmp_path):
     }
 
 
+def test_departures_per_day_average_over_the_days_the_timetable_covers(tmp_path):
+    """PID's calendar runs a year while its full timetable covers two weeks,
+    so dividing by the whole calendar put Prague at 28,270 departures a day
+    against about 690,000 on a weekday."""
+    from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
+
+    cache = tmp_path / "cache"
+    feeds = [
+        {"feed_id": "f-pid", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    trips = {"t1": "two", "t2": "two", "t3": "two", "t4": "two", "ty": "year"}
+    _write_crawl(
+        cache,
+        "f-pid",
+        {
+            "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
+            "routes.txt": b"route_id,route_type\ntram,0\n",
+            "trips.txt": (
+                "trip_id,route_id,service_id\n"
+                + "".join(f"{t},tram,{s}\n" for t, s in trips.items())
+            ).encode(),
+            "calendar.txt": (
+                b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+                b"sunday,start_date,end_date\n"
+                b"two,1,1,1,1,1,1,1,20261003,20261016\n"
+                b"year,1,1,1,1,1,1,1,20251213,20261212\n"
+            ),
+            "stop_times.txt": (
+                "trip_id,stop_id,stop_sequence\n"
+                + "".join(f"{t},s1,1\n{t},s2,2\n" for t in trips)
+            ).encode(),
+        },
+        "complete",
+    )
+    _coverage(cache, feeds, [_candidate("Q-city", "f-pid", 2)])
+    classify.classify(cache, lookup=LOOKUP)
+    edges, _ = store.read_jsonl(
+        cache / "classify", "edges.json", classify.EDGES_ARTIFACT
+    )
+    (edge,) = edges
+    # Five trips a day over the fourteen days, two stop-events each.
+    assert edge["service"]["departures_per_day"] == pytest.approx(10.0)
+
+
+def test_an_expired_feed_leaves_the_place_shares_and_service():
+    """DPP's Prague feed ended in 2023 yet held 0.915 of Prague's departures
+    against PID's current timetable, and was summed into Prague's service."""
+    from transitio_index import rank
+
+    def edge(place, feed, departures, **evidence):
+        return {
+            "place_id": place,
+            "feed_id": feed,
+            "tier": "local",
+            "service": {"stops": 10, "routes": 1, "departures_per_day": departures},
+            "evidence": {"share_of_feed": 0.5, **evidence},
+        }
+
+    ended = {"stale_when_indexed": "2023-11-06"}
+    edges = [
+        edge("prg", "pid", 600_000.0),
+        edge("prg", "dpp", 500_000.0, **ended),
+        edge("brn", "dpp", None, **ended),
+    ]
+    places = {p: {"kind": "city", "country_code": "CZ"} for p in ("prg", "brn")}
+    scored, basis, _ = rank.score_edges(edges, places)
+    evidence = {(e["place_id"], e["feed_id"]): e["evidence"] for e in scored}
+    assert evidence["prg", "pid"]["share_of_place"] == 1.0
+    assert evidence["prg", "dpp"]["share_of_place"] == 0.0
+    # A place only stale feeds serve keeps their basis and has no service.
+    assert basis == {"prg": "departures", "brn": "stops"}
+    assert publish._service_by_place(edges) == {
+        "prg": {
+            "feeds": 1,
+            "stops": 10,
+            "routes": 1,
+            "departures_per_day": 600_000.0,
+        }
+    }
+
+
+def test_a_merged_places_service_and_validity_sum_every_builds_feeds(tmp_path):
+    """The merge kept a place's service and validity from the build serving
+    it most, so Prague stored 16 feeds and 822 departures a day against 42
+    feeds over the merged edges."""
+    from builds_fixture import BOX, _feed7, _place, _run
+
+    from transitio_index import merge
+
+    def edge(feed, stops, departures, **evidence):
+        service = {"stops": stops, "routes": 1, "departures_per_day": departures}
+        return {
+            "place_id": "prg",
+            "feed_id": feed,
+            "tier": "local",
+            "service": json.dumps(service),
+            "evidence": json.dumps({"share_of_feed": 1.0, **evidence}),
+            "needs_review": False,
+            "relevance_category": "primary",
+            "relevance": 1.0,
+            "cross_border": False,
+        }
+
+    places = [
+        _place(p, "city", p, None, BOX(14, 49, 17, 50), "CZ", validity="{}")
+        for p in ("prg", "brn")
+    ]
+    ended = {"stale_when_indexed": "2023-11-06"}
+    sources = []
+    for label, digit, feeds, edges in (
+        ("cz", 1, [("pid", "2026-10-01", "2026-12-12")], [edge("pid", 8000, 6e5)]),
+        (
+            "de",
+            2,
+            [
+                ("a", "2026-09-01", "2026-12-31"),
+                ("b", "2026-10-01", "2026-11-30"),
+                ("dpp", "2023-01-01", "2023-11-06"),
+            ],
+            [edge("a", 50, 800.0), edge("b", 23, 22.0), edge("dpp", 400, 5e5, **ended)],
+        ),
+    ):
+        run = _run(
+            tmp_path,
+            label,
+            digit,
+            places=places,
+            feeds=[_feed7(f, f, "CZ", "domestic", start=s, end=e) for f, s, e in feeds],
+            edges={"CZ": edges},
+            built_at=f"2026-09-1{digit}T00:00:00+00:00",
+        )
+        snapshot, _, tables = builds.load_tables(tmp_path / run / "index")
+        sources.append((run, snapshot, tables))
+    _, tables = merge.merge_tables(sources)
+    rows = {p["place_id"]: p for p in tables["places.parquet"].to_pylist()}
+    assert rows["prg"]["build_id"] == sources[1][0]
+    # The stale feed stays out of the service and in the validity.
+    assert json.loads(rows["prg"]["service"]) == {
+        "feeds": 3,
+        "stops": 8073,
+        "routes": 3,
+        "departures_per_day": 600822.0,
+    }
+    validity = json.loads(rows["prg"]["validity"])
+    assert (validity["feeds_dated"], validity["start"], validity["end"]) == (
+        4,
+        "2023-01-01",
+        "2026-12-31",
+    )
+    assert rows["brn"]["service"] is None and rows["brn"]["validity"] is None
+
+
 def _padded(text, width=150):
     """Every line of ``text`` padded with trailing spaces, as Renfe writes."""
     return "".join(line + " " * width + "\n" for line in text.splitlines()).encode()
@@ -1344,9 +1543,9 @@ def test_a_padded_member_reads_as_the_clean_one(read, members):
     clean = read(*(io.BytesIO(m.encode()) for m in members))
     assert read(*(io.BytesIO(_padded(m)) for m in members)) == clean
     if members[0] == _CALENDAR:
-        active, _, span = clean
-        assert active == {"s1": 12}
-        assert [d.isoformat() for d in span] == ["2026-09-29", "2026-10-11"]
+        weights = classify._calendar_weights(clean, {"t1": "s1"})
+        assert weights == {"s1": pytest.approx(12 / 13)}
+        assert [d.isoformat() for d in clean.span] == ["2026-09-29", "2026-10-11"]
 
 
 def test_a_feed_with_spaced_header_names_keeps_its_fingerprint():
@@ -1713,6 +1912,21 @@ def test_a_fao_metros_country_is_its_centres_whatever_cities_a_build_holds(
     assert country == expected
 
 
+def test_a_city_with_a_sliver_in_a_functional_urban_area_stays_out():
+    """A city whose representative point lay outside every functional urban
+    area joined any area its land overlapped: Weilheim, 0.001 of its area
+    inside München's, was a member, and the metro outgrew the official FUA."""
+    rows = eurostat.assign(
+        [{"place_id": "Q_W", "kind": "city", "country_code": "DE", "overture_id": "w"}],
+        {"w": [{"geom": shapely.box(10.51, 47.9, 11.01, 48.0), "sources": []}]},
+        {"DE003F": {"name": "München", "country": "DE", "nuts3": ["DE003F"]}},
+        {"DE003F": shapely.box(11.0, 47.8, 11.5, 48.2)},
+        min_share=metros.FUNCTIONAL_URBAN_AREA.min_share,
+        land={"DE21N": shapely.box(10.0, 47.0, 12.0, 49.0)},
+    )
+    assert [row["status"] for row in rows] == ["unassigned"]
+
+
 @pytest.mark.parametrize("place_id, refused", [("Q404", False), ("Q-nowhere", True)])
 def test_a_set_coverage_for_another_builds_feed_is_skipped(tmp_path, place_id, refused):
     """A set_coverage naming a feed the build does not hold raised "names no
@@ -1947,3 +2161,38 @@ def test_the_round_trip_waits_out_a_cached_release_listing(
         with pytest.raises(publisher.PublishIndexError, match="'0000000000000001'"):
             publish()
         assert len(listings) == publisher.ROUND_TRIP_ATTEMPTS
+
+
+def test_a_metro_leaves_no_holes_along_its_members_seams(tmp_path):
+    """Members were simplified one by one and the metro was the union of
+    those: along a winding border the two sides' simplified edges parted and
+    left holes in the metro, about 42,000 m² of them here."""
+    import test_index_geometry as gt
+
+    seam = [
+        (24.0 + 0.05 * i / 80, 60.0 + 0.002 * math.sin(i * math.pi / 5))
+        for i in range(81)
+    ]
+    areas = {
+        "a": shapely.Polygon([(24.0, 59.9), (24.05, 59.9), *seam[::-1]]),
+        "b": shapely.Polygon([*seam[:41], (24.025, 60.1), (24.0, 60.1)]),
+        "c": shapely.Polygon([*seam[40:], (24.05, 60.1), (24.025, 60.1)]),
+    }
+    old = shapely.union_all([geometry._simplify(area) for area in areas.values()])
+    assert len(old.interiors) > 0
+    cache = tmp_path / "cache"
+    members = [gt._place(f"Q_{key}", "city", overture_id=key) for key in areas]
+    metro = gt._place("Q_METRO", "metro", members=[m["place_id"] for m in members])
+    gt._publish(cache, [*members, metro])
+    dataset = fx.write_area_dataset(
+        tmp_path / "areas.parquet",
+        [fx.area(key, shapely.to_wkb(area), GOOD) for key, area in areas.items()],
+    )
+    geometry.attach_geometry(cache, dataset=dataset)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    (row,) = [place for place in places if place["place_id"] == "Q_METRO"]
+    drawn = shapely.from_wkb(row["geometry"])
+    assert drawn.geom_type == "Polygon" and len(drawn.interiors) == 0
+    assert drawn.covers(shapely.Polygon(old.interiors[0]).point_on_surface())

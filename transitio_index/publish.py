@@ -666,16 +666,21 @@ def _validity_by_place(edges, records):
 
 
 def _service_by_place(edges):
-    """Each place's service level summed over the feeds serving it.
+    """Each place's service level summed over the feeds serving it, a feed
+    stale when indexed (:func:`rank.is_stale`) left out.
 
     Every tier edge of a (place, feed) pair carries the same struct, so pairs
     are counted once. Each number sums over the feeds that report it and
     stays null when none does: a place served only by declared feeds has
-    unknown counts, not zero.
+    unknown counts, not zero. A place only stale feeds serve has no entry.
     """
+    from transitio_index import rank
+
     per_pair = {}
     for edge in edges or []:
-        per_pair.setdefault((edge["place_id"], edge["feed_id"]), edge.get("service"))
+        if not rank.is_stale(edge):
+            key = (edge["place_id"], edge["feed_id"])
+            per_pair.setdefault(key, edge.get("service"))
     totals = {}
     for (place_id, _), service in per_pair.items():
         service = service or {}

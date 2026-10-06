@@ -1107,10 +1107,14 @@ def test_calendar_days_are_counted_not_walked():
         b"wk,20260920,2\n"  # added and removed: the removal wins
         b"lone,20260903,1\n"  # a service with exceptions only
     )
-    active_days, span_days, span = classify._read_calendar(calendar, dates)
-    assert span_days == 3652059
-    assert active_days == {"all": 3652059, "wk": 10, "lone": 1}
-    assert span == (datetime.date(1, 1, 1), datetime.date(9999, 12, 31))
+    calendar = classify._read_calendar(calendar, dates)
+    assert calendar.span == (datetime.date(1, 1, 1), datetime.date(9999, 12, 31))
+    # Every day runs a trip, so the period covered is the whole calendar, as
+    # it is when no day runs one.
+    days = 3652059
+    expected = {"all": 1.0, "wk": 10 / days, "lone": 1 / days}
+    for trips in ({"t1": "all", "t2": "wk", "t3": "lone"}, {}):
+        assert classify._calendar_weights(calendar, trips) == pytest.approx(expected)
 
 
 def test_the_service_span_is_the_effective_first_and_last_date():
@@ -1134,22 +1138,19 @@ def test_the_service_span_is_the_effective_first_and_last_date():
         b"wk,20260920,1\n"
         b"gone,20260906,2\n"
     )
-    _, _, span = classify._read_calendar(calendar, dates)
+    span = classify._read_calendar(calendar, dates).span
     assert span == (datetime.date(2026, 9, 7), datetime.date(2026, 9, 20))
-    assert (
-        classify._read_calendar(None, io.BytesIO(b"service_id,date,exception_type\n"))[
-            2
-        ]
-        is None
-    )
+    empty = io.BytesIO(b"service_id,date,exception_type\n")
+    assert classify._read_calendar(None, empty).span is None
     assert classify._service_span(None) == (None, None)
-    assert classify._service_span(({}, 0, span)) == ("2026-09-07", "2026-09-20")
+    spanned = classify.Calendar({}, {}, {}, span)
+    assert classify._service_span(spanned) == ("2026-09-07", "2026-09-20")
     # A feed with exceptions only spans its added dates, removals aside.
     only = io.BytesIO(
         b"service_id,date,exception_type\n"
         b"x,20260903,1\nx,20260910,1\nx,20260910,2\ny,20260830,1\n"
     )
-    assert classify._read_calendar(None, only)[2] == (
+    assert classify._read_calendar(None, only).span == (
         datetime.date(2026, 8, 30),
         datetime.date(2026, 9, 3),
     )

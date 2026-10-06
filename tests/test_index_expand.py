@@ -602,6 +602,42 @@ def test_a_discovered_city_gains_the_functional_urban_area_the_run_derived(
     assert manifest["metros_added"] == (0 if seeded else 1)
 
 
+def test_a_city_found_in_a_hole_a_seeded_metro_filled_reopens_it(tmp_path):
+    ring = shapely.box(21.0, 60.0, 25.0, 62.0).difference(
+        shapely.box(21.5, 60.5, 24.5, 61.9)
+    )
+    seed = SEED_PLACES + [
+        {
+            "place_id": "Q_RING",
+            "kind": "city",
+            "name": "Ring",
+            "country_code": "FI",
+            "overture_id": "fi-ring",
+            "geometry": shapely.to_wkb(ring, hex=True),
+            "geometry_source": "overture",
+            "metro_ids": ["Q_METRO"],
+            "member_ids": [],
+        },
+        {
+            "place_id": "Q_METRO",
+            "kind": "metro",
+            "name": "Ring",
+            "country_code": "FI",
+            "geometry": shapely.to_wkb(shapely.Polygon(ring.exterior), hex=True),
+            "geometry_source": "member_union",
+            "metro_ids": [],
+            "member_ids": ["Q_RING"],
+        },
+    ]
+    cache = tmp_path / "cache"
+    _publish_names(cache, seed)
+    # Tampere, discovered inside the hole, is not a member.
+    _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
+    _, places, _ = _expand(tmp_path, cache)
+    assert places["Q_METRO"]["member_ids"] == ["Q_RING"]
+    assert shapely.from_wkb(places["Q_METRO"]["geometry"]).equals(ring)
+
+
 @pytest.mark.parametrize(
     "recorded",
     [

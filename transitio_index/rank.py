@@ -21,7 +21,8 @@ cities the feed serves in the country over all served cities there. A feed
 stale when indexed — its ``service_end`` more than ``STALE_DAYS`` before its
 ``last_crawled`` — scores 0 on every edge, so it sorts last in its category
 with its tier and category unchanged; the edge's evidence records that
-``service_end`` as ``stale_when_indexed``. The weights live here and nothing
+``service_end`` as ``stale_when_indexed``, and its pairs stay out of the
+place totals with a ``share_of_place`` of 0. The weights live here and nothing
 else in the pipeline reads them; the merge rescores merged edges through
 :func:`score_edges`, the half of the scoring that depends on the place.
 """
@@ -58,6 +59,12 @@ class RankError(RuntimeError):
 def _pair_value(service, basis):
     value = service.get("departures_per_day" if basis == "departures" else "stops")
     return float(value or 0.0)
+
+
+def is_stale(edge):
+    """Whether the edge's feed was stale when indexed: its evidence records
+    ``stale_when_indexed``."""
+    return "stale_when_indexed" in (edge.get("evidence") or {})
 
 
 def _stale_when_indexed(feed):
@@ -158,18 +165,27 @@ def score_edges(edges, places):
     ``relevance_category``, ``relevance`` and ``needs_review``. A city, metro
     or region edge without ``share_of_feed`` scores 0 for it and carries the
     ``no_share_of_feed`` note unless it has a note; ``unscored`` counts them.
+    A stale pair (:func:`is_stale`) has a ``share_of_place`` of 0 and counts
+    toward neither its place's total nor, while the place has a pair that is
+    not stale, its basis.
     """
-    pairs = {}
+    pairs, stale = {}, set()
     for edge in edges:
-        pairs.setdefault((edge["feed_id"], edge["place_id"]), edge.get("service") or {})
+        key = (edge["feed_id"], edge["place_id"])
+        pairs.setdefault(key, edge.get("service") or {})
+        if is_stale(edge):
+            stale.add(key)
     by_place = collections.defaultdict(list)
     for key in pairs:
         by_place[key[1]].append(key)
     basis, totals = {}, {}
     for place_id, keys in by_place.items():
-        crawled = all(pairs[k].get("departures_per_day") is not None for k in keys)
+        fresh = [k for k in keys if k not in stale]
+        crawled = all(
+            pairs[k].get("departures_per_day") is not None for k in fresh or keys
+        )
         basis[place_id] = "departures" if crawled else "stops"
-        totals[place_id] = sum(_pair_value(pairs[k], basis[place_id]) for k in keys)
+        totals[place_id] = sum(_pair_value(pairs[k], basis[place_id]) for k in fresh)
     served_cities = collections.defaultdict(set)
     feed_cities = collections.defaultdict(set)
     for feed_id, place_id in pairs:
@@ -182,13 +198,15 @@ def score_edges(edges, places):
     unscored = 0
     for edge in edges:
         place = places[edge["place_id"]]
-        service = pairs[(edge["feed_id"], edge["place_id"])]
+        key = (edge["feed_id"], edge["place_id"])
         category = CATEGORY_BY_TIER[edge["tier"]]
         evidence = dict(edge.get("evidence") or {})
         evidence["share_basis"] = basis[edge["place_id"]]
         total = totals[edge["place_id"]]
         share_of_place = (
-            _pair_value(service, basis[edge["place_id"]]) / total if total else 0.0
+            _pair_value(pairs[key], basis[edge["place_id"]]) / total
+            if total and key not in stale
+            else 0.0
         )
         evidence["share_of_place"] = share_of_place
         if place.get("kind") in FEED_SHARE_KINDS:
@@ -209,7 +227,7 @@ def score_edges(edges, places):
             evidence["breadth"] = second
         relevance = (
             0.0
-            if category == "unknown" or "stale_when_indexed" in evidence
+            if category == "unknown" or key in stale
             else W_PLACE * share_of_place + W_FEED * second
         )
         scored.append(
