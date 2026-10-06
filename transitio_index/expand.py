@@ -243,29 +243,6 @@ def _shipped_footprint(place):
         return None
 
 
-def _draw_member_geometry(places_by_id, keys):
-    """Draw each metro in ``keys`` from its members' shipped polygons, like
-    the geometry stage does for seeded metros — over the full membership, so
-    a seeded metro's boundary grows with the discovered cities it gained; one
-    whose members ship no polygon keeps the boundary it has. Without one a
-    metro is dropped by the licence stage's rehoming."""
-    for key in keys:
-        metro = places_by_id[key]
-        members = (places_by_id.get(m) for m in metro.get("member_ids") or [])
-        geoms = [
-            geom
-            for geom in (_shipped_footprint(m) for m in members if m is not None)
-            if geom is not None
-        ]
-        if not geoms:
-            continue
-        merged = geoms[0] if len(geoms) == 1 else shapely.unary_union(geoms)
-        simplified = geometry._simplify(merged)
-        if geometry._valid_polygon(simplified):
-            metro["geometry"] = shapely.to_wkb(simplified).hex()
-            metro["geometry_source"] = "member_union"
-
-
 def _derived_inputs(cache_dir, recorded):
     """The Eurostat, Urban Audit and FAO inputs, the UCDB names and the FAO
     centres the metros stage published metros from: ``(eurostat, urau, fao,
@@ -330,16 +307,30 @@ class _SeededPlacement:
     """The seeded cities placed in their FAO regions from their Overture land
     areas as the metros stage placed them — once, and only when a region the
     seed left unpublished is minted, since the seed's own FAO metros already
-    hold their cities."""
+    hold their cities. The areas are read from the seed's ``release``, ``reopen``
+    reopening ``dataset`` when its scan stalls."""
 
-    def __init__(self, cache_dir, dataset, places_by_id, city_rows, regions, patches):
+    def __init__(
+        self,
+        cache_dir,
+        dataset,
+        places_by_id,
+        city_rows,
+        regions,
+        patches,
+        *,
+        release=None,
+        reopen=None,
+    ):
         discovered = {row["place_id"] for row in city_rows}
         self._rows = [
             row
             for key, row in places_by_id.items()
             if row.get("kind") == "city" and key not in discovered
         ]
-        self._read = functools.partial(geometry.place_areas, cache_dir, dataset)
+        self._read = functools.partial(
+            geometry.place_areas, cache_dir, dataset, release=release, reopen=reopen
+        )
         self._regions = regions
         self._patches = patches
         self._grouped = None
@@ -422,13 +413,17 @@ def _attach_fao_metros(
     fao_inputs,
     names,
     centres,
+    *,
+    release=None,
+    reopen=None,
 ):
     """FAO city-region membership for the discovered cities, mirroring the
     metros stage over the inputs it read (``fao_inputs``, None for none, the
     UCDB ``names`` and the FAO ``centres``): each city joins its region's
     metro, found by its code (``codes``) or minted — over every city in the
-    region, the seeded ones included, when the seed left it unpublished —
-    and every FAO metro's core is settled. Returns ``(added, touched)``."""
+    region, the seeded ones included, when the seed left it unpublished,
+    their areas read from the seed's ``release`` — and every FAO metro's core
+    is settled. Returns ``(added, touched)``."""
     from transitio_index import fao
 
     added = []
@@ -438,7 +433,14 @@ def _attach_fao_metros(
     regions, patches, _ = fao_inputs
     grouped, _, _, _ = fao.place_cities(city_rows, areas, regions, patches)
     seeded = _SeededPlacement(
-        cache_dir, dataset, places_by_id, city_rows, regions, patches
+        cache_dir,
+        dataset,
+        places_by_id,
+        city_rows,
+        regions,
+        patches,
+        release=release,
+        reopen=reopen,
     )
     for region_id in sorted(grouped):
         metro = codes.get((metros.FAO_SUBTYPE, region_id))
@@ -755,6 +757,8 @@ def _discover(
         fao_inputs,
         names,
         centres,
+        release=release,
+        reopen=reopen,
     )
     dropped |= metros.partition(
         {key: places_by_id[key] for key in fao_touched},
@@ -775,7 +779,38 @@ def _discover(
         metro["member_ids"].sort()
         for member in metro["member_ids"]:
             places_by_id[member]["metro_ids"].sort()
-    _draw_member_geometry(places_by_id, touched)
+    # A discovered city may stand in a hole a seeded metro filled: that metro
+    # is redrawn to keep the hole.
+    ids, tree = geometry.city_points({key: places_by_id[key] for key in new_cities})
+    unions = [
+        key
+        for key, place in places_by_id.items()
+        if place.get("geometry_source") == "member_union"
+    ]
+    hit, city = tree.query(
+        shapely.from_wkb(
+            [places_by_id[key]["geometry"] for key in unions], on_invalid="ignore"
+        ),
+        predicate="contains",
+    )
+    touched |= {
+        unions[m]
+        for m, c in zip(hit, city)
+        if ids[c] not in places_by_id[unions[m]]["member_ids"]
+    }
+    # Over the full membership, so a seeded metro's boundary grows with the
+    # discovered cities it gained; one whose members ship no polygon keeps
+    # the boundary it has. Without one a metro is dropped by the licence
+    # stage's rehoming.
+    geometry.draw_member_unions(
+        cache_dir,
+        area_dataset,
+        places_by_id,
+        sorted(touched),
+        chunk=geometry.AREA_CHUNK,
+        release=release,
+        reopen=reopen,
+    )
     if centres is not None:
         metros.fao_centres(
             [places_by_id[key] for key in fao_touched - dropped], centres

@@ -7,6 +7,7 @@ import hashlib
 import http.client
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -597,6 +598,51 @@ def test_the_metros_read_warms_the_area_cache_for_every_seeded_division(tmp_path
         countries={"FI"},
     )
     assert set(later) == {"region"} and scans["n"] == 1  # served from the warmed cache
+
+
+def test_an_area_read_for_a_recorded_release_uses_that_releases_cache(tmp_path):
+    """Expansion redraws metros from the seed's recorded Overture release; the
+    shared area read keyed its cache by the pinned release instead, so a cache
+    the pinned release had warmed answered for the recorded one."""
+    places = [{"overture_id": "city", "kind": "city", "country_code": "FI"}]
+    cache_dir = tmp_path / "cache"
+    pinned = fx.write_area_dataset(
+        tmp_path / "pinned.parquet",
+        [fx.area("city", _wkb(0, 0, 1, 1), GOOD, country="FI")],
+    )
+    recorded = fx.write_area_dataset(
+        tmp_path / "recorded.parquet",
+        [fx.area("city", _wkb(0, 0, 2, 2), GOOD, country="FI")],
+    )
+    geometry.place_areas(cache_dir, pinned, places, {"city"})
+    areas = geometry.place_areas(
+        cache_dir, recorded, places, {"city"}, release="2020-01-01.0"
+    )
+    assert shapely.area(areas["city"][0]["geom"]) == 4.0
+
+
+def test_expansion_places_seeded_cities_from_the_recorded_release(monkeypatch):
+    """The FAO placement of seeded cities during expansion read their areas
+    through the pinned release's cache, not the seed's recorded release."""
+    from transitio_index import expand, fao
+
+    calls = []
+
+    def read(*args, **kwargs):
+        calls.append(kwargs)
+        return {}
+
+    def reopen():
+        return None
+
+    monkeypatch.setattr(geometry, "place_areas", read)
+    monkeypatch.setattr(fao, "place_cities", lambda *args: ({}, None, None, None))
+    places = {"c": {"kind": "city", "overture_id": "a"}}
+    seeded = expand._SeededPlacement(
+        "cache", None, places, [], None, None, release="2020-01-01.0", reopen=reopen
+    )
+    assert seeded.cities("region") == []
+    assert calls == [{"release": "2020-01-01.0", "reopen": reopen}]
 
 
 @pytest.mark.parametrize("proxied", [True, False], ids=["proxy", "direct"])
@@ -2099,3 +2145,38 @@ def test_the_round_trip_waits_out_a_cached_release_listing(
         with pytest.raises(publisher.PublishIndexError, match="'0000000000000001'"):
             publish()
         assert len(listings) == publisher.ROUND_TRIP_ATTEMPTS
+
+
+def test_a_metro_leaves_no_holes_along_its_members_seams(tmp_path):
+    """Members were simplified one by one and the metro was the union of
+    those: along a winding border the two sides' simplified edges parted and
+    left holes in the metro, about 42,000 m² of them here."""
+    import test_index_geometry as gt
+
+    seam = [
+        (24.0 + 0.05 * i / 80, 60.0 + 0.002 * math.sin(i * math.pi / 5))
+        for i in range(81)
+    ]
+    areas = {
+        "a": shapely.Polygon([(24.0, 59.9), (24.05, 59.9), *seam[::-1]]),
+        "b": shapely.Polygon([*seam[:41], (24.025, 60.1), (24.0, 60.1)]),
+        "c": shapely.Polygon([*seam[40:], (24.05, 60.1), (24.025, 60.1)]),
+    }
+    old = shapely.union_all([geometry._simplify(area) for area in areas.values()])
+    assert len(old.interiors) > 0
+    cache = tmp_path / "cache"
+    members = [gt._place(f"Q_{key}", "city", overture_id=key) for key in areas]
+    metro = gt._place("Q_METRO", "metro", members=[m["place_id"] for m in members])
+    gt._publish(cache, [*members, metro])
+    dataset = fx.write_area_dataset(
+        tmp_path / "areas.parquet",
+        [fx.area(key, shapely.to_wkb(area), GOOD) for key, area in areas.items()],
+    )
+    geometry.attach_geometry(cache, dataset=dataset)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    (row,) = [place for place in places if place["place_id"] == "Q_METRO"]
+    drawn = shapely.from_wkb(row["geometry"])
+    assert drawn.geom_type == "Polygon" and len(drawn.interiors) == 0
+    assert drawn.covers(shapely.Polygon(old.interiors[0]).point_on_surface())

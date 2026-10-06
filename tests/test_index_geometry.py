@@ -416,13 +416,69 @@ def test_derived_inputs_are_inventoried_and_credited(tmp_path):
     assert geometry.DERIVED_SOURCE_ALLOWLIST <= set(geometry.DERIVED_SOURCES)
 
 
-def test_a_metro_gets_the_union_of_its_members_shipped_polygons(tmp_path):
-    manifest, places, _ = _run(tmp_path)
+@pytest.mark.parametrize(
+    ("parent_source", "raw"),
+    [("overture", "city"), ("qid_twin", None), ("curated", None)],
+)
+def test_a_council_member_reads_its_raw_area_only_from_an_overture_council(
+    parent_source, raw
+):
+    by_id = {"council": {"geometry_source": parent_source}}
+    member = {
+        "overture_id": "city",
+        "parent_id": "council",
+        "geometry_source": geometry.COUNCIL_AREA,
+    }
+    assert geometry._raw_area(member, by_id) == raw
+
+
+def test_a_metro_is_its_members_union_holed_only_around_other_cities(tmp_path):
+    # A frame of four members round an empty square holding a member island,
+    # and a ring member round a city that is not a member.
+    areas = {
+        "n": shapely.box(0, 2, 3, 3),
+        "s": shapely.box(0, 0, 3, 1),
+        "w": shapely.box(0, 1, 1, 2),
+        "e": shapely.box(2, 1, 3, 2),
+        "island": shapely.box(1.4, 1.4, 1.6, 1.6),
+        "ring": shapely.box(3, 0, 6, 3).difference(
+            shapely.box(4, 1, 5, 2).union(shapely.box(5.1, 1, 5.9, 2))
+        ),
+        "town": shapely.box(4.2, 1.2, 4.8, 1.8),
+    }
+    records = [_place(f"Q_{key}", "city", overture_id=key) for key in areas]
+    # Curated only: a member east of the ring, and a city in the ring's
+    # other hole.
+    for key, wkt in (
+        ("cur", "POLYGON ((6 0, 7 0, 7 3, 6 3, 6 0))"),
+        ("curtown", "POLYGON ((5.2 1.2, 5.8 1.2, 5.8 1.8, 5.2 1.8, 5.2 1.2))"),
+    ):
+        records.append(
+            {**_place(f"Q_{key}", "city"), "curated": True, "boundary_wkt": wkt}
+        )
+    members = [f"Q_{key}" for key in (*areas, "cur") if key != "town"]
+    records += [
+        _place("Q_UNION", "metro", members=members),
+        _place("Q_PARTIAL", "metro", members=("Q_n", "Q_DENIED")),
+        _place("Q_DENIED", "city", overture_id="denied"),
+        _place("Q_METRO", "metro"),
+    ]
+    cache = tmp_path / "cache"
+    _publish(cache, records)
+    rows = [fx.area(key, shapely.to_wkb(area), [_osm()]) for key, area in areas.items()]
+    dataset = fx.write_area_dataset(tmp_path / "areas.parquet", rows + AREAS)
+    manifest = geometry.attach_geometry(cache, dataset=dataset)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    places = {p["place_id"]: p for p in places}
     union = places["Q_UNION"]
     assert union["geometry_source"] == "member_union"
-    geom = shapely.from_wkb(union["geometry"])
-    for member in ("Q1757", "Q_TWOLAND"):
-        assert geom.contains(shapely.from_wkb(places[member]["geometry"]).centroid)
+    # The square is filled and the island merged into one part; the holes
+    # round the town and the curated town stay, and the curated member joins.
+    holes = shapely.box(4, 1, 5, 2).union(shapely.box(5.1, 1, 5.9, 2))
+    expected = shapely.box(0, 0, 7, 3).difference(holes)
+    assert shapely.from_wkb(union["geometry"]).equals(expected)
     # A member without shipped geometry, or no members at all: no geometry.
     assert places["Q_PARTIAL"]["geometry"] is None
     assert places["Q_METRO"]["geometry"] is None

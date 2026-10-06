@@ -6,14 +6,17 @@ an allowlist of audited ``(dataset, licence)`` pairs: geometry ships (as
 hex-encoded WKB) only when every source that built it is on the allowlist, and
 its attribution goes into ``NOTICE``; geometry with any unaudited or unlicensed
 source is omitted and recorded in the licence inventory. A metro's geometry is
-the union of its members' shipped polygons, so it never carries what a
-member may not. The shipped geometry is simplified to a tolerance; the boundary
-lookup used for point-in-polygon (the expand and coverage stages) memoizes
-geometry at that same tolerance.
+the union of its members' land areas, read at full resolution, and is drawn
+only from members that ship their own, so it never carries what a member may
+not; its holes are filled unless a non-member city stands in one, and the
+union is simplified once. The shipped geometry is simplified to a tolerance; the
+boundary lookup used for point-in-polygon (the expand and coverage stages)
+memoizes geometry at that same tolerance.
 """
 
 import collections
 import datetime
+import functools
 import logging
 import os
 import queue
@@ -266,13 +269,16 @@ def read_areas(
     return areas
 
 
-def place_areas(cache_dir, dataset, places, wanted, *, simplify=None):
+def place_areas(
+    cache_dir, dataset, places, wanted, *, simplify=None, release=None, reopen=None
+):
     """The land areas of the ``wanted`` division ids among ``places`` — the
     metros and fao stages' read, raw unless ``simplify`` is given (as in
-    :func:`read_areas`): served from the release-keyed cache, the scan
-    narrowed to the places' countries, and the S3 dataset opened (under the
-    read's deadline) only when ``dataset`` is None and an id is missing. ``{}``
-    when nothing is wanted.
+    :func:`read_areas`): served from the cache of ``release`` (default: the
+    pinned one), the scan narrowed to the places' countries, and the S3
+    dataset of that release opened (under the read's deadline) only when
+    ``dataset`` is None and an id is missing; ``reopen`` reopens ``dataset``
+    when its scan stalls. ``{}`` when nothing is wanted.
 
     A scan reads every row group of the places' countries whatever ids it asks
     for, so the fetch covers every seeded division, not only ``wanted``: the
@@ -280,8 +286,10 @@ def place_areas(cache_dir, dataset, places, wanted, *, simplify=None):
     """
     if not wanted:
         return {}
-    cache = (cache_dir, overture.OVERTURE_RELEASE)
-    reopen = division_area_dataset if dataset is None else None
+    release = release or overture.OVERTURE_RELEASE
+    cache = (cache_dir, release)
+    if reopen is None and dataset is None:
+        reopen = functools.partial(division_area_dataset, release)
     countries = {p.get("country_code") for p in places} - {None}
     lent = lenders(places)
     wanted = set(wanted) | {area for key in wanted for area, _ in lent.get(key, ())}
@@ -389,6 +397,120 @@ def shipped_geometry(rows):
     if not _valid_polygon(simplified):
         return "invalid", None
     return "shipped", simplified
+
+
+def city_points(by_id):
+    """``(keys, tree)``: the keys of the cities in ``by_id`` that ship a
+    boundary, and an STRtree over a point on each boundary."""
+    keys = [
+        key
+        for key, place in by_id.items()
+        if place.get("kind") == "city" and place.get("geometry")
+    ]
+    geoms = shapely.from_wkb(
+        [by_id[key]["geometry"] for key in keys], on_invalid="ignore"
+    )
+    points = shapely.point_on_surface(geoms)
+    return np.array(keys, dtype=object), shapely.STRtree(points)
+
+
+def member_union(parts, member_ids, cities):
+    """A metro's boundary from its members' polygons ``parts``: their union
+    with every hole filled but those holding a city of ``cities`` (from
+    :func:`city_points`) that is not in ``member_ids``, simplified once;
+    None when that is not a valid polygon."""
+    keys, tree = cities
+    polygons = shapely.get_parts(shapely.union_all(parts))
+    counts = shapely.get_num_interior_rings(polygons)
+    owner = np.repeat(np.arange(len(polygons)), counts)
+    ring = np.arange(len(owner)) - np.repeat(np.cumsum(counts) - counts, counts)
+    holes = shapely.get_interior_ring(polygons[owner], ring)
+    hole, city = tree.query(shapely.polygons(holes), predicate="contains")
+    kept = np.unique(hole[~np.isin(keys[city], list(member_ids))])
+    # Each polygon's shell, then the holes it keeps.
+    rings = np.concatenate([shapely.get_exterior_ring(polygons), holes[kept]])
+    index = np.concatenate([np.arange(len(polygons)), owner[kept]])
+    order = np.argsort(index, kind="stable")
+    filled = shapely.polygons(rings[order], indices=index[order])
+    simplified = _simplify(shapely.union_all(filled))
+    return simplified if _valid_polygon(simplified) else None
+
+
+def _raw_area(place, by_id):
+    """The division whose land area ``place`` ships simplified, or None: a
+    curated or urban-centre boundary, or a council's that is not the council's
+    own Overture area."""
+    source = place.get("geometry_source")
+    if source == COUNCIL_AREA:
+        parent = by_id.get(place.get("parent_id")) or {}
+        own = parent.get("geometry_source") == "overture"
+        return place.get("overture_id") if own else None
+    return place.get("overture_id") if source in ("overture", QID_TWIN) else None
+
+
+def draw_member_unions(
+    cache_dir, dataset, by_id, keys, *, chunk=0, release=None, reopen=None
+):
+    """Draw each metro ``by_id[key]`` of ``keys`` with :func:`member_union`
+    from its members that ship a boundary: a member's raw land area, read
+    with :func:`place_areas` about ``chunk`` members' areas at a time (all
+    at once when not positive) from ``release`` as :func:`place_areas` reads
+    it, else its shipped polygon. A metro whose
+    union is not a valid polygon keeps the boundary it has; returns how many
+    were drawn."""
+    if not keys:
+        return 0
+    members = {
+        key: [
+            by_id[m]
+            for m in by_id[key].get("member_ids") or []
+            if (by_id.get(m) or {}).get("geometry")
+        ]
+        for key in keys
+    }
+    raw = {
+        key: {_raw_area(m, by_id) for m in rows} - {None}
+        for key, rows in members.items()
+    }
+    # The members and the parents whose council areas they may borrow: the
+    # read is scoped to their countries, not to every place's.
+    places = {
+        id(place): place
+        for rows in members.values()
+        for member in rows
+        for place in (member, by_id.get(member.get("parent_id")))
+        if place is not None
+    }.values()
+    groups, size = [[]], 0
+    for key in keys:
+        if chunk > 0 and groups[-1] and size + len(raw[key]) > chunk:
+            groups.append([])
+            size = 0
+        groups[-1].append(key)
+        size += len(raw[key])
+    cities = city_points(by_id)
+    drawn = 0
+    for group in groups:
+        wanted = set().union(*(raw[key] for key in group))
+        areas = place_areas(
+            cache_dir, dataset, places, wanted, release=release, reopen=reopen
+        )
+        for key in group:
+            parts, shipped = [], []
+            for member in members[key]:
+                rows = areas.get(_raw_area(member, by_id))
+                if rows:
+                    parts += [row["geom"] for row in rows]
+                else:
+                    shipped.append(member["geometry"])
+            parts += list(shapely.from_wkb(shipped, on_invalid="ignore"))
+            member_ids = by_id[key].get("member_ids") or []
+            boundary = member_union(parts, member_ids, cities)
+            if boundary is not None:
+                by_id[key]["geometry"] = shapely.to_wkb(boundary).hex()
+                by_id[key]["geometry_source"] = "member_union"
+                drawn += 1
+    return drawn
 
 
 def _area_predicate(ids):
@@ -951,7 +1073,7 @@ def attach_geometry(
     simplified (unioned) geometry only where every land area's sources are
     allowlisted, recording the audit in the licence inventory and NOTICE; a place
     with a disallowed source, no source, or invalid geometry keeps a null
-    geometry; a metro gets the union of its members' shipped polygons, or none.
+    geometry; a metro gets the union of its members' areas, or none.
     One writer lock spans the read, the geometry read and the publish.
     Returns the generation manifest.
     """
@@ -1060,26 +1182,6 @@ def attach_geometry(
             if urban:
                 shipped.add(UCDB_DERIVED)
                 inventory[(*UCDB_DERIVED, True)] += urban
-            member_union = 0
-            for place in places:
-                if place.get("kind") != "metro" or place.get("geometry"):
-                    continue
-                # Every member must have shipped its own polygon: a metro is
-                # drawn only from what its members already redistribute.
-                members = [by_id.get(qid) for qid in place.get("member_ids") or []]
-                if not members or any(not (m and m.get("geometry")) for m in members):
-                    continue
-                merged = shapely.unary_union(
-                    [shapely.from_wkb(m["geometry"]) for m in members]
-                )
-                simplified = _simplify(merged)
-                if not _valid_polygon(simplified):
-                    invalid += 1
-                    continue
-                place["geometry"] = shapely.to_wkb(simplified).hex()
-                place["geometry_source"] = "member_union"
-                member_union += 1
-
             place_overrides, places_digest = overrides.load_place_overrides(
                 overrides_dir, registry=registry
             )
@@ -1109,6 +1211,24 @@ def attach_geometry(
                 curated += 1
             # A council area's curated boundary is its cities' too.
             _lend_council_boundaries(places, by_id, lent, absent)
+            # Drawn once curated boundaries are in, so a curated member or city
+            # counts with its own boundary; a metro set_boundary gave a geometry
+            # keeps it. Every member must have shipped its own polygon: a metro
+            # is drawn only from what its members already redistribute.
+            unions = [
+                place["place_id"]
+                for place in places
+                if place.get("kind") == "metro"
+                and not place.get("geometry")
+                and place.get("member_ids")
+                and all(
+                    (by_id.get(m) or {}).get("geometry") for m in place["member_ids"]
+                )
+            ]
+            member_union = draw_member_unions(
+                cache_dir, dataset, by_id, unions, chunk=chunk
+            )
+            invalid += len(unions) - member_union
             centres = settle_centres(places, shipped)
             derived = metros_manifest.get("derived_inventory") or []
             from transitio_index import ucdb  # ucdb -> fao -> geometry
