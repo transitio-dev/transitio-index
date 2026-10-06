@@ -54,6 +54,7 @@ import csv
 import datetime
 import hashlib
 import io
+import itertools
 import json
 import math
 import os
@@ -251,6 +252,19 @@ def verified_member(feed_dir, state, name):
             return
         opened.seek(0)
         yield opened
+
+
+def sole_row(feed_dir, state, member):
+    """A verified member's only row, or None when it has none, several, or
+    cannot be read."""
+    try:
+        with verified_member(feed_dir, state, member) as opened:
+            if opened is None:
+                return None
+            rows = list(itertools.islice(member_rows(opened), 2))
+    except MEMBER_ERRORS:
+        return None
+    return rows[0] if len(rows) == 1 else None
 
 
 def states_digest(cache_dir):

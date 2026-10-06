@@ -2196,3 +2196,24 @@ def test_a_metro_leaves_no_holes_along_its_members_seams(tmp_path):
     drawn = shapely.from_wkb(row["geometry"])
     assert drawn.geom_type == "Polygon" and len(drawn.interiors) == 0
     assert drawn.covers(shapely.Polygon(old.interiors[0]).point_on_surface())
+
+
+@pytest.mark.parametrize(
+    "inline, listing, name",
+    [
+        (["A", " B ", "A", " "], [], "A, B"),
+        ([], ["C"], "C"),
+        (["A"], ["C"], "A"),
+    ],
+    ids=["inline", "listing", "inline-first"],
+)
+def test_an_atlas_only_feed_takes_its_operators_name(inline, listing, name):
+    """1,731 Atlas-only feeds had no name: the crosswalk took only the DMFR
+    feed's own ``name``, which most Atlas feeds leave to their operators."""
+    import test_index_crosswalk as cwt
+
+    feed = cwt.atlas_feed("f-a", operators=[{"name": n} for n in inline])
+    records, _ = crosswalk.build_records(
+        [feed], [], [cwt.operator(n, "f-a") for n in listing]
+    )
+    assert [record["name"] for record in records] == [name]

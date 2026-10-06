@@ -22,6 +22,8 @@ else a minted ``f-mdb-<mdb_id>``. A record keeps the contributing source rows
 verbatim under ``atlas`` / ``mdb`` so nothing downstream must re-read raw. A
 deprecated MDB row that redirects to a live row of the ingest is no feed of its
 own: it is folded into that row's record, which keeps its minted id as an alias.
+An Atlas-only feed without a name of its own is named after its inline
+operators, else the operators listing it.
 
 After the catalogues, the curated feeds ``overrides/feeds.yaml`` adds with
 ``add_feed`` join the feed set, source ``curated``, their entry kept under
@@ -292,6 +294,17 @@ def _operator_names_by_feed(operators):
     return by_feed
 
 
+def _operator_name(feed, operator_names):
+    """The names of the feed's inline operators, else of the operators listing
+    it, each once in order and joined by ``", "``; None when none is named."""
+    inline = [operator.get("name") for operator in feed.get("operators") or []]
+    for names in (inline, operator_names.get(feed["onestop_id"], ())):
+        kept = dict.fromkeys(name.strip() for name in names if name and name.strip())
+        if kept:
+            return ", ".join(kept)
+    return None
+
+
 def _name_token_sets(names):
     """One token set per non-empty name, dropping names that tokenize to empty.
 
@@ -506,7 +519,7 @@ def _match_within_host_by_geohash(atlas_feeds, mdb_feeds, host):
     return pairs, provisional
 
 
-def _same_host_matches(atlas_feeds, mdb_feeds, operators):
+def _same_host_matches(atlas_feeds, mdb_feeds, operator_names):
     """Resolve GTFS feeds sharing a download host.
 
     Returns ``(name_pairs, geohash_pairs, provisional, candidates)``: within
@@ -515,7 +528,6 @@ def _same_host_matches(atlas_feeds, mdb_feeds, operators):
     reduce; ``provisional`` holds the ambiguous name and geohash candidates for
     a human to adjudicate.
     """
-    operator_names = _operator_names_by_feed(operators)
     atlas_by_host = _gtfs_by_host(atlas_feeds, ATLAS_STATIC_URL)
     mdb_by_host = _gtfs_by_host(mdb_feeds, MDB_DOWNLOAD_URL)
     name_pairs = []
@@ -598,7 +610,7 @@ def _both_record(atlas_feed, mdb_feed, *, method, confidence):
     }
 
 
-def _atlas_record(feed):
+def _atlas_record(feed, operator_names):
     return {
         "feed_id": feed["onestop_id"],
         "onestop_id": feed["onestop_id"],
@@ -607,7 +619,7 @@ def _atlas_record(feed):
         "id_minted": False,
         "source": "atlas",
         "spec": feed["spec"],
-        "name": feed.get("name"),
+        "name": feed.get("name") or _operator_name(feed, operator_names),
         "crosswalk_method": "none",
         "crosswalk_confidence": 0.0,
         "atlas": feed,
@@ -924,6 +936,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
     _require_unique_ids(mdb_feeds, "mdb_id", "mdb feed")
     successors = _successors(mdb_feeds)
     mdb_feeds = [feed for feed in mdb_feeds if feed["mdb_id"] not in successors]
+    operator_names = _operator_names_by_feed(operators)
 
     url_pairs = _url_exact_pairs(atlas_feeds, mdb_feeds)
     matched_onestop = {atlas_feed["onestop_id"] for atlas_feed, _ in url_pairs}
@@ -934,7 +947,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
     ]
     mdb_residual = [feed for feed in mdb_feeds if feed["mdb_id"] not in matched_mdb]
     name_pairs, geohash_pairs, provisional, same_host_candidates = _same_host_matches(
-        atlas_residual, mdb_residual, operators
+        atlas_residual, mdb_residual, operator_names
     )
     for atlas_feed, mdb_feed in (*name_pairs, *geohash_pairs):
         matched_onestop.add(atlas_feed["onestop_id"])
@@ -988,7 +1001,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         records.append(
             _gbfs_linked_record(feed, system, _usable_mint(system))
             if system is not None
-            else _atlas_record(feed)
+            else _atlas_record(feed, operator_names)
         )
     records.extend(
         _mdb_record(feed) for feed in mdb_feeds if feed["mdb_id"] not in matched_mdb

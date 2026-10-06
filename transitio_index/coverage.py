@@ -37,6 +37,8 @@ feed's membership in the edge-override stage, after curation, so a curated chang
 to the static feed reaches its companion. An unlinked GTFS-RT feed falls back to
 declared coverage like any uncrawlable feed. Crawled evidence supersedes all of
 this feed by feed once the crawl exists.
+
+A feed the catalogues leave nameless takes the name of its crawl's one agency.
 """
 
 import collections
@@ -258,7 +260,10 @@ def fold_duplicates(feeds, states):
                     source="both",
                     mdb_id=other.get("mdb_id"),
                     mdb=other.get("mdb"),
-                    name=keep.get("name") or other.get("name"),
+                    # Named as the crosswalk names a pair: Atlas, then MDB.
+                    name=(keep.get("atlas") or {}).get("name")
+                    or other.get("name")
+                    or keep.get("name"),
                     crosswalk_method="content",
                     crosswalk_confidence=1.0,
                 )
@@ -949,8 +954,17 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                         )
                         lookup = opened_lookup
                     states, unmatched = crawled_states(cache_dir, feeds)
-                    read = set(crawled_states(cache_dir, feeds, stops=False)[0])
+                    committed = crawled_states(cache_dir, feeds, stops=False)[0]
+                    read = set(committed)
                     folded = fold_duplicates(feeds, states)
+                    # After the fold, so a folded MDB copy names a feed first.
+                    for feed in feeds:
+                        if not feed.get("name") and feed["feed_id"] in committed:
+                            agency = crawl.sole_row(
+                                *committed[feed["feed_id"]], "agency.txt"
+                            )
+                            name = ((agency or {}).get("agency_name") or "").strip()
+                            feed["name"] = name or None
                     near = near_duplicates(states)
                     contained = contained_feeds(states)
                     # Each kept feed's identity, which the snapshot records
