@@ -2338,3 +2338,19 @@ def test_an_mdb_row_on_an_atlas_feeds_past_url_is_that_feed(tmp_path, monkeypatc
         ("f-mdb-d3", "d3", "none", None),
         ("f-mdb-d4", "d4", "none", None),
     ]
+
+
+def test_a_catalogue_note_is_not_a_feed_name(tmp_path):
+    """DELFI's feed was listed as "User registration required to download",
+    the Mobility Database name column holding a note about the feed, not a
+    name."""
+    note = ct.DELFI_NOTE
+    feed = {
+        **ct._feed("f-city"),
+        "name": note,
+        "mdb": {"name": note, "provider": "DELFI"},
+    }
+    manifest, covered, _ = ct._cover(tmp_path, feeds=[feed])
+    assert covered["f-city"]["name"] == "DELFI"
+    assert covered["f-city"]["mdb"]["name"] == note
+    assert manifest["named_after_provider"] == ["f-city"]

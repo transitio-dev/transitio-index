@@ -120,6 +120,8 @@ matching registry together.
 6. `expand` — add the places a feed's crawled stops actually fall in that the
    declared seed missed.
 7. `coverage` — derive the membership edges: which places each feed serves.
+   A feed whose catalogue name is a note, such as "User registration
+   required to download", takes its Mobility Database provider's name.
 8. `classify` — give each candidate edge a tier. Tier is a property of routes,
    surfaced per place: the edge carries the tier of the routes serving the
    place, so a national coach stopping once in a town gives that town a

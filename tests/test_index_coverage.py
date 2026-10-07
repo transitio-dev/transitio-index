@@ -586,28 +586,47 @@ def test_a_damaged_cache_does_not_keep_twins_apart(tmp_path):
     assert manifest["folded_feeds"] == {"f-mdb-1": "f-atlas"}
 
 
+DELFI_NOTE = "User registration required to download"
+GTFS_DE_NOTE = "gtfs.de - GTFS for Germany Data provided by DELFI e.V."
+
+
+def _mdb(name, provider="Provider"):
+    return {"name": name, "provider": provider}
+
+
 def test_a_nameless_crawled_feed_takes_its_sole_agency_name(tmp_path):
-    # feed id -> (its own name, its agency.txt rows, the name it ends with)
+    # feed id -> (its own name, its MDB row, its agency.txt rows, the name it
+    # ends with)
     cases = {
-        "f-one": (None, "a, Wiener Linien \n", "Wiener Linien"),
-        "f-two": (None, "a,Alpha\nb,Beta\n", None),
-        "f-same": (None, "a,Alpha\nb,Alpha\n", None),
-        "f-named": ("Named", "a,Alpha\n", "Named"),
+        "f-one": (None, None, "a, Wiener Linien \n", "Wiener Linien"),
+        "f-two": (None, None, "a,Alpha\nb,Beta\n", None),
+        "f-same": (None, None, "a,Alpha\nb,Alpha\n", None),
+        "f-named": ("Named", None, "a,Alpha\n", "Named"),
+        # A catalogue note takes the provider's name, else the agency's.
+        "f-delfi": (DELFI_NOTE, _mdb(DELFI_NOTE, "DELFI"), "a,Alpha\n", "DELFI"),
+        "f-de": (GTFS_DE_NOTE, _mdb(GTFS_DE_NOTE), "a,Alpha\n", "Provider"),
+        "f-url": ("https://x.example/", _mdb("https://x.example/"), "", "Provider"),
+        "f-real": ("Metro Transit", _mdb("Metro Transit"), "", "Metro Transit"),
+        "f-curated": ("Login required", _mdb(DELFI_NOTE), "", "Login required"),
+        "f-bare": (DELFI_NOTE, _mdb(DELFI_NOTE, None), "a,Alpha\n", "Alpha"),
     }
     _, covered, _ = _cover(
         tmp_path,
-        feeds=[{**_feed(f), "name": own} for f, (own, _, _) in cases.items()],
+        feeds=[
+            {**_feed(f), "name": own, "mdb": mdb}
+            for f, (own, mdb, _, _) in cases.items()
+        ],
         placements=[],
         # Distinct stops, so no two crawls fold.
         crawls={f: _rows(2 + i, 10.0) for i, f in enumerate(cases)},
         members={
             f: {"agency.txt": f"agency_id,agency_name\n{rows}".encode()}
-            for f, (_, rows, _) in cases.items()
+            for f, (_, _, rows, _) in cases.items()
         },
         lookup=LOOKUP,
     )
     assert {f: covered[f]["name"] for f in cases} == {
-        f: name for f, (_, _, name) in cases.items()
+        f: name for f, (_, _, _, name) in cases.items()
     }
 
 

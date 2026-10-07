@@ -38,12 +38,14 @@ to the static feed reaches its companion. An unlinked GTFS-RT feed falls back to
 declared coverage like any uncrawlable feed. Crawled evidence supersedes all of
 this feed by feed once the crawl exists.
 
-A feed the catalogues leave nameless takes the name of its crawl's one agency.
+A feed named by a catalogue note takes its Mobility Database provider's name;
+a feed the catalogues leave nameless takes the name of its crawl's one agency.
 """
 
 import collections
 import datetime
 import logging
+import re
 
 from transitio.index import fingerprint
 
@@ -56,6 +58,13 @@ COVERAGE_POINTER = "coverage.json"
 FEEDS_ARTIFACT = "feeds_covered.jsonl"
 EDGES_ARTIFACT = "edges_candidate.jsonl"
 NEAR_DUPLICATES_ARTIFACT = "near_duplicates.jsonl"
+# A catalogue name that is a note about access, attribution or status.
+_NOTE_NAME = re.compile(
+    r"\b(?:required|registration|register|log ?in|account|accessible to"
+    r"|users only|provided by|powered by|raw data|static feed for|unofficial)\b"
+    r"|https?://",
+    re.I,
+)
 
 
 class CoverageError(RuntimeError):
@@ -866,6 +875,28 @@ def _set_coverage(
     return applied, curated
 
 
+def catalogue_note(feed):
+    """The feed's Mobility Database name when it is a note and still the
+    feed's name (a curated name is never one), else None."""
+    note = (feed.get("mdb") or {}).get("name")
+    if note and feed.get("name") == note and _NOTE_NAME.search(note):
+        return note
+    return None
+
+
+def _name_after_provider(feeds):
+    """Name each feed whose name is a catalogue note after its MDB provider;
+    one without a provider is left nameless. Returns the ids of the feeds
+    named after a provider."""
+    named = []
+    for feed in feeds:
+        if catalogue_note(feed) is not None:
+            feed["name"] = feed["mdb"].get("provider") or None
+            if feed["name"]:
+                named.append(feed["feed_id"])
+    return sorted(named)
+
+
 def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=None):
     """Derive declared membership edges; publish the ``coverage`` generation.
 
@@ -916,6 +947,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             elsewhere = _placed_elsewhere(feeds, places, feed_overrides, own_ids)
             feeds = [feed for feed in feeds if feed["feed_id"] not in elsewhere]
             placements = [p for p in placements if p["feed_id"] not in elsewhere]
+            named_after_provider = _name_after_provider(feeds)
 
             crawled_by_key = {}
             crawl_report = {
@@ -1062,6 +1094,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "feeds_covered": len(covered),
                 "folded_feeds": dict(sorted(folded.items())),
                 "feeds_placed_elsewhere": sorted(elsewhere),
+                "named_after_provider": named_after_provider,
                 "near_duplicate_groups": len(near),
                 "feeds_contained": len(contained),
                 "containment_rules": dict(sorted(contained.items())),
