@@ -82,7 +82,8 @@ OVERRIDE_FIELDS = (
 # shares. 13: a place's service and validity are summed over the merged edges.
 # 14: a content fold names the feed by its Atlas name, then the MDB copy's.
 # 15: overlap evidence names the merged feeds.
-MERGE_FORMAT = 15
+# 16: overlap evidence lists the feeds its build measured at the place.
+MERGE_FORMAT = 16
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -368,17 +369,26 @@ def _merged_containers(table, mapping):
     )
 
 
-def _merged_overlaps(edges, mapping, feed_ids):
+def _merged_overlaps(edges, mapping, feed_ids, measured=None):
     """``edges`` with each overlap block's other feeds named by the merged
     ids: re-keyed through ``mapping``, the larger share kept per mode when
     two ids become one, without the edge's own feed or an id no merged feed
-    carries. An edge without a block stays as taken."""
+    carries. An edge without a block stays as taken.
+
+    With ``measured`` (``{(place_id, build_id): merged feed ids}``, the feeds
+    each build classified at each place), a block also lists under
+    ``compared`` the other merged feeds its own build measured there: a
+    feed of another build is absent from ``with`` because its overlap was
+    never measured, not because it shares no line."""
     if "evidence" not in edges.column_names:
         return edges
     kept = set(feed_ids)
     values = edges["evidence"].to_pylist()
-    rows = zip(edges["feed_id"].to_pylist(), _json_records(edges, "evidence"))
-    for i, (feed_id, evidence) in enumerate(rows):
+    keys = [None] * len(edges)
+    if measured is not None:
+        keys = zip(edges["place_id"].to_pylist(), edges["build_id"].to_pylist())
+    rows = zip(edges["feed_id"].to_pylist(), _json_records(edges, "evidence"), keys)
+    for i, (feed_id, evidence, key) in enumerate(rows):
         if "overlap" not in evidence:
             continue
         overlap = evidence["overlap"]
@@ -398,6 +408,8 @@ def _merged_overlaps(edges, mapping, feed_ids):
             for mode, share in shares.items():
                 into[mode] = max(share, into.get(mode, share))
         overlap["with"] = named
+        if measured is not None:
+            overlap["compared"] = sorted((measured.get(key, set()) & kept) - {feed_id})
         values[i] = publish._json_block(evidence)
     return _replaced(edges, "evidence", values)
 
@@ -533,8 +545,17 @@ def merge_tables(sources, skipped=()):
         tables["access_providers.parquet"] = _providers(
             merged["access_providers.parquet"], tables["feeds.parquet"]
         )
+    measured = (
+        edges.assign(merged_id=edges["feed_id"].map(lambda f: mapping.get(f, f)))
+        .groupby(["place_id", "build_id"])["merged_id"]
+        .agg(set)
+        .to_dict()
+    )
     tables["edges.parquet"] = _merged_overlaps(
-        tables["edges.parquet"], mapping, tables["feeds.parquet"]["feed_id"].to_pylist()
+        tables["edges.parquet"],
+        mapping,
+        tables["feeds.parquet"]["feed_id"].to_pylist(),
+        measured,
     )
     tables["edges.parquet"], relevance = _rescored(
         tables["edges.parquet"], tables["places.parquet"]
