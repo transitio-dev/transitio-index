@@ -501,11 +501,15 @@ ALL = ["f-atlas", "f-mdb-1", "f-mdb-2"]
 def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
     tmp_path, stops, tables, copy_tables, folded, near
 ):
+    # The Atlas feed's name is its operators', not one of its own.
+    atlas = {"source": "atlas", "crosswalk_method": "none", "name": "Operators"}
     feeds = [
-        {**_feed("f-atlas"), "source": "atlas", "crosswalk_method": "none"},
+        {**_feed("f-atlas"), **atlas, "atlas": {"name": None}},
         {**_feed("f-mdb-2"), "source": "mdb", "mdb_id": "2", "mdb": {"id": "2"}},
         {**_feed("f-mdb-1"), "source": "mdb", "mdb_id": "1", "mdb": {"id": "1"}},
     ]
+    for feed in feeds[1:]:
+        feed["name"] = f"MDB {feed['mdb_id']}"
     manifest, covered, edges = _cover(
         tmp_path,
         feeds=feeds,
@@ -519,9 +523,13 @@ def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
     assert set(edges) == set(covered)
     kept = covered["f-atlas"]
     assert kept["aliases"] == sorted(folded)
-    # The Atlas feed takes the first MDB copy's record: both catalogues carry it.
-    assert (kept["source"], kept.get("mdb_id"), kept["crosswalk_method"]) == (
-        ("both", "1", "content") if folded else ("atlas", None, "none")
+    # The Atlas feed takes the first MDB copy's record and name: both
+    # catalogues carry it.
+    record = ("source", "mdb_id", "crosswalk_method", "name")
+    assert tuple(kept.get(field) for field in record) == (
+        ("both", "1", "content", "MDB 1")
+        if folded
+        else ("atlas", None, "none", "Operators")
     )
     # Feeds sharing stops and routes but not every table are reported apart.
     rows, _ = store.read_jsonl(
@@ -576,6 +584,31 @@ def test_a_damaged_cache_does_not_keep_twins_apart(tmp_path):
         lookup=LOOKUP,
     )
     assert manifest["folded_feeds"] == {"f-mdb-1": "f-atlas"}
+
+
+def test_a_nameless_crawled_feed_takes_its_sole_agency_name(tmp_path):
+    # feed id -> (its own name, its agency.txt rows, the name it ends with)
+    cases = {
+        "f-one": (None, "a, Wiener Linien \n", "Wiener Linien"),
+        "f-two": (None, "a,Alpha\nb,Beta\n", None),
+        "f-same": (None, "a,Alpha\nb,Alpha\n", None),
+        "f-named": ("Named", "a,Alpha\n", "Named"),
+    }
+    _, covered, _ = _cover(
+        tmp_path,
+        feeds=[{**_feed(f), "name": own} for f, (own, _, _) in cases.items()],
+        placements=[],
+        # Distinct stops, so no two crawls fold.
+        crawls={f: _rows(2 + i, 10.0) for i, f in enumerate(cases)},
+        members={
+            f: {"agency.txt": f"agency_id,agency_name\n{rows}".encode()}
+            for f, (_, rows, _) in cases.items()
+        },
+        lookup=LOOKUP,
+    )
+    assert {f: covered[f]["name"] for f in cases} == {
+        f: name for f, (_, _, name) in cases.items()
+    }
 
 
 def _stops(count, first=0):

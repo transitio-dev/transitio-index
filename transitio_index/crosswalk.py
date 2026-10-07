@@ -6,7 +6,9 @@ a stable ``feed_id`` and the crosswalk method that produced it. Identity is
 resolved in a cascade of narrowing confidence: url-exact (one GTFS download URL
 in both catalogues, http and https alike), then a gated same-host match (feeds
 sharing a download host whose names agree), then geohash-confirm (a same-host
-candidate whose Onestop-ID geohash meets the MDB centroid geohash). GBFS
+candidate whose Onestop-ID geohash meets the MDB centroid geohash). Feeds still
+unpaired then pair by url-historic: an MDB download URL that is one of an Atlas
+feed's past URLs. GBFS
 ``systems.csv`` systems are linked to their Atlas feed by auto-discovery URL,
 or minted ``f-gbfs-*`` where no Atlas feed carries them, and written to their
 own ``gbfs_systems.jsonl``: shared-mobility systems are not transit feeds, so
@@ -22,6 +24,8 @@ else a minted ``f-mdb-<mdb_id>``. A record keeps the contributing source rows
 verbatim under ``atlas`` / ``mdb`` so nothing downstream must re-read raw. A
 deprecated MDB row that redirects to a live row of the ingest is no feed of its
 own: it is folded into that row's record, which keeps its minted id as an alias.
+An Atlas-only feed without a name of its own is named after its inline
+operators, else the operators listing it.
 
 After the catalogues, the curated feeds ``overrides/feeds.yaml`` adds with
 ``add_feed`` join the feed set, source ``curated``, their entry kept under
@@ -53,6 +57,7 @@ CURATED_SOURCE = "curated"
 # a URL match there is one-to-many and cannot assert a single identity; RT
 # linkage is the static-link step, not this one.
 ATLAS_STATIC_URL = "static_current"
+ATLAS_HISTORIC_URLS = "static_historic"
 MDB_DOWNLOAD_URL = "direct_download"
 ATLAS_REALTIME_URLS = (
     "realtime_trip_updates",
@@ -156,38 +161,39 @@ def _source_versions(atlas, mdb, gbfs):
     }
 
 
-def _unique_url_index(records, spec, url_of):
-    """Records of ``spec`` keyed by URL, keeping only URLs unique in the source.
+def _unique_url_index(records, spec, urls_of):
+    """Records of ``spec`` keyed by each of their URLs (``urls_of(record)``),
+    keeping only URLs unique in the source.
 
-    A URL shared by several records cannot resolve a single identity, so it is
-    dropped from the index and left unmatched rather than resolved to an
-    arbitrary one of them.
+    A record listing a URL twice is still its one holder. A URL shared by
+    several records cannot resolve a single identity, so it is dropped from the
+    index and left unmatched rather than resolved to an arbitrary one of them.
     """
     by_url = {}
     dropped = set()
     for record in records:
         if record["spec"] != spec:
             continue
-        url = _clean_url(url_of(record))
-        if url is None:
-            continue
-        if url in by_url:
-            dropped.add(url)
-        else:
-            by_url[url] = record
+        for url in dict.fromkeys(map(_clean_url, urls_of(record))):
+            if url is None:
+                continue
+            if url in by_url:
+                dropped.add(url)
+            else:
+                by_url[url] = record
     for url in dropped:
         del by_url[url]
     return by_url
 
 
-def _unique_url_pairs(left, right, spec, left_url, right_url):
-    """``(left, right)`` pairs of ``spec`` whose URL is identical and unique.
+def _unique_url_pairs(left, right, spec, left_urls, right_urls):
+    """``(left, right)`` pairs of ``spec`` sharing a URL unique on both sides.
 
     Uniqueness on both sides makes each pair a clean one-to-one identity;
     anything ambiguous stays unmatched.
     """
-    left_index = _unique_url_index(left, spec, left_url)
-    right_index = _unique_url_index(right, spec, right_url)
+    left_index = _unique_url_index(left, spec, left_urls)
+    right_index = _unique_url_index(right, spec, right_urls)
     pairs = []
     for url, left_record in left_index.items():
         right_record = right_index.get(url)
@@ -196,14 +202,66 @@ def _unique_url_pairs(left, right, spec, left_url, right_url):
     return pairs
 
 
+def _atlas_url(feed):
+    """An Atlas feed's static download URL, the one url-exact matches on, in
+    match form; realtime endpoints carry no identity."""
+    return _match_url((feed.get("urls") or {}).get(ATLAS_STATIC_URL))
+
+
+def _mdb_url(feed):
+    return _match_url((feed.get("urls") or {}).get(MDB_DOWNLOAD_URL))
+
+
+def _historic_urls(feed):
+    """An Atlas feed's past download URLs, in match form."""
+    urls = (feed.get("urls") or {}).get(ATLAS_HISTORIC_URLS)
+    if not isinstance(urls, list):
+        return []
+    return [url for url in map(_match_url, urls) if url is not None]
+
+
+def _atlas_urls(feed):
+    """An Atlas feed's current and past download URLs, in match form."""
+    return [_atlas_url(feed), *_historic_urls(feed)]
+
+
 def _url_exact_pairs(atlas_feeds, mdb_feeds):
     return _unique_url_pairs(
         atlas_feeds,
         mdb_feeds,
         "gtfs",
-        lambda feed: _match_url((feed.get("urls") or {}).get(ATLAS_STATIC_URL)),
-        lambda feed: _match_url((feed.get("urls") or {}).get(MDB_DOWNLOAD_URL)),
+        lambda feed: [_atlas_url(feed)],
+        lambda feed: [_mdb_url(feed)],
     )
+
+
+# url-historic runs after every other match, so it only pairs feeds they left
+# unpaired.
+URL_HISTORIC_CONFIDENCE = 0.9
+
+
+def _url_historic_pairs(atlas_feeds, mdb_feeds, matched_onestop, matched_mdb):
+    """``(atlas_feed, mdb_feed)`` pairs, both still unpaired, whose MDB download
+    URL is one of the Atlas feed's past URLs.
+
+    The index holds every Atlas feed's current and past URLs, so a URL two
+    Atlas feeds hold is no identity, and an Atlas feed two unpaired MDB rows
+    reach pairs with neither.
+    """
+    pairs = [
+        (atlas_feed, mdb_feed)
+        for atlas_feed, mdb_feed in _unique_url_pairs(
+            atlas_feeds,
+            mdb_feeds,
+            "gtfs",
+            _atlas_urls,
+            lambda feed: [_mdb_url(feed)],
+        )
+        if atlas_feed["onestop_id"] not in matched_onestop
+        and mdb_feed["mdb_id"] not in matched_mdb
+    ]
+    reached = collections.Counter(atlas_feed["onestop_id"] for atlas_feed, _ in pairs)
+    return [pair for pair in pairs if reached[pair[0]["onestop_id"]] == 1]
 
 
 # The same-host step gates a shared download host on name agreement. Vendor
@@ -290,6 +348,17 @@ def _operator_names_by_feed(operators):
         for feed_id in operator.get("associated_feed_ids") or []:
             by_feed[feed_id].append(name)
     return by_feed
+
+
+def _operator_name(feed, operator_names):
+    """The names of the feed's inline operators, else of the operators listing
+    it, each once in order and joined by ``", "``; None when none is named."""
+    inline = [operator.get("name") for operator in feed.get("operators") or []]
+    for names in (inline, operator_names.get(feed["onestop_id"], ())):
+        kept = dict.fromkeys(name.strip() for name in names if name and name.strip())
+        if kept:
+            return ", ".join(kept)
+    return None
 
 
 def _name_token_sets(names):
@@ -506,7 +575,19 @@ def _match_within_host_by_geohash(atlas_feeds, mdb_feeds, host):
     return pairs, provisional
 
 
-def _same_host_matches(atlas_feeds, mdb_feeds, operators):
+def _unresolved_links(provisional, pairs):
+    """The provisional links on neither endpoint of any of ``pairs``."""
+    resolved_onestop = {atlas_feed["onestop_id"] for atlas_feed, _ in pairs}
+    resolved_mdb = {mdb_feed["mdb_id"] for _, mdb_feed in pairs}
+    return [
+        link
+        for link in provisional
+        if link["onestop_id"] not in resolved_onestop
+        and link["mdb_id"] not in resolved_mdb
+    ]
+
+
+def _same_host_matches(atlas_feeds, mdb_feeds, operator_names):
     """Resolve GTFS feeds sharing a download host.
 
     Returns ``(name_pairs, geohash_pairs, provisional, candidates)``: within
@@ -515,7 +596,6 @@ def _same_host_matches(atlas_feeds, mdb_feeds, operators):
     reduce; ``provisional`` holds the ambiguous name and geohash candidates for
     a human to adjudicate.
     """
-    operator_names = _operator_names_by_feed(operators)
     atlas_by_host = _gtfs_by_host(atlas_feeds, ATLAS_STATIC_URL)
     mdb_by_host = _gtfs_by_host(mdb_feeds, MDB_DOWNLOAD_URL)
     name_pairs = []
@@ -543,14 +623,7 @@ def _same_host_matches(atlas_feeds, mdb_feeds, operators):
     # A geohash match can resolve a feed whose name was ambiguous; drop the now
     # stale provisional rows — on either endpoint, since a resolved MDB feed can
     # no longer pair with the other Atlas feeds that named it.
-    resolved_onestop = {atlas_feed["onestop_id"] for atlas_feed, _ in geohash_pairs}
-    resolved_mdb = {mdb_feed["mdb_id"] for _, mdb_feed in geohash_pairs}
-    provisional = [
-        link
-        for link in provisional
-        if link["onestop_id"] not in resolved_onestop
-        and link["mdb_id"] not in resolved_mdb
-    ]
+    provisional = _unresolved_links(provisional, geohash_pairs)
     return name_pairs, geohash_pairs, provisional, candidates
 
 
@@ -573,10 +646,10 @@ def _both_record(atlas_feed, mdb_feed, *, method, confidence):
     """One feed carried by both catalogues, keyed on its Onestop ID.
 
     ``method`` and ``confidence`` record how the match was made — ``url_exact``
-    at 1.0, ``same_host`` lower. The minted ``f-mdb-*`` id is kept in ``aliases``
-    so overrides filed against it before the crosswalk resolved still find the
-    feed — unless the Onestop ID already equals it, when the alias would be a
-    redundant self-reference.
+    at 1.0, the other methods lower. The minted ``f-mdb-*`` id is kept in
+    ``aliases`` so overrides filed against it before the crosswalk resolved
+    still find the feed — unless the Onestop ID already equals it, when the
+    alias would be a redundant self-reference.
     """
     onestop_id = atlas_feed["onestop_id"]
     minted = _mint_mdb(mdb_feed["mdb_id"])
@@ -598,7 +671,7 @@ def _both_record(atlas_feed, mdb_feed, *, method, confidence):
     }
 
 
-def _atlas_record(feed):
+def _atlas_record(feed, operator_names):
     return {
         "feed_id": feed["onestop_id"],
         "onestop_id": feed["onestop_id"],
@@ -607,7 +680,7 @@ def _atlas_record(feed):
         "id_minted": False,
         "source": "atlas",
         "spec": feed["spec"],
-        "name": feed.get("name"),
+        "name": feed.get("name") or _operator_name(feed, operator_names),
         "crosswalk_method": "none",
         "crosswalk_confidence": 0.0,
         "atlas": feed,
@@ -694,8 +767,8 @@ def _gbfs_links(atlas_feeds, systems):
         atlas_feeds,
         systems,
         "gbfs",
-        lambda feed: (feed.get("urls") or {}).get(GBFS_DISCOVERY_URL),
-        lambda system: system.get("auto_discovery_url"),
+        lambda feed: [(feed.get("urls") or {}).get(GBFS_DISCOVERY_URL)],
+        lambda system: [system.get("auto_discovery_url")],
     )
 
 
@@ -913,6 +986,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
 
     Resolved in a cascade of narrowing confidence: url-exact, then a gated
     same-host match (name agreement, then geohash-confirm) over the residual;
+    url-historic then pairs the feeds still unpaired by a past Atlas URL;
     GBFS systems are linked to their Atlas feed by auto-discovery URL and minted
     ``f-gbfs-*`` where no Atlas feed carries them. Returns ``(records,
     summary)``; every feed appears exactly once, a matched pair as one ``both``
@@ -924,6 +998,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
     _require_unique_ids(mdb_feeds, "mdb_id", "mdb feed")
     successors = _successors(mdb_feeds)
     mdb_feeds = [feed for feed in mdb_feeds if feed["mdb_id"] not in successors]
+    operator_names = _operator_names_by_feed(operators)
 
     url_pairs = _url_exact_pairs(atlas_feeds, mdb_feeds)
     matched_onestop = {atlas_feed["onestop_id"] for atlas_feed, _ in url_pairs}
@@ -934,11 +1009,19 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
     ]
     mdb_residual = [feed for feed in mdb_feeds if feed["mdb_id"] not in matched_mdb]
     name_pairs, geohash_pairs, provisional, same_host_candidates = _same_host_matches(
-        atlas_residual, mdb_residual, operators
+        atlas_residual, mdb_residual, operator_names
     )
     for atlas_feed, mdb_feed in (*name_pairs, *geohash_pairs):
         matched_onestop.add(atlas_feed["onestop_id"])
         matched_mdb.add(mdb_feed["mdb_id"])
+    historic_pairs = _url_historic_pairs(
+        atlas_feeds, mdb_feeds, matched_onestop, matched_mdb
+    )
+    for atlas_feed, mdb_feed in historic_pairs:
+        matched_onestop.add(atlas_feed["onestop_id"])
+        matched_mdb.add(mdb_feed["mdb_id"])
+    # Neither end of a historic pair is a same-host candidate any longer.
+    provisional = _unresolved_links(provisional, historic_pairs)
 
     gbfs_pairs = _gbfs_links(atlas_feeds, systems)
     system_by_onestop = {feed["onestop_id"]: system for feed, system in gbfs_pairs}
@@ -981,6 +1064,10 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         _both_record(a, m, method="geohash", confidence=GEOHASH_CONFIDENCE)
         for a, m in geohash_pairs
     )
+    records.extend(
+        _both_record(a, m, method="url_historic", confidence=URL_HISTORIC_CONFIDENCE)
+        for a, m in historic_pairs
+    )
     for feed in progress(atlas_feeds, "crosswalk"):
         if feed["onestop_id"] in matched_onestop:
             continue
@@ -988,7 +1075,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         records.append(
             _gbfs_linked_record(feed, system, _usable_mint(system))
             if system is not None
-            else _atlas_record(feed)
+            else _atlas_record(feed, operator_names)
         )
     records.extend(
         _mdb_record(feed) for feed in mdb_feeds if feed["mdb_id"] not in matched_mdb
@@ -1016,6 +1103,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         "url_exact": 0,
         "same_host": 0,
         "geohash": 0,
+        "url_historic": 0,
         "systems_csv": 0,
         "none": 0,
     }
@@ -1030,6 +1118,7 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
         "same_host_candidates": same_host_candidates,
         "same_host_pairs": len(name_pairs),
         "geohash_pairs": len(geohash_pairs),
+        "url_historic_pairs": len(historic_pairs),
         "mdb_folded": len(successors),
         "gbfs_linked": len(gbfs_pairs),
         "gbfs_minted": len(orphan_systems) - len(skipped_orphans),

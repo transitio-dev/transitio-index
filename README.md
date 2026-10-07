@@ -89,6 +89,8 @@ matching registry together.
 2. `crosswalk` — match the same feed across the Transitland Atlas and the
    Mobility Database into one de-duplicated table. A deprecated Mobility
    Database row that redirects to a live row becomes an alias of that feed.
+   A Mobility Database row the other matches leave unmatched is paired with
+   the unmatched Atlas feed that lists its download URL among its past URLs.
    The GBFS systems go to a table of their own, which the index does not
    publish. The feeds no catalogue lists that `overrides/feeds.yaml` adds
    with `add_feed` join the table in every build whose catalogue feeds

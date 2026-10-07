@@ -687,6 +687,7 @@ def _discover(
         reopen=reopen,
         countries={discovered[qid].get("country_code") for qid in new_ids} - {None},
     )
+    absent = wanted - areas.keys()
     given = geometry.lend_areas(areas, lent)
     # The geometry stage applied the entries naming a seeded key; the rest
     # name a place discovery added, or a seeded row it gave their QID.
@@ -723,6 +724,18 @@ def _discover(
         parent = place.get("parent_id")
         if parent not in places_by_id and held.get(parent) in places_by_id:
             place["parent_id"] = held[parent]
+    # A council area's curated boundary is its cities' too.
+    absent |= {
+        place["overture_id"]
+        for place in places_by_id.values()
+        if place.get("geometry_source") == geometry.COUNCIL_AREA
+    }
+    geometry._lend_council_boundaries(
+        places_by_id.values(),
+        places_by_id,
+        geometry.council_areas(places_by_id.values()),
+        absent,
+    )
 
     new_cities = [qid for qid in new_ids if places_by_id[qid].get("kind") == "city"]
     city_rows = [places_by_id[qid] for qid in new_cities]

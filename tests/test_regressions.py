@@ -33,9 +33,11 @@ from transitio_index import (  # noqa: E402
     coverage,
     crawl,
     crosswalk,
+    csv_source,
     eurostat,
     fetch,
     geometry,
+    mdb,
     metros,
     names,
     overture,
@@ -1758,6 +1760,50 @@ def test_set_boundary_applies_to_a_place_expand_discovers(tmp_path, stale, joine
     assert manifest["stale_place_overrides"] == stale
 
 
+@pytest.mark.parametrize("seeded", [False, True], ids=["discovered", "seeded"])
+def test_a_discovered_city_takes_its_councils_curated_boundary(tmp_path, seeded):
+    """Expand lent a discovered city with no area its council's Overture
+    area and never lent again, so the city kept that area when the council's
+    boundary was curated — in expand, or by the geometry stage for a seeded
+    council. It now takes the council's curated boundary."""
+    import test_index_expand as ex
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import overrides
+
+    curated = shapely.box(17.9, 59.25, 18.1, 59.4)
+    entry = {"place": "Q506250", "set_boundary": shapely.to_wkt(curated)}
+    directory = write_overrides(tmp_path, places=[entry])
+    rows = list(ex.SEED_PLACES)
+    if seeded:
+        # The municipality as the geometry stage left it.
+        rows.append(
+            {
+                "place_id": "Q506250",
+                "kind": "region",
+                "source_subtype": "county",
+                "resolution_method": "overture_wikidata",
+                "name": "Stockholms kommun",
+                "country_code": "SE",
+                "overture_id": "se-sto-county",
+                "geometry": shapely.to_wkb(curated).hex(),
+                "geometry_source": geometry.CURATED,
+                "metro_ids": [],
+                "member_ids": [],
+            }
+        )
+    cache = tmp_path / "cache"
+    ex._publish_names(
+        cache, rows, places_overrides_sha256=overrides.places_digest(directory)
+    )
+    ex._write_crawl(cache, "f-sto", ["s1,59.33,18.07\n"])
+    _, places, _ = ex._expand(tmp_path, cache, overrides_dir=directory)
+    stockholm = places["Q1754"]
+    assert stockholm["parent_id"] == "Q506250"
+    assert stockholm["geometry_source"] == geometry.COUNCIL_AREA
+    assert shapely.from_wkb(bytes.fromhex(stockholm["geometry"])).equals(curated)
+
+
 def _council(country, subtype, name, qid=None, **names):
     """A division record as ``seed.council_area`` reads it."""
     return {
@@ -2196,3 +2242,99 @@ def test_a_metro_leaves_no_holes_along_its_members_seams(tmp_path):
     drawn = shapely.from_wkb(row["geometry"])
     assert drawn.geom_type == "Polygon" and len(drawn.interiors) == 0
     assert drawn.covers(shapely.Polygon(old.interiors[0]).point_on_surface())
+
+
+@pytest.mark.parametrize(
+    "inline, listing, name",
+    [
+        (["A", " B ", "A", " "], [], "A, B"),
+        ([], ["C"], "C"),
+        (["A"], ["C"], "A"),
+    ],
+    ids=["inline", "listing", "inline-first"],
+)
+def test_an_atlas_only_feed_takes_its_operators_name(inline, listing, name):
+    """1,731 Atlas-only feeds had no name: the crosswalk took only the DMFR
+    feed's own ``name``, which most Atlas feeds leave to their operators."""
+    import test_index_crosswalk as cwt
+
+    feed = cwt.atlas_feed("f-a", operators=[{"name": n} for n in inline])
+    records, _ = crosswalk.build_records(
+        [feed], [], [cwt.operator(n, "f-a") for n in listing]
+    )
+    assert [record["name"] for record in records] == [name]
+
+
+def test_an_mdb_row_on_an_atlas_feeds_past_url_is_that_feed(tmp_path, monkeypatch):
+    """mdb-779's download URL is a past URL of the Atlas MVV feed, but the
+    crosswalk matched current URLs only and the partition cut placed Atlas
+    feeds by current URL: the index carried MVV twice, its Atlas copy
+    nameless."""
+    import test_sample_catalogues as sct
+
+    sc = sct.sc
+    mvv = "Münchner Verkehrs- und Tarifverbund GmbH (MVV)"
+    rows = [
+        {**sct._mdb_gtfs("d1", "DE", "https://mvv.example/old"), "provider": mvv},
+        sct._mdb_gtfs("d2", "DE", "https://x.example/now"),
+        sct._mdb_gtfs("a1", "AT", "https://x.example/then"),
+        sct._mdb_gtfs("a2", "AT", "https://mvv.example/h"),
+        sct._mdb_gtfs("d3", "DE", "https://two.example/1"),
+        sct._mdb_gtfs("a3", "AT", "https://two.example/2"),
+        sct._mdb_gtfs("a4", "AT", "https://s.example/a"),
+        sct._mdb_gtfs("d4", "DE", "https://s.example/p"),
+    ]
+
+    def feed(feed_id, current, *past):
+        urls = {
+            "static_current": f"https://{current}",
+            "static_historic": [f"https://{url}" for url in past],
+        }
+        return {"id": feed_id, "spec": "gtfs", "urls": urls}
+
+    files = [
+        (
+            "r/feeds/de.dmfr.json",
+            sct._payload(
+                feed("f-mvv", "mvv.example/new", "mvv.example/old"),
+                feed("f-x", "x.example/now", "x.example/then"),
+                feed("f-h", "mvv.example/h", "mvv.example/g"),
+                feed("f-two", "two.example/0", "two.example/1", "two.example/2"),
+                feed("f-s1", "s.example/a", "s.example/p"),
+                feed("f-s2", "t.example/b", "s.example/p"),
+            ),
+        )
+    ]
+    sct._partition_inputs(tmp_path, monkeypatch, rows, files)
+    sc.main(["--partition", "--out-dir", str(tmp_path / "out")])
+
+    (published,) = (tmp_path / "out").glob("partition-*")
+    manifest = json.loads((published / "partition.json").read_text())
+    # AT picks f-mvv by host, DE by a past URL; f-x's current URL is in DE,
+    # its past one in AT. Rows in two labels reach f-two, which pairs neither,
+    # so neither cut holds it; nor does DE hold f-s2 by the past URL it shares
+    # with f-s1, which is no identity.
+    assert manifest["atlas"] == {
+        "f-mvv": "de",
+        "f-x": "de",
+        "f-h": "at",
+        "f-two": "atlas1",
+        "f-s1": "at",
+        "f-s2": "atlas1",
+    }
+    cut = Path(manifest["labels"]["de"]["cut"])
+    text = (cut / "mdb_sample.csv").read_text(encoding="utf-8")
+    mdb_feeds, _ = mdb.parse_rows(
+        csv_source.read_rows(text, mdb.REQUIRED_HEADERS), "mdb_sample.csv"
+    )
+    records, _ = crosswalk.build_records(
+        atlas.parse(cut / "atlas_sample.tar.gz")["feeds"], mdb_feeds
+    )
+    assert [
+        (r["feed_id"], r["mdb_id"], r["crosswalk_method"], r["name"]) for r in records
+    ] == [
+        ("f-x", "d2", "url_exact", None),
+        ("f-mvv", "d1", "url_historic", mvv),
+        ("f-mdb-d3", "d3", "none", None),
+        ("f-mdb-d4", "d4", "none", None),
+    ]

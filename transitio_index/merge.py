@@ -80,7 +80,8 @@ OVERRIDE_FIELDS = (
 # 10: schema 11, the providers table and the places' populations. 11: the
 # NOTICE's credential providers' paragraph. 12: stale pairs leave the place
 # shares. 13: a place's service and validity are summed over the merged edges.
-MERGE_FORMAT = 13
+# 14: a content fold names the feed by its Atlas name, then the MDB copy's.
+MERGE_FORMAT = 14
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -272,6 +273,13 @@ def _take_mdb_records(table, stacked, folds, best):
         if canonical is not None:
             records[canonical] = row
     ids = table["feed_id"].to_pylist()
+    # The canonical's own Atlas name, from its published Atlas block.
+    blocks = table["atlas"].to_pylist() if "atlas" in table.column_names else ()
+    atlas_names = {
+        feed_id: json.loads(block).get("name")
+        for feed_id, block in zip(ids, blocks)
+        if feed_id in records and block
+    }
     for column in (
         "source",
         "mdb_id",
@@ -291,7 +299,7 @@ def _take_mdb_records(table, stacked, folds, best):
                 "source": "both",
                 "mdb_id": record.get("mdb_id"),
                 "mdb": record.get("mdb"),
-                "name": values[i] or record.get("name"),
+                "name": atlas_names.get(feed_id) or record.get("name") or values[i],
                 "crosswalk_method": "content",
                 "crosswalk_confidence": 1.0,
             }[column]

@@ -354,7 +354,7 @@ def test_feeds_another_build_kept_with_the_same_content_fold(
             tmp_path,
             "atlas6",
             2,
-            feeds=[feed("f-wl", "atlas", name="")],
+            feeds=[feed("f-wl", "atlas", name="Wiener Linien")],
             edges={"AT": [_edge7("wien", "f-wl", "local", "primary", 0.5, False)]},
             built_at=BUILT(15),
         ),
