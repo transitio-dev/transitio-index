@@ -40,6 +40,17 @@ never built from less than complete route coverage. A skipped feed whose
 whole-feed claim no longer holds is requested for a complete recrawl
 through ``recrawl_requests.jsonl``, the one artifact that crosses builds.
 
+Each route-level tier edge also records which other feeds run its service:
+``evidence["overlap"]`` holds the edge's departures a day in the place by
+basic mode, and per other feed at the place the share of them on routes
+that feed also runs — a route of the same family (tram, subway and rail are
+one, rail-bound) and line name (short, else long, without whitespace,
+casefolded) whose stops in the place come within ``OVERLAP_NEAR_DEG`` of the
+route's stop box there. A route's departures are its calendar-weighted
+stop-events spread evenly over its stops, times its stops in the place; a
+feed without a calendar gets no block, but its routes still count for the
+others.
+
 The stage also decides each feed's home country from its stops: the distinct
 scheduled stops per country (``country_stops``), their shares, the country
 holding at least ``HOME_SHARE`` of them (``home_country``, else null) and the
@@ -120,6 +131,31 @@ COVERED_SHARE = 0.25
 # taxi and miscellaneous services unclassifiable (rule 10); 3 gates rule 1 on
 # the border share and records every route's scale.
 RULES_VERSION = 3
+
+# Basic modes over GTFS route types, the reader's table: railway 100s and
+# suburban railway 300s are rail; urban railway 400s, metro 500s,
+# underground 600s and monorail join subway; coach 200s, bus 700s and
+# trolleybus 800s join bus; tram 900s; water 1000s and ferry 1200s are ferry.
+BASIC_MODES = {
+    "tram": {0, 5} | set(range(900, 1000)),
+    "subway": {1, 12} | set(range(400, 700)),
+    "rail": {2} | set(range(100, 200)) | set(range(300, 400)),
+    "bus": {3, 11} | set(range(200, 300)) | set(range(700, 900)),
+    "ferry": {4} | set(range(1000, 1100)) | set(range(1200, 1300)),
+}
+_MODE_OF_TYPE = {t: mode for mode, types in BASIC_MODES.items() for t in types}
+# One family when matching another feed's routes: feeds type the same
+# suburban rail as tram or rail.
+RAIL_BOUND = frozenset({"tram", "subway", "rail"})
+# Another feed runs a route when its route of the same family and line name
+# has stops in the place within this many degrees of the route's stop box.
+OVERLAP_NEAR_DEG = 0.003
+# An edge lists the other feeds running at least this share of its
+# departures, at most this many, largest first.
+OVERLAP_MIN_SHARE = 0.01
+OVERLAP_MAX_FEEDS = 10
+# Rows per box test in the place pass.
+_OVERLAP_BLOCK = 2048
 
 EARTH_RADIUS_KM = 6371.0088
 
@@ -309,6 +345,24 @@ def route_serves(stops_in_place, route_stops, *, route_min_stops=ROUTE_MIN_STOPS
     return route_stops > 0 and stops_in_place >= route_min_stops
 
 
+def basic_mode(route_type):
+    """The route type's mode in ``BASIC_MODES``, else the type as a string;
+    ``"unknown"`` without a type."""
+    if route_type is None:
+        return "unknown"
+    return _MODE_OF_TYPE.get(route_type, str(route_type))
+
+
+def _line_name(row):
+    """The route's short name, else its long name, without whitespace and
+    casefolded, so "RB 16" and "rb16" are one line; empty without either."""
+    for field in ("route_short_name", "route_long_name"):
+        name = "".join((row.get(field) or "").split()).casefold()
+        if name:
+            return name
+    return ""
+
+
 class _LaterFirst:
     """A heap key that ranks the lexicographically LATER trip id as smaller,
     so the bounded heap evicts it first and keeps the earlier id on ties."""
@@ -326,10 +380,10 @@ class _LaterFirst:
 
 
 def _read_routes(opened):
-    """``({route_id: {"route_type", "agency_id"}}, route_types)`` — an
-    unparsable type is a missing signal (None), never a guessed one; ids
-    stay verbatim. ``route_types`` lists every row's type, id or not, as the
-    crawl's skip predicate saw them."""
+    """``({route_id: {"route_type", "agency_id", "name"}}, route_types)`` —
+    an unparsable type is a missing signal (None), never a guessed one; ids
+    stay verbatim; ``name`` is the :func:`_line_name`. ``route_types`` lists
+    every row's type, id or not, as the crawl's skip predicate saw them."""
     routes = {}
     route_types = []
     for row in crawl.member_rows(opened):
@@ -342,6 +396,7 @@ def _read_routes(opened):
         routes[route_id] = {
             "route_type": route_type,
             "agency_id": row.get("agency_id") or "",
+            "name": _line_name(row),
         }
     return routes, route_types
 
@@ -575,13 +630,15 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     None without a calendar. The fifth result is every served stop id the
     file schedules for a trip the feed declares (``trips``, default the
     joined ones), whether or not that trip joins a route: the feed's
-    country evidence must not shrink with a partial join.
+    country evidence must not shrink with a partial join. The sixth is the
+    same weighted stop-events per route, or None without a calendar.
     """
     stops = collections.defaultdict(set)
     scheduled = set()
     declared = trip_routes if trips is None else trips
     trip_rows = collections.Counter()
     departures = collections.Counter()
+    events = collections.Counter()
     dangling = 0
     for row in crawl.member_rows(opened):
         trip_id = row.get("trip_id") or ""
@@ -606,7 +663,9 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
             continue
         stops[route_id].add(stop_id)
         if weights is not None:
-            departures[stop_id] += weights.get(trip_services.get(trip_id, ""), 0.0)
+            weight = weights.get(trip_services.get(trip_id, ""), 0.0)
+            departures[stop_id] += weight
+            events[route_id] += weight
     # Candidates are bounded PER DISTINCT TRIP LENGTH: for each route and
     # each stop count, a small heap keeps the PATTERN_SAMPLE smallest trip
     # ids, and the PATTERN_SAMPLE largest lengths are then taken — so
@@ -658,6 +717,7 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
         dangling,
         (dict(departures) if weights is not None else None),
         scheduled,
+        (dict(events) if weights is not None else None),
     )
 
 
@@ -807,6 +867,7 @@ def _members(feed_dir, state, names, calendar=None):
                     dangling,
                     parsed["stop_departures"],
                     parsed["scheduled"],
+                    parsed["route_events"],
                 ) = _read_stop_times(
                     opened,
                     trip_routes,
@@ -1030,6 +1091,122 @@ def _stops_inside(route, place_id, place):
     return len(_place_stop_ids(route, place_id, place))
 
 
+def _overlap_rows(routes, place_id, place, coords, route_events, interned):
+    """One row per route for :func:`_overlaps`: the interned ids of its line
+    key ``(family, name)`` (-1 without a name, matching nothing) and of its
+    basic mode, its departures a day in the place (NaN without a calendar),
+    and the box ``x0, y0, x1, y1`` of its stops in the place (NaN, meeting
+    nothing, when the stops span over 180 degrees of longitude: across the
+    antimeridian)."""
+    rows = np.full((len(routes), 7), np.nan)
+    for row, route in zip(rows, routes):
+        mode = basic_mode(route["route_type"])
+        family = "rail-bound" if mode in RAIL_BOUND else mode
+        key = (family, route["name"])
+        row[0] = interned.setdefault(key, len(interned)) if route["name"] else -1
+        row[1] = interned.setdefault(mode, len(interned))
+        inside = _place_stop_ids(route, place_id, place)
+        if route_events is not None:
+            events = route_events.get(route["route_id"], 0.0)
+            row[2] = events / max(route["stop_count"], 1) * len(inside)
+        if inside:
+            xs, ys = zip(*(coords[stop_id] for stop_id in inside))
+            if max(xs) - min(xs) <= 180:
+                row[3:] = min(xs), min(ys), max(xs), max(ys)
+    return rows
+
+
+def _overlap_matches(rows, feeds, count):
+    """The ``(row, other feed)`` pairs, each once: a row of another feed
+    carries the row's line key and its box, grown by ``OVERLAP_NEAR_DEG``,
+    meets the row's. ``feeds`` holds each row's feed index below ``count``.
+
+    Rows are sorted by key; only a key two feeds or more run is tested, in
+    blocks of ``_OVERLAP_BLOCK`` rows against the key's rows."""
+    keyed = np.flatnonzero(rows[:, 0] >= 0)
+    order = keyed[np.argsort(rows[keyed, 0], kind="stable")]
+    if not len(order):
+        return np.empty(0, np.int64), np.empty(0, np.int64)
+    keys = rows[order, 0]
+    starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]])
+    ends = np.r_[starts[1:], len(order)]
+    shared = np.minimum.reduceat(feeds[order], starts) != np.maximum.reduceat(
+        feeds[order], starts
+    )
+    near = OVERLAP_NEAR_DEG
+    found = [np.empty(0, np.int64)]
+    for start, end in zip(starts[shared], ends[shared]):
+        group = order[start:end]
+        box = rows[group, 3:]
+        for first in range(0, len(group), _OVERLAP_BLOCK):
+            block = group[first : first + _OVERLAP_BLOCK]
+            own = rows[block, 3:, None]
+            hit = own[:, 0] - near <= box[:, 2]
+            hit &= box[:, 0] <= own[:, 2] + near
+            hit &= own[:, 1] - near <= box[:, 3]
+            hit &= box[:, 1] <= own[:, 3] + near
+            hit &= feeds[block, None] != feeds[group]
+            i, j = np.nonzero(hit)
+            found.append(np.unique(block[i] * count + feeds[group[j]]))
+    codes = np.unique(np.concatenate(found))
+    return codes // count, codes % count
+
+
+def _overlap_block(rows, matched, other, names, modes):
+    """The ``overlap`` evidence of one edge from its ``rows`` and the
+    ``(matched row, other feed index)`` pairs among them."""
+    mode_ids, local = np.unique(rows[:, 1], return_inverse=True)
+    totals = np.bincount(local, rows[:, 2], len(mode_ids))
+    sums = np.zeros((len(names), len(mode_ids)))
+    np.add.at(sums, (other, local[matched]), rows[matched, 2])
+    shares = np.divide(sums, totals, out=np.zeros_like(sums), where=totals > 0)
+    shares = shares.round(3)
+    # Zero over zero is no share: nothing runs, so nothing is matched.
+    overall = sums.sum(axis=1) / (totals.sum() or 1.0)
+    listed = sorted(
+        np.flatnonzero(overall >= OVERLAP_MIN_SHARE),
+        key=lambda i: (-overall[i], names[i]),
+    )[:OVERLAP_MAX_FEEDS]
+    return {
+        "departures": {
+            modes[int(m)]: round(float(t), 1) for m, t in zip(mode_ids, totals)
+        },
+        "with": {
+            names[i]: {
+                modes[int(m)]: float(s) for m, s in zip(mode_ids, shares[i]) if s > 0
+            }
+            for i in listed
+        },
+    }
+
+
+def _overlaps(by_place, interned):
+    """Write ``evidence["overlap"]`` on the edges :func:`_overlap_rows` gave
+    rows, one place at a time, emptying ``by_place`` (``{place_id: [(edge,
+    rows)]}``) as it goes; how many edges got a block. An edge whose feed
+    has no calendar gets none."""
+    modes = {i: name for name, i in interned.items() if isinstance(name, str)}
+    written = 0
+    for place_id in sorted(by_place):
+        pairs = by_place.pop(place_id)
+        names = sorted({edge["feed_id"] for edge, _ in pairs})
+        index = {feed_id: i for i, feed_id in enumerate(names)}
+        sizes = [len(rows) for _, rows in pairs]
+        stacked = np.concatenate([rows for _, rows in pairs])
+        feeds = np.repeat([index[edge["feed_id"]] for edge, _ in pairs], sizes)
+        matched, other = _overlap_matches(stacked, feeds, len(names))
+        bounds = np.cumsum([0] + sizes)
+        cuts = np.searchsorted(matched, bounds)
+        for (edge, rows), low, lo, hi in zip(pairs, bounds, cuts, cuts[1:]):
+            if np.isnan(rows[:, 2]).any():
+                continue
+            edge["evidence"]["overlap"] = _overlap_block(
+                rows, matched[lo:hi] - low, other[lo:hi], names, modes
+            )
+            written += 1
+    return written
+
+
 def _classify_feed(
     candidates,
     feed_dir,
@@ -1042,6 +1219,7 @@ def _classify_feed(
     conflicts=frozenset(),
     calendar=None,
     curated=None,
+    interned=None,
 ):
     """The classified edges for one crawled feed; ``(edges, status, routes,
     dropped, join_gaps, country_stops, country_basis)`` — ``dropped`` counting
@@ -1062,6 +1240,9 @@ def _classify_feed(
     complete crawl with no routes, or with routes but no scheduled stops
     (header-only trips or stop_times), yields ``unknown`` edges too: no route
     serves anything, but the feed's membership is not a vanished edge.
+
+    With ``interned`` (the line keys and modes interned so far), each
+    route-level tier edge carries its :func:`_overlap_rows` as ``_overlap``.
     """
     mode = (state.get("stop_times") or {}).get("state")
     names = ("trips.txt",) if mode == "complete" else ()
@@ -1242,6 +1423,7 @@ def _classify_feed(
             ),
             "route_id": route_id,
             "route_type": route_type,
+            "name": info["name"],
             "span_km": span,
             "median_km": median,
             "stop_count": count,
@@ -1278,19 +1460,31 @@ def _classify_feed(
             # omission is loud in the manifest.
             dropped += 1
             continue
-        edges.extend(
-            _tier_edges(
-                candidate,
-                contributing,
-                route_min_stops,
-                {"join_gaps": parsed.get("join_gaps")},
-                _service_level(
-                    contributing, place_id, place, parsed.get("stop_departures")
-                ),
-                stamp,
-                "complete",
-            )
+        tier_edges = _tier_edges(
+            candidate,
+            contributing,
+            route_min_stops,
+            {"join_gaps": parsed.get("join_gaps")},
+            _service_level(
+                contributing, place_id, place, parsed.get("stop_departures")
+            ),
+            stamp,
+            "complete",
         )
+        if interned is not None:
+            by_tier = collections.defaultdict(list)
+            for route in contributing:
+                by_tier[route["decision"]["tier"]].append(route)
+            for edge in tier_edges:
+                edge["_overlap"] = _overlap_rows(
+                    by_tier[edge["tier"]],
+                    place_id,
+                    place,
+                    coords,
+                    parsed.get("route_events"),
+                    interned,
+                )
+        edges.extend(tier_edges)
     return (
         edges,
         "route_stops",
@@ -1690,6 +1884,7 @@ def classify(
             country_basis = {}
             artefacts = {}
             spans = {}
+            interned, by_place = {}, collections.defaultdict(list)
             for feed_id in progress(sorted(by_feed), "classify"):
                 feed_candidates = by_feed[feed_id]
                 if sources.get(feed_id) == "crawl" and feed_id in crawled:
@@ -1711,8 +1906,13 @@ def classify(
                             conflicts=conflicts,
                             calendar=calendar,
                             curated=curated,
+                            interned=interned,
                         )
                     )
+                    for edge in classified:
+                        rows = edge.pop("_overlap", None)
+                        if rows is not None:
+                            by_place[edge["place_id"]].append((edge, rows))
                     routes_classified += routes
                     edges_dropped += dropped
                     for key, value in (gaps or {}).items():
@@ -1734,6 +1934,7 @@ def classify(
             for feed_id, (feed_dir, state) in crawled.items():
                 if feed_id not in spans and sources.get(feed_id) == "crawl":
                     spans[feed_id] = _service_span(_calendar(feed_dir, state))
+            edges_with_overlap = _overlaps(by_place, interned)
             edges.sort(key=lambda e: (e["place_id"], e["feed_id"], e["tier"]))
             scopes = collections.Counter()
             bases = collections.Counter()
@@ -1815,6 +2016,12 @@ def classify(
                 "unknown_share": (by_tier["unknown"] / len(edges)) if edges else 0.0,
                 "needs_review": sum(1 for e in edges if e["needs_review"]),
                 "edges_near_threshold": near_threshold_count(edges),
+                "edges_with_overlap": edges_with_overlap,
+                "overlap_settings": {
+                    "near_deg": OVERLAP_NEAR_DEG,
+                    "min_share": OVERLAP_MIN_SHARE,
+                    "max_feeds": OVERLAP_MAX_FEEDS,
+                },
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),

@@ -89,7 +89,7 @@ def evidence_hash(edges, targets=(), feed_id=None, route_evidence=None):
             edge["feed_id"],
             edge["place_id"],
             edge["tier"],
-            _canonical(edge.get("evidence")),
+            _canonical(_own_evidence(edge.get("evidence"))),
             edge.get("classification_fingerprint"),
         )
         for edge in edges
@@ -105,6 +105,14 @@ def evidence_hash(edges, targets=(), feed_id=None, route_evidence=None):
 
 def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _own_evidence(evidence):
+    """The evidence without its overlap block, which moves with the other
+    feeds at the place."""
+    if not isinstance(evidence, dict) or "overlap" not in evidence:
+        return evidence
+    return {key: value for key, value in evidence.items() if key != "overlap"}
 
 
 def _needs_review(edge):
@@ -494,6 +502,8 @@ class _Curator:
         edge["selector_state"], edge["selector"] = self.selector(
             feed_id, entry["set_selector"], entry
         )
+        # The overlap block described the routes the machine selected.
+        (edge.get("evidence") or {}).pop("overlap", None)
         if edge["selector_state"] != "unavailable":
             # A trusted selector is validated at fetch time against the
             # fingerprint of the very evidence it was built from — an edge

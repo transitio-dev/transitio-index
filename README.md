@@ -126,7 +126,9 @@ matching registry together.
    surfaced per place: the edge carries the tier of the routes serving the
    place, so a national coach stopping once in a town gives that town a
    national edge, and the edge's `service` struct says how much service that
-   is.
+   is. Its evidence also records, per other feed at the place, the share of
+   its departures on lines that feed runs too: the same line name and mode
+   family, with stops nearby.
 9. `curate` — apply the curated edge overrides on top of the classified edges.
 10. `rank` — give every edge its relevance: a category from its tier (local
     is primary, regional secondary, national tertiary, international stays

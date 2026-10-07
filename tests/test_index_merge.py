@@ -1132,6 +1132,41 @@ def test_edges_whose_evidence_is_not_a_record_are_refused(evidence, message):
         merge._shares(edges)
 
 
+@pytest.mark.parametrize(
+    "others, named",
+    [
+        pytest.param(
+            {"f-old": {"bus": 0.7}, "f-new": {"bus": 0.6, "rail": 0.2}},
+            {"f-new": {"bus": 0.7, "rail": 0.2}},
+            id="alias",
+        ),
+        pytest.param({"f-a": {"bus": 1.0}, "f-a-old": {"bus": 0.5}}, {}, id="own"),
+        pytest.param({"f-gone": {"bus": 0.5}}, {}, id="unknown"),
+        pytest.param(None, None, id="no-block"),
+        pytest.param({"f-new": [0.5]}, merge.MergeError, id="not-a-record"),
+    ],
+)
+def test_overlap_evidence_names_the_merged_feeds(others, named):
+    evidence = {"near_threshold": False}
+    if others is not None:
+        evidence["overlap"] = {"departures": {"bus": 2.0}, "with": others}
+    edges = pa.table(
+        {"feed_id": ["f-a", "f-a"], "evidence": [json.dumps(evidence), None]}
+    )
+    mapping = {"f-old": "f-new", "f-a-old": "f-a"}
+    if named is merge.MergeError:
+        with pytest.raises(named, match="overlap is not a record"):
+            merge._merged_overlaps(edges, mapping, ["f-a", "f-new"])
+        return
+    merged = merge._merged_overlaps(edges, mapping, ["f-a", "f-new"])
+    first, second = merged["evidence"].to_pylist()
+    assert second is None
+    if named is None:
+        assert first == edges["evidence"][0].as_py()
+    else:
+        assert json.loads(first)["overlap"]["with"] == named
+
+
 def test_an_edge_without_evidence_counts_as_not_near_a_threshold():
     edges = pa.table(
         {"tier": ["unknown", "local"], "evidence": [None, '{"near_threshold": true}']}

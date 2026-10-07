@@ -2354,3 +2354,23 @@ def test_a_catalogue_note_is_not_a_feed_name(tmp_path):
     assert covered["f-city"]["name"] == "DELFI"
     assert covered["f-city"]["mdb"]["name"] == note
     assert manifest["named_after_provider"] == ["f-city"]
+
+
+def test_feeds_running_the_same_lines_name_each_other(tmp_path):
+    """MVV, DELFI and gtfs.de urban each carried about 95 % of Munich's
+    departures and the index said nothing; MVV types the S-Bahn as tram."""
+    import test_index_classify as clt
+
+    cache = tmp_path / "cache"
+    built = [
+        clt._lines(cache, feed_id, [("S1", kind), ("210", 3)])
+        for feed_id, kind in (("f-mvv", 0), ("f-delfi", 109), ("f-urban", 2))
+    ]
+    feeds, candidates = zip(*built)
+    clt._coverage(cache, list(feeds), list(candidates))
+    classify.classify(cache, lookup=clt.LOOKUP)
+    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    for edge in edges:
+        others = edge["evidence"]["overlap"]["with"]
+        assert set(others) == {"f-mvv", "f-delfi", "f-urban"} - {edge["feed_id"]}
+        assert {s for shares in others.values() for s in shares.values()} == {1.0}
