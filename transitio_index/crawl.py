@@ -7,6 +7,12 @@ into ``cache/crawl/<feed dir>/`` alongside a ``state.json`` provenance record
 (URL, validators, digests, members, the member set asked for, the archive's full
 root-file manifest, time).
 
+The state also records the archive's size in bytes, every root file's
+uncompressed size and the ``.txt`` files holding no data row (a header alone,
+or nothing): files up to :data:`EMPTY_PROBE_BYTES` are read to tell, larger
+ones count as having rows. A state written before these were recorded is
+re-fetched once.
+
 Feeds large enough to pay for it (past the size threshold, on a server that
 honours ranges and offers a strong validator) are read member-by-member through
 :mod:`transitio_index.ziprange`; everything else — and any range oddity — downloads
@@ -56,6 +62,7 @@ import hashlib
 import io
 import itertools
 import json
+import lzma
 import math
 import os
 import re
@@ -106,6 +113,25 @@ ARCHIVE_FILE = "feed.zip"
 # national aggregate's stop_times.txt runs to several GiB.
 RANGED_MEMBER_BYTES = 256 * 1024 * 1024
 DOWNLOAD_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
+
+# A root .txt file over this many uncompressed bytes counts as having rows
+# unread; smaller ones are read to tell header-only (or blank) files from
+# files with rows.
+EMPTY_PROBE_BYTES = 64 * 1024
+
+# What reading a root file for that test can raise: a range read refused, a
+# corrupt or unsupported member. The file then counts as having rows.
+_PROBE_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    EOFError,
+    NotImplementedError,
+    zipfile.BadZipFile,
+    zlib.error,
+    lzma.LZMAError,
+    fetch.FetchError,
+)
 
 # Where a crawl read the feed from: its producer URL, or the MDB-hosted copy.
 PRODUCER = "producer"
@@ -265,6 +291,15 @@ def sole_row(feed_dir, state, member):
     except MEMBER_ERRORS:
         return None
     return rows[0] if len(rows) == 1 else None
+
+
+def _has_rows(data):
+    """Whether a file's bytes hold a data row as :func:`member_rows` reads
+    them; bytes it cannot decode or parse count as rows."""
+    try:
+        return any(True for _ in itertools.islice(member_rows(io.BytesIO(data)), 1))
+    except (UnicodeError, csv.Error):
+        return True
 
 
 def states_digest(cache_dir):
@@ -483,6 +518,9 @@ def _cache_reusable(feed_dir, state, url, force, lookup):
         # A crawl that asked for fewer members (before the calendar files
         # joined the set) cannot stand in for one that asks for them all.
         return False
+    if _sizes(state) is None:
+        # A state written before the sizes were recorded is re-fetched once.
+        return False
     if (state.get("stop_times") or {}).get("state") == "skipped":
         still_skipped, _ = _skip_stop_times(
             feed_dir, state.get("member_sha256") or {}, lookup, force
@@ -687,19 +725,63 @@ def _manifest_list(value):
     return None
 
 
+def _sizes(state):
+    """``(archive_bytes, member_bytes, empty_files)`` from a state, or None
+    when one is missing or malformed: a size that is not a non-negative
+    int, a listed file without one, or empty files that are not names."""
+    files = _manifest_list(state.get("files"))
+    member_bytes = state.get("member_bytes")
+    empty_files = state.get("empty_files")
+    if files is None or not isinstance(member_bytes, dict):
+        return None
+    sizes = [state.get("archive_bytes"), *(member_bytes.get(name) for name in files)]
+    if not all(type(size) is int and size >= 0 for size in sizes):
+        return None
+    if not isinstance(empty_files, list) or not all(
+        isinstance(name, str) for name in empty_files
+    ):
+        return None
+    return state["archive_bytes"], member_bytes, empty_files
+
+
+def _file_record(names, size_of, read):
+    """The state's record of the archive's root files: ``files``, their
+    uncompressed ``member_bytes`` and the ``empty_files``, the ``.txt`` files
+    up to :data:`EMPTY_PROBE_BYTES` that hold no data row. A file ``read``
+    cannot read counts as having rows, so a broken optional file never
+    fails the feed."""
+    sizes = {name: size_of(name) for name in names}
+
+    def empty(name):
+        if not name.lower().endswith(".txt") or sizes[name] > EMPTY_PROBE_BYTES:
+            return False
+        try:
+            return not _has_rows(read(name))
+        except _PROBE_ERRORS:
+            return False
+
+    return {
+        "files": names,
+        "member_bytes": sizes,
+        "empty_files": sorted(name for name in names if empty(name)),
+    }
+
+
 def _write_ranged(fetcher, url, probe, feed_dir, decide, fragment=None):
     """Write members via range reads, one at a time; return their digests and
-    the archive's file manifest.
+    the archive's file record (:func:`_file_record`).
 
     The cheap members land first; ``decide`` then rules on the complete
-    ``stop_times.txt`` read from what is on disk. The manifest is the central
-    directory the range reads already parse, so it costs no extra fetch.
+    ``stop_times.txt`` read from what is on disk. The manifest and sizes are
+    the central directory the range reads already parse; a small root file
+    that is not a member is read to tell whether it is empty.
     ``fragment`` is a folder fragment when the URL carries one.
     """
     read = fetcher.range_reader(url, validator=_range_validator(probe))
     directory = ziprange.central_directory(read, probe["size"])
     root = _archive_root(directory, fragment[1] if fragment else None)
     digests = {}
+    small = {}
 
     def write(name):
         entry = directory.get(root + name)
@@ -708,13 +790,27 @@ def _write_ranged(fetcher, url, probe, feed_dir, decide, fragment=None):
         data = ziprange.read_member(read, entry, max_member_bytes=RANGED_MEMBER_BYTES)
         store.write_bytes(feed_dir, name, data)
         digests[name] = hashlib.sha256(data).hexdigest()
+        if entry["uncompressed_size"] <= EMPTY_PROBE_BYTES:
+            small[name] = data
 
     for name in CHEAP_MEMBERS:
         write(name)
     skipped, reason = decide(feed_dir, digests)
     if not skipped:
         write(STOP_TIMES)
-    return digests, _root_files(_under(directory, root)), skipped, reason
+
+    def member(name):
+        if name in small:
+            return small[name]
+        entry = directory[root + name]
+        return ziprange.read_member(read, entry, max_member_bytes=2 * EMPTY_PROBE_BYTES)
+
+    record = _file_record(
+        _root_files(_under(directory, root)),
+        lambda name: directory[root + name]["uncompressed_size"],
+        member,
+    )
+    return digests, record, skipped, reason
 
 
 def _write_member(feed_dir, archive, info):
@@ -783,9 +879,10 @@ def _extract_members(feed_dir, decide, fragment=None, check=None):
     extracted first and read in the outer one's place. The cheap members land
     first; ``decide`` then rules on extracting ``stop_times.txt``. ``check``
     may refuse the file manifest before any member is written. Returns the
-    digests and the archive file manifest, which comes from the same
-    ``zipfile`` reader that extracts the members, so the two never disagree
-    about what the archive holds.
+    digests and the archive's file record (:func:`_file_record`), which comes
+    from the same ``zipfile`` reader that extracts the members, so the two
+    never disagree about what the archive holds. For a nested archive the
+    record describes the inner one.
     """
     digests = {}
     inner = None
@@ -826,7 +923,16 @@ def _extract_members(feed_dir, decide, fragment=None, check=None):
         skipped, reason = decide(feed_dir, digests)
         if not skipped:
             extract(STOP_TIMES)
-    return digests, files, skipped, reason
+
+        def member(name):
+            # Read to its end, so zipfile checks the CRC.
+            with archive.open(archive.getinfo(root + name)) as opened:
+                return opened.read(EMPTY_PROBE_BYTES + 1)
+
+        record = _file_record(
+            files, lambda name: archive.getinfo(root + name).file_size, member
+        )
+    return digests, record, skipped, reason
 
 
 def _crawl_keyless(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
@@ -1020,7 +1126,6 @@ def _crawl_from(
                 return record, None
 
         digests = None
-        files = []
         fragment = _fragment(url)
         nested = fragment is not None and fragment[0] == "archive"
         # Range reads span several requests, so they are only taken when a
@@ -1036,9 +1141,10 @@ def _crawl_from(
         )
         if ranged:
             try:
-                digests, files, skipped, skip_reason = _write_ranged(
+                digests, file_record, skipped, skip_reason = _write_ranged(
                     fetcher, url, probe, feed_dir, decide, fragment
                 )
+                archive_bytes = probe["size"]
                 record["method"] = "range"
                 record["bytes_saved"] = probe["size"] - (
                     fetcher.bytes_fetched - fetched_before
@@ -1099,9 +1205,11 @@ def _crawl_from(
             }
             try:
                 check(validators.values())
-                digests, files, skipped, skip_reason = _extract_members(
+                digests, file_record, skipped, skip_reason = _extract_members(
                     feed_dir, decide, fragment, check
                 )
+                # The bytes written: for a nested archive, the outer one.
+                archive_bytes = outcome["bytes"]
             except zipfile.BadZipFile:
                 if _html_page(feed_dir, outcome.get("content_type")):
                     raise HtmlPage(f"GET {url}: an HTML page, not a zip archive")
@@ -1115,7 +1223,7 @@ def _crawl_from(
         _prune_members(feed_dir, digests)
         record["fetched_from"] = fetched_from
         record["members"] = sorted(digests)
-        record["files"] = files
+        record["files"] = file_record["files"]
         record["fallback_reason"] = fallback_reason
         # "complete" must mean the member exists AND was read; an archive
         # that simply has none is "absent", never a false completeness claim.
@@ -1142,7 +1250,12 @@ def _crawl_from(
                 "members": sorted(digests),
                 # Every root file the archive carries (a superset of the
                 # extracted members), so callers can filter feeds by capability.
-                "files": files,
+                "files": file_record["files"],
+                # The archive's bytes, each root file's uncompressed bytes and
+                # the .txt files holding no data row.
+                "archive_bytes": archive_bytes,
+                "member_bytes": file_record["member_bytes"],
+                "empty_files": file_record["empty_files"],
                 # The member set this crawler asked for: a cache written
                 # for a smaller set is not reusable, optional members or not.
                 "members_requested": sorted(MEMBERS),
