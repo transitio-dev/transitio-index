@@ -81,7 +81,8 @@ OVERRIDE_FIELDS = (
 # NOTICE's credential providers' paragraph. 12: stale pairs leave the place
 # shares. 13: a place's service and validity are summed over the merged edges.
 # 14: a content fold names the feed by its Atlas name, then the MDB copy's.
-MERGE_FORMAT = 14
+# 15: overlap evidence names the merged feeds.
+MERGE_FORMAT = 15
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -367,6 +368,40 @@ def _merged_containers(table, mapping):
     )
 
 
+def _merged_overlaps(edges, mapping, feed_ids):
+    """``edges`` with each overlap block's other feeds named by the merged
+    ids: re-keyed through ``mapping``, the larger share kept per mode when
+    two ids become one, without the edge's own feed or an id no merged feed
+    carries. An edge without a block stays as taken."""
+    if "evidence" not in edges.column_names:
+        return edges
+    kept = set(feed_ids)
+    values = edges["evidence"].to_pylist()
+    rows = zip(edges["feed_id"].to_pylist(), _json_records(edges, "evidence"))
+    for i, (feed_id, evidence) in enumerate(rows):
+        if "overlap" not in evidence:
+            continue
+        overlap = evidence["overlap"]
+        others = overlap.get("with") if isinstance(overlap, dict) else None
+        if not isinstance(others, dict) or not all(
+            isinstance(shares, dict)
+            and all(isinstance(s, (int, float)) for s in shares.values())
+            for shares in others.values()
+        ):
+            raise MergeError("edge overlap is not a record")
+        named = {}
+        for other, shares in others.items():
+            other = mapping.get(other, other)
+            if other == feed_id or other not in kept:
+                continue
+            into = named.setdefault(other, {})
+            for mode, share in shares.items():
+                into[mode] = max(share, into.get(mode, share))
+        overlap["with"] = named
+        values[i] = publish._json_block(evidence)
+    return _replaced(edges, "evidence", values)
+
+
 def merge_tables(sources, skipped=()):
     """The catalogue's ``(snapshot, tables)`` over loaded ``sources``, each a
     ``(build_id, snapshot, tables)`` as ``load_tables`` returns them.
@@ -498,6 +533,9 @@ def merge_tables(sources, skipped=()):
         tables["access_providers.parquet"] = _providers(
             merged["access_providers.parquet"], tables["feeds.parquet"]
         )
+    tables["edges.parquet"] = _merged_overlaps(
+        tables["edges.parquet"], mapping, tables["feeds.parquet"]["feed_id"].to_pylist()
+    )
     tables["edges.parquet"], relevance = _rescored(
         tables["edges.parquet"], tables["places.parquet"]
     )

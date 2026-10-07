@@ -906,6 +906,9 @@ def test_the_evidence_hash_covers_targets_and_pair_evidence(tmp_path):
     assert curate.evidence_hash([edge], [("Q1", "local")]) != curate.evidence_hash(
         [], [("Q1", "local")]
     )
+    # Other feeds' overlap with the edge is not the edge's own evidence.
+    overlapped = {**edge, "evidence": {"x": 1, "overlap": {"with": {"f-b": {}}}}}
+    assert curate.evidence_hash([overlapped]) == curate.evidence_hash([edge])
     entry = {
         "feed": "f-a",
         "place": "Q-other",

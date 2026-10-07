@@ -239,7 +239,7 @@ def test_shorter_patterns_survive_many_longer_duplicates():
     rows += b"branch,a,1\nbranch,d,2\n"
     trips = {f"t{i:02d}": "r" for i in range(64)}
     trips["branch"] = "r"
-    _, sequences, _, _, _ = classify._read_stop_times(io.BytesIO(rows), trips, {})
+    _, sequences, *_ = classify._read_stop_times(io.BytesIO(rows), trips, {})
     assert sequences["r"] == [("a", "b", "c"), ("a", "d")]
 
 
@@ -247,9 +247,7 @@ def test_a_blank_stop_id_row_leaves_no_legs():
     import io
 
     rows = b"trip_id,stop_id,stop_sequence\nt,a,1\nt,,2\nt,c,3\n"
-    stops, sequences, _, _, _ = classify._read_stop_times(
-        io.BytesIO(rows), {"t": "r"}, {}
-    )
+    stops, sequences, *_ = classify._read_stop_times(io.BytesIO(rows), {"t": "r"}, {})
     assert stops["r"] == {"a", "c"}
     assert sequences == {}
 
@@ -265,7 +263,7 @@ def test_pattern_sampling_keeps_distinct_patterns():
     rows += b"branch,a,1\nbranch,d,2\n"
     trips = {f"t{i}": "r" for i in range(9)}
     trips["branch"] = "r"
-    stops, sequences, _, _, _ = classify._read_stop_times(io.BytesIO(rows), trips, {})
+    stops, sequences, *_ = classify._read_stop_times(io.BytesIO(rows), trips, {})
     assert stops["r"] == {"a", "b", "c", "d"}
     assert sequences["r"] == [("a", "b", "c"), ("a", "d")]
 
@@ -298,8 +296,8 @@ def test_ids_are_joined_verbatim():
         io.BytesIO(b"route_id,agency_id,route_type\na ,x,3\na,,0\n,,7\n")
     )
     assert routes == {
-        "a ": {"route_type": 3, "agency_id": "x"},
-        "a": {"route_type": 0, "agency_id": ""},
+        "a ": {"route_type": 3, "agency_id": "x", "name": ""},
+        "a": {"route_type": 0, "agency_id": "", "name": ""},
     }
     # The id-less row still counts for the skip predicate's tier check.
     assert route_types == [3, 0, 7]
@@ -1343,6 +1341,97 @@ def test_departures_per_day_are_weighted_by_the_calendar(tmp_path):
     (feed,) = feeds
     assert (feed["service_start"], feed["service_end"]) == ("2026-09-01", "2026-09-14")
     assert manifest["feeds_dated"] == 1
+
+
+DAILY = (
+    b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+    b"start_date,end_date\nd,1,1,1,1,1,1,1,20260901,20260914\n"
+)
+
+
+def _lines(cache, feed_id, lines, xs=(10.0, 10.01), calendar=True):
+    """``(feed, candidate)`` of a crawled feed whose ``(name, route_type)``
+    lines each run one trip a day over stops at ``xs`` in Q-city."""
+    stops = "".join(f"p{j},1.0,{x}\n" for j, x in enumerate(xs))
+    routes = "".join(f"r{i},{name},{kind}\n" for i, (name, kind) in enumerate(lines))
+    trips = "".join(f"t{i},r{i},d\n" for i in range(len(lines)))
+    times = "".join(
+        f"t{i},p{j},{j}\n" for i in range(len(lines)) for j in range(len(xs))
+    )
+    members = {
+        "stops.txt": "stop_id,stop_lat,stop_lon\n" + stops,
+        "routes.txt": "route_id,route_short_name,route_type\n" + routes,
+        "trips.txt": "trip_id,route_id,service_id\n" + trips,
+        "stop_times.txt": "trip_id,stop_id,stop_sequence\n" + times,
+    }
+    members = {name: text.encode() for name, text in members.items()}
+    if calendar:
+        members["calendar.txt"] = DAILY
+    _write_crawl(cache, feed_id, members, "complete")
+    feed = {"feed_id": feed_id, "spec": "gtfs", "coverage_source": "crawl"}
+    feed["aliases"] = []
+    return feed, _candidate("Q-city", feed_id, len(xs))
+
+
+@pytest.mark.parametrize(
+    "case, named",
+    [
+        ("as given", {"rail": 1.0, "bus": 1.0}),
+        ("other name", {"rail": 1.0}),
+        ("far", {}),
+        ("no calendar", {"rail": 1.0, "bus": 1.0}),
+        ("trimmed", {"rail": 1.0, "bus": 1.0}),
+        ("blocks of one", {"rail": 1.0, "bus": 1.0}),
+        ("across 180", {}),
+    ],
+)
+def test_an_edge_records_how_much_of_it_other_feeds_run(
+    tmp_path, monkeypatch, case, named
+):
+    # f-copy types f-big's tram "S 1" as rail "S1": one rail-bound family, one
+    # line name without whitespace.
+    cache = tmp_path / "cache"
+    built = [
+        _lines(cache, "f-big", [("S 1", 0), ("10", 3)], calendar=case != "no calendar"),
+        _lines(
+            cache,
+            "f-copy",
+            [("S1", 109), ("11" if case == "other name" else "10", 700)],
+            {"far": (10.3, 10.3), "across 180": (179.999, -179.999)}.get(
+                case, (10.0, 10.01)
+            ),
+        ),
+    ]
+    if case == "trimmed":
+        monkeypatch.setattr(classify, "OVERLAP_MAX_FEEDS", 1)
+        built.append(_lines(cache, "f-third", [("S1", 2), ("10", 3)]))
+    if case == "blocks of one":
+        monkeypatch.setattr(classify, "_OVERLAP_BLOCK", 1)
+    feeds, candidates = zip(*built)
+    _coverage(cache, list(feeds), list(candidates))
+    city = _records("Q-city")
+    lookup = StubLookup({**LOOKUP.by_x, 179.999: city, -179.999: city})
+    manifest = classify.classify(cache, lookup=lookup)
+    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    blocks = {
+        (e["feed_id"], e["tier"]): e["evidence"]["overlap"]
+        for e in edges
+        if "overlap" in e["evidence"]
+    }
+    assert manifest["edges_with_overlap"] == len(blocks)
+    # One trip a day over two stops, both in the place.
+    assert blocks[("f-copy", "regional")]["departures"] == {"rail": 2.0}
+    assert blocks[("f-copy", "local")]["departures"] == {"bus": 2.0}
+    found = {}
+    for tier in ("regional", "local"):
+        others = blocks[("f-copy", tier)]["with"]
+        assert set(others) <= {"f-big"}
+        found.update(others.get("f-big", {}))
+    assert found == named
+    if case == "no calendar":
+        assert ("f-big", "local") not in blocks
+    else:
+        assert blocks[("f-big", "local")]["departures"] == {"tram": 2.0, "bus": 2.0}
 
 
 def test_publish_refuses_edges_from_another_places_generation(tmp_path):
