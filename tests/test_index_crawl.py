@@ -691,10 +691,21 @@ def test_an_unchanged_feed_is_skipped_on_rerun(tmp_path):
     assert summary["by_method"] == {"not_modified": 1}
 
 
-def test_a_cache_from_a_smaller_member_set_is_refetched(tmp_path):
-    # A state written before the calendar files joined the member set has
-    # no way to say whether the feed lacks them or was never asked: one
-    # refetch settles it, after which validators skip again.
+@pytest.mark.parametrize(
+    "edit",
+    [
+        # Before the calendar files joined the member set, a state could not
+        # say whether the feed lacks them or was never asked.
+        pytest.param(lambda s: s.pop("members_requested"), id="smaller-member-set"),
+        # Before the sizes were recorded, or with one malformed.
+        pytest.param(lambda s: s.pop("member_bytes"), id="no-member-bytes"),
+        pytest.param(lambda s: s.update(archive_bytes="12"), id="archive-bytes-text"),
+        pytest.param(lambda s: s.update(empty_files=None), id="no-empty-files"),
+        pytest.param(lambda s: s["member_bytes"].pop("stops.txt"), id="file-unsized"),
+    ],
+)
+def test_a_legacy_state_is_refetched_once(tmp_path, edit):
+    # One refetch settles it, after which validators skip again.
     cache = tmp_path / "cache"
     data = _zip_bytes()
     server = _server({"/a.zip": (data, '"v1"')})
@@ -702,8 +713,7 @@ def test_a_cache_from_a_smaller_member_set_is_refetched(tmp_path):
     _crawl(cache, server)
     state_path = _feed_dir(cache, "f-a") / "state.json"
     state = json.loads(state_path.read_text())
-    assert state["members_requested"] == sorted(crawl.MEMBERS)
-    del state["members_requested"]
+    edit(state)
     state_path.write_text(json.dumps(state))
     _, log = _crawl(cache, server)
     assert log["f-a"]["method"] == "download"
@@ -1187,6 +1197,48 @@ def test_manifest_list_rejects_non_list_and_mixed_types():
     assert crawl._manifest_list(None) is None
 
 
+SIZED_MEMBERS = {
+    **FULL_MEMBERS,
+    "calendar.txt": b"service_id,monday,start_date,end_date\n",  # a member
+    "shapes.txt": b"shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n",
+    "fare_rules.txt": b"fare_id,route_id\nf1,r1\n",
+    "feed_info.txt": b"",
+    "translations.txt": b"table_name,field_name," + b"x" * 70 * 1024 + b"\n",
+    "attributions.txt": b"attribution_id,organization_name\n",  # unreadable below
+    "notes.md": b"# notes\n",
+}
+
+
+@pytest.mark.parametrize("range_threshold", [10**9, 1])
+def test_the_crawl_records_the_archive_and_file_sizes(
+    tmp_path, monkeypatch, range_threshold
+):
+    real = crawl._file_record
+
+    def unreadable(names, size_of, read):
+        def failing(name):
+            if name == "attributions.txt":
+                raise NotImplementedError("compression type 99")
+            return read(name)
+
+        return real(names, size_of, failing)
+
+    monkeypatch.setattr(crawl, "_file_record", unreadable)
+    cache = tmp_path / "cache"
+    _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
+    data = _zip_bytes(SIZED_MEMBERS)
+    _, log = _crawl(
+        cache, _server({"/a.zip": (data, '"v1"')}), range_threshold=range_threshold
+    )
+    assert log["f-a"]["method"] == ("range" if range_threshold == 1 else "download")
+    state = json.loads((_feed_dir(cache, "f-a") / "state.json").read_text())
+    assert state["archive_bytes"] == len(data)
+    assert state["files"] == sorted(SIZED_MEMBERS)
+    assert state["member_bytes"] == {k: len(v) for k, v in SIZED_MEMBERS.items()}
+    # With a row, over the probe, not a .txt or unreadable: never empty.
+    assert state["empty_files"] == ["calendar.txt", "feed_info.txt", "shapes.txt"]
+
+
 def test_the_crawl_log_records_each_feed_source(tmp_path):
     # A crawled feed carries its catalogue source (mdb/atlas/both/systems_csv)
     # into the crawl log, so provenance — e.g. which feeds come via the
@@ -1238,6 +1290,21 @@ def test_member_rows_trims_header_names_and_keeps_values(data, rows):
     opened = io.BytesIO(data)
     assert list(crawl.member_rows(opened)) == rows
     opened.seek(0)
+
+
+@pytest.mark.parametrize(
+    "data, has_rows",
+    [
+        pytest.param(b"shape_id,shape_pt_lat\n", False, id="header"),
+        pytest.param(b"shape_id,shape_pt_lat\r\n\r\n", False, id="blank-lines"),
+        pytest.param(b"\xef\xbb\xbfshape_id,shape_pt_lat\n", False, id="bom"),
+        pytest.param(b"", False, id="zero-bytes"),
+        pytest.param(b"shape_id,shape_pt_lat\ns1,60.1\n", True, id="row"),
+        pytest.param(b"shape_id\n\xff\n", True, id="invalid-utf8"),
+    ],
+)
+def test_has_rows_reads_a_member_as_the_csv_reader_does(data, has_rows):
+    assert crawl._has_rows(data) is has_rows
 
 
 # --- Crawl with the maintainer's keys -----------------------------------------

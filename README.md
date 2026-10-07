@@ -113,6 +113,10 @@ matching registry together.
    where its provider approves (see below); one without a URL, or of which
    the crawl reads no copy, is marked uncrawlable,
    "requires authentication". Its access details stay as given either way.
+   The crawl records each archive's size, every root file's uncompressed
+   size and the `.txt` files holding no data row (a file over 64 KiB counts
+   as having rows); a feed crawled before these were recorded is fetched
+   again once.
 6. `expand` — add the places a feed's crawled stops actually fall in that the
    declared seed missed.
 7. `coverage` — derive the membership edges: which places each feed serves.
