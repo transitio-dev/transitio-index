@@ -1167,6 +1167,29 @@ def test_overlap_evidence_names_the_merged_feeds(others, named):
         assert json.loads(first)["overlap"]["with"] == named
 
 
+def test_overlap_evidence_lists_the_feeds_its_build_measured():
+    # MVV's feed came from another build than DELFI's: neither names the
+    # other because nothing compared them, which the block now records.
+    block = {"overlap": {"departures": {"bus": 2.0}, "with": {}}}
+    edges = pa.table(
+        {
+            "place_id": ["muc", "muc", "muc"],
+            "feed_id": ["f-delfi", "f-mvg", "f-mvv"],
+            "build_id": ["de-1", "de-1", "atlas2-1"],
+            "evidence": [json.dumps(block)] * 3,
+        }
+    )
+    measured = {
+        ("muc", "de-1"): {"f-delfi", "f-mvg", "f-gone"},
+        ("muc", "atlas2-1"): {"f-mvv", "f-delfi"},
+    }
+    feeds = ["f-delfi", "f-mvg", "f-mvv"]
+    merged = merge._merged_overlaps(edges, {}, feeds, measured)
+    evidence = merged["evidence"].to_pylist()
+    compared = [json.loads(e)["overlap"]["compared"] for e in evidence]
+    assert compared == [["f-mvg"], ["f-delfi"], ["f-delfi"]]
+
+
 def test_an_edge_without_evidence_counts_as_not_near_a_threshold():
     edges = pa.table(
         {"tier": ["unknown", "local"], "evidence": [None, '{"near_threshold": true}']}
