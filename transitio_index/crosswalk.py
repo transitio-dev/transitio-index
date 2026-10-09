@@ -442,6 +442,25 @@ def _geohash_encode(lat, lon, precision):
     return "".join(geohash)
 
 
+def _geohash_decode(geohash):
+    """The centre ``(lat, lon)`` of the cell ``geohash`` names."""
+    lat_low, lat_high = -90.0, 90.0
+    lon_low, lon_high = -180.0, 180.0
+    even = True
+    for char in geohash:
+        value = _GEOHASH_BASE32.index(char)
+        for shift in range(4, -1, -1):
+            high = (value >> shift) & 1
+            if even:
+                mid = (lon_low + lon_high) / 2
+                lon_low, lon_high = (mid, lon_high) if high else (lon_low, mid)
+            else:
+                mid = (lat_low + lat_high) / 2
+                lat_low, lat_high = (mid, lat_high) if high else (lat_low, mid)
+            even = not even
+    return (lat_low + lat_high) / 2, (lon_low + lon_high) / 2
+
+
 def _onestop_geohash(onestop_id):
     """The Onestop ID's geohash prefix at ``GEOHASH_PRECISION``, or None."""
     match = _ONESTOP_GEOHASH.match(onestop_id)
