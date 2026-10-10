@@ -440,3 +440,72 @@ def test_the_partition_refuses_bad_flags_before_any_download(
     with pytest.raises(SystemExit):
         sc.main(["--partition", *extra])
     assert message in capsys.readouterr().err
+
+
+def test_an_unowned_atlas_feed_goes_to_the_country_it_serves(tmp_path):
+    # MVV's own feed fell into an atlas batch, built apart from DELFI, so the
+    # index never measured the two together for Munich.
+    def row(mdb_id, country, south, north, west, east):
+        values = dict(zip(mdb.BOX_KEYS, map(str, (south, north, west, east))))
+        url = f"https://{mdb_id}.example/gtfs.zip"
+        return {
+            "id": mdb_id,
+            "location.country_code": country,
+            sc.MDB_DOWNLOAD: url,
+            **values,
+        }
+
+    def feed(onestop_id, url):
+        return {"id": onestop_id, "spec": "gtfs", "urls": {"static_current": url}}
+
+    labels = {
+        "de": (["DE"], [row("mdb-3215", "DE", 47.2, 55.1, 5.8, 15.1)]),
+        "it": (["IT"], [row("mdb-1", "IT", 36.6, 47.1, 6.6, 18.5)]),
+    }
+    files = [
+        # Owned by URL, as before, whatever the file's domain says.
+        (
+            "r/feeds/delfi.it.dmfr.json",
+            {"feeds": [feed("f-delfi", labels["de"][1][0][sc.MDB_DOWNLOAD])]},
+        ),
+        # A geohash in Munich, whatever the file's domain.
+        (
+            "r/feeds/mvv-muenchen.dmfr.json",
+            {"feeds": [feed("f-u281z9-mvv", "https://mvv.example/a.zip")]},
+        ),
+        # No geohash, or one too short to place it: the file's .de domain.
+        (
+            "r/feeds/gtfs.de.dmfr.json",
+            {"feeds": [feed("f-germany~urban", "https://gtfs.de/a.zip")]},
+        ),
+        (
+            "r/feeds/bahn.de.dmfr.json",
+            {"feeds": [feed("f-u-bahn", "https://bahn.example/a.zip")]},
+        ),
+        # No geohash and no country domain; a geohash no label's box holds.
+        (
+            "r/feeds/x.example.com.dmfr.json",
+            {"feeds": [feed("f-sta~altoadige", "https://x.com/a.zip")]},
+        ),
+        (
+            "r/feeds/bart.dmfr.json",
+            {"feeds": [feed("f-9q9pq-bart", "https://bart.example/a.zip")]},
+        ),
+        # A base32 token longer than a geohash is a name.
+        (
+            "r/feeds/long.dmfr.json",
+            {"feeds": [feed("f-u281z9u281z9u-x", "https://long.example/a.zip")]},
+        ),
+    ]
+    archive = tmp_path / "atlas.tar.gz"
+    _archive(archive, files)
+    planned = sc._partition_atlas(archive, files, labels, size=10)
+    held = {
+        label: sorted(sc._gtfs_feed_ids(kept))
+        for label, (_, _, kept) in planned.items()
+    }
+    assert held == {
+        "atlas1": ["f-9q9pq-bart", "f-sta~altoadige", "f-u281z9u281z9u-x"],
+        "de": ["f-delfi", "f-germany~urban", "f-u-bahn", "f-u281z9-mvv"],
+        "it": [],
+    }

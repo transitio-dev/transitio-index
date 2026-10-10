@@ -62,8 +62,11 @@ from pathlib import Path
 
 from transitio_index import atlas, csv_source, gbfs, mdb, store
 from transitio_index.crosswalk import (
+    GEOHASH_PRECISION,
+    _ONESTOP_GEOHASH,
     _atlas_url,
     _atlas_urls,
+    _geohash_decode,
     _historic_urls,
     _host,
     _match_url,
@@ -679,6 +682,44 @@ def _partition_labels(units, extra, size):
     return dict(sorted(labels.items()))
 
 
+def _box_holds(box, lat, lon):
+    """Whether the MDB ``box`` holds the point; a box crossing the antimeridian
+    (min_lon > max_lon) holds both its longitude ranges."""
+    if not box["min_lat"] <= lat <= box["max_lat"]:
+        return False
+    west, east = box["min_lon"], box["max_lon"]
+    return west <= lon <= east if west <= east else (lon >= west or lon <= east)
+
+
+def _box_area(box):
+    """The extent of the MDB ``box`` in square degrees, as a measure of size."""
+    west, east = box["min_lon"], box["max_lon"]
+    width = east - west if west <= east else 360.0 - west + east
+    return (box["max_lat"] - box["min_lat"]) * width
+
+
+def _country_label(source_file, feed, boxes, owners):
+    """The label of the country an Atlas feed no label owns serves, or None:
+    the label of the smallest MDB box holding its Onestop ID's geohash point,
+    the most local feed there, the first in label order on a tie; without a
+    geohash of ``GEOHASH_PRECISION`` to 12 characters (a shorter one names too
+    large a cell; a longer token is a name), the label ``owners`` names for
+    the country code its DMFR file's domain ends in
+    (``feeds/gtfs.de.dmfr.json``)."""
+    match = _ONESTOP_GEOHASH.match(feed.get("id") or "")
+    if match is not None and GEOHASH_PRECISION <= len(match.group(1)) <= 12:
+        lat, lon = _geohash_decode(match.group(1))
+        holding = [
+            (_box_area(box), order, label)
+            for order, (label, label_boxes) in enumerate(boxes.items())
+            for box in label_boxes
+            if _box_holds(box, lat, lon)
+        ]
+        return min(holding)[2] if holding else None
+    domain = Path(source_file).name.removesuffix(".dmfr.json")
+    return owners.get(domain.rsplit(".", 1)[-1].upper()) if "." in domain else None
+
+
 def _partition_atlas(archive, files, labels, size):
     """``{label: (countries, mdb rows, atlas files)}`` in label order.
 
@@ -688,8 +729,10 @@ def _partition_atlas(archive, files, labels, size):
     first that picked it. A feed whose current URL no label carries goes to no
     label when the rows of several labels carry its past URLs, or when another
     feed holds one of them too: the crosswalk pairs a feed two rows reach, or a
-    URL two feeds hold, with nothing. The GTFS feeds of the archive's ``files``
-    no label owns fill ``atlas1..atlasK`` of at most ``size`` feeds each; other
+    URL two feeds hold, with nothing. A GTFS feed of the archive's ``files``
+    no label owns goes to the label of the country it serves
+    (``_country_label``), so its build compares it with that country's feeds;
+    the rest fill ``atlas1..atlasK`` of at most ``size`` feeds each. Other
     specs get no label.
     """
     picked, exact = {}, {}
@@ -719,11 +762,20 @@ def _partition_atlas(archive, files, labels, size):
         for feed_id, held in historic.items()
     }
     owner = {**picked, **past, **exact}
+    # The labels of countries: their MDB boxes, and the label owning each code.
+    boxes = {
+        label: [box for row in rows if (box := mdb._bounding_box(row)) is not None]
+        for label, (_, rows) in labels.items()
+        if label not in ("other", "cities")
+    }
+    owners = {code: label for label, (codes, _) in labels.items() for code in codes}
     owned, rest = collections.defaultdict(list), []
     for source_file, payload in files:
         for feed in filter(_is_gtfs_feed, payload.get("feeds") or []):
             entry = (source_file, payload, feed)
             label = owner.get(feed.get("id"))
+            if label is None:
+                label = _country_label(source_file, feed, boxes, owners)
             if label is not None:
                 owned[label].append(entry)
             else:
@@ -842,8 +894,8 @@ def main(argv=None):
         metavar="CC",
         help="ISO country code to keep (repeatable; default: "
         + " ".join(DEFAULT_COUNTRIES)
-        + "; with --partition, a country to list in the feedless 'cities' label "
-        "when it has no label of its own, none by default)",
+        + "; with --partition, a country to list in the 'cities' label, which "
+        "holds no MDB feeds, when it has no label of its own, none by default)",
     )
     parser.add_argument(
         "--out-dir",
