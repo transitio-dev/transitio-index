@@ -86,7 +86,16 @@ def test_read_index_builds_one_layer_per_country_partition(tmp_path):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         listing.setdefault(partition, {})[table.split(".")[0]] = {"sha256": digest}
 
-    write("FI", "places.parquet", [{"place_id": "hel", "kind": "city"}])
+    # FI in the schema-12 layout: the boundary in its own table.
+    shapely = pytest.importorskip("shapely")
+    from transitio.index._boundaries import encode
+
+    box = shapely.box(24.8, 60.1, 25.3, 60.35)
+    bbox = dict(zip(("xmin", "ymin", "xmax", "ymax"), box.bounds))
+    write("FI", "places.parquet", [{"place_id": "hel", "kind": "city", **bbox}])
+    data = encode(["hel"], [box], "s")
+    (tmp_path / "FI" / "boundaries.parquet").write_bytes(data)
+    listing["FI"]["boundaries"] = {"sha256": hashlib.sha256(data).hexdigest()}
     write("FI", "feeds.parquet", [{"feed_id": "hsl", "name": "HSL"}])
     write("FI", "edges.parquet", [{"place_id": "hel", "feed_id": "hsl", "tier": "a"}])
     write("EE", "places.parquet", [{"place_id": "tll", "kind": "city"}])
@@ -107,6 +116,7 @@ def test_read_index_builds_one_layer_per_country_partition(tmp_path):
     assert list(layers) == ["EE", "FI"]
     places, edges, feeds = layers["FI"]
     assert [p["place_id"] for p in places] == ["hel"]
+    assert places[0]["geometry"] == shapely.to_wkb(box)
     assert sorted((e["feed_id"], e["tier"]) for e in edges) == [
         ("ferry", "b"),
         ("hsl", "a"),

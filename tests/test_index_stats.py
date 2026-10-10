@@ -762,6 +762,12 @@ def test_the_realtime_companions_have_their_own_section(tmp_path):
     bad["partitions"]["international"]["vehicles"] = {"rows": 0, "sha256": "x"}
     with pytest.raises(stats.StatsError, match="not a table of the index"):
         stats._index_tables(cache, bad)
+    # Before schema 12 an index has no on-demand tables to skip.
+    bad = json.loads(json.dumps(snapshot))
+    bad["schema_version"] = 11
+    bad["partitions"].setdefault("FI", {})["boundaries"] = {"rows": 0, "sha256": "x"}
+    with pytest.raises(stats.StatsError, match="not a table of the index"):
+        stats._index_tables(cache, bad)
     bad = json.loads(json.dumps(snapshot))
     bad["partitions"]["../x"] = bad["partitions"].pop("international")
     with pytest.raises(stats.StatsError, match="not a partition"):

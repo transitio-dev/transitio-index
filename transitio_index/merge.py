@@ -14,10 +14,12 @@ sources' NOTICEs and the merged feeds, and ``assemble`` turns the merged
 tables into a schema-11 snapshot: the partition tables, the providers
 table at the root, their manifest and a snapshot id that names exactly the
 sources, the merge format and the
-toolchain they were merged with. ``write_snapshot`` reads the assembled
-snapshot back through the reader before committing it into the cache's
-``index/`` as publish commits its own. Given the ``partition.json`` of the
-catalogue cut the builds came from, ``catalogue_check`` records which of its
+toolchain they were merged with. The sources may be schema-11 or schema-12
+builds; ``load_tables`` reads both into the same tables. ``write_snapshot``
+reads the assembled snapshot back through the reader before committing it
+into the cache's ``index/`` as publish commits its own. Given the
+``partition.json`` of the catalogue cut the builds came from,
+``catalogue_check`` records which of its
 feeds and labels, and which ``add_feed`` feeds of ``overrides/feeds.yaml``, the
 merged index lacks; the publisher refuses the gaps.
 """
@@ -84,6 +86,8 @@ OVERRIDE_FIELDS = (
 # 15: overlap evidence names the merged feeds.
 # 16: overlap evidence lists the feeds its build measured at the place.
 MERGE_FORMAT = 16
+# The schemas of the builds a merge takes: both load into the same tables.
+SOURCE_SCHEMAS = (11, 12)
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -664,17 +668,18 @@ def _providers(stacked, feeds):
 
 
 def _check_sources(snapshots):
-    """Refuse a selection the merge cannot ship: a source below schema 9, an
-    unlicensed one or one licensed under another policy (whose NOTICE the
-    merge cannot compose from), one without a field of ``AGREED_FIELDS``, or
-    sources disagreeing on one. Returns the agreed values."""
+    """Refuse a selection the merge cannot ship: a source of a schema outside
+    ``SOURCE_SCHEMAS``, an unlicensed one or one licensed under another
+    policy (whose NOTICE the merge cannot compose from), one without a field
+    of ``AGREED_FIELDS``, or sources disagreeing on one. Returns the agreed
+    values."""
     agreed = {}
     for build_id, snapshot in snapshots:
         version = snapshot.get("schema_version")
-        if version != publish.SCHEMA_VERSION:
+        if type(version) is not int or version not in SOURCE_SCHEMAS:
             raise MergeError(
                 f"{build_id}: schema_version {version!r}; the merge takes schema "
-                f"{publish.SCHEMA_VERSION} builds only"
+                f"{' or '.join(map(str, SOURCE_SCHEMAS))} builds only"
             )
         if snapshot.get("licensed") is not True or not isinstance(
             snapshot.get("notice_sha256"), str
