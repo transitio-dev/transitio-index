@@ -17,6 +17,7 @@ from test_index_publish import (  # noqa: E402
     _publish_audit,
     _publish_coverage,
     _publish_gen,
+    _read_on_demand,
 )
 
 LICENSED = {
@@ -589,7 +590,7 @@ def test_a_place_without_a_boundary_gets_one_from_redistributable_hulls(
     index = transitio_index.read_index(cache / "index")
     rows = index.places.set_index("place_id")
     assert rows.loc["Q-metro", "geometry_source"] == "derived_from_feeds"
-    assert rows.loc["Q-metro", "geometry"].equals(boundary)
+    assert _read_on_demand(index, "boundaries")["Q-metro"].equals(boundary)
 
 
 def test_unpublished_places_rehome_their_edges_and_the_closure_holds(tmp_path):

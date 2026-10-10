@@ -1,16 +1,20 @@
 """Publish stage: the feeds, places and membership edges as a shippable index.
 
-Writes ``<cache>/index/`` as a directory of partitions (schema 11): under each
+Writes ``<cache>/index/`` as a directory of partitions (schema 12): under each
 country code ``feeds.parquet`` (one row per GTFS feed whose home country it
 is), ``realtime.parquet`` (the GTFS-RT companions of those feeds),
-``places.parquet`` (one row per place there, a GeoParquet with the simplified
-boundary) and ``edges.parquet`` (the domestic membership rows, one per
-place/feed/tier); ``international/feeds.parquet`` and ``realtime.parquet``
-for the feeds without a home country and the companions without a static
-feed; ``links/edges.parquet`` for every cross-border edge, with
-``feed_partition``; and ``snapshot.json`` (the manifest: a deterministic
-snapshot id, the schema version, the source versions, the counts, and every
-partition table's row count and SHA-256). The feeds come from the latest edge
+``places.parquet`` (one row per place there, with its boundary's bounding
+box), ``boundaries.parquet`` (the simplified boundaries, one row per place in
+the same order), ``edges.parquet`` (the domestic membership rows, one per
+place/feed/tier, with a ``summary`` of their evidence) and
+``details.parquet`` (each edge's evidence, selector and curation, one row per
+edge in the same order); ``international/feeds.parquet`` and
+``realtime.parquet`` for the feeds without a home country and the companions
+without a static feed; ``links/edges.parquet`` and ``details.parquet`` for
+every cross-border edge, with ``feed_partition``; and ``snapshot.json`` (the
+manifest: a deterministic snapshot id, the schema version, the source
+versions, the counts, and every partition table's row count, SHA-256 and
+size). Every table is zstd-compressed. The feeds come from the latest edge
 stage when one exists (ranked, curated, classified or coverage edges, with
 the feeds stamped ``coverage_source`` and ``crawlable``),
 else from the resolved feeds, else from the crosswalk; the places from the
@@ -46,25 +50,32 @@ import io
 import json
 import stat
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import shapely
 
 from transitio.index import fingerprint
+from transitio.index._boundaries import encode
 
 from transitio_index import crawl, overture
 from transitio_index import registry as _registry
 from transitio_index import store
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 # The reader release that first reads this schema; the installed reader's own
 # floor table wins once it knows the version.
-MIN_READER_VERSION = "0.19.0"
+MIN_READER_VERSION = "0.24.0"
 # The edge generations that carry curation (curate, and rank on top of it).
 FINAL_SOURCES = ("curate", "rank")
 FEEDS_FILE = "feeds.parquet"
 REALTIME_FILE = "realtime.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
+# Schema 12: the place boundaries, and the edges' evidence, selectors and
+# curation, in tables of their own beside places and edges.
+BOUNDARIES_FILE = "boundaries.parquet"
+DETAILS_FILE = "details.parquet"
 STATIC_SPEC = "gtfs"
 REALTIME_SPEC = "gtfs-rt"
 SNAPSHOT_FILE = "snapshot.json"
@@ -85,8 +96,28 @@ TABLE_FILES = {
     "realtime": REALTIME_FILE,
     "places": PLACES_FILE,
     "edges": EDGES_FILE,
+    "boundaries": BOUNDARIES_FILE,
+    "details": DETAILS_FILE,
     "access_providers": ACCESS_PROVIDERS_FILE,
 }
+# A place keeps its boundary's bounding box, and an edge the evidence keys
+# the reader ranks by as its ``summary``; the rest of an edge is its details.
+BBOX_COLUMNS = ("xmin", "ymin", "xmax", "ymax")
+SUMMARY_KEYS = (
+    "share_of_place",
+    "share_basis",
+    "stale_when_indexed",
+    "carried_by",
+    "overlap",
+)
+DETAIL_COLUMNS = (
+    "evidence",
+    "selector",
+    "merged_evidence",
+    "curation",
+    "curation_history",
+    "rehomed_from",
+)
 
 
 class PublishError(RuntimeError):
@@ -518,13 +549,20 @@ def static_edges(edges, realtime):
     return [edge for edge in edges if edge["feed_id"] not in companions]
 
 
-def _parquet_bytes(records, snapshot_id, row=_row, schema=_SCHEMA):
-    table = pa.Table.from_pylist(
+def _parquet(table):
+    sink = io.BytesIO()
+    pq.write_table(table, sink, compression="zstd")
+    return sink.getvalue()
+
+
+def _rows_table(records, snapshot_id, row=_row, schema=_SCHEMA):
+    return pa.Table.from_pylist(
         [row(record, snapshot_id) for record in records], schema=schema
     )
-    sink = io.BytesIO()
-    pq.write_table(table, sink)
-    return sink.getvalue()
+
+
+def _parquet_bytes(records, snapshot_id, row=_row, schema=_SCHEMA):
+    return _parquet(_rows_table(records, snapshot_id, row, schema))
 
 
 _PLACES_SCHEMA = pa.schema(
@@ -562,24 +600,6 @@ _PLACES_SCHEMA = pa.schema(
         ("geometry", pa.binary()),
     ]
 )
-
-
-def _geo_metadata():
-    """The GeoParquet ``geo`` metadata so a reader treats the boundary and the
-    centre as WKB."""
-    import pyproj
-
-    crs = json.loads(pyproj.CRS.from_epsg(4326).to_json())
-    return json.dumps(
-        {
-            "version": "1.0.0",
-            "primary_column": "geometry",
-            "columns": {
-                "geometry": {"encoding": "WKB", "geometry_types": [], "crs": crs},
-                "centre": {"encoding": "WKB", "geometry_types": ["Point"], "crs": crs},
-            },
-        }
-    ).encode("utf-8")
 
 
 def coverage_windows(intervals):
@@ -695,10 +715,10 @@ def _service_by_place(edges):
     return totals
 
 
-def _places_parquet_bytes(
+def _places_table(
     places, snapshot_id, service_by_place=None, identities=None, validity_by_place=None
 ):
-    """The places as GeoParquet bytes: declared columns plus the WKB boundary.
+    """The places as an Arrow table: declared columns plus the WKB boundary.
 
     The schema is declared, not inferred, so an all-null column (``geonames_id``,
     say) or an all-empty list column keeps its type across builds rather than
@@ -716,11 +736,7 @@ def _places_parquet_bytes(
         wkb = place.get("geometry")
         row["geometry"] = bytes.fromhex(wkb) if wkb else None
         rows.append(row)
-    schema = _PLACES_SCHEMA.with_metadata({b"geo": _geo_metadata()})
-    table = pa.Table.from_pylist(rows, schema=schema)
-    sink = io.BytesIO()
-    pq.write_table(table, sink)
-    return sink.getvalue()
+    return pa.Table.from_pylist(rows, schema=_PLACES_SCHEMA)
 
 
 _EDGES_SCHEMA = pa.schema(
@@ -812,15 +828,12 @@ def _access_providers(providers, records):
     return [_provider_row(providers[provider_id]) for provider_id in sorted(named)]
 
 
-def _edges_parquet_bytes(edges, snapshot_id, links=False):
+def _edges_table(edges, snapshot_id, links=False):
     rows = [_edge_row(record, snapshot_id) for record in edges]
     if links:
         for row, record in zip(rows, edges):
             row["feed_partition"] = record["feed_partition"]
-    table = pa.Table.from_pylist(rows, schema=_LINKS_SCHEMA if links else _EDGES_SCHEMA)
-    sink = io.BytesIO()
-    pq.write_table(table, sink)
-    return sink.getvalue()
+    return pa.Table.from_pylist(rows, schema=_LINKS_SCHEMA if links else _EDGES_SCHEMA)
 
 
 def partition(records, places, edges, realtime=()):
@@ -880,19 +893,16 @@ def partition(records, places, edges, realtime=()):
 
 def _partition_tables(partitions, snapshot_id, service, identities, validity=None):
     """``({(partition, table): parquet bytes}, manifest listing)`` for every
-    partition table; the listing carries each file's row count and digest."""
-    files, listing = {}, {}
-    for name, tables in partitions.items():
-        listing[name] = {}
-        for table, rows in tables.items():
+    partition table, as :func:`partition_files` writes them."""
+    tables = {}
+    for name, part in partitions.items():
+        for table, rows in part.items():
             if table == "feeds":
-                data = _parquet_bytes(rows, snapshot_id)
+                rows = _rows_table(rows, snapshot_id)
             elif table == "realtime":
-                data = _parquet_bytes(
-                    rows, snapshot_id, _realtime_row, _REALTIME_SCHEMA
-                )
+                rows = _rows_table(rows, snapshot_id, _realtime_row, _REALTIME_SCHEMA)
             elif table == "places":
-                data = _places_parquet_bytes(
+                rows = _places_table(
                     rows,
                     snapshot_id,
                     service,
@@ -900,14 +910,84 @@ def _partition_tables(partitions, snapshot_id, service, identities, validity=Non
                     validity_by_place=validity,
                 )
             else:
-                data = _edges_parquet_bytes(
-                    rows, snapshot_id, links=name == LINKS_PARTITION
-                )
-            files[(name, table)] = data
-            listing[name][table] = {
-                "rows": len(rows),
-                "sha256": hashlib.sha256(data).hexdigest(),
-            }
+                rows = _edges_table(rows, snapshot_id, links=name == LINKS_PARTITION)
+            tables[(name, table)] = rows
+    return partition_files(tables, snapshot_id)
+
+
+def _boundary_shapes(places):
+    """The boundaries of a places table as shapely geometries, refusing one
+    that is not a 2D Polygon or MultiPolygon or null."""
+    shapes = shapely.from_wkb(places["geometry"].to_numpy())
+    odd = ~shapely.is_missing(shapes) & (
+        ~np.isin(shapely.get_type_id(shapes), (3, 6))
+        | shapely.is_empty(shapes)
+        | shapely.has_z(shapes)
+    )
+    if odd.any():
+        place_id = places["place_id"][int(np.flatnonzero(odd)[0])].as_py()
+        raise ValueError(
+            f"place {place_id}: its boundary is not a 2D Polygon, MultiPolygon "
+            "or null"
+        )
+    return shapes
+
+
+def _summary(evidence):
+    """The ``SUMMARY_KEYS`` an edge's evidence JSON has, as JSON; null when
+    it has none."""
+    found = json.loads(evidence) if evidence is not None else {}
+    return _json_block({k: found[k] for k in SUMMARY_KEYS if k in found} or None)
+
+
+def _layout(table, rows, snapshot_id):
+    """``{table: Parquet bytes}`` of one partition table in the schema-12
+    layout. A places table (each boundary as WKB ``geometry``) becomes the
+    core, each boundary's bounding box in its place, and the boundaries,
+    written with transitio's encoder; an edges table becomes the core, a
+    ``summary`` in place of the detail columns, and the details; each in the
+    rows' order. Any other table stays as it is."""
+    if table == "places":
+        shapes = _boundary_shapes(rows)
+        # Plain Parquet: no GeoParquet metadata a merged source's table brings.
+        core = rows.drop_columns(["geometry"]).replace_schema_metadata(None)
+        for name, values in zip(BBOX_COLUMNS, shapely.bounds(shapes).T):
+            core = core.append_column(
+                pa.field(name, pa.float64()), pa.array(values, from_pandas=True)
+            )
+        ids = rows["place_id"].to_pylist()
+        return {
+            "places": _parquet(core),
+            "boundaries": encode(ids, shapes, snapshot_id),
+        }
+    if table == "edges":
+        summary = [_summary(value) for value in rows["evidence"].to_pylist()]
+        core = rows.drop_columns(list(DETAIL_COLUMNS)).append_column(
+            pa.field("summary", pa.string()), pa.array(summary, pa.string())
+        )
+        details = ["place_id", "feed_id", "tier", *DETAIL_COLUMNS, "snapshot"]
+        return {"edges": _parquet(core), "details": _parquet(rows.select(details))}
+    return {table: _parquet(rows)}
+
+
+def partition_files(tables, snapshot_id):
+    """``(files, listing)`` of the tables ``{(partition, table): Arrow
+    table}``, places with their boundaries and edges with their details: the
+    Parquet bytes of each in the schema-12 layout (see :func:`_layout`),
+    keyed ``(partition, table)``, and the manifest listing of every
+    partition table's rows, SHA-256 and size. A root table (partition
+    ``None``) is written but not listed. Publish and the merge both write
+    their tables through it."""
+    files, listing = {}, {}
+    for (name, table), rows in tables.items():
+        for part, data in _layout(table, rows, snapshot_id).items():
+            files[(name, part)] = data
+            if name is not None:
+                listing.setdefault(name, {})[part] = {
+                    "rows": len(rows),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data),
+                }
     return files, listing
 
 

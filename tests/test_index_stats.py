@@ -315,9 +315,10 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
 
 
 def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):
-    from test_index_publish import _build_index
+    from test_index_publish import PLACES, _build_index
 
-    cache, published = _build_index(tmp_path)
+    # Places in the schema-12 layout: their boundaries are not read.
+    cache, published = _build_index(tmp_path, places=PLACES)
     manifest = stats.stats(cache)
     assert manifest["snapshot_id"] == published["snapshot_id"]
     generation, _ = store.resolve(cache / "stats", "stats.json")

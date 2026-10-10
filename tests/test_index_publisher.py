@@ -31,12 +31,14 @@ from transitio.index import release as contract  # noqa: E402
 
 def _expected_members(index_dir):
     """The release members a partitioned index packs: the snapshot, the
-    providers table, every partition table it lists, the NOTICE."""
+    providers table, every core partition table it lists (not the on-demand
+    boundaries and details), the NOTICE."""
     snapshot = json.loads((index_dir / "snapshot.json").read_text())
     tables = [
         f"{part}/{table}.parquet"
         for part, listed in sorted(snapshot["partitions"].items())
         for table in sorted(listed)
+        if table not in ("boundaries", "details")
     ]
     return ["snapshot.json", "access_providers.parquet", *tables, "NOTICE"]
 
@@ -502,6 +504,7 @@ def test_pack_ships_a_listed_realtime_table(tmp_path):
     snapshot["partitions"][part]["realtime"] = {
         "rows": 1,
         "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
     }
     (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
     # Packed under the lineage check: the table derives from the feeds leaf
