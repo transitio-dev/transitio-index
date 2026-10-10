@@ -26,6 +26,7 @@ from test_index_publish import (  # noqa: E402
     _publish_gen,
 )
 from transitio import index as reader  # noqa: E402
+from transitio.exceptions import IncompatibleIndexError  # noqa: E402
 from transitio.index import release as contract  # noqa: E402
 
 
@@ -41,6 +42,15 @@ def _expected_members(index_dir):
         if table not in ("boundaries", "details")
     ]
     return ["snapshot.json", "access_providers.parquet", *tables, "NOTICE"]
+
+
+def _parts(snapshot_id):
+    """The on-demand members of the index ``_index`` builds, each with the
+    name of its release asset."""
+    return {
+        "FI/boundaries.parquet": f"transitio-index-{snapshot_id}-FI-boundaries.parquet",
+        "links/details.parquet": f"transitio-index-{snapshot_id}-links-details.parquet",
+    }
 
 
 def _index(tmp_path):
@@ -82,9 +92,11 @@ def test_pack_is_deterministic_and_lists_only_index_members(tmp_path):
     (out / "manifest.json").symlink_to(tmp_path / "elsewhere.json")
     assets, manifest = publisher.pack(index_dir, out)
     again, _ = publisher.pack(index_dir)
-    name = contract.archive_name(manifest["snapshot_id"])
+    assert again == assets
+    name = f"transitio-index-{manifest['snapshot_id']}-core.tar.gz"
+    parts = _parts(manifest["snapshot_id"])
+    assert list(assets) == [name, name + ".sha256", *parts.values(), "manifest.json"]
     archive = assets[name]
-    assert archive == again[name]
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
         assert tar.getnames() == _expected_members(index_dir)
         assert all(m.mtime == 0 and m.uid == 0 and m.isreg() for m in tar.getmembers())
@@ -96,10 +108,21 @@ def test_pack_is_deterministic_and_lists_only_index_members(tmp_path):
         "bytes": len(archive),
     }
     assert set(manifest["members"]) == set(_expected_members(index_dir))
+    # Each on-demand file is an asset of its own, its bytes as written.
+    files = {member: (index_dir / member).read_bytes() for member in parts}
+    assert manifest["parts"] == {
+        member: {
+            "name": parts[member],
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
+        }
+        for member, data in files.items()
+    }
+    assert all(assets[parts[member]] == data for member, data in files.items())
     assert json.loads(assets["manifest.json"]) == manifest
     assert contract.compatible(manifest) == (True, None)
     # Written through the store: the planted symlink is replaced, not followed.
-    assert (out / name).read_bytes() == archive
+    assert all((out / asset).read_bytes() == data for asset, data in assets.items())
     assert not (out / "manifest.json").is_symlink()
     assert not (tmp_path / "elsewhere.json").exists()
 
@@ -126,11 +149,10 @@ def test_publish_drafts_verifies_publishes_and_round_trips(tmp_path):
     assert release["draft"] is False and release["tag_name"] == summary["tag"]
     # Index data never becomes the repository's latest release.
     assert fake.latest == software["id"]
-    assert set(summary["assets"]) == {
-        contract.archive_name(summary["snapshot_id"]),
-        contract.archive_name(summary["snapshot_id"]) + ".sha256",
-        "manifest.json",
-    }
+    # Every asset written is uploaded as it is, the parts included.
+    written = {path.name: path.read_bytes() for path in (tmp_path / "out").iterdir()}
+    assert {a["name"]: fake.blobs[a["id"]] for a in release["assets"]} == written
+    assert set(summary["assets"]) == set(written) and len(written) == 5
     assert summary["skipped"] == []
     with httpx.Client(transport=fake.transport()) as anonymous:
         listed = anonymous.get(f"{API}/repos/o/r/releases").json()
@@ -154,11 +176,16 @@ def test_publish_drafts_verifies_publishes_and_round_trips(tmp_path):
     ]
 
 
-def test_a_corrupted_upload_leaves_the_release_a_draft(tmp_path):
-    fake = FakeGitHub(corrupt="manifest.json")
+@pytest.mark.parametrize(
+    "corrupt", ["manifest.json", "FI/boundaries.parquet"], ids=["manifest", "part"]
+)
+def test_a_corrupted_upload_leaves_the_release_a_draft(tmp_path, corrupt):
+    index_dir = _index(tmp_path)
+    snapshot_id = json.loads((index_dir / "snapshot.json").read_text())["snapshot_id"]
+    fake = FakeGitHub(corrupt=_parts(snapshot_id).get(corrupt, corrupt))
     with pytest.raises(publisher.PublishIndexError, match="does not match"):
         publisher.publish_index(
-            _index(tmp_path),
+            index_dir,
             cache_dir=tmp_path / "cache",
             repository="o/r",
             token="secret",
@@ -446,15 +473,55 @@ def test_an_altered_notice_is_not_released(tmp_path):
         publisher.pack(index_dir, cache_dir=index_dir.parent)
 
 
+def test_an_index_failing_the_full_check_is_not_released(tmp_path):
+    import pyarrow.parquet as pq
+
+    index_dir = _index(tmp_path)
+    # Boundaries without their GeoParquet metadata, listed consistently: the
+    # core read never opens them, the full check does.
+    path = index_dir / "FI" / "boundaries.parquet"
+    pq.write_table(pq.read_table(path).replace_schema_metadata({}), path)
+    data = path.read_bytes()
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    snapshot["partitions"]["FI"]["boundaries"].update(
+        sha256=hashlib.sha256(data).hexdigest(), bytes=len(data)
+    )
+    (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+    reader.read_index(index_dir)
+    fake = FakeGitHub()
+    with pytest.raises(IncompatibleIndexError, match="GeoParquet"):
+        publisher.publish_index(
+            index_dir,
+            cache_dir=tmp_path / "cache",
+            repository="o/r",
+            token="secret",
+            api_url=API,
+            out_dir=tmp_path / "out",
+            transport=fake.transport(),
+        )
+    assert fake.releases == {} and not (tmp_path / "out").exists()
+
+
+def test_an_asset_over_the_release_ceiling_is_refused(tmp_path, monkeypatch):
+    index_dir = _index(tmp_path)
+    part = index_dir / "FI" / "boundaries.parquet"
+    monkeypatch.setattr(contract, "MAX_ASSET_BYTES", part.stat().st_size - 1)
+    with pytest.raises(publisher.PublishIndexError, match=r"-FI-boundaries\.parquet"):
+        publisher.pack(index_dir, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
 @pytest.mark.skipif(
     publish.SCHEMA_VERSION not in reader.SUPPORTED_SCHEMA_VERSIONS,
     reason="the reader fixture follows the released reader's layout",
 )
-def test_the_reader_fixture_packs_the_way_the_publisher_does(tmp_path):
+@pytest.mark.parametrize("split", [False, True], ids=["schema-9", "schema-12"])
+def test_the_reader_fixture_packs_the_way_the_publisher_does(tmp_path, split):
     """The reader tests' index fixture writes an index the real publisher
-    reads, verifies and packs into a compatible release whose archive holds
-    the same members the fixture's own packer produces -- the guard that the
-    two cannot drift apart. It moves to transitio-index with the build."""
+    reads, verifies and packs into a compatible release whose assets are
+    the bytes the fixture's own packer produces, its manifest listing the
+    same archive, parts and members -- the guard that the two cannot drift
+    apart. It moves to transitio-index with the build."""
     from index_fixture import covered_feed, edge, place, write_partitioned_index
 
     # The fixture's partitioned index at the schema the build publishes: a
@@ -469,14 +536,22 @@ def test_the_reader_fixture_packs_the_way_the_publisher_does(tmp_path):
         edge("hel", "f-ferry", tier="international", cross_border=True),
     ]
     directory = write_partitioned_index(
-        tmp_path / "index", feeds=feeds, places=places, edges=edges, validity={}
+        tmp_path / "index",
+        feeds=feeds,
+        places=places,
+        edges=edges,
+        validity={},
+        split=split,
     )
     assets, manifest = publisher.pack(directory)
     ok, reason = contract.compatible(manifest)
     assert ok, reason
-    fixture_manifest = json.loads(_fixture_pack(directory)["manifest.json"])
-    assert manifest["members"] == fixture_manifest["members"]
-    assert manifest["archive"]["sha256"] == fixture_manifest["archive"]["sha256"]
+    fixture = _fixture_pack(directory)
+    fixture_manifest = json.loads(fixture.pop(contract.MANIFEST_NAME))
+    assert {k: v for k, v in assets.items() if k != contract.MANIFEST_NAME} == fixture
+    assert ("parts" in manifest) is split
+    for key in ("archive", "parts", "members"):
+        assert manifest.get(key) == fixture_manifest.get(key)
 
 
 def test_pack_ships_a_listed_realtime_table(tmp_path):
@@ -511,7 +586,7 @@ def test_pack_ships_a_listed_realtime_table(tmp_path):
     # the snapshot already records, so nothing more is required of it.
     assets, manifest = publisher.pack(index_dir, cache_dir=tmp_path / "cache")
     assert f"{part}/realtime.parquet" in manifest["members"]
-    archive = assets[contract.archive_name(manifest["snapshot_id"])]
+    archive = assets[contract.core_archive_name(manifest["snapshot_id"])]
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
         assert tar.extractfile(f"{part}/realtime.parquet").read() == data
 

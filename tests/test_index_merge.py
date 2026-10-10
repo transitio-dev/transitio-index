@@ -1867,8 +1867,9 @@ def test_the_publisher_packs_a_merged_snapshot_with_its_lineage_checked(tmp_path
         release["lineage"]["licensed"] is True
         and release["lineage"]["generations"] is None
     )
-    archive = f"transitio-index-{manifest['snapshot_id']}.tar.gz"
-    assert {archive, archive + ".sha256"} < set(assets) and len(assets) == 3
+    archive = f"transitio-index-{manifest['snapshot_id']}-core.tar.gz"
+    assert {archive, archive + ".sha256"} < set(assets)
+    assert len(assets) == 3 + len(release["parts"])
     # Naming the cache but not the archived builds cannot check a merged
     # index, so it is refused rather than packed unchecked.
     with pytest.raises(publisher.PublishIndexError, match="name their directory"):

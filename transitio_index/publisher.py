@@ -2,18 +2,21 @@
 
 :func:`pack` turns ``<cache>/index`` into ``transitio-index-<snapshot_id>.tar.gz``
 (gzip, deterministic: same index, same bytes), its ``.sha256`` and the
-immutable ``manifest.json`` a client reads first. :func:`publish_index` then
-creates the release ``index-<snapshot_id>`` as a **draft**, uploads the three
-assets, downloads each one back and checks its digest, and only then flips
-the draft to published — a plain release is listable the moment it exists, so
-publishing the draft is the atomic commit. Last it lists the releases as an
+immutable ``manifest.json`` a client reads first. From schema 12 the archive
+is ``transitio-index-<snapshot_id>-core.tar.gz`` with the core tables only,
+and each on-demand table is an asset of its own, listed in the manifest's
+``parts``. :func:`publish_index` then creates the release
+``index-<snapshot_id>`` as a **draft**, uploads the assets, downloads each
+one back and checks its digest, and only then flips the draft to published
+— a plain release is listable the moment it exists, so publishing the draft
+is the atomic commit. Last it lists the releases as an
 anonymous client would and confirms the newest compatible one is the snapshot
 just published, asking again for up to two minutes while GitHub still serves
 an anonymous listing cached from before the release.
 
-The index is read through the reader first, so nothing the reader would
-refuse can ship. The token is only ever sent to the API host and the upload
-host GitHub names in the release it created.
+The index is read through the reader first, every table and check, so
+nothing the reader would refuse can ship. The token is only ever sent to the
+API host and the upload host GitHub names in the release it created.
 """
 
 import contextlib
@@ -31,7 +34,7 @@ import time
 import httpx
 
 from transitio_index import crawl, store
-from transitio.index import read_index
+from transitio.index import check_index, read_index
 from transitio.index import release as contract
 
 TIMEOUT = 60.0
@@ -73,7 +76,8 @@ def _pieces(data):
 def _members(index_dir):
     """The index files to pack as ``(name, bytes)``, in the order the release
     contract lists them (the snapshot, every partition table it lists, the
-    NOTICE), read under the index's writer lock so a publish cannot
+    NOTICE), and the on-demand files a schema-12 release ships as assets of
+    their own; both read under the index's writer lock so a publish cannot
     interleave with the capture."""
     directory = store.open_directory(pathlib.Path(index_dir))
     try:
@@ -82,11 +86,12 @@ def _members(index_dir):
             snapshot = json.loads(found[0][1].decode("utf-8"))
             try:
                 names = contract.members(snapshot)
+                parts = contract.on_demand(snapshot)
             except ValueError as error:
                 raise PublishIndexError(
                     f"snapshot.json: {error}; a release ships every table"
                 ) from error
-            for name in names:
+            for name in names + parts:
                 if name == "snapshot.json":
                     continue
                 part, _, file = name.rpartition("/")
@@ -98,7 +103,7 @@ def _members(index_dir):
                     found.append((name, _member(child, file)))
                 finally:
                     child.close()
-            return found
+            return found[: len(names)], found[len(names) :]
     finally:
         directory.close()
 
@@ -447,10 +452,13 @@ def _current(cache_dir, snapshot, overrides_dir):
 def pack(
     index_dir, out_dir=None, *, cache_dir=None, overrides_dir=None, builds_dir=None
 ):
-    """The three release assets, as ``(bytes by asset name, manifest)``, and
-    written into ``out_dir`` when given. The members are read once, and the
-    reader validates that very copy (staged privately), so a build replacing
-    the index meanwhile cannot put unvalidated bytes under a validated id.
+    """The release assets, as ``(bytes by asset name, manifest)``, and
+    written into ``out_dir`` when given: the archive, its checksum, from
+    schema 12 each on-demand file, and the manifest. The members are read
+    once, and the reader reads and checks that very copy whole (staged
+    privately), so a build replacing the index meanwhile cannot put
+    unvalidated bytes under a validated id. No asset may exceed the
+    contract's asset ceiling.
     The lineage the index records must still be current, unless the index
     is packed with neither ``cache_dir`` nor ``builds_dir`` (the assets-only
     escape hatch): for a built index its stage generations, checked under
@@ -470,7 +478,7 @@ def pack(
     with contextlib.ExitStack() as stack:
         if verify:
             _lock_lineage(stack, cache_dir, merged)
-        members = _members(index_dir)
+        members, parts = _members(index_dir)
         if verify:
             snapshot = json.loads(dict(members)["snapshot.json"].decode("utf-8"))
             if _is_merged(snapshot) != merged:
@@ -487,10 +495,11 @@ def pack(
     try:
         directory = store.open_directory(staged)
         try:
-            _stage(directory, members)
+            _stage(directory, members + parts)
         finally:
             directory.close()
         snapshot = read_index(staged).snapshot
+        check_index(staged)
     finally:
         shutil.rmtree(staged, ignore_errors=True)
     snapshot_id = snapshot["snapshot_id"]
@@ -498,6 +507,13 @@ def pack(
         raise PublishIndexError(f"snapshot_id {snapshot_id!r} is not one publish mints")
     archive = _archive(members)
     name = contract.archive_name(snapshot_id)
+    if snapshot["schema_version"] >= 12:
+        name = contract.core_archive_name(snapshot_id)
+    released = {}
+    for member, data in parts:
+        partition, table = member.removesuffix(".parquet").split("/")
+        asset = contract.part_asset_name(snapshot_id, partition, table)
+        released[member] = (asset, data)
     manifest = {
         "snapshot_id": snapshot_id,
         "schema_version": snapshot["schema_version"],
@@ -530,16 +546,31 @@ def pack(
             else {}
         ),
     }
+    if released:
+        manifest["parts"] = {
+            member: {"name": asset, "sha256": _sha256(data), "bytes": len(data)}
+            for member, (asset, data) in released.items()
+        }
     ok, reason = contract.compatible(manifest)
     if not ok:
         raise PublishIndexError(f"the snapshot would not be readable: {reason}")
+    # The manifest goes last, so it is uploaded once every asset it lists is.
     assets = {
         name: archive,
         name + contract.CHECKSUM_SUFFIX: f"{_sha256(archive)}  {name}\n".encode(),
+        **dict(released.values()),
         contract.MANIFEST_NAME: (
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         ).encode(),
     }
+    over = [
+        asset for asset, data in assets.items() if len(data) > contract.MAX_ASSET_BYTES
+    ]
+    if over:
+        raise PublishIndexError(
+            f"over the {contract.MAX_ASSET_BYTES}-byte release asset ceiling: "
+            + ", ".join(over)
+        )
     if out_dir is not None:
         write_assets(assets, out_dir)
     return assets, manifest
