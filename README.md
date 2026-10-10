@@ -138,7 +138,7 @@ matching registry together.
 11. `prune` — drop the places that no kept edge needs.
 12. `license` — record each shipped feed's licence and lineage, and write the
     NOTICE.
-13. `publish` — write the shippable `cache/index/`: the GeoParquet tables,
+13. `publish` — write the shippable `cache/index/`: the Parquet tables,
     the table of the access providers its feeds name and the manifest the
     reader installs.
 14. `stats` — write statistics about the catalogue rows the build saw and the
@@ -296,8 +296,8 @@ python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache
     --partition cache/sample/partition-<id>/partition.json
 ```
 
-Every source must be a licensed schema-11 or schema-12 build, and the sources
-must agree on
+Every source must be a licensed schema-11 or schema-12 build (the merge writes
+schema 12), and the sources must agree on
 the Overture release, the simplification tolerance and the classifier. A feed
 comes from the newest build carrying it and its edges from that same build; a
 place comes from the build serving it most, with the largest population any

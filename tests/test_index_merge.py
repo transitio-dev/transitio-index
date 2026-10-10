@@ -27,6 +27,7 @@ from builds_fixture import (
     _run,
     write_build,
 )
+from test_index_publish import _read_on_demand
 from transitio.index import fingerprint
 
 from transitio_index import builds, classify, licensing, merge, store
@@ -937,9 +938,7 @@ def test_a_feed_without_a_home_country_is_international(home):
     assert routed[("links", "edges")]["feed_partition"].to_pylist() == ["international"]
 
 
-def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadata(
-    tmp_path,
-):
+def test_partition_files_carry_the_snapshot_id_their_digests_and_sizes(tmp_path):
     fx = pytest.importorskip("index_fixture")
     _two_runs(fx, tmp_path)
     _, tables = _merged(tmp_path)
@@ -955,11 +954,14 @@ def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadat
         assert listing[partition][table] == {
             "rows": len(read),
             "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
         }
-    assert listing["links"]["edges"]["rows"] == 2
+    assert listing["links"]["edges"]["rows"] == listing["links"]["details"]["rows"] == 2
     assert listing["FI"]["realtime"]["rows"] == 1
-    geo = pq.read_schema(io.BytesIO(files[("FI", "places")])).metadata[b"geo"]
-    assert json.loads(geo)["columns"]["centre"]["geometry_types"] == ["Point"]
+    # Each places table beside its boundaries, each edges table its details.
+    for tables_ in listing.values():
+        assert ("places" in tables_) == ("boundaries" in tables_)
+        assert ("edges" in tables_) == ("details" in tables_)
     # The same tables give the same bytes again.
     again, _ = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
     assert again.pop((None, "access_providers")) == root_bytes and again == files
@@ -983,9 +985,9 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
     read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
     assert set(read["snapshot"].to_pylist()) == {snapshot_id}
-    assert manifest["schema_version"] == 11
+    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 17
     assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
-    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[11]
+    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[12]
     assert manifest["built_with"] == transitio.__version__
     assert manifest["built_at"] == BUILT(15)  # the newest source's, not the clock
     assert manifest["counts"] == {
@@ -1005,10 +1007,17 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         p: {t: e["rows"] for t, e in ts.items()}
         for p, ts in manifest["partitions"].items()
     } == {
-        "DE": {"edges": 1, "feeds": 1, "places": 1},
-        "FI": {"edges": 2, "feeds": 2, "places": 2, "realtime": 1},
+        "DE": {"boundaries": 1, "details": 1, "edges": 1, "feeds": 1, "places": 1},
+        "FI": {
+            "boundaries": 2,
+            "details": 2,
+            "edges": 2,
+            "feeds": 2,
+            "places": 2,
+            "realtime": 1,
+        },
         "international": {"feeds": 1, "realtime": 1},
-        "links": {"edges": 2},
+        "links": {"details": 2, "edges": 2},
     }
     for (partition, table), data in files.items():
         entry = (
@@ -1628,6 +1637,25 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
     assert index.access_provider("flix").name == "FlixBus"
     centre = index.places.set_index("place_id").loc["hel", "centre"]
     assert centre.equals(shapely.from_wkb(HEL_CENTRE))
+    # The schema-11 sources' boundaries read back bit for bit, and the
+    # edges' evidence as the merge gave it.
+    boundaries = _read_on_demand(index, "boundaries")
+    assert shapely.to_wkb(boundaries["hel"], hex=True) == HEL_BOUNDARY
+    assert shapely.to_wkb(boundaries["ber"], hex=True) == BER_BOUNDARY
+    assert boundaries["fi"] is None
+    # The core places are plain Parquet, without the sources' GeoParquet
+    # metadata.
+    for path in (cache / "index").glob("*/places.parquet"):
+        assert b"geo" not in (pq.read_schema(path).metadata or {})
+    loaded = merge.load_sources(merge.select_sources(builds)[0])
+    _, tables = merge.merge_tables(
+        [(s["build_id"], s["snapshot"], s["tables"]) for s in loaded]
+    )
+    edges = tables["edges.parquet"]
+    details = _read_on_demand(index, "details").reset_index()
+    assert dict(zip(_pairs(edges), edges["evidence"].to_pylist())) == dict(
+        zip(zip(details["place_id"], details["feed_id"]), details["evidence"])
+    )
     notice = (cache / "index" / "NOTICE").read_bytes()
     assert notice.startswith(b"This index includes place boundary geometry")
     assert hashlib.sha256(notice).hexdigest() == index.snapshot["notice_sha256"]
@@ -1716,8 +1744,10 @@ def test_a_second_merge_replaces_the_live_index_and_drops_what_it_lacks(tmp_path
     assert len(index.feeds) == 2 and len(index.places) == 2 and index.links is None
 
 
+# A core table, and an on-demand one that only the full check reads.
+@pytest.mark.parametrize("table", ["feeds", "boundaries"])
 def test_a_snapshot_the_reader_rejects_leaves_the_live_index_untouched(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, table
 ):
     fx = pytest.importorskip("index_fixture")
     builds, cache = tmp_path / "builds", tmp_path / "cache"
@@ -1728,8 +1758,7 @@ def test_a_snapshot_the_reader_rejects_leaves_the_live_index_untouched(
 
     def tampered(loaded, tables, notice, **options):  # a digest the reader refuses
         manifest, files = assemble(loaded, tables, notice, **options)
-        manifest["partitions"]["FI"]["feeds"]["sha256"] = "0" * 64
-        manifest["snapshot_id"] = "feedcafefeedcafe"
+        manifest["partitions"]["FI"][table]["sha256"] = "0" * 64
         return manifest, files
 
     monkeypatch.setattr(merge, "assemble", tampered)
