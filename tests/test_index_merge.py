@@ -416,10 +416,12 @@ MANIFEST_9 = {
 }
 
 
-def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fields):
+def _archive(
+    fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", split=False, **fields
+):
     """A schema-11 run archived as ``<label>-<16 hex>``: the reader fixture's
     partitioned index (``access`` its providers, none by default) with the
-    manifest fields a merge checks."""
+    manifest fields a merge checks; with ``split`` a schema-12 run."""
     path = archived / f"{label}-{digit:016x}" / "index"
     fx.write_partitioned_index(
         path,
@@ -431,6 +433,7 @@ def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fiel
         access=fields.pop("access", {"providers": []}),
         snapshot_id=f"{digit:016x}",
         notice=notice,
+        split=split,
     )
     _rewrite_snapshot(
         path, lambda s: s.update({**MANIFEST_9, "built_at": built_at, **fields})
@@ -450,6 +453,11 @@ FLIX = {
     "free": None,
 }
 HEL_CENTRE = shapely.to_wkb(shapely.Point(24.94, 60.17), hex=True)
+HEL_BOUNDARY = shapely.to_wkb(BOX(24.8, 60.1, 25.3, 60.35), hex=True)
+BER_BOUNDARY = shapely.to_wkb(
+    shapely.MultiPolygon([BOX(13.1, 52.3, 13.7, 52.7), BOX(13.8, 52.3, 13.9, 52.4)]),
+    hex=True,
+)
 DE_SOURCES = {
     "atlas": {"archive_sha256": "d" * 64},
     "mdb": {"csv_sha256": "e" * 64},
@@ -481,9 +489,10 @@ def _partition(directory, change=None):
     return path
 
 
-def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
+def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n", split=False):
     """A Finnish run and a newer German one that also carries Helsinki; the
-    German run read other catalogue samples."""
+    German run read other catalogue samples. With ``split`` both are
+    schema-12 runs."""
     fi = _archive(
         fx,
         archived,
@@ -491,6 +500,7 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         1,
         built_at=BUILT(14),
         notice=fi_notice,
+        split=split,
         feeds=[
             {
                 **fx.covered_feed("hsl"),
@@ -511,7 +521,9 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         ],
         places=[
             fx.place("fi", "country", country_code="FI"),
-            fx.place("hel", "city", country_code="FI", parent_id="fi"),
+            fx.place(
+                "hel", "city", country_code="FI", parent_id="fi", geometry=HEL_BOUNDARY
+            ),
         ],
         edges=[
             fx.edge("hel", "hsl", tier="local", relevance_category="primary"),
@@ -526,6 +538,7 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         2,
         built_at=BUILT(15),
         notice=de_notice,
+        split=split,
         sources=DE_SOURCES,
         access={"providers": [FLIX]},
         feeds=[
@@ -543,9 +556,14 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
             },
         ],
         places=[
-            fx.place("ber", "city", country_code="DE"),
+            fx.place("ber", "city", country_code="DE", geometry=BER_BOUNDARY),
             fx.place(
-                "hel", "city", country_code="FI", parent_id="fi", centre=HEL_CENTRE
+                "hel",
+                "city",
+                country_code="FI",
+                parent_id="fi",
+                centre=HEL_CENTRE,
+                geometry=HEL_BOUNDARY,
             ),
         ],
         edges=[
@@ -583,6 +601,31 @@ def test_a_selection_loads_verified_in_label_order_with_its_digests(tmp_path):
     assert "realtime.parquet" in loaded[1]["tables"]
     assert "realtime.parquet" not in loaded[0]["tables"]
     assert loaded[1]["tables"]["feeds.parquet"]["feed_id"].to_pylist() == ["hsl", "nat"]
+    # The same runs in the schema-12 layout load into the same tables.
+    _two_runs(fx, tmp_path / "split", split=True)
+    split = merge.load_sources(merge.select_sources(tmp_path / "split")[0])
+    for old, new in zip(loaded, split):
+        assert new["snapshot"]["schema_version"] == 12
+        assert set(new["tables"]) == set(old["tables"])
+        for name, table in old["tables"].items():
+            assert sorted(new["tables"][name].column_names) == sorted(
+                table.column_names
+            )
+            assert new["tables"][name].select(table.column_names).equals(table)
+    # A table's listed size is checked: without one, or a wrong one, the
+    # build is refused.
+    index = tmp_path / "split" / split[0]["build_id"] / "index"
+    partition = next(
+        p for p, t in split[0]["snapshot"]["partitions"].items() if "places" in t
+    )
+    for size in (None, 1):
+        _rewrite_snapshot(
+            index,
+            lambda s, size=size: s["partitions"][partition]["places"].update(
+                bytes=size
+            ),
+        )
+        assert builds.load_tables(index) is None
 
 
 def _unlicensed(archived, fi, de):

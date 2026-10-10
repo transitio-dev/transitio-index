@@ -296,7 +296,8 @@ python -m transitio_index.merge --builds ~/.cache/transitio-index/builds --cache
     --partition cache/sample/partition-<id>/partition.json
 ```
 
-Every source must be a licensed schema-11 build, and the sources must agree on
+Every source must be a licensed schema-11 or schema-12 build, and the sources
+must agree on
 the Overture release, the simplification tolerance and the classifier. A feed
 comes from the newest build carrying it and its edges from that same build; a
 place comes from the build serving it most, with the largest population any

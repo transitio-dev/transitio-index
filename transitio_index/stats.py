@@ -26,16 +26,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from transitio_index import store
+from transitio_index.builds import ON_DEMAND, PARTITION_LAYOUT, PARTITION_NAME
 from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host, _mint_mdb
 
 STATS_POINTER = "stats.json"
 # The shape of the stats artifacts; the aggregation script refuses a mismatch.
 # 2: the realtime section; 3: validity; 4: hosted copies; 5: keyed crawls
 STATS_SCHEMA_VERSION = 5
-# A partition of the published index: a country code, international or links.
-PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
-# The tables a partition kind may carry; a country partition any of them.
-PARTITION_LAYOUT = {"international": {"feeds", "realtime"}, "links": {"edges"}}
 CATALOGUE_ARTIFACT = "catalogue.parquet"
 FEEDS_ARTIFACT = "feeds.parquet"
 PLACES_ARTIFACT = "places.parquet"
@@ -936,15 +933,24 @@ def _index_tables(cache_dir, snapshot):
     """``(feeds, realtime, edges, places)`` of the published index, its
     partitions joined; JSON columns decoded. Every file is read once and
     checked against the snapshot's digest and row count, and only the
-    layout's own partition and table names are opened."""
+    layout's own partition and table names are opened. Schema 12's
+    on-demand tables (the boundaries and the edges' details) are not read:
+    the statistics use the core columns only."""
     tables = {"feeds": [], "realtime": [], "edges": [], "places": []}
+    unread = {extra for extra, _, _ in ON_DEMAND.values()}
+    version = snapshot.get("schema_version")
+    split = type(version) is int and version >= 12
     for partition, listed in (snapshot.get("partitions") or {}).items():
         if not PARTITION_NAME.fullmatch(partition):
             raise StatsError(f"{partition!r}: not a partition of the index")
-        allowed = PARTITION_LAYOUT.get(partition, set(tables))
+        allowed = PARTITION_LAYOUT.get(partition, set(tables) | unread)
+        if not split:
+            allowed = allowed - unread
         for table, entry in listed.items():
             if table not in allowed:
                 raise StatsError(f"{partition}/{table}: not a table of the index")
+            if table in unread:
+                continue
             path = cache_dir / "index" / partition / f"{table}.parquet"
             data = path.read_bytes()
             if hashlib.sha256(data).hexdigest() != (entry or {}).get("sha256"):
