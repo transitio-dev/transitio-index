@@ -15,7 +15,10 @@ just published, asking again for up to two minutes while GitHub still serves
 an anonymous listing cached from before the release.
 
 The index is read through the reader first, every table and check, so
-nothing the reader would refuse can ship. The token is only ever sent to the
+nothing the reader would refuse can ship. The release report
+(:mod:`transitio_index.release_report`) is attached to the release, and a
+reference check that passed on the previous release and fails on this one
+stops it unless accepted. The token is only ever sent to the
 API host and the upload host GitHub names in the release it created.
 """
 
@@ -33,7 +36,7 @@ import time
 
 import httpx
 
-from transitio_index import crawl, store
+from transitio_index import crawl, release_report, store
 from transitio.index import check_index, read_index
 from transitio.index import release as contract
 
@@ -649,11 +652,32 @@ def publish_index(
     cache_dir,
     overrides_dir=None,
     builds_dir=None,
+    report,
+    accept_regressions=False,
 ):
-    """Pack ``index_dir`` and publish it as the release for its snapshot;
-    returns a summary. A failure before the draft is flipped leaves it a
-    draft (invisible to clients); a failed round trip afterwards reports a
-    release that is already published."""
+    """Pack ``index_dir`` and publish it as the release for its snapshot,
+    its ``report`` (:func:`~transitio_index.release_report.build_report`)
+    attached as ``transitio-index-<snapshot_id>-report.md``; returns a
+    summary. A report of another snapshot is refused, before packing and
+    after it (a snapshot id is derived from the build's inputs and contents,
+    so the report describes the index packed), and so is a report with
+    reference checks that passed on the previous release and fail on this
+    one, unless ``accept_regressions``. A failure before the draft is
+    flipped leaves it a draft (invisible to clients); a failed round trip
+    afterwards reports a release that is already published."""
+    peeked = _peek(index_dir).get("snapshot_id")
+    if report.get("snapshot") != peeked:
+        raise PublishIndexError(
+            f"the report describes snapshot {report.get('snapshot')!r}, not {peeked!r}"
+        )
+    failed = release_report.regressions(report)
+    page = release_report.render(report).encode("utf-8")
+    if failed and not accept_regressions:
+        raise PublishIndexError(
+            f"{len(failed)} reference checks that passed on the previous release "
+            f"fail on this one ({', '.join(failed[:10])}"
+            f"{', ...' if len(failed) > 10 else ''}); accept the change to publish"
+        )
     assets, manifest = pack(
         index_dir,
         out_dir,
@@ -662,6 +686,15 @@ def publish_index(
         builds_dir=builds_dir,
     )
     snapshot_id = manifest["snapshot_id"]
+    if snapshot_id != peeked:
+        raise PublishIndexError(
+            f"the index changed to snapshot {snapshot_id} while being packed; "
+            "make the report again"
+        )
+    rendered = {f"transitio-index-{snapshot_id}-report.md": page}
+    write_assets(rendered, out_dir)
+    # First, so the manifest stays the last asset uploaded.
+    assets = {**rendered, **assets}
     tag = contract.release_tag(snapshot_id)
     repo = f"/repos/{repository}"
     with _client(api_url, token, transport) as client:
