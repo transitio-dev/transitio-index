@@ -65,6 +65,10 @@ class RegistryError(RuntimeError):
     """The registry is malformed, or a change it forbids was attempted."""
 
 
+class ReadOnlyError(RegistryError):
+    """A change a read-only session refuses."""
+
+
 def _number(place_id):
     return int(place_id[3:])
 
@@ -432,7 +436,7 @@ class Registry:
 
     def _refuse_change(self, what):
         if self.read_only:
-            raise RegistryError(f"{what}: the registry is read-only")
+            raise ReadOnlyError(f"{what}: the registry is read-only")
 
     def identify(
         self,

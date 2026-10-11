@@ -399,18 +399,23 @@ def test_overture_s3_filesystem_widens_the_timeout_and_retries(monkeypatch):
     assert kw["retry_strategy"] is not None
 
 
+@pytest.mark.parametrize("read_only", [False, True], ids=["writable", "read-only"])
 def test_a_seed_place_conflicting_with_a_registry_place_is_skipped_not_fatal(
-    tmp_path, caplog
+    tmp_path, caplog, read_only
 ):
     """A seeded place that shares its QID with a registry place of another kind
     (CA's Saskatoon: a region in the registry, a city from a feed) cannot be
     identified; it is logged and dropped — a child of a dropped place moves up
     to its nearest surviving ancestor — so one cross-level clash no longer
-    aborts the gazetteer."""
+    aborts the gazetteer. A read-only registry, as the parallel rebuild holds
+    it, drops the same places: it refuses changes, not conflicts (Tbilisi's
+    city aborted Georgia's build against its region)."""
     path = tmp_path / "places_registry.jsonl"
     path.write_text('{"next_id": 1, "registry": 1}\n')
+    registered = (("Q10566", "region"), ("Q77", "city"), ("Q88", "city"))
+    survivors = (("Q1", "country"), ("Q5", "city"), ("Q6", "city"), ("Q2", "city"))
     with registry.session(path) as reg:
-        for qid, kind in (("Q10566", "region"), ("Q77", "city"), ("Q88", "city")):
+        for qid, kind in registered + survivors:
             reg.identify(
                 {"wikidata": [qid]},
                 kind=kind,
@@ -418,6 +423,8 @@ def test_a_seed_place_conflicting_with_a_registry_place_is_skipped_not_fatal(
                 minted_from=f"overture:{qid}",
                 minted_in="overture test",
             )
+        reg.save()
+    with registry.session(path, read_only=read_only) as reg:
         ca = {"country_code": "CA"}
         places = {
             "Q1": {"kind": "country", **ca},

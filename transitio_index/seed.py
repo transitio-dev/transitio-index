@@ -899,7 +899,9 @@ def _identify_places(places, registry, places_digest, report=None):
     e.g. a city that shares its QID with a like-named region — cannot be
     identified; it is logged, appended to ``report`` as a ``conflict`` row
     when one is given, and dropped from ``places`` so one collision no longer
-    aborts the gazetteer. Returns the number identified."""
+    aborts the gazetteer, whether or not the registry is read-only. A mint or
+    an enrichment a read-only registry refuses still stops it. Returns the
+    number identified."""
     if registry is None:
         return 0
     from transitio_index import ucdb  # ucdb -> fao -> geometry -> seed
@@ -929,11 +931,13 @@ def _identify_places(places, registry, places_digest, report=None):
                 minted_from=minted_from,
                 minted_in=minted_in,
             )
+        except _registry.ReadOnlyError:
+            # A mint or an enrichment a read-only session cannot make.
+            raise
         except _registry.RegistryError as exc:
-            # A read-only session refuses every change loudly; only a writable
-            # build treats an identity conflict as a per-item miss.
-            if registry.read_only:
-                raise
+            # An identity conflict is a per-item miss in a read-only session
+            # too, so a build against a read-only registry drops the places a
+            # writable one drops.
             log.warning("seed: %s not identified (%s); skipped", place_id, exc)
             skipped.append(place_id)
             if report is not None:
