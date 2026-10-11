@@ -11,13 +11,15 @@ disagree on what the merged index holds. ``load_sources`` verifies and
 loads the selection for a merge, refusing what a merged snapshot could
 not ship, ``compose_notice`` writes the merged index's NOTICE from the
 sources' NOTICEs and the merged feeds, and ``assemble`` turns the merged
-tables into a schema-11 snapshot: the partition tables, the providers
+tables into a schema-12 snapshot: the partition tables, the providers
 table at the root, their manifest and a snapshot id that names exactly the
 sources, the merge format and the
-toolchain they were merged with. ``write_snapshot`` reads the assembled
-snapshot back through the reader before committing it into the cache's
-``index/`` as publish commits its own. Given the ``partition.json`` of the
-catalogue cut the builds came from, ``catalogue_check`` records which of its
+toolchain they were merged with. The sources may be schema-11 or schema-12
+builds; ``load_tables`` reads both into the same tables. ``write_snapshot``
+reads the assembled snapshot back through the reader before committing it
+into the cache's ``index/`` as publish commits its own. Given the
+``partition.json`` of the catalogue cut the builds came from,
+``catalogue_check`` records which of its
 feeds and labels, and which ``add_feed`` feeds of ``overrides/feeds.yaml``, the
 merged index lacks; the publisher refuses the gaps.
 """
@@ -25,7 +27,6 @@ merged index lacks; the publisher refuses the gaps.
 import argparse
 import collections
 import hashlib
-import io
 import json
 import math
 import re
@@ -37,7 +38,6 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 from transitio.index import fingerprint
 
 from . import classify, coverage, crosswalk, licensing, overrides, publish, rank, store
@@ -83,7 +83,10 @@ OVERRIDE_FIELDS = (
 # 14: a content fold names the feed by its Atlas name, then the MDB copy's.
 # 15: overlap evidence names the merged feeds.
 # 16: overlap evidence lists the feeds its build measured at the place.
-MERGE_FORMAT = 16
+# 17: schema 12, boundaries and edge details in tables of their own, zstd.
+MERGE_FORMAT = 17
+# The schemas of the builds a merge takes: both load into the same tables.
+SOURCE_SCHEMAS = (11, 12)
 
 STALE_FIELDS = ("stale_place_overrides", "stale_feed_overrides", "stale_edge_overrides")
 
@@ -664,17 +667,18 @@ def _providers(stacked, feeds):
 
 
 def _check_sources(snapshots):
-    """Refuse a selection the merge cannot ship: a source below schema 9, an
-    unlicensed one or one licensed under another policy (whose NOTICE the
-    merge cannot compose from), one without a field of ``AGREED_FIELDS``, or
-    sources disagreeing on one. Returns the agreed values."""
+    """Refuse a selection the merge cannot ship: a source of a schema outside
+    ``SOURCE_SCHEMAS``, an unlicensed one or one licensed under another
+    policy (whose NOTICE the merge cannot compose from), one without a field
+    of ``AGREED_FIELDS``, or sources disagreeing on one. Returns the agreed
+    values."""
     agreed = {}
     for build_id, snapshot in snapshots:
         version = snapshot.get("schema_version")
-        if version != publish.SCHEMA_VERSION:
+        if type(version) is not int or version not in SOURCE_SCHEMAS:
             raise MergeError(
                 f"{build_id}: schema_version {version!r}; the merge takes schema "
-                f"{publish.SCHEMA_VERSION} builds only"
+                f"{' or '.join(map(str, SOURCE_SCHEMAS))} builds only"
             )
         if snapshot.get("licensed") is not True or not isinstance(
             snapshot.get("notice_sha256"), str
@@ -892,27 +896,19 @@ def _route(tables):
 
 def _partition_files(routed, snapshot_id):
     """``(files, listing)``: every routed table with its ``snapshot`` column
-    set to the merged id, as Parquet bytes keyed ``(partition, table)``, and
-    the manifest listing of each table's rows and digest; a root table
-    (partition ``None``) has neither."""
-    files, listing = {}, {}
+    set to the merged id, written by ``publish.partition_files`` as Parquet
+    bytes keyed ``(partition, table)`` in the schema-12 layout, and the
+    manifest listing of each table's rows, digest and size; a root table
+    (partition ``None``) is not listed."""
+    tables = {}
     for (partition, table), rows in routed.items():
         if partition is not None:
             column = pa.array([snapshot_id] * len(rows), pa.string())
             rows = rows.set_column(
                 rows.schema.get_field_index("snapshot"), "snapshot", column
             )
-        sink = io.BytesIO()
-        pq.write_table(rows, sink)
-        data = sink.getvalue()
-        files[(partition, table)] = data
-        if partition is None:
-            continue
-        listing.setdefault(partition, {})[table] = {
-            "rows": len(rows),
-            "sha256": hashlib.sha256(data).hexdigest(),
-        }
-    return files, listing
+        tables[(partition, table)] = rows
+    return publish.partition_files(tables, snapshot_id)
 
 
 def _merged_id(loaded, partition_sha256=None, curated_sha256=None):
@@ -1570,7 +1566,8 @@ def write_snapshot(cache_dir, manifest, files, notice):
 
     Under the cache's writer lock throughout, so two merges cannot stage
     at once: first into a temporary sibling, ``index.<snapshot id>.tmp``,
-    where the reader reads it back; a snapshot the reader refuses is
+    where the reader reads it back and checks every table, the on-demand
+    boundaries and details included; a snapshot the reader refuses is
     removed and the live index is left as it was, absent included. Then
     committed as publish commits, under the index's own lock (the one the
     publisher takes): every partition table through the store's atomic
@@ -1582,7 +1579,7 @@ def write_snapshot(cache_dir, manifest, files, notice):
     itself failed), and a leftover one is removed before writing.
     """
     from transitio.exceptions import IncompatibleIndexError
-    from transitio.index import read_index
+    from transitio.index import check_index, read_index
 
     cache = Path(cache_dir)
     staged = cache / f"index.{manifest['snapshot_id']}.tmp"
@@ -1598,6 +1595,7 @@ def write_snapshot(cache_dir, manifest, files, notice):
                     directory.close()
                 try:
                     read = read_index(staged)
+                    check_index(staged)
                 except (IncompatibleIndexError, OSError, ValueError) as error:
                     raise MergeError(
                         f"the assembled snapshot does not read back: {error}"

@@ -19,7 +19,10 @@ read. A partitioned build's tables are joined into flat frames (feeds
 with their ``partition``, places, edges with ``feed_partition`` on the
 links, and from schema 8 the realtime companions keyed by static feed); a
 table at the root (schema 11's ``access_providers.parquet``) passes through.
-The viewer and the merge of builds both read through this module.
+From schema 12 each partition's ``boundaries.parquet`` and
+``details.parquet`` are joined back into its places and edges first, so a
+schema-12 build loads into the same tables as a schema-11 one. The viewer
+and the merge of builds both read through this module.
 """
 
 import datetime
@@ -33,7 +36,9 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import shapely
 import shapely.errors
+from transitio.index._boundaries import decode
 
 INDEX_FILES = ("places.parquet", "edges.parquet", "feeds.parquet", "NOTICE")
 
@@ -60,8 +65,20 @@ PARTITION_TABLES = ("feeds", "places", "edges")
 REALTIME = "realtime"
 
 
+# Schema 12: the on-demand tables, each beside the core table it extends,
+# with the keys its rows share with the core ones (in the same order) and
+# the core columns it stands in for.
+ON_DEMAND = {
+    "places": ("boundaries", ["place_id"], ["xmin", "ymin", "xmax", "ymax"]),
+    "edges": ("details", ["place_id", "feed_id", "tier"], ["summary"]),
+}
+
+
 # The tables a partition kind may carry; a country partition any of them.
-PARTITION_LAYOUT = {"international": {"feeds", REALTIME}, "links": {"edges"}}
+PARTITION_LAYOUT = {
+    "international": {"feeds", REALTIME},
+    "links": {"edges", "details"},
+}
 
 
 LINKS = "links"
@@ -110,6 +127,27 @@ SCHEMA_11_COLUMNS = {
         "terms_url",
         "credential_fields",
         "free",
+    },
+}
+
+
+# What schema 12 writes in place of the places' boundaries and the edges'
+# details, and the on-demand tables holding them.
+SCHEMA_12_COLUMNS = {
+    "places.parquet": {"xmin", "ymin", "xmax", "ymax"},
+    "edges.parquet": {"summary"},
+    "boundaries.parquet": {"place_id", "geometry", "polygon", "snapshot"},
+    "details.parquet": {
+        "place_id",
+        "feed_id",
+        "tier",
+        "evidence",
+        "selector",
+        "merged_evidence",
+        "curation",
+        "curation_history",
+        "rehomed_from",
+        "snapshot",
     },
 }
 
@@ -226,12 +264,17 @@ def snapshot_files(snapshot):
     table of the layout, a string digest and an integer row count) and the
     ``NOTICE`` when the build is licensed (``notice_sha256`` a string; an
     unlicensed build has none); from schema 11 the root
-    ``access_providers.parquet`` (``access_providers_sha256``, no row count).
+    ``access_providers.parquet`` (``access_providers_sha256``, no row count);
+    from schema 12 the on-demand tables, each listed exactly where its core
+    table is, and every partition table's size in ``bytes`` (a positive
+    integer, which :func:`load_tables` checks).
     """
     if not isinstance(snapshot, dict):
         return None
     version = snapshot.get("schema_version")
     accessed = isinstance(version, int) and version >= 11
+    split = isinstance(version, int) and version >= 12
+    extras = {extra for extra, _, _ in ON_DEMAND.values()}
     listing = snapshot.get("partitions")
     if listing is None:
         digests = snapshot_digests(snapshot)
@@ -247,7 +290,16 @@ def snapshot_files(snapshot):
             return None
         if not isinstance(tables, dict) or not tables:
             return None
-        allowed = PARTITION_LAYOUT.get(partition, {*PARTITION_TABLES, REALTIME})
+        allowed = PARTITION_LAYOUT.get(
+            partition, {*PARTITION_TABLES, REALTIME, *extras}
+        )
+        if not split:
+            allowed = allowed - extras
+        elif any(
+            (core in tables) != (extra in tables)
+            for core, (extra, *_) in ON_DEMAND.items()
+        ):
+            return None
         for table, entry in tables.items():
             if table not in allowed or not isinstance(entry, dict):
                 return None
@@ -255,6 +307,11 @@ def snapshot_files(snapshot):
             if not isinstance(digest, str) or not digest:
                 return None
             if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
+                return None
+            size = entry.get("bytes")
+            if split and (isinstance(size, bool) or not isinstance(size, int)):
+                return None
+            if split and size <= 0:
                 return None
             files[f"{partition}/{table}.parquet"] = (digest, rows)
     notice = snapshot.get("notice_sha256")
@@ -312,6 +369,43 @@ def _join_partitions(tables):
     return joined
 
 
+def with_on_demand(table, core, extra):
+    """A schema-12 core ``table`` (``places`` or ``edges``) joined with its
+    on-demand table into its shape before schema 12: places with each
+    boundary as WKB ``geometry`` in place of the bounding box, edges with
+    their details in place of the summary. The two must hold the same keys
+    in the same order, as publish writes them; a ``KeyError`` otherwise."""
+    name, keys, dropped = ON_DEMAND[table]
+    if table == "places":
+        shapes = decode(extra)["geometry"].to_numpy()
+        extra = pa.table(
+            {
+                "place_id": extra["place_id"],
+                "geometry": pa.array(shapely.to_wkb(shapes), pa.binary()),
+            }
+        )
+    if not core.select(keys).equals(extra.select(keys)):
+        raise KeyError(f"{table} and {name} do not hold the same rows")
+    core = core.drop_columns(dropped)
+    for field in extra.schema:
+        if field.name not in (*keys, "snapshot"):
+            core = core.append_column(field, extra[field.name])
+    return core
+
+
+def _unsplit(tables):
+    """A schema-12 build's partition tables by path with each on-demand
+    table joined into its core one (see :func:`with_on_demand`)."""
+    joined = dict(tables)
+    for table, (extra, _, _) in ON_DEMAND.items():
+        for path in tables:
+            partition, _, file = path.rpartition("/")
+            if partition and file == f"{table}.parquet":
+                partner = joined.pop(f"{partition}/{extra}.parquet")
+                joined[path] = with_on_demand(table, tables[path], partner)
+    return joined
+
+
 def _plain_directory(path):
     """A directory that is not a symlink; False if it cannot be inspected."""
     try:
@@ -355,6 +449,7 @@ def load_tables(path, read_bytes=_read_file, expected=None):
         dated = isinstance(version, int) and version >= 9
         nested = isinstance(version, int) and version >= 10
         accessed = isinstance(version, int) and version >= 11
+        split = isinstance(version, int) and version >= 12
         digests, tables = {}, {}
         for name, (digest, rows) in files.items():
             partition = name.rpartition("/")[0]
@@ -363,15 +458,28 @@ def load_tables(path, read_bytes=_read_file, expected=None):
             data = read_bytes(path / name)
             if hashlib.sha256(data).hexdigest() != digest:
                 return None
+            if split and partition:
+                table = name.rpartition("/")[2].removesuffix(".parquet")
+                if len(data) != snapshot["partitions"][partition][table]["bytes"]:
+                    return None
             digests[name] = digest
             if name.endswith(".parquet"):
                 table = pq.read_table(io.BytesIO(data))
                 if rows is not None and len(table) != rows:
                     return None
+                tables[name] = table
+        if "partitions" in snapshot:
+            if split:
+                for name, table in tables.items():
+                    base = name.rpartition("/")[2]
+                    if not _has_columns(table, base, SCHEMA_12_COLUMNS):
+                        return None
+                tables = _unsplit(tables)
+            # Each partition on its own: a join promotes a column one
+            # partition lacks to nulls, which would hide the gap.
+            for name, table in tables.items():
                 base = name.rpartition("/")[2]
-                # Each partition on its own: a join promotes a column one
-                # partition lacks to nulls, which would hide the gap.
-                if "partitions" in snapshot and not (
+                if not (
                     _has_columns(table, base, REQUIRED_COLUMNS)
                     and _has_columns(table, base, SCHEMA_7_COLUMNS)
                     and (not dated or _has_columns(table, base, SCHEMA_9_COLUMNS))
@@ -379,8 +487,6 @@ def load_tables(path, read_bytes=_read_file, expected=None):
                     and (not accessed or _has_columns(table, base, SCHEMA_11_COLUMNS))
                 ):
                     return None
-                tables[name] = table
-        if "partitions" in snapshot:
             tables = _join_partitions(tables)
             if tables is None:
                 return None

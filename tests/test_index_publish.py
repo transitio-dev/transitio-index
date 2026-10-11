@@ -18,6 +18,7 @@ pytest.importorskip("pyarrow")
 import shapely  # noqa: E402
 
 from transitio_index import publish  # noqa: E402
+from transitio_index import builds  # noqa: E402
 from transitio_index import classify  # noqa: E402
 from transitio_index import geometry  # noqa: E402
 from transitio_index import overrides  # noqa: E402
@@ -68,10 +69,33 @@ def _redigest(index_dir, table):
     the snapshot, so a rewritten table is judged on its shape, not its digest."""
     path, part = _table_file(index_dir, table)
     snapshot = json.loads((index_dir / "snapshot.json").read_text())
-    snapshot["partitions"][part][table]["sha256"] = hashlib.sha256(
-        path.read_bytes()
-    ).hexdigest()
+    data = path.read_bytes()
+    snapshot["partitions"][part][table].update(
+        sha256=hashlib.sha256(data).hexdigest(), bytes=len(data)
+    )
     (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+
+
+def _joined(index_dir, part, table):
+    """A partition's ``table`` with its on-demand table joined back, in the
+    shape before schema 12."""
+    import pyarrow.parquet as pq
+
+    core = pq.read_table(index_dir / part / f"{table}.parquet")
+    if table not in builds.ON_DEMAND:
+        return core
+    extra = pq.read_table(index_dir / part / f"{builds.ON_DEMAND[table][0]}.parquet")
+    return builds.with_on_demand(table, core, extra)
+
+
+def _read_on_demand(index, table):
+    """The ``boundaries`` (by place id) or ``details`` (by place, feed and
+    tier) of every partition of a schema-12 index, read through the reader."""
+    import pandas
+
+    read = index.boundaries_in if table == "boundaries" else index.details_in
+    listing = sorted(index.partitions.items())
+    return pandas.concat([read(part) for part, tables in listing if table in tables])
 
 
 def _has_table(manifest, table):
@@ -91,13 +115,13 @@ def _flatten(index_dir, version, drop=()):
         parts = [p for p, t in sorted(snapshot["partitions"].items()) if table in t]
         if not parts:
             continue
-        joined = pa.concat_tables(
-            [pq.read_table(index_dir / p / f"{table}.parquet") for p in parts]
-        )
+        joined = pa.concat_tables([_joined(index_dir, p, table) for p in parts])
         gone = [c for c in (*_SCHEMA_7_FEED_COLUMNS, *drop) if c in joined.column_names]
         if table == "edges":
             gone += ["relevance_category", "relevance", "cross_border"]
         joined = joined.drop_columns(gone)
+        if table == "places":
+            joined = joined.replace_schema_metadata({"geo": json.dumps(FLAT_GEO)})
         if table == "feeds" and "gbfs" not in drop:
             at = joined.column_names.index("mdb") + 1
             joined = joined.add_column(at, "gbfs", pa.nulls(len(joined), pa.string()))
@@ -108,6 +132,14 @@ def _flatten(index_dir, version, drop=()):
     snapshot["schema_version"] = version
     snapshot["min_reader_version"] = transitio_index.MIN_READER_VERSIONS[version]
     (index_dir / "snapshot.json").write_text(json.dumps(snapshot))
+
+
+# The flat layout's places are GeoParquet with the boundary as WKB.
+FLAT_GEO = {
+    "version": "1.0.0",
+    "primary_column": "geometry",
+    "columns": {"geometry": {"encoding": "WKB", "geometry_types": []}},
+}
 
 
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
@@ -528,7 +560,7 @@ def test_the_reader_still_reads_a_schema_4_index(tmp_path):
 def test_the_reader_refuses_a_parquet_that_does_not_match_its_manifest(tmp_path):
     cache, _ = _build_index(tmp_path)
     _table_file(cache / "index", "feeds")[0].write_bytes(b"not the published parquet")
-    with pytest.raises(IncompatibleIndexError, match="sha256"):
+    with pytest.raises(IncompatibleIndexError, match="sha256|bytes where"):
         transitio_index.read_index(cache / "index")
 
 
@@ -607,12 +639,13 @@ def test_places_round_trip_through_the_reader(tmp_path):
     by_id = {row["place_id"]: row for _, row in index.places.iterrows()}
     helsinki = by_id["Q1757"]
     assert helsinki["kind"] == "city"
-    assert helsinki.geometry.area > 0  # the boundary round-tripped
+    boundaries = _read_on_demand(index, "boundaries")
+    assert boundaries["Q1757"].area > 0  # the boundary round-tripped
     assert dict(helsinki["names"])["sv"] == "Helsingfors"  # a map column
     assert list(helsinki["aliases"]) == ["Stadi"]
     assert helsinki["default_metro_id"] == "Q-metro"  # the sole metro
     # The metro has no geometry here.
-    assert by_id["Q-metro"].geometry is None
+    assert boundaries["Q-metro"] is None
     assert _has_table(manifest, "places")
     assert manifest["overture_release"] == "2026-08-19.0"
     assert manifest["counts"]["places"] == 2
@@ -689,7 +722,7 @@ def test_the_reader_refuses_a_places_parquet_that_does_not_match(tmp_path):
     pytest.importorskip("geopandas")
     cache, _ = _build_index(tmp_path, places=PLACES)
     _table_file(cache / "index", "places")[0].write_bytes(b"not the published parquet")
-    with pytest.raises(IncompatibleIndexError, match="sha256"):
+    with pytest.raises(IncompatibleIndexError, match="sha256|bytes where"):
         transitio_index.read_index(cache / "index")
 
 
@@ -772,7 +805,8 @@ def test_edges_round_trip_through_the_reader(tmp_path):
     assert pandas.isna(row["service"])  # a null column reads None or NaN
     assert row["selector_state"] == "unavailable"
     assert bool(row["needs_review"]) is True
-    assert json.loads(row["evidence"])["declared_level"] == "municipality"
+    evidence = _read_on_demand(index, "details").loc[("Q1757", "f-a", "unknown")]
+    assert json.loads(evidence["evidence"])["declared_level"] == "municipality"
     # The feeds come from the coverage generation, stamped with their coverage.
 
     by_id = {r["feed_id"]: r for _, r in index.feeds.iterrows()}
@@ -805,7 +839,7 @@ def test_the_reader_refuses_an_edges_parquet_that_does_not_match(tmp_path):
     pytest.importorskip("geopandas")
     cache, _ = _edges_index(tmp_path, [_edge("Q1757", "f-a")])
     _table_file(cache / "index", "edges")[0].write_bytes(b"not the published parquet")
-    with pytest.raises(IncompatibleIndexError, match="sha256"):
+    with pytest.raises(IncompatibleIndexError, match="sha256|bytes where"):
         transitio_index.read_index(cache / "index")
 
 
@@ -1332,7 +1366,13 @@ def test_the_reader_reads_schema_6_places_and_refuses_a_mismatch(tmp_path):
     geopandas = pytest.importorskip("geopandas")
     cache, _ = _build_index(tmp_path, places=PLACES)
     index_dir = cache / "index"
-    published = geopandas.read_parquet(_table_file(index_dir, "places")[0])
+    joined = _joined(index_dir, _table_file(index_dir, "places")[1], "places")
+    published = geopandas.GeoDataFrame(
+        joined.to_pandas().assign(
+            geometry=lambda f: geopandas.GeoSeries.from_wkb(f["geometry"])
+        ),
+        crs="EPSG:4326",
+    )
     qids = [str(q) for q in published["place_id"]]
     own = {qid: f"tp_{n}" for n, qid in enumerate(qids, start=1)}
     places = published.copy()
@@ -1537,7 +1577,9 @@ MUNI_LICENCE = {
 }
 
 
-def test_the_index_ships_the_country_relevance_and_access_columns(tmp_path):
+def test_the_index_ships_the_country_relevance_and_access_columns_in_schema_12(
+    tmp_path,
+):
     import pyarrow as pa
     import pyarrow.parquet as pq
     from test_index_place_overrides import write_overrides
@@ -1598,15 +1640,19 @@ def test_the_index_ships_the_country_relevance_and_access_columns(tmp_path):
     (muni,) = crosswalk.curated_records(entries, [{"mdb": add_feed}])
     muni.update(resolve._catalogue_access(muni), coverage_source="declared")
     ranked = {"relevance_category": "primary", "relevance": 0.75, "cross_border": True}
+    shared = _edge("Q1757", "f-a", tier="local")
+    shared["evidence"] = {**shared["evidence"], "share_of_place": 0.4}
     edges = [
-        {**_edge("Q1757", "f-a", tier="local"), **ranked},
+        {**shared, **ranked},
         {**_edge("Q1757", "f-curated-muni", tier="local"), **ranked},
     ]
     centre = shapely.to_wkb(shapely.Point(25.0, 60.2)).hex()
+    # A one-part MultiPolygon stays one, beside a Polygon and a null boundary.
+    tallinn = shapely.to_wkb(shapely.MultiPolygon([shapely.box(24, 59, 25, 60)])).hex()
     places = [
         {**PLACES[0], "centre": centre, "population": 1_300_000},
         PLACES[1],
-        _place("Q-tll", "city", country_code="EE"),
+        _place("Q-tll", "city", country_code="EE", geometry=tallinn),
     ]
     cache, manifest = _edges_index(
         tmp_path,
@@ -1616,9 +1662,9 @@ def test_the_index_ships_the_country_relevance_and_access_columns(tmp_path):
         lineage={"resolve_generation": resolved["generation"]},
         overrides_dir=directory,
     )
-    assert manifest["schema_version"] == 11 == publish.SCHEMA_VERSION
+    assert manifest["schema_version"] == 12 == publish.SCHEMA_VERSION
     assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
-        11, publish.MIN_READER_VERSION
+        12, publish.MIN_READER_VERSION
     )
     # Without a home country the feeds sit in the international partition and
     # their edges in the links, naming that partition.
@@ -1640,8 +1686,8 @@ def test_the_index_ships_the_country_relevance_and_access_columns(tmp_path):
     for name in ("access", "access_provider", "auth_method", "registration_url"):
         assert row[name] == muni[name]
     assert json.loads(row["auth_params"]) == {"api_key": "key"}
-    links = pq.read_table(cache / "index" / "links" / "edges.parquet").to_pylist()
-    edge_row = links[0]
+    links = pq.read_table(cache / "index" / "links" / "edges.parquet")
+    edge_row = links.to_pylist()[0]
     assert edge_row["relevance_category"] == "primary"
     assert edge_row["relevance"] == 0.75 and edge_row["cross_border"] is True
     assert edge_row["feed_partition"] == "international"
@@ -1651,15 +1697,65 @@ def test_the_index_ships_the_country_relevance_and_access_columns(tmp_path):
     # The population typed even where no place records one.
     ee_places = pq.read_table(cache / "index" / "EE" / "places.parquet")
     assert ee_places.schema.field("population").type == pa.int64()
-    geo = json.loads(ee_places.schema.metadata[b"geo"])
-    assert geo["primary_column"] == "geometry"
-    assert geo["columns"]["centre"]["geometry_types"] == ["Point"]
+    # Schema 12: a place keeps its boundary's bounding box and an edge the
+    # evidence keys the reader ranks by; the boundaries and the edges'
+    # details sit beside them, one row each in the same order.
+    fi = pq.read_table(cache / "index" / "FI" / "places.parquet")
+    assert "geometry" not in fi.column_names and fi.schema.metadata is None
+    assert {
+        row["place_id"]: [row[name] for name in publish.BBOX_COLUMNS]
+        for row in fi.to_pylist()
+    } == {"Q1757": [24.9, 60.1, 25.1, 60.3], "Q-metro": [None] * 4}
+    for part, polygon in (("FI", [True, False]), ("EE", [False])):
+        path = cache / "index" / part / "boundaries.parquet"
+        boundaries = pq.read_table(path)
+        core = pq.read_table(cache / "index" / part / "places.parquet")
+        assert boundaries["place_id"].equals(core["place_id"])
+        assert boundaries["polygon"].to_pylist() == polygon
+        chunk = pq.ParquetFile(path).metadata.row_group(0)
+        encodings = {
+            chunk.column(i).path_in_schema: chunk.column(i).encodings
+            for i in range(chunk.num_columns)
+        }
+        for axis in ("x", "y"):
+            leaf = f"geometry.list.element.list.element.list.element.{axis}"
+            assert "BYTE_STREAM_SPLIT" in encodings[leaf]
+    assert not set(publish.DETAIL_COLUMNS) & set(links.column_names)
+    summaries = dict(zip(links["feed_id"].to_pylist(), links["summary"].to_pylist()))
+    assert json.loads(summaries["f-a"]) == {"share_of_place": 0.4}
+    assert summaries["f-curated-muni"] is None
+    details = pq.read_table(cache / "index" / "links" / "details.parquet")
+    keys = ["place_id", "feed_id", "tier"]
+    assert details.select(keys).equals(links.select(keys))
+    evidence = dict(
+        zip(details["feed_id"].to_pylist(), details["evidence"].to_pylist())
+    )
+    assert json.loads(evidence["f-a"]).items() >= shared["evidence"].items()
+    # Every table zstd-compressed and listed with its size.
+    for part, tables in manifest["partitions"].items():
+        for table, entry in tables.items():
+            path = cache / "index" / part / f"{table}.parquet"
+            assert entry["bytes"] == path.stat().st_size
+            meta = pq.ParquetFile(path).metadata
+            assert {
+                meta.row_group(group).column(i).compression
+                for group in range(meta.num_row_groups)
+                for i in range(meta.num_columns)
+            } == {"ZSTD"}
     # The root table holds the named provider only; the reader checks its
     # digest and the columns' types.
     root = pq.read_table(cache / "index" / publish.ACCESS_PROVIDERS_FILE)
     assert root["provider_id"].to_pylist() == ["mtc-511"]
     assert manifest["counts"]["access_providers"] == 1
     index = transitio_index.read_index(cache / "index")
+    # The boundaries read back bit for bit, and the evidence whole.
+    read = _read_on_demand(index, "boundaries")
+    assert {
+        place_id: None if shape is None else shapely.to_wkb(shape).hex()
+        for place_id, shape in read.items()
+    } == {place["place_id"]: place["geometry"] for place in places}
+    read = _read_on_demand(index, "details").reset_index()
+    assert dict(zip(read["feed_id"], read["evidence"])) == evidence
     helsinki = transitio_index.place("Q1757", index=index)
     assert (helsinki.centre.x, helsinki.centre.y) == (25.0, 60.2)
     assert helsinki.population == 1_300_000
@@ -1673,6 +1769,22 @@ def test_the_index_ships_the_country_relevance_and_access_columns(tmp_path):
     assert by_id["f-a"].access_instructions() is None
     assert index.access_provider("mtc-511").docs_url == "https://511.example/docs"
     assert index.access_provider("other") is None
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        shapely.Point(25, 60),
+        shapely.Polygon([(0, 0, 1), (1, 0, 1), (1, 1, 1)]),
+        shapely.Polygon(),
+    ],
+    ids=["point", "3d", "empty"],
+)
+def test_a_boundary_the_layout_cannot_hold_is_refused(shape):
+    place = _place("Q1", "city", geometry=shapely.to_wkb(shape).hex())
+    places = publish._places_table([place], "s")
+    with pytest.raises(ValueError, match="place Q1"):
+        publish.partition_files({("FI", "places"): places}, "s")
 
 
 def test_partition_routes_by_home_country_and_place_country():

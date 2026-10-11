@@ -19,7 +19,9 @@ generation's places with another's edges: a digest that does not match means
 the build is mid-publish, and it is reported unavailable rather than cached.
 A partitioned build's tables are joined into the frames the viewer reads
 (feeds with their ``partition``, places, edges with ``feed_partition`` on the
-links, and from schema 8 the realtime companions keyed by static feed).
+links, and from schema 8 the realtime companions keyed by static feed); from
+schema 12 each partition's boundaries and edge details are joined back into
+its places and edges.
 Per-country builds are written once and never rewritten; only ``cache/index``
 churns.
 

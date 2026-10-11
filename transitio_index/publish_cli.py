@@ -56,8 +56,8 @@ def parse_args(argv=None):
         "--out-dir",
         type=Path,
         default=None,
-        help="where to write the archive, checksum and manifest (default: a "
-        "temporary directory)",
+        help="where to write the release assets: the archive, its checksum, the "
+        "on-demand files and the manifest (default: a temporary directory)",
     )
     parser.add_argument(
         "--api-url",

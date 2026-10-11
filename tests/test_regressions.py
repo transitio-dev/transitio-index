@@ -2152,7 +2152,7 @@ def test_a_release_asset_uploads_in_pieces_of_a_declared_length(tmp_path, monkey
         out_dir=tmp_path / "out",
         transport=Recording(),
     )
-    headers, pieces = uploads[contract.archive_name(summary["snapshot_id"])]
+    headers, pieces = uploads[contract.core_archive_name(summary["snapshot_id"])]
     assert int(headers["Content-Length"]) == sum(map(len, pieces))
     assert "Transfer-Encoding" not in headers
     assert len(pieces) > 1 and max(map(len, pieces)) <= 1024

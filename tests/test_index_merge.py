@@ -27,6 +27,7 @@ from builds_fixture import (
     _run,
     write_build,
 )
+from test_index_publish import _read_on_demand
 from transitio.index import fingerprint
 
 from transitio_index import builds, classify, licensing, merge, store
@@ -416,10 +417,12 @@ MANIFEST_9 = {
 }
 
 
-def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fields):
+def _archive(
+    fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", split=False, **fields
+):
     """A schema-11 run archived as ``<label>-<16 hex>``: the reader fixture's
     partitioned index (``access`` its providers, none by default) with the
-    manifest fields a merge checks."""
+    manifest fields a merge checks; with ``split`` a schema-12 run."""
     path = archived / f"{label}-{digit:016x}" / "index"
     fx.write_partitioned_index(
         path,
@@ -431,6 +434,7 @@ def _archive(fx, archived, label, digit, *, built_at, notice=b"NOTICE\n", **fiel
         access=fields.pop("access", {"providers": []}),
         snapshot_id=f"{digit:016x}",
         notice=notice,
+        split=split,
     )
     _rewrite_snapshot(
         path, lambda s: s.update({**MANIFEST_9, "built_at": built_at, **fields})
@@ -450,6 +454,11 @@ FLIX = {
     "free": None,
 }
 HEL_CENTRE = shapely.to_wkb(shapely.Point(24.94, 60.17), hex=True)
+HEL_BOUNDARY = shapely.to_wkb(BOX(24.8, 60.1, 25.3, 60.35), hex=True)
+BER_BOUNDARY = shapely.to_wkb(
+    shapely.MultiPolygon([BOX(13.1, 52.3, 13.7, 52.7), BOX(13.8, 52.3, 13.9, 52.4)]),
+    hex=True,
+)
 DE_SOURCES = {
     "atlas": {"archive_sha256": "d" * 64},
     "mdb": {"csv_sha256": "e" * 64},
@@ -481,9 +490,10 @@ def _partition(directory, change=None):
     return path
 
 
-def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
+def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n", split=False):
     """A Finnish run and a newer German one that also carries Helsinki; the
-    German run read other catalogue samples."""
+    German run read other catalogue samples. With ``split`` both are
+    schema-12 runs."""
     fi = _archive(
         fx,
         archived,
@@ -491,6 +501,7 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         1,
         built_at=BUILT(14),
         notice=fi_notice,
+        split=split,
         feeds=[
             {
                 **fx.covered_feed("hsl"),
@@ -511,7 +522,9 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         ],
         places=[
             fx.place("fi", "country", country_code="FI"),
-            fx.place("hel", "city", country_code="FI", parent_id="fi"),
+            fx.place(
+                "hel", "city", country_code="FI", parent_id="fi", geometry=HEL_BOUNDARY
+            ),
         ],
         edges=[
             fx.edge("hel", "hsl", tier="local", relevance_category="primary"),
@@ -526,6 +539,7 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
         2,
         built_at=BUILT(15),
         notice=de_notice,
+        split=split,
         sources=DE_SOURCES,
         access={"providers": [FLIX]},
         feeds=[
@@ -543,9 +557,14 @@ def _two_runs(fx, archived, fi_notice=b"NOTICE\n", de_notice=b"NOTICE\n"):
             },
         ],
         places=[
-            fx.place("ber", "city", country_code="DE"),
+            fx.place("ber", "city", country_code="DE", geometry=BER_BOUNDARY),
             fx.place(
-                "hel", "city", country_code="FI", parent_id="fi", centre=HEL_CENTRE
+                "hel",
+                "city",
+                country_code="FI",
+                parent_id="fi",
+                centre=HEL_CENTRE,
+                geometry=HEL_BOUNDARY,
             ),
         ],
         edges=[
@@ -583,6 +602,31 @@ def test_a_selection_loads_verified_in_label_order_with_its_digests(tmp_path):
     assert "realtime.parquet" in loaded[1]["tables"]
     assert "realtime.parquet" not in loaded[0]["tables"]
     assert loaded[1]["tables"]["feeds.parquet"]["feed_id"].to_pylist() == ["hsl", "nat"]
+    # The same runs in the schema-12 layout load into the same tables.
+    _two_runs(fx, tmp_path / "split", split=True)
+    split = merge.load_sources(merge.select_sources(tmp_path / "split")[0])
+    for old, new in zip(loaded, split):
+        assert new["snapshot"]["schema_version"] == 12
+        assert set(new["tables"]) == set(old["tables"])
+        for name, table in old["tables"].items():
+            assert sorted(new["tables"][name].column_names) == sorted(
+                table.column_names
+            )
+            assert new["tables"][name].select(table.column_names).equals(table)
+    # A table's listed size is checked: without one, or a wrong one, the
+    # build is refused.
+    index = tmp_path / "split" / split[0]["build_id"] / "index"
+    partition = next(
+        p for p, t in split[0]["snapshot"]["partitions"].items() if "places" in t
+    )
+    for size in (None, 1):
+        _rewrite_snapshot(
+            index,
+            lambda s, size=size: s["partitions"][partition]["places"].update(
+                bytes=size
+            ),
+        )
+        assert builds.load_tables(index) is None
 
 
 def _unlicensed(archived, fi, de):
@@ -894,9 +938,7 @@ def test_a_feed_without_a_home_country_is_international(home):
     assert routed[("links", "edges")]["feed_partition"].to_pylist() == ["international"]
 
 
-def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadata(
-    tmp_path,
-):
+def test_partition_files_carry_the_snapshot_id_their_digests_and_sizes(tmp_path):
     fx = pytest.importorskip("index_fixture")
     _two_runs(fx, tmp_path)
     _, tables = _merged(tmp_path)
@@ -912,11 +954,14 @@ def test_partition_files_carry_the_snapshot_id_their_digests_and_the_geo_metadat
         assert listing[partition][table] == {
             "rows": len(read),
             "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
         }
-    assert listing["links"]["edges"]["rows"] == 2
+    assert listing["links"]["edges"]["rows"] == listing["links"]["details"]["rows"] == 2
     assert listing["FI"]["realtime"]["rows"] == 1
-    geo = pq.read_schema(io.BytesIO(files[("FI", "places")])).metadata[b"geo"]
-    assert json.loads(geo)["columns"]["centre"]["geometry_types"] == ["Point"]
+    # Each places table beside its boundaries, each edges table its details.
+    for tables_ in listing.values():
+        assert ("places" in tables_) == ("boundaries" in tables_)
+        assert ("edges" in tables_) == ("details" in tables_)
     # The same tables give the same bytes again.
     again, _ = merge._partition_files(merge._route(tables), "feedcafefeedcafe")
     assert again.pop((None, "access_providers")) == root_bytes and again == files
@@ -940,9 +985,9 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
     read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
     assert set(read["snapshot"].to_pylist()) == {snapshot_id}
-    assert manifest["schema_version"] == 11
+    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 17
     assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
-    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[11]
+    assert manifest["min_reader_version"] == MIN_READER_VERSIONS[12]
     assert manifest["built_with"] == transitio.__version__
     assert manifest["built_at"] == BUILT(15)  # the newest source's, not the clock
     assert manifest["counts"] == {
@@ -962,10 +1007,17 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
         p: {t: e["rows"] for t, e in ts.items()}
         for p, ts in manifest["partitions"].items()
     } == {
-        "DE": {"edges": 1, "feeds": 1, "places": 1},
-        "FI": {"edges": 2, "feeds": 2, "places": 2, "realtime": 1},
+        "DE": {"boundaries": 1, "details": 1, "edges": 1, "feeds": 1, "places": 1},
+        "FI": {
+            "boundaries": 2,
+            "details": 2,
+            "edges": 2,
+            "feeds": 2,
+            "places": 2,
+            "realtime": 1,
+        },
         "international": {"feeds": 1, "realtime": 1},
-        "links": {"edges": 2},
+        "links": {"details": 2, "edges": 2},
     }
     for (partition, table), data in files.items():
         entry = (
@@ -1585,6 +1637,25 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
     assert index.access_provider("flix").name == "FlixBus"
     centre = index.places.set_index("place_id").loc["hel", "centre"]
     assert centre.equals(shapely.from_wkb(HEL_CENTRE))
+    # The schema-11 sources' boundaries read back bit for bit, and the
+    # edges' evidence as the merge gave it.
+    boundaries = _read_on_demand(index, "boundaries")
+    assert shapely.to_wkb(boundaries["hel"], hex=True) == HEL_BOUNDARY
+    assert shapely.to_wkb(boundaries["ber"], hex=True) == BER_BOUNDARY
+    assert boundaries["fi"] is None
+    # The core places are plain Parquet, without the sources' GeoParquet
+    # metadata.
+    for path in (cache / "index").glob("*/places.parquet"):
+        assert b"geo" not in (pq.read_schema(path).metadata or {})
+    loaded = merge.load_sources(merge.select_sources(builds)[0])
+    _, tables = merge.merge_tables(
+        [(s["build_id"], s["snapshot"], s["tables"]) for s in loaded]
+    )
+    edges = tables["edges.parquet"]
+    details = _read_on_demand(index, "details").reset_index()
+    assert dict(zip(_pairs(edges), edges["evidence"].to_pylist())) == dict(
+        zip(zip(details["place_id"], details["feed_id"]), details["evidence"])
+    )
     notice = (cache / "index" / "NOTICE").read_bytes()
     assert notice.startswith(b"This index includes place boundary geometry")
     assert hashlib.sha256(notice).hexdigest() == index.snapshot["notice_sha256"]
@@ -1673,8 +1744,10 @@ def test_a_second_merge_replaces_the_live_index_and_drops_what_it_lacks(tmp_path
     assert len(index.feeds) == 2 and len(index.places) == 2 and index.links is None
 
 
+# A core table, and an on-demand one that only the full check reads.
+@pytest.mark.parametrize("table", ["feeds", "boundaries"])
 def test_a_snapshot_the_reader_rejects_leaves_the_live_index_untouched(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, table
 ):
     fx = pytest.importorskip("index_fixture")
     builds, cache = tmp_path / "builds", tmp_path / "cache"
@@ -1685,8 +1758,7 @@ def test_a_snapshot_the_reader_rejects_leaves_the_live_index_untouched(
 
     def tampered(loaded, tables, notice, **options):  # a digest the reader refuses
         manifest, files = assemble(loaded, tables, notice, **options)
-        manifest["partitions"]["FI"]["feeds"]["sha256"] = "0" * 64
-        manifest["snapshot_id"] = "feedcafefeedcafe"
+        manifest["partitions"]["FI"][table]["sha256"] = "0" * 64
         return manifest, files
 
     monkeypatch.setattr(merge, "assemble", tampered)
@@ -1795,8 +1867,9 @@ def test_the_publisher_packs_a_merged_snapshot_with_its_lineage_checked(tmp_path
         release["lineage"]["licensed"] is True
         and release["lineage"]["generations"] is None
     )
-    archive = f"transitio-index-{manifest['snapshot_id']}.tar.gz"
-    assert {archive, archive + ".sha256"} < set(assets) and len(assets) == 3
+    archive = f"transitio-index-{manifest['snapshot_id']}-core.tar.gz"
+    assert {archive, archive + ".sha256"} < set(assets)
+    assert len(assets) == 3 + len(release["parts"])
     # Naming the cache but not the archived builds cannot check a merged
     # index, so it is refused rather than packed unchecked.
     with pytest.raises(publisher.PublishIndexError, match="name their directory"):

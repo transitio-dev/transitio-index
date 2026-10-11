@@ -25,13 +25,10 @@ import argparse
 import hashlib
 import io
 import json
-import re
 import tempfile
 from pathlib import Path
 
 DEFAULT_INDEX = Path("cache/index")
-# A partition is a country code, ``international`` or ``links``.
-_PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 
 
 def _feed_names(feeds):
@@ -107,25 +104,36 @@ def _read_index(index_dir):
     """``{partition: (places, edges, feeds)}`` for every country partition of a
     produced index: its places, the edges touching them — its domestic edges
     and the ``links`` edges to its places — and every feed of the index (the
-    names come from whichever partition holds the feed)."""
+    names come from whichever partition holds the feed). From schema 12 the
+    places' boundaries are read from ``boundaries.parquet``."""
     import pyarrow.parquet as pq
+
+    from transitio_index import builds
 
     snapshot = json.loads((index_dir / "snapshot.json").read_text(encoding="utf-8"))
     partitions = snapshot["partitions"]
     for partition in partitions:
         # Names become path components on both sides: only the layout's own.
-        if not _PARTITION_NAME.fullmatch(partition):
+        if not builds.PARTITION_NAME.fullmatch(partition):
             raise SystemExit(f"{index_dir}: unexpected partition name {partition!r}")
 
-    def rows(partition, table):
-        listed = partitions.get(partition, {}).get(table)
-        if listed is None:
-            return []
+    def read(partition, table):
         path = index_dir / partition / f"{table}.parquet"
         data = path.read_bytes()
+        listed = partitions[partition][table]
         if hashlib.sha256(data).hexdigest() != listed.get("sha256"):
             raise SystemExit(f"{path}: does not match the snapshot's digest")
-        return pq.read_table(io.BytesIO(data)).to_pylist()
+        return pq.read_table(io.BytesIO(data))
+
+    def rows(partition, table):
+        listed = partitions.get(partition, {})
+        if table not in listed:
+            return []
+        found = read(partition, table)
+        if table == "places" and "boundaries" in listed:
+            boundaries = read(partition, "boundaries")
+            found = builds.with_on_demand(table, found, boundaries)
+        return found.to_pylist()
 
     feeds = [
         feed for partition in sorted(partitions) for feed in rows(partition, "feeds")
