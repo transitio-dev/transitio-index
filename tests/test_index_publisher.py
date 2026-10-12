@@ -14,7 +14,7 @@ from index_fixture import (  # noqa: E402
 )
 
 from transitio_index import publish_cli as publish_index  # noqa: E402
-from transitio_index import publisher  # noqa: E402
+from transitio_index import publisher, release_report  # noqa: E402
 from transitio_index import atlas, classify, licensing, publish  # noqa: E402
 from test_index_coverage import _write_crawl  # noqa: E402
 from test_index_publish import (  # noqa: E402
@@ -51,6 +51,47 @@ def _parts(snapshot_id):
         "FI/boundaries.parquet": f"transitio-index-{snapshot_id}-FI-boundaries.parquet",
         "links/details.parquet": f"transitio-index-{snapshot_id}-links-details.parquet",
     }
+
+
+def _report(index_dir, **sections):
+    """A release report of ``index_dir``'s snapshot with nothing in it."""
+    snapshot = json.loads((index_dir / "snapshot.json").read_text())
+    return {
+        "snapshot": snapshot["snapshot_id"],
+        "previous": None,
+        "totals": {
+            "feeds": 0,
+            "places": 0,
+            "edges": 0,
+            "not_crawled": {},
+            "stale": 0,
+            "contained": 0,
+            "without_stops": 0,
+            "no_home": 0,
+            "unknown_tier_edges": 0,
+            "cross_border_edges": 0,
+        },
+        "places": {},
+        "anomalies": {
+            key: []
+            for key in (
+                "few_feeds",
+                "stale_only",
+                "no_home",
+                "unknown_tier",
+                "long_window",
+            )
+        },
+        "changes": None,
+        "reference": None,
+        **sections,
+    }
+
+
+def _publish(index_dir, **options):
+    """``publish_index`` with an empty report of the index's snapshot."""
+    options.setdefault("report", _report(index_dir))
+    return publisher.publish_index(index_dir, **options)
 
 
 def _index(tmp_path):
@@ -136,7 +177,7 @@ def test_publish_drafts_verifies_publishes_and_round_trips(tmp_path):
         "index-0000000000000002",
         {"manifest.json": _manifest_bytes(schema_version=999)},
     )
-    summary = publisher.publish_index(
+    summary = _publish(
         _index(tmp_path),
         cache_dir=tmp_path / "cache",
         repository="o/r",
@@ -152,7 +193,7 @@ def test_publish_drafts_verifies_publishes_and_round_trips(tmp_path):
     # Every asset written is uploaded as it is, the parts included.
     written = {path.name: path.read_bytes() for path in (tmp_path / "out").iterdir()}
     assert {a["name"]: fake.blobs[a["id"]] for a in release["assets"]} == written
-    assert set(summary["assets"]) == set(written) and len(written) == 5
+    assert set(summary["assets"]) == set(written) and len(written) == 6
     assert summary["skipped"] == []
     with httpx.Client(transport=fake.transport()) as anonymous:
         listed = anonymous.get(f"{API}/repos/o/r/releases").json()
@@ -184,7 +225,7 @@ def test_a_corrupted_upload_leaves_the_release_a_draft(tmp_path, corrupt):
     snapshot_id = json.loads((index_dir / "snapshot.json").read_text())["snapshot_id"]
     fake = FakeGitHub(corrupt=_parts(snapshot_id).get(corrupt, corrupt))
     with pytest.raises(publisher.PublishIndexError, match="does not match"):
-        publisher.publish_index(
+        _publish(
             index_dir,
             cache_dir=tmp_path / "cache",
             repository="o/r",
@@ -206,7 +247,7 @@ def test_a_snapshot_is_published_once(tmp_path):
     snapshot_id = json.loads((index_dir / "snapshot.json").read_text())["snapshot_id"]
     fake.seed(contract.release_tag(snapshot_id), {})
     with pytest.raises(publisher.PublishIndexError, match="already exists"):
-        publisher.publish_index(
+        _publish(
             index_dir,
             cache_dir=index_dir.parent,
             repository="o/r",
@@ -262,10 +303,52 @@ def test_incompatible_manifests_say_why(manifest, reason):
     assert ok is False and reason in why
 
 
-def test_the_cli_needs_a_token(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    ("environment", "message"),
+    [({}, "no token"), ({"GITHUB_TOKEN": "secret"}, "--reference-tests")],
+)
+def test_the_cli_refuses_without_what_it_needs(
+    monkeypatch, capsys, environment, message
+):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("TRANSITIO_TESTS", raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
     assert publish_index.main(["--cache-dir", "nowhere"]) == 1
-    assert "no token" in capsys.readouterr().err
+    assert message in capsys.readouterr().err
+
+
+def test_the_report_rides_along_and_regressions_stop_the_release(tmp_path):
+    index_dir = _index(tmp_path)
+    fake = FakeGitHub()
+    options = dict(
+        cache_dir=tmp_path / "cache",
+        repository="o/r",
+        token="secret",
+        api_url=API,
+        out_dir=tmp_path / "out",
+        transport=fake.transport(),
+    )
+    with pytest.raises(publisher.PublishIndexError, match="describes snapshot"):
+        _publish(index_dir, report=_report(index_dir, snapshot="0" * 16), **options)
+    reference = {
+        "passed": 1,
+        "failed": 1,
+        "skipped": 0,
+        "regressions": ["test_broken"],
+        "repaired": [],
+    }
+    with pytest.raises(publisher.PublishIndexError, match="accept the change"):
+        _publish(index_dir, report=_report(index_dir, reference=reference), **options)
+    assert fake.releases == {}
+    report = release_report.build_report(index_dir)
+    report["reference"] = reference
+    summary = _publish(index_dir, report=report, accept_regressions=True, **options)
+    (release,) = fake.releases.values()
+    uploaded = {a["name"]: fake.blobs[a["id"]] for a in release["assets"]}
+    page = uploaded[f"transitio-index-{summary['snapshot_id']}-report.md"]
+    assert page == release_report.render(report).encode()
+    assert "### Passed before, fail now (1)" in page.decode()
 
 
 def test_a_partial_index_is_not_releasable(tmp_path):
@@ -276,7 +359,7 @@ def test_a_partial_index_is_not_releasable(tmp_path):
 
 def test_a_lost_publish_response_is_reconciled_from_the_release(tmp_path):
     fake = FakeGitHub(lose_publish_response=True)
-    summary = publisher.publish_index(
+    summary = _publish(
         _index(tmp_path),
         cache_dir=tmp_path / "cache",
         repository="o/r",
@@ -329,7 +412,7 @@ def test_an_index_built_from_superseded_generations_is_not_released(tmp_path):
     )
     fake = FakeGitHub()
     with pytest.raises(publisher.PublishIndexError, match="no longer current"):
-        publisher.publish_index(
+        _publish(
             index_dir,
             repository="o/r",
             token="secret",
@@ -402,7 +485,7 @@ def test_a_stage_that_moves_during_upload_stops_the_flip(tmp_path):
 
     fake = FakeGitHub(on_upload=supersede)
     with pytest.raises(publisher.PublishIndexError, match="no longer current"):
-        publisher.publish_index(
+        _publish(
             index_dir,
             repository="o/r",
             token="secret",
@@ -453,7 +536,7 @@ def test_a_moved_repository_is_followed_when_reading_and_reported_when_writing(
         )
     assert manifest["snapshot_id"] == "0000000000000001"
     with pytest.raises(publisher.PublishIndexError, match="has moved to"):
-        publisher.publish_index(
+        _publish(
             _index(tmp_path),
             cache_dir=tmp_path / "cache",
             repository="old/r",
@@ -490,7 +573,7 @@ def test_an_index_failing_the_full_check_is_not_released(tmp_path):
     reader.read_index(index_dir)
     fake = FakeGitHub()
     with pytest.raises(IncompatibleIndexError, match="GeoParquet"):
-        publisher.publish_index(
+        _publish(
             index_dir,
             cache_dir=tmp_path / "cache",
             repository="o/r",

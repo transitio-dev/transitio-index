@@ -2131,7 +2131,7 @@ def test_a_release_asset_uploads_in_pieces_of_a_declared_length(tmp_path, monkey
     """An asset went up as a single write, which the client's timeout bounded
     as a whole, so an archive too large to send within it never uploaded."""
     fx = pytest.importorskip("index_fixture")
-    from test_index_publisher import _index
+    from test_index_publisher import _index, _publish
 
     monkeypatch.setattr(publisher, "UPLOAD_CHUNK", 1024)
     inner = fx.FakeGitHub().transport()
@@ -2150,7 +2150,7 @@ def test_a_release_asset_uploads_in_pieces_of_a_declared_length(tmp_path, monkey
                 )
             return inner.handle_request(request)
 
-    summary = publisher.publish_index(
+    summary = _publish(
         _index(tmp_path),
         cache_dir=tmp_path / "cache",
         repository="o/r",
@@ -2173,7 +2173,7 @@ def test_the_round_trip_waits_out_a_cached_release_listing(
     the round trip, asked once right after the flip, resolved the release
     before the one just published and reported a good release as failed."""
     fx = pytest.importorskip("index_fixture")
-    from test_index_publisher import _index
+    from test_index_publisher import _index, _publish
 
     monkeypatch.setattr(publisher, "ROUND_TRIP_INTERVAL", 0)
     fake = fx.FakeGitHub()
@@ -2197,7 +2197,7 @@ def test_the_round_trip_waits_out_a_cached_release_listing(
             return response
 
     def publish():
-        return publisher.publish_index(
+        return _publish(
             _index(tmp_path),
             cache_dir=tmp_path / "cache",
             repository="o/r",
