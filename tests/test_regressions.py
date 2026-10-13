@@ -2565,3 +2565,39 @@ def test_departures_a_day_are_a_working_days(tmp_path):
     trips = {f"w{i}": "wk" for i in range(10)} | {"s1": "wkend", "s2": "wkend"}
     weights = classify._calendar_weights(calendar, trips | {"l1": "long"})
     assert weights == {"long": 1.0, "wk": 1.0, "wkend": 0.0}
+
+
+def test_a_window_of_placeholder_dates_is_flagged_nominal():
+    """222 feeds carry placeholder dates (CORE Calabria from 1970, shuttles
+    to 2099), so they looked as if they covered almost any study day."""
+    import json
+
+    from transitio_index import rank
+
+    crawled = "2026-10-03T08:00:00+00:00"
+    feeds = [
+        {"feed_id": f, "service_start": a, "service_end": b, "last_crawled": crawled}
+        for f, a, b in (
+            ("from-1970", "1970-01-01", "2026-12-31"),
+            ("to-2099", "2025-12-12", "2099-12-31"),
+            ("five-years", "2026-01-01", "2031-10-03"),
+        )
+    ]
+    places = {"c": {"place_id": "c", "kind": "city", "country_code": "FI"}}
+    edges = [
+        {
+            "feed_id": feed["feed_id"],
+            "place_id": "c",
+            "tier": "local",
+            "service": {"stops": 2, "routes": 1, "departures_per_day": 10.0},
+            "evidence": {},
+        }
+        for feed in feeds
+    ]
+    ranked, _ = rank.rank_edges(edges, feeds, places)
+    summaries = {
+        e["feed_id"]: json.loads(publish._summary(json.dumps(e["evidence"])))
+        for e in ranked
+    }
+    flagged = {f for f, summary in summaries.items() if summary.get("nominal_window")}
+    assert flagged == {"from-1970", "to-2099"}

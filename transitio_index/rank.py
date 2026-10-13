@@ -20,7 +20,9 @@ its countries otherwise). For country places ``share_of_feed`` is replaced by
 breadth: the cities the feed serves in the country over all served cities
 there. A feed stale when indexed — its ``service_end`` more than
 ``STALE_DAYS`` before its ``last_crawled`` — has that ``service_end``
-recorded as ``stale_when_indexed`` in its edges' evidence. A stale pair is
+recorded as ``stale_when_indexed`` in its edges' evidence, and one whose
+window holds placeholder dates (see :func:`_nominal_window`) has
+``nominal_window``. A stale pair is
 set aside — it scores 0, so it sorts last in its category with its tier and
 category unchanged, and stays out of the place totals with a
 ``share_of_place`` of 0 — unless it runs a mode no fresh pair of its place
@@ -45,6 +47,11 @@ FEEDS_ARTIFACT = classify.RANKED_FEEDS_ARTIFACT
 W_PLACE = 0.7
 W_FEED = 0.3
 STALE_DAYS = 30
+# A service window is nominal — its dates placeholders, such as 1970 or 2099 —
+# when it starts before this date or ends more than this many years after
+# the feed's last crawl.
+NOMINAL_BEFORE = datetime.date(2000, 1, 1)
+NOMINAL_YEARS = 5
 CATEGORY_BY_TIER = {
     "local": "primary",
     "regional": "secondary",
@@ -85,6 +92,30 @@ def _stale_when_indexed(feed):
     return span[1].isoformat() if (day - span[1]).days > STALE_DAYS else None
 
 
+def _nominal_window(feed):
+    """Whether the feed's service window holds placeholder dates: it starts
+    before ``NOMINAL_BEFORE`` or ends more than ``NOMINAL_YEARS`` after the
+    feed's ``last_crawled``."""
+    span = publish.service_span(feed)
+    if span is None:
+        return False
+    if span[0] < NOMINAL_BEFORE:
+        return True
+    crawled = feed.get("last_crawled")
+    if not isinstance(crawled, str):
+        return False
+    try:
+        day = datetime.datetime.fromisoformat(crawled).date()
+    except ValueError:
+        return False
+    end = span[1]
+    return (end.year, end.month, end.day) > (
+        day.year + NOMINAL_YEARS,
+        day.month,
+        day.day,
+    )
+
+
 def rank_edges(edges, feeds, places):
     """The edges with their relevance fields, and the stage report.
 
@@ -99,6 +130,7 @@ def rank_edges(edges, feeds, places):
             raise RankError(f"duplicate feed {feed['feed_id']!r}")
         feed_by_id[feed["feed_id"]] = feed
     stale = {feed_id: _stale_when_indexed(f) for feed_id, f in feed_by_id.items()}
+    nominal = {feed_id: _nominal_window(f) for feed_id, f in feed_by_id.items()}
     pairs = {}
     for edge in edges:
         key = (edge["feed_id"], edge["place_id"])
@@ -136,6 +168,8 @@ def rank_edges(edges, feeds, places):
         ended = stale[edge["feed_id"]]
         if ended is not None:
             evidence["stale_when_indexed"] = ended
+        if nominal[edge["feed_id"]]:
+            evidence["nominal_window"] = True
         prepared.append({**edge, "evidence": evidence})
     scored, basis, _ = score_edges(prepared, places)
 
