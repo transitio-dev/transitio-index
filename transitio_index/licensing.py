@@ -33,7 +33,7 @@ import collections
 import contextlib
 import datetime
 
-from transitio_index import crawl, overrides, store
+from transitio_index import crawl, overrides, seed, store
 from transitio_index.progress import progress
 
 POINTER = "licensed.json"
@@ -68,8 +68,9 @@ KNOWN_PERMISSIVE = frozenset(
 # The sanitisation and attribution rules a licensed generation was built
 # under; publication refuses a generation from an older policy rather than
 # shipping it. 5: a shipped population credits the GHS-UCDB. 6: the NOTICE
-# credits the credential providers whose feeds' data the index holds.
-POLICY_VERSION = 6
+# credits the credential providers whose feeds' data the index holds. 7: only
+# an urban centre's population, or one of no recorded source, credits it.
+POLICY_VERSION = 7
 
 # How an edge was derived, strongest provenance first; a merge keeps the
 # stronger.
@@ -371,8 +372,9 @@ def _geometry_notice(
 ):
     """The NOTICE's geometry credit: the geometry stage's text, recomposed
     over both stages' sources when the expand stage shipped a boundary from
-    a source the geometry stage did not, or when a place ships a population
-    (``populated``) and nothing credits the GHS-UCDB it comes from."""
+    a source the geometry stage did not, or when a place ships an urban
+    centre's population (``populated``) and nothing credits the GHS-UCDB it
+    comes from."""
     from transitio_index import geometry
 
     audited = {"licence_sources", "licence_inventory"} <= places_manifest.keys()
@@ -641,7 +643,12 @@ def license_index(cache_dir, *, overrides_dir=None):
                 audit,
                 places_manifest,
                 inputs["overture_release"],
-                populated=any(p.get("population") is not None for p in places or ()),
+                populated=any(
+                    p.get("population") is not None
+                    and p.get("population_source", seed.UCDB_POPULATION)
+                    == seed.UCDB_POPULATION
+                    for p in places or ()
+                ),
             )
         feed_rows = _feed_rows(records)
         inventory = (

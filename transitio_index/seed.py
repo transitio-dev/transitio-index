@@ -40,6 +40,10 @@ log = logging.getLogger(__name__)
 CITY_SUBTYPES = ("locality", "localadmin")
 # A city candidate's columns: the gazetteer's and its population.
 CANDIDATE_COLUMNS = [*overture.PROJECT, "population"]
+# Where a place's population comes from: its Overture division, or the GHS
+# urban centre a city of its own is.
+OVERTURE_POPULATION = "overture"
+UCDB_POPULATION = "ghs_ucdb"
 
 # The GHS-UCDB centres seeded as places, matched to Overture once per release
 # and rules version (``prepare_centres``).
@@ -815,7 +819,8 @@ def prepare_centres(cache_dir, dataset, *, expected=None):
 def _mark(place, row):
     """Mark a place a centre row lands on: of all its rows, the one with a
     polygon, then the lowest id, gives ``ucdb_id`` and the polygon
-    (``ucdb_boundary``); the largest ``population`` is kept."""
+    (``ucdb_boundary``); the largest ``population`` is kept, with its
+    ``population_source``."""
     rank = (not row.get("boundary"), row["ucdb_id"])
     if "ucdb_id" not in place or rank < (
         "ucdb_boundary" not in place,
@@ -826,6 +831,7 @@ def _mark(place, row):
             place["ucdb_boundary"] = row["boundary"]
     if (row.get("population") or 0) > (place.get("population") or 0):
         place["population"] = row["population"]
+        place["population_source"] = row.get("population_source")
 
 
 def _seed_centres(places, skeleton, countries, rows, report):
@@ -834,7 +840,10 @@ def _seed_centres(places, skeleton, countries, rows, report):
     place of its key stays unless the division outranks it; a main name on
     none is a city of its own, ``ghs_ucdb:<id>``, under its country
     (``countries``, by code); a bracket on none is reported.
-    ``(counts, marks)``: the ``(key, row)`` pairs to ``_mark``."""
+    ``(counts, marks)``: the ``(key, row)`` pairs to ``_mark``, each row's
+    ``population`` the place's own: the division's Overture population (none
+    when Overture has none), or the urban centre's for a city of its own,
+    with its ``population_source``."""
     counts = dict.fromkeys(("matched", "existing", "urban", "reported"), 0)
     marks = []
     for row in sorted(rows, key=lambda row: (not row["primary"], row["ucdb_id"])):
@@ -844,6 +853,11 @@ def _seed_centres(places, skeleton, countries, rows, report):
             counts["matched"] += 1
             counts["existing"] += key in places
             _add_place(places, skeleton, division)
+            row = {
+                **row,
+                "population": division.get("population"),
+                "population_source": OVERTURE_POPULATION,
+            }
         elif row["primary"]:
             key = f"ghs_ucdb:{row['ucdb_id']}"
             counts["urban"] += 1
@@ -865,6 +879,7 @@ def _seed_centres(places, skeleton, countries, rows, report):
                 }
                 place = _place(record, parent_id=place_key(country))
                 places[key] = {**place, "place_id": key}
+            row = {**row, "population_source": UCDB_POPULATION}
         else:
             counts["reported"] += 1
             report.append(

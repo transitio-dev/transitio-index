@@ -1075,6 +1075,7 @@ SEEDED = [
         wikidata="Q1754",
         name="Stockholm",
         point=(18.07, 59.33),
+        population=984748,
         hierarchies=fx.chain(
             ("se", "country", "Sweden"),
             ("se-sthlm", "region", "S"),
@@ -1142,11 +1143,14 @@ def test_the_listed_countries_capitals_and_large_cities_are_seeded(
         solna, taby = (reg.resolve(f"ghs_ucdb:{i}") for i in (99, 104))
         minted = {i: reg.rows[i]["minted_from"] for i in (solna, taby)}
     # A declared city is marked, not repeated; a new one comes with its
-    # ancestors; one two centres land on keeps the first's id and polygon
-    # and the larger population.
-    assert places["Q1757"]["ucdb_id"] == 101 and places["Q1757"]["population"] == 600000
+    # ancestors; one two centres land on keeps the first's id and polygon.
+    # A city's population is its division's own, none when Overture has none,
+    # never its urban centre's.
+    assert (
+        places["Q1757"]["ucdb_id"] == 101 and places["Q1757"].get("population") is None
+    )
     stockholm = places["Q1754"]
-    assert (stockholm["ucdb_id"], stockholm["population"]) == (102, 1200000)
+    assert (stockholm["ucdb_id"], stockholm["population"]) == (102, 984748)
     assert stockholm["curated"] and stockholm["overture_id"] == "se-stockholm"
     assert shapely.from_wkb(stockholm["ucdb_boundary"]).equals(CENTRES[1][4])
     assert stockholm["parent_id"] == places["Q104231"]["place_id"]
@@ -1157,6 +1161,8 @@ def test_the_listed_countries_capitals_and_large_cities_are_seeded(
     assert places[solna]["name"] == "Solna" and places[solna]["kind"] == "city"
     assert places[solna]["parent_id"] == places["Q34"]["place_id"]
     assert places[solna]["resolution_method"] == "ghs_ucdb"
+    assert places[solna]["population"] == 100000
+    assert places[solna]["population_source"] == seed.UCDB_POPULATION
     # Its centre is a point on its polygon; a matched row's is its division's.
     assert shapely.from_wkb(places[solna]["centre"]).equals(
         shapely.point_on_surface(shapely.from_wkb(places[solna]["ucdb_boundary"]))
@@ -1209,7 +1215,8 @@ def test_a_centre_locality_outranks_an_admin_place_of_its_key():
     row = {"ucdb_id": 1, "primary": True, "division": city, "boundary": "01"}
     counts, marks = seed._seed_centres(places, {}, {}, [row], [])
     assert places["Q5"]["source_subtype"] == "locality" and counts["existing"] == 1
-    assert marks == [("Q5", row)]
+    own = {"population": None, "population_source": seed.OVERTURE_POPULATION}
+    assert marks == [("Q5", {**row, **own})]
 
 
 def test_seed_countries_are_given_as_two_capital_codes():
