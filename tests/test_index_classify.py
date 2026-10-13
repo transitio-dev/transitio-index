@@ -622,11 +622,12 @@ def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
     "country_stops, declared, home, scope",
     [
         ({"AA": 4, "BB": 1}, [], "AA", "domestic"),  # exactly HOME_SHARE
-        ({"AA": 3, "BB": 1}, ["AA"], None, "international"),
-        ({}, ["AA"], None, "declared"),
+        ({"AA": 3, "BB": 1}, ["BB"], "AA", "international"),
+        ({}, ["AA"], "AA", "declared"),
+        ({}, ["AA", "BB"], None, "declared"),
         ({}, [], None, "unknown"),
     ],
-    ids=["domestic", "international", "declared", "unknown"],
+    ids=["domestic", "international", "declared", "declared-several", "unknown"],
 )
 def test_feed_scope_follows_the_decision_table(country_stops, declared, home, scope):
     shares, found_home, found_scope = classify.feed_scope(country_stops, declared)
@@ -662,7 +663,7 @@ def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
     assert by_id["f-none"]["country_stops"] == {}
     assert by_id["f-declared"]["scope"] == "declared"
     assert by_id["f-declared"]["declared_countries"] == ["AA"]
-    assert by_id["f-declared"]["home_country"] is None
+    assert by_id["f-declared"]["home_country"] == "AA"
     # No calendar in these crawls, and no crawl for the declared feed: undated.
     assert {f["service_start"] for f in feeds} == {None}
     assert manifest["feeds_dated"] == 0
@@ -683,7 +684,7 @@ def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
     assert manifest["home_country_agreement"] == {"undeclared": 2, "unobserved": 2}
 
 
-def test_a_two_country_feed_without_a_home_is_international(tmp_path):
+def test_a_feed_split_evenly_is_international_at_home_in_the_lower_code(tmp_path):
     cache = tmp_path / "cache"
     feeds = [
         {
@@ -729,9 +730,9 @@ def test_a_two_country_feed_without_a_home_is_international(tmp_path):
     )
     assert feed["country_stops"] == {"AA": 1, "BB": 1}
     assert feed["country_shares"] == {"AA": 0.5, "BB": 0.5}
-    assert feed["home_country"] is None and feed["scope"] == "international"
+    assert feed["home_country"] == "AA" and feed["scope"] == "international"
     assert feed["declared_countries"] == ["AA"]
-    assert manifest["home_country_agreement"] == {"unobserved": 1}
+    assert manifest["home_country_agreement"] == {"agree": 1}
     assert manifest["join_gaps"] == {"orphan_trips": 1, "dangling_stop_times": 1}
 
 

@@ -728,7 +728,9 @@ def feed_rows(
                     feed.get("country_shares") or {}, sort_keys=True
                 ),
                 "declared_countries": list(declared),
-                "country_agreement": classify._agreement(home, declared),
+                "country_agreement": classify._agreement(
+                    feed.get("country_shares"), home, declared
+                ),
                 "declared_place_id": (placed.get(feed_id) or {}).get("place_id"),
                 "declared_level": (placed.get(feed_id) or {}).get("level"),
                 "municipality_outcome": _municipality_outcome(

@@ -15,8 +15,8 @@ once and each of its edges gets that score. For city, metro and region places
 ``share_of_place`` is the pair's departures per day (or stops, when any pair
 of the place lacks a crawled calendar — one basis per place, recorded as
 ``share_basis``) over the place total; ``share_of_feed`` is the pair's stops
-over the feed's stops in its home country (all its countries when it has no
-home). For country places ``share_of_feed`` is replaced by breadth: the
+over the feed's stops in its home country when the feed is domestic (in all
+its countries otherwise). For country places ``share_of_feed`` is replaced by breadth: the
 cities the feed serves in the country over all served cities there. A feed
 stale when indexed — its ``service_end`` more than ``STALE_DAYS`` before its
 ``last_crawled`` — scores 0 on every edge, so it sorts last in its category
@@ -119,7 +119,9 @@ def rank_edges(edges, feeds, places):
         if places[edge["place_id"]].get("kind") in FEED_SHARE_KINDS:
             country_stops = feed.get("country_stops") or {}
             denominator = (
-                country_stops.get(home, 0) if home else sum(country_stops.values())
+                country_stops.get(home, 0)
+                if feed.get("scope") == "domestic"
+                else sum(country_stops.values())
             )
             if denominator:
                 stops = pairs[(edge["feed_id"], edge["place_id"])].get("stops")

@@ -53,11 +53,12 @@ others.
 
 The stage also decides each feed's home country from its stops: the distinct
 scheduled stops per country (``country_stops``), their shares, the country
-holding at least ``HOME_SHARE`` of them (``home_country``, else null) and the
-resulting ``scope`` — ``domestic``, ``international`` (stops, no home),
-``declared`` (no stop evidence, a catalogue country) or ``unknown``. The
-catalogues' ``declared_countries`` never set the home; they only tell
-``declared`` from ``unknown`` and feed the statistics. ``country_basis`` says
+holding the most of them (``home_country``; a tie goes to the lower code) and
+the resulting ``scope`` — ``domestic`` when the home holds at least
+``HOME_SHARE`` of them, ``international`` when it holds less, ``declared`` (no
+stop evidence, a catalogue country) or ``unknown``. A feed without stop
+evidence takes its home from the catalogues' ``declared_countries`` when they
+name one country only, and has none otherwise. ``country_basis`` says
 which stops the counts came from: every located stop of a whole-feed (skipped)
 feed or of a crawl with stops but no schedule, the scheduled stops of declared
 trips of a route-level feed, or null whenever the counts are empty.
@@ -94,7 +95,8 @@ REVIEW_CUTOFF = coverage.REVIEW_CUTOFF
 # every one of them; a neighbourhood route's single stop serves the people
 # around it.
 ROUTE_MIN_STOPS = 1
-# A feed's home country holds at least this share of its scheduled stops.
+# A feed is domestic when its home country holds at least this share of its
+# scheduled stops.
 HOME_SHARE = 0.80
 # A route decided within this fraction of a threshold has its confidence
 # multiplied by the penalty.
@@ -932,24 +934,34 @@ def _stop_artefacts(stop_countries, border=0):
     }
 
 
+def home_country(country_stops, declared):
+    """The country holding the most of ``country_stops`` (stop counts or
+    shares by code; a tie goes to the lower code), else the one country
+    ``declared`` names, else None."""
+    if country_stops:
+        return min(country_stops, key=lambda code: (-country_stops[code], code))
+    return declared[0] if len(declared) == 1 else None
+
+
 def feed_scope(country_stops, declared):
     """``(country_shares, home_country, scope)`` from the decision table:
-    ``domestic`` when one country holds at least ``HOME_SHARE`` of the stops,
-    ``international`` when stops exist but none does, ``declared`` when there
-    is no stop evidence but a catalogue country, else ``unknown``."""
+    ``domestic`` when the home holds at least ``HOME_SHARE`` of the stops,
+    ``international`` when it holds less, ``declared`` when there is no stop
+    evidence but a catalogue country, else ``unknown``."""
+    home = home_country(country_stops, declared)
     total = sum(country_stops.values())
     if not total:
-        return {}, None, "declared" if declared else "unknown"
+        return {}, home, "declared" if declared else "unknown"
     shares = {code: count / total for code, count in country_stops.items()}
-    home = max(shares, key=shares.get)
     if shares[home] < HOME_SHARE:
-        return shares, None, "international"
+        return shares, home, "international"
     return shares, home, "domestic"
 
 
-def _agreement(home, declared):
-    """How the observed home country compares with the catalogues' claim."""
-    if home is None:
+def _agreement(shares, home, declared):
+    """How the home country observed from the stops compares with the
+    catalogues' claim."""
+    if not shares:
         return "unobserved"
     if not declared:
         return "undeclared"
@@ -1971,7 +1983,7 @@ def classify(
                 )
                 scopes[scope] += 1
                 bases[basis or "none"] += 1
-                agreement[_agreement(home, declared)] += 1
+                agreement[_agreement(shares, home, declared)] += 1
             # Under the crawl lock still held: appenders and the crawl's own
             # rewrite of this file must never interleave.
             recrawl_requested = _request_recrawl(cache_dir, stale_skips)

@@ -2381,3 +2381,37 @@ def test_feeds_running_the_same_lines_name_each_other(tmp_path):
         others = edge["evidence"]["overlap"]["with"]
         assert set(others) == {"f-mvv", "f-delfi", "f-urban"} - {edge["feed_id"]}
         assert {s for shares in others.values() for s in shares.values()} == {1.0}
+
+
+def test_a_feed_split_across_countries_gets_a_home_in_the_merge():
+    """Barcelona's ATM feed (70 % of its stops in Spain) had no home country,
+    so every one of its edges counted as cross-border, even in Spain."""
+    from transitio_index import merge
+
+    feeds = pa.table(
+        {
+            "feed_id": ["kept", "split", "blank", "declared", "several"],
+            "home_country": ["FI", None, "", None, None],
+            "country_shares": [
+                '{"FI": 1.0}',
+                '{"EE": 0.5, "FI": 0.5}',
+                '{"FI": 0.9, "SE": 0.1}',
+                "{}",
+                None,
+            ],
+            "declared_countries": [["FI"], [], [], ["SE"], ["EE", "FI"]],
+        }
+    )
+    places = pa.table({"place_id": ["hel", "tll"], "country_code": ["FI", "EE"]})
+    edges = pa.table(
+        {
+            "place_id": ["hel", "hel", "tll", "hel", "hel", "hel"],
+            "feed_id": ["kept", "split", "split", "blank", "declared", "several"],
+            "cross_border": [False, True, True, True, True, True],
+        }
+    )
+    feeds, edges = merge._homes(feeds, edges, places)
+    # A tie goes to the lower code, an empty home is none; a stopless feed
+    # takes its one declared country, and none of several.
+    assert feeds["home_country"].to_pylist() == ["FI", "EE", "FI", "SE", None]
+    assert edges["cross_border"].to_pylist() == [False, True, False, False, True, True]

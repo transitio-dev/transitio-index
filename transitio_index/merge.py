@@ -84,7 +84,9 @@ OVERRIDE_FIELDS = (
 # 15: overlap evidence names the merged feeds.
 # 16: overlap evidence lists the feeds its build measured at the place.
 # 17: schema 12, boundaries and edge details in tables of their own, zstd.
-MERGE_FORMAT = 17
+# 18: a feed without a home gets the country with the most of its stops,
+# else its one declared country, and each edge's cross_border follows.
+MERGE_FORMAT = 18
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
@@ -433,8 +435,10 @@ def merge_tables(sources, skipped=()):
     companions follow the feed from the newest build carrying the id. A feed
     lists the companions linked to it. Every table gains ``build_id``. The
     edges' relevance is scored again over the merged edges (see
-    :func:`_rescored`), and each place's ``service`` and ``validity`` summed
-    over them (see :func:`_place_aggregates`). The snapshot recounts the
+    :func:`_rescored`), each feed's home country and its edges'
+    ``cross_border`` decided again (see :func:`_homes`), and each place's
+    ``service`` and ``validity`` summed over them (see
+    :func:`_place_aggregates`). The snapshot recounts the
     merged tables and lists the ``sources``, the ``skipped`` runs, the
     ``alias_conflicts``, the ``content_folds`` and the ``relevance`` rescore.
     """
@@ -541,6 +545,9 @@ def merge_tables(sources, skipped=()):
         tables["places.parquet"] = _populations(
             tables["places.parquet"], merged["places.parquet"]
         )
+    tables["feeds.parquet"], tables["edges.parquet"] = _homes(
+        tables["feeds.parquet"], tables["edges.parquet"], tables["places.parquet"]
+    )
     tables["places.parquet"] = _place_aggregates(
         tables["places.parquet"], tables["edges.parquet"], tables["feeds.parquet"]
     )
@@ -612,6 +619,38 @@ def _populations(places, stacked):
     )
     values = [by_id.get(place_id) for place_id in places["place_id"].to_pylist()]
     return _replaced(places, "population", values, publish._PLACES_SCHEMA)
+
+
+def _homes(feeds, edges, places):
+    """``(feeds, edges)`` with a home country for each feed that has none and
+    whose ``country_shares`` or ``declared_countries`` give one (see
+    :func:`classify.home_country`), and each edge's ``cross_border`` from the
+    homes: true when the feed has none or the place lies outside it."""
+    if "home_country" not in feeds.column_names:
+        return feeds, edges
+    homes = feeds["home_country"].to_pylist()
+    # Null or empty, as ``publish.partition`` reads no home.
+    missing = [row for row, home in enumerate(homes) if not home]
+    columns = [
+        c for c in ("country_shares", "declared_countries") if c in feeds.column_names
+    ]
+    records = feeds.select(columns).take(pa.array(missing, pa.int64())).to_pylist()
+    for row, record in zip(missing, records):
+        shares = json.loads(record.get("country_shares") or "{}")
+        declared = record.get("declared_countries") or []
+        homes[row] = classify.home_country(shares, declared)
+    index = feeds.schema.get_field_index("home_country")
+    field = feeds.field(index)
+    feeds = feeds.set_column(index, field, pa.array(homes, field.type))
+    if "cross_border" not in edges.column_names:
+        return feeds, edges
+    keys = edges.select(["feed_id", "place_id"]).to_pandas()
+    home = pd.Series(homes, index=feeds["feed_id"].to_pylist(), dtype=object)
+    country = places.select(["place_id", "country_code"]).to_pandas()
+    feed_home = keys["feed_id"].map(home)
+    place_country = keys["place_id"].map(country.set_index("place_id")["country_code"])
+    crossing = feed_home.isna() | (feed_home != place_country)
+    return feeds, _replaced(edges, "cross_border", crossing.to_numpy())
 
 
 def _place_aggregates(places, edges, feeds):
@@ -970,10 +1009,9 @@ def _replaced(table, name, values, schema=publish._EDGES_SCHEMA):
 def _rescored(edges, places):
     """``(edges, block)``: the merged edges with their relevance scored again
     over the merged edge set by :func:`rank.score_edges`, and the snapshot's
-    ``relevance`` block. Tier and ``cross_border`` stay: a feed's row and its
-    edges come from one build, and a place's country is fixed by its id. An
-    edges table without ``service`` or ``evidence`` stays as taken, with no
-    block."""
+    ``relevance`` block. Tier stays: a feed's row and its edges come from one
+    build. An edges table without ``service`` or ``evidence`` stays as taken,
+    with no block."""
     if not {"service", "evidence"} <= set(edges.column_names):
         return edges, None
     by_id = {
