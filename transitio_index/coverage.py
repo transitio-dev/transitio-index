@@ -239,8 +239,10 @@ def _identity(state):
     return None
 
 
-def fold_duplicates(feeds, states):
-    """Fold feeds whose crawls hold the same data; ``{folded id: canonical id}``.
+def fold_duplicates(feeds, states, anonymous=None, exempt=frozenset()):
+    """Fold feeds whose crawls hold the same data; ``({folded id: canonical
+    id}, {canonical id: member id})``, the second naming the member whose
+    URL a canonical feed took.
 
     Two crawls hold the same data when their content identities match
     (:func:`transitio.index.fingerprint.identical_groups`: the same stops,
@@ -251,10 +253,16 @@ def fold_duplicates(feeds, states):
     the others' ids and aliases as aliases, and an Atlas-only canonical takes a
     folded MDB feed's record as a feed both catalogues carry, matched by
     ``content``. ``feeds`` and ``states`` lose the folded feeds.
+
+    ``anonymous`` (:func:`anonymous_reads`) maps the feeds read at their own
+    URL without a key to that URL: a canonical feed that was not, and is not
+    in ``exempt``, takes the URL of its group's first member that was and is
+    not exempt, as its ``download_url``, and counts as read at it.
     """
+    anonymous = {} if anonymous is None else anonymous
     by_id = {feed["feed_id"]: feed for feed in feeds}
     identities = {feed_id: _identity(state) for feed_id, (_, state) in states.items()}
-    folded = {}
+    folded, twins = {}, {}
     for members in fingerprint.identical_groups(identities):
         members.sort(
             key=lambda f: (SOURCE_RANK.get(by_id[f].get("source"), len(SOURCE_RANK)), f)
@@ -262,6 +270,14 @@ def fold_duplicates(feeds, states):
         if not _enough_stops(states, members):
             continue
         keep = by_id[members[0]]
+        if keep["feed_id"] not in anonymous and keep["feed_id"] not in exempt:
+            for feed_id in members[1:]:
+                if feed_id in anonymous and feed_id not in exempt:
+                    keep["download_url"] = anonymous[keep["feed_id"]] = anonymous[
+                        feed_id
+                    ]
+                    twins[keep["feed_id"]] = feed_id
+                    break
         for feed_id in members[1:]:
             other = by_id[feed_id]
             if keep.get("source") == "atlas" and other.get("source") == "mdb":
@@ -284,7 +300,83 @@ def fold_duplicates(feeds, states):
             folded[feed_id] = keep["feed_id"]
             del states[feed_id]
     feeds[:] = [feed for feed in feeds if feed["feed_id"] not in folded]
-    return folded
+    return folded, twins
+
+
+# The status a failed producer request answered, as the crawl records it.
+_HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
+
+
+def anonymous_reads(feeds, committed):
+    """``{feed_id: url}`` of the feeds whose committed crawl (``{feed_id:
+    (feed_dir, state)}``) read their own URL without a key."""
+    from transitio_index import crawl
+
+    found = {}
+    for feed in feeds:
+        state = (committed.get(feed["feed_id"]) or (None, {}))[1]
+        url = crawl.feed_url(feed)
+        if (
+            url
+            and state.get("fetched_from") == crawl.PRODUCER
+            and state.get("url") == url
+        ):
+            found[feed["feed_id"]] = url
+    return found
+
+
+def access_exempt(feeds, feed_overrides):
+    """The ids of the feeds whose access a curator set: a curated feed and a
+    feed with a ``set_access`` override, by its id or an alias."""
+    from transitio_index import resolve
+
+    return {
+        feed["feed_id"]
+        for feed in feeds
+        if feed.get("curated") is not None
+        or any(
+            "set_access" in feed_overrides[ref]
+            for ref in resolve._matching_refs(feed_overrides, feed)
+        )
+    }
+
+
+def judge_access(feeds, committed, anonymous, exempt):
+    """Set each kept feed's access from its crawl; ``(opened, keyed,
+    refused)``.
+
+    A feed read at its URL without a key (``anonymous``) is ``open``, its
+    provider and authentication cleared; an ``open`` feed whose producer
+    answered HTTP 401 needs a ``key``, with no provider or method; any other
+    ``open`` feed whose URL the crawl did not read keeps ``open`` and is
+    ``refused``, with the failure. ``opened`` lists the feeds that were
+    ``key``. A feed without a committed crawl, or in ``exempt``, keeps the
+    value it has.
+    """
+    from transitio_index import resolve
+
+    opened, keyed, refused = [], [], {}
+    for feed in feeds:
+        feed_id = feed["feed_id"]
+        if feed_id in exempt or feed_id not in committed:
+            continue
+        if feed_id in anonymous:
+            if feed.get("access") == "key":
+                opened.append(feed_id)
+            registration = feed.get("registration_url")
+            feed.update(resolve._OPEN, registration_url=registration)
+            continue
+        if feed.get("access") != "open":
+            continue
+        failure = committed[feed_id][1].get("producer_failure")
+        failure = failure or "the crawl did not read the feed's URL"
+        status = _HTTP_STATUS.search(failure)
+        if status and status.group(1) == "401":
+            feed.update(resolve._OPEN, access="key")
+            keyed.append(feed_id)
+        else:
+            refused[feed_id] = failure
+    return sorted(opened), sorted(keyed), dict(sorted(refused.items()))
 
 
 def near_duplicates(states):
@@ -959,7 +1051,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "dropped_divisions_hit": [],
                 "crawl_fields": {},
             }
-            folded = {}
+            folded, twins = {}, {}
+            access = [], [], {}
             near = []
             contained = {}
             content = {}
@@ -990,7 +1083,10 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     states, unmatched = crawled_states(cache_dir, feeds)
                     committed = crawled_states(cache_dir, feeds, stops=False)[0]
                     read = set(committed)
-                    folded = fold_duplicates(feeds, states)
+                    exempt = access_exempt(feeds, feed_overrides)
+                    anonymous = anonymous_reads(feeds, committed)
+                    folded, twins = fold_duplicates(feeds, states, anonymous, exempt)
+                    access = judge_access(feeds, committed, anonymous, exempt)
                     # After the fold, so a folded MDB copy names a feed first.
                     for feed in feeds:
                         if not feed.get("name") and feed["feed_id"] in committed:
@@ -1095,6 +1191,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "feeds": len(feeds),
                 "feeds_covered": len(covered),
                 "folded_feeds": dict(sorted(folded.items())),
+                "access_judged": dict(zip(("opened", "keyed", "refused_open"), access)),
+                "access_from_twin": dict(sorted(twins.items())),
                 "feeds_placed_elsewhere": sorted(elsewhere),
                 "named_after_provider": named_after_provider,
                 "near_duplicate_groups": len(near),

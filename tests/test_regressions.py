@@ -2877,3 +2877,74 @@ def test_a_route_across_a_border_counts_its_departures_once(tmp_path):
     assert found[1] == {"overlap_repeats": {"regional": own}}
     # f-x's route counts once against f-y, however many of its edges hold it.
     assert found[2]["overlap"]["with"] == {"f-x": {"tram": 1.0}}
+
+
+def test_a_feeds_access_follows_what_its_crawl_read(tmp_path):
+    """The index published each feed's access as its catalogue declared it:
+    PATH and seven more were `key` though the crawl read them without one,
+    Renfe Cercanías kept the keyed NAP URL of a file Renfe serves openly, and
+    two `open` feeds answered 401. Access now follows the anonymous crawl of
+    the URL the index publishes; a 403 is reported, and a curator's value
+    stands."""
+
+    def feed(feed_id, source, access, url):
+        record = {"urls": {"static_current": url, "direct_download": url}}
+        return {
+            **ct._feed(feed_id),
+            "source": source,
+            source: record,
+            **resolve._OPEN,
+            "access": access,
+        }
+
+    feeds = [
+        feed("f-path", "atlas", "key", "https://path/gtfs.zip"),
+        feed("f-nap", "atlas", "key", "https://nap/1130"),
+        feed("f-renfe", "mdb", "open", "https://renfe/cer.zip"),
+        feed("f-401", "mdb", "open", "https://ch/permalink"),
+        feed("f-403", "mdb", "open", "https://toscana/gtfs.zip"),
+        {**feed("f-cur", "curated", "key", None), "curated": {"url": "https://c"}},
+    ]
+    read = {"fetched_from": crawl.PRODUCER}
+    states = {
+        "f-path": {**read, "url": "https://path/gtfs.zip"},
+        "f-nap": {"fetched_from": crawl.MAINTAINER_KEY, "url": "https://nap/1130"},
+        "f-renfe": {**read, "url": "https://renfe/cer.zip"},
+        "f-401": {
+            "fetched_from": crawl.HOSTED_COPY,
+            "producer_failure": "GET https://ch/permalink: HTTP 401 Unauthorized",
+        },
+        "f-403": {
+            "fetched_from": crawl.HOSTED_COPY,
+            "producer_failure": "GET https://toscana/gtfs.zip: HTTP 403 Forbidden",
+        },
+        "f-cur": {**read, "url": "https://c"},
+    }
+    # Renfe's NAP and open copies hold the same data; the rest differ.
+    crawls = {f["feed_id"]: ct._rows(3, 10.0 + i) for i, f in enumerate(feeds)}
+    crawls["f-renfe"] = crawls["f-nap"]
+    manifest, covered, _ = ct._cover(
+        tmp_path,
+        feeds=feeds,
+        placements=[],
+        crawls=crawls,
+        members={"f-nap": ct.TABLES, "f-renfe": ct.TABLES},
+        states=states,
+        lookup=ct.LOOKUP,
+    )
+    assert manifest["folded_feeds"] == {"f-renfe": "f-nap"}
+    assert manifest["access_from_twin"] == {"f-nap": "f-renfe"}
+    assert covered["f-nap"]["download_url"] == "https://renfe/cer.zip"
+    access = {feed_id: f["access"] for feed_id, f in covered.items()}
+    assert access == {
+        "f-path": "open",
+        "f-nap": "open",
+        "f-401": "key",
+        "f-403": "open",
+        "f-cur": "key",
+    }
+    assert manifest["access_judged"] == {
+        "opened": ["f-nap", "f-path"],
+        "keyed": ["f-401"],
+        "refused_open": {"f-403": "GET https://toscana/gtfs.zip: HTTP 403 Forbidden"},
+    }
