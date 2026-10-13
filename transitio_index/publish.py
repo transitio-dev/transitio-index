@@ -111,6 +111,7 @@ SUMMARY_KEYS = (
     "nominal_window",
     "carried_by",
     "overlap",
+    "mark",
 )
 DETAIL_COLUMNS = (
     "evidence",

@@ -2655,3 +2655,47 @@ def test_padded_ids_join_and_match_the_readers_fingerprint(tmp_path, padded):
         fingerprint.compute(kind, routes, coords, served),
         {"r1"},
     )
+
+
+def test_a_marked_feed_carries_its_mark_to_the_published_summary(tmp_path):
+    """The reader leaves private or campus services and unofficial
+    compilations out by default, but the index marked none of them, so the
+    building shuttles at Chicago and the UIUC intercity-bus compilation were
+    taken like operators' feeds."""
+    import json
+
+    import test_index_resolve_stage as rst
+
+    from transitio_index import overrides, rank, resolve
+
+    for i, bad in enumerate(("x", ["private"])):
+        (tmp_path / f"bad{i}").mkdir()
+        entries = [{"feed": "f", "set_mark": bad}]
+        with pytest.raises(overrides.OverrideError, match="set_mark must be one of"):
+            overrides.load_feed_overrides(
+                rst._overrides_dir(tmp_path / f"bad{i}", entries)
+            )
+    cache = tmp_path / "cache"
+    rst._crosswalk(cache, [rst._feed("f-shuttle"), rst._feed("f-bus")])
+    marks = [{"feed": "f-shuttle", "set_mark": "private"}]
+    resolve.resolve(cache, overrides_dir=rst._overrides_dir(tmp_path, marks))
+    feeds, _ = rst._resolved(cache)
+    assert feeds["f-shuttle"]["mark"] == "private" and "mark" not in feeds["f-bus"]
+    places = {"c": {"place_id": "c", "kind": "city", "country_code": "FI"}}
+    edges = [
+        {
+            "feed_id": feed_id,
+            "place_id": "c",
+            "tier": "local",
+            "service": {"stops": 2, "routes": 1, "departures_per_day": 10.0},
+            "evidence": {},
+        }
+        for feed_id in feeds
+    ]
+    ranked, _ = rank.rank_edges(edges, list(feeds.values()), places)
+    summaries = {
+        e["feed_id"]: json.loads(publish._summary(json.dumps(e["evidence"])))
+        for e in ranked
+    }
+    assert summaries["f-shuttle"]["mark"] == "private"
+    assert "mark" not in summaries["f-bus"]

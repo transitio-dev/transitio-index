@@ -28,9 +28,11 @@ category unchanged, and stays out of the place totals with a
 ``share_of_place`` of 0 — unless it runs a mode no fresh pair of its place
 runs (its overlap evidence names the modes), or, without mode evidence, its
 place has no fresh pair: the place's only feed of a mode keeps its share.
-The weights live here and nothing
-else in the pipeline reads them; the merge rescores merged edges through
-:func:`score_edges`, the half of the scoring that depends on the place.
+A feed's mark (``set_mark``: a private or campus service, an unofficial
+compilation) is recorded as ``mark`` in its edges' evidence. The weights
+live here and nothing else in the pipeline reads them; the merge rescores
+merged edges through :func:`score_edges`, the half of the scoring that
+depends on the place.
 """
 
 import collections
@@ -170,6 +172,8 @@ def rank_edges(edges, feeds, places):
             evidence["stale_when_indexed"] = ended
         if nominal[edge["feed_id"]]:
             evidence["nominal_window"] = True
+        if feed.get("mark"):
+            evidence["mark"] = feed["mark"]
         prepared.append({**edge, "evidence": evidence})
     scored, basis, _ = score_edges(prepared, places)
 

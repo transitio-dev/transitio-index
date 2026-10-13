@@ -1,7 +1,8 @@
 """Stage 3, resolve half: settle feed identity, access and crawlability.
 
-Applies the ``set_identity``, ``mark_uncrawlable`` and ``set_access``
-operations from ``overrides/feeds.yaml`` to the crosswalk feeds and writes
+Applies the ``set_identity``, ``mark_uncrawlable``, ``set_access`` and
+``set_mark`` operations from ``overrides/feeds.yaml`` to the crosswalk feeds
+and writes
 ``feeds_resolved.jsonl``. These are settled before any crawl because identity
 is the crawl cache key and an uncrawlable feed must never be fetched at all; the
 crawl half itself is a later stage, and ``set_coverage`` is left for the coverage
@@ -195,6 +196,10 @@ def _apply(feed, entry):
         feed["uncrawlable_reason"] = (
             spec.get("reason") if isinstance(spec, dict) else None
         )
+    if "set_mark" in entry:
+        # A private or campus service, or an unofficial compilation: the rank
+        # stage puts the mark in every edge's evidence.
+        feed["mark"] = entry["set_mark"]
 
 
 _BASIC_FIELDS = ["password", "username"]
