@@ -10,7 +10,9 @@ Ancestor edges come free — a stop inside a city is inside its region and
 country polygons too. Metro edges are propagated from member-city edges,
 because minted metros carry no geometry yet (the merged metros stage's own
 convention); when metro polygons exist, PIP takes over with no schema change.
-Crawled evidence supersedes the declared placements feed by feed. Feeds whose
+Crawled evidence supersedes the declared placements feed by feed, unless the
+crawl places none of the feed's stops (none read, or none inside a known
+place): such a feed keeps its declared placements. Feeds whose
 crawls hold the same data by their content identity — an operator's feed listed
 twice, often once in each catalogue — fold into one feed first, the others' ids
 kept as its aliases; feeds sharing their stops and routes but not their
@@ -36,7 +38,7 @@ A GTFS-RT feed linked to a static feed gets no edges here: it inherits the stati
 feed's membership in the edge-override stage, after curation, so a curated change
 to the static feed reaches its companion. An unlinked GTFS-RT feed falls back to
 declared coverage like any uncrawlable feed. Crawled evidence supersedes all of
-this feed by feed once the crawl exists.
+this feed by feed once the crawl places any of the feed's stops.
 
 A feed named by a catalogue note takes its Mobility Database provider's name;
 a feed the catalogues leave nameless takes the name of its crawl's one agency.
@@ -734,9 +736,9 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
     :func:`crawled_states`: the crawl's state.json is the commit point,
     exactly as expansion reads them), resolves every stop
     through the boundary lookup, and admits every ``(place, feed)`` pair with
-    a stop inside, the count being the service level's first term. A feed
-    whose stops were read supersedes its declared placements even when no
-    stop lands anywhere — the crawl saw where it stops. Metro edges are
+    a stop inside, the count being the service level's first term. Every
+    feed whose stops were read is reported in ``superseded``; the stage keeps
+    the declared placements of one that gets no edge here. Metro edges are
     propagated from member-city edges; a metro's own aggregated evidence
     outranks them.
 
@@ -1135,10 +1137,17 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 crawl_report["crawl_fields"],
                 own_ids,
             )
+            # A crawl that places none of its stops (none read, or none inside
+            # a known place) leaves a feed its declared placements, when they
+            # give it an edge.
+            crawl_placed = {feed_id for _, feed_id in crawled_by_key}
+            no_edge = crawl_report["superseded"] - crawl_placed
             superseded = crawl_report["superseded"] - curated
             edges, unknown_places, unmatched_feeds, unknown_levels = declared_edges(
-                feeds, places, placements, superseded=superseded
+                feeds, places, placements, superseded=superseded - no_edge
             )
+            unplaced = no_edge & {edge["feed_id"] for edge in edges}
+            superseded -= unplaced
             merged = {
                 key: edge
                 for key, edge in crawled_by_key.items()
@@ -1163,7 +1172,12 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     feed.update(crawl_report["crawl_fields"][feed["feed_id"]])
                 elif feed["feed_id"] in declared_covered:
                     feed["coverage_source"] = "declared"
-                    feed.update(crawl_report["crawl_fields"].get(feed["feed_id"]) or {})
+                    fields = crawl_report["crawl_fields"].get(feed["feed_id"]) or {}
+                    if feed["feed_id"] in unplaced:
+                        # The hull of stops in no known place is not the
+                        # feed's coverage.
+                        fields = {k: v for k, v in fields.items() if k != "coverage"}
+                    feed.update(fields)
                 else:
                     feed["coverage_source"] = None
                 if (
@@ -1213,6 +1227,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     if feed.get("dangling_static_feed_id")
                 ),
                 "feeds_crawl_covered": len(superseded),
+                # Crawled, but no stop in a known place: placed as declared.
+                "crawled_unplaced_declared": sorted(unplaced),
                 # Uncrawlable GTFS feeds that need a key, after the crawl.
                 "requires_auth": resolve.count_requires_auth(feeds),
                 "crawl_state_mismatches": crawl_report["state_mismatches"],
