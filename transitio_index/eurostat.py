@@ -258,11 +258,14 @@ class Containment:
 
 
 def _footprint(rows):
-    """The union of a place's usable land areas, or None."""
+    """The union of a place's usable land areas, or None; a territorial area,
+    which also holds the sea, is left out."""
     geoms = [
         row["geom"]
         for row in rows or []
-        if row["geom"] is not None and not row["geom"].is_empty
+        if row.get("land", True)
+        and row["geom"] is not None
+        and not row["geom"].is_empty
     ]
     if not geoms:
         return None

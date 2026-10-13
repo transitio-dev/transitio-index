@@ -5,11 +5,14 @@ simplifies them to a shipping tolerance, and audits each area's sources against
 an allowlist of audited ``(dataset, licence)`` pairs: geometry ships (as
 hex-encoded WKB) only when every source that built it is on the allowlist, and
 its attribution goes into ``NOTICE``; geometry with any unaudited or unlicensed
-source is omitted and recorded in the licence inventory. A metro's geometry is
-the union of its members' land areas, read at full resolution, and is drawn
-only from members that ship their own, so it never carries what a member may
-not; its holes are filled unless a non-member city stands in one, and the
-union is simplified once. The shipped geometry is simplified to a tolerance; the
+source is omitted and recorded in the licence inventory. A division Overture
+splits into a land area and a territorial one (land and sea) ships both, so
+its boundary holds its sea; metro memberships are measured over land areas
+only (``eurostat.place_footprint``). A metro's geometry is the union of its
+members' areas, read at full resolution, and is drawn only from members that
+ship their own, so it never carries what a member may not; its holes are
+filled unless a non-member city stands in one, and the union is simplified
+once. The shipped geometry is simplified to a tolerance; the
 boundary lookup used for point-in-polygon (the expand and coverage stages)
 memoizes geometry at that same tolerance.
 """
@@ -213,12 +216,14 @@ def division_area_dataset(release=overture.OVERTURE_RELEASE):
 def read_areas(
     dataset, division_ids, *, simplify=None, cache=None, reopen=None, countries=None
 ):
-    """``{division_id: [{"geom", "sources"}, ...]}`` land-area rows for the ids.
+    """``{division_id: [{"geom", "sources", "land"}, ...]}`` area rows for the
+    ids.
 
-    One row per land area is kept with its own sources — never flattened across a
-    division's areas — so each area is audited on its own provenance; maritime
-    (non-land) areas are dropped. Geometry is forced to 2D and malformed WKB is
-    skipped (stored as ``None``) rather than aborting the stage.
+    One row per area is kept with its own sources — never flattened across a
+    division's areas — so each area is audited on its own provenance; ``land``
+    tells a land area from a territorial one, which also holds the sea.
+    Geometry is forced to 2D and malformed WKB is skipped (stored as ``None``)
+    rather than aborting the stage.
 
     ``simplify`` (a tolerance in degrees) simplifies each area as it is read, so
     a full-resolution country or region polygon — hundreds of thousands to
@@ -248,8 +253,6 @@ def read_areas(
     areas = {}
     for batch in _area_batches(dataset, ids, cache, reopen, countries):
         for row in batch.to_pylist():
-            if not row.get("is_land"):
-                continue
             try:
                 geom = shapely.from_wkb(row["geometry"])
             except Exception:
@@ -264,7 +267,11 @@ def read_areas(
                 if simplify is not None and _valid_polygon(geom):
                     geom = shapely.simplify(geom, simplify, preserve_topology=True)
             areas.setdefault(row["division_id"], []).append(
-                {"geom": geom, "sources": row.get("sources") or []}
+                {
+                    "geom": geom,
+                    "sources": row.get("sources") or [],
+                    "land": bool(row.get("is_land")),
+                }
             )
     return areas
 
@@ -272,7 +279,7 @@ def read_areas(
 def place_areas(
     cache_dir, dataset, places, wanted, *, simplify=None, release=None, reopen=None
 ):
-    """The land areas of the ``wanted`` division ids among ``places`` — the
+    """The areas of the ``wanted`` division ids among ``places`` — the
     metros and fao stages' read, raw unless ``simplify`` is given (as in
     :func:`read_areas`): served from the cache of ``release`` (default: the
     pinned one), the scan narrowed to the places' countries, and the S3
@@ -359,14 +366,14 @@ def lend_areas(areas, lent):
 
 
 def ship_area(place, rows, inventory=None, shipped=None, source="overture"):
-    """Ship a division's land-area ``rows`` as ``place``'s simplified geometry,
+    """Ship a division's area ``rows`` as ``place``'s simplified geometry,
     labelled ``source``, when every area's every source is allowlisted and
     every polygon valid; ``"shipped"``, ``"omitted"`` (a source not
     allowlisted) or ``"invalid"``. ``inventory`` counts every row's sources
     and ``shipped`` gathers those of an area that ships."""
     if inventory is not None:
         for row in rows:
-            # A land area with no sources still records one row, keyed to the
+            # An area with no sources still records one row, keyed to the
             # null source, so its omission is auditable, not silent.
             for row_source in row["sources"] or [None]:
                 key = _source_key(row_source)
@@ -383,7 +390,7 @@ def ship_area(place, rows, inventory=None, shipped=None, source="overture"):
 
 
 def shipped_geometry(rows):
-    """``(outcome, geometry)`` for a division's land-area ``rows``:
+    """``(outcome, geometry)`` for a division's area ``rows``:
     ``"shipped"`` and the simplified union it ships when every area's every
     source is allowlisted and every polygon valid, else ``"omitted"`` (a
     source not allowlisted) or ``"invalid"``, and None."""
@@ -437,7 +444,7 @@ def member_union(parts, member_ids, cities):
 
 
 def _raw_area(place, by_id):
-    """The division whose land area ``place`` ships simplified, or None: a
+    """The division whose areas ``place`` ships simplified, or None: a
     curated or urban-centre boundary, or a council's that is not the council's
     own Overture area."""
     source = place.get("geometry_source")
@@ -452,7 +459,7 @@ def draw_member_unions(
     cache_dir, dataset, by_id, keys, *, chunk=0, release=None, reopen=None
 ):
     """Draw each metro ``by_id[key]`` of ``keys`` with :func:`member_union`
-    from its members that ship a boundary: a member's raw land area, read
+    from its members that ship a boundary: a member's raw areas, read
     with :func:`place_areas` about ``chunk`` members' areas at a time (all
     at once when not positive) from ``release`` as :func:`place_areas` reads
     it, else its shipped polygon. A metro whose
@@ -1070,7 +1077,7 @@ def attach_geometry(
     """Attach simplified geometry to the seeded places and write the NOTICE.
 
     Resolves each seeded place's ``division_area`` polygon(s) and ships the
-    simplified (unioned) geometry only where every land area's sources are
+    simplified (unioned) geometry only where every area's sources are
     allowlisted, recording the audit in the licence inventory and NOTICE; a place
     with a disallowed source, no source, or invalid geometry keeps a null
     geometry; a metro gets the union of its members' areas, or none.

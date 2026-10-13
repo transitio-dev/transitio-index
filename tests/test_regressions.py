@@ -2480,3 +2480,13 @@ def test_a_places_only_stale_feed_of_a_mode_keeps_its_share():
     assert share == {"bus": 0.6, "old-bus": 0.0, "rail": 0.4, "old": 1.0}
     relevance = {e["feed_id"]: e["relevance"] for e in scored}
     assert relevance["old-bus"] == 0.0 and relevance["rail"] > 0.0
+
+
+def test_a_stop_at_sea_lies_in_the_division_whose_waters_hold_it(tmp_path):
+    """The boundary lookup read Overture's land areas only, so Stavanger's
+    ferry stops off its coast lay in no city and its ferries were cropped
+    away; a division's territorial area holds its sea."""
+    with bt._lookup(tmp_path, tmp_path / "cache") as lookup:
+        lookup.ensure([(24.0, 59.0, 25.5, 60.35)])
+        at_sea = lookup.divisions_at(24.5, 59.5)
+        assert [r["division_id"] for r in at_sea] == ["fi-hel", "fi"]

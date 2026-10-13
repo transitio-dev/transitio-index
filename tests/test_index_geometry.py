@@ -48,6 +48,8 @@ PLACES = [
 
 BOX = shapely.to_wkb(shapely.box(24.9, 60.1, 25.1, 60.3))
 OTHER = shapely.to_wkb(shapely.box(23.0, 60.0, 24.0, 61.0))
+# Helsinki's territorial area: its land box and the sea around it.
+TERRITORIAL = shapely.box(24.5, 59.8, 25.5, 60.4)
 
 
 def _osm(license="ODbL-1.0"):
@@ -56,8 +58,8 @@ def _osm(license="ODbL-1.0"):
 
 AREAS = [
     fx.area("fi-helsinki", BOX, [_osm()]),
-    # A second, maritime area for the same division must be ignored.
-    fx.area("fi-helsinki", OTHER, [_osm()], is_land=False),
+    # A second, territorial area for the same division: land and sea.
+    fx.area("fi-helsinki", shapely.to_wkb(TERRITORIAL), [_osm()], is_land=False),
     fx.area(
         "fi-uusimaa",
         BOX,
@@ -261,13 +263,14 @@ def test_the_licence_inventory_records_sources_and_the_aggregator(tmp_path):
     assert any(row["dataset"] is None and row["allowed"] is False for row in inventory)
 
 
-def test_only_the_land_area_is_used(tmp_path):
-    # fi-helsinki has a land box and a larger maritime box; the shipped geometry
-    # must come from the land area, not their union.
+def test_a_territorial_area_ships_with_the_land(tmp_path):
+    # fi-helsinki has a land box and a territorial box holding it and the sea
+    # around it: the place ships their union, its sea included.
     _, places, _ = _run(tmp_path)
     shipped = shapely.from_wkb(bytes.fromhex(places["Q1757"]["geometry"]))
-    land = shapely.box(24.9, 60.1, 25.1, 60.3)
-    assert shipped.difference(land).area == pytest.approx(0.0, abs=1e-9)
+    assert shipped.symmetric_difference(TERRITORIAL).area == pytest.approx(
+        0.0, abs=1e-9
+    )
 
 
 def test_set_boundary_attaches_a_curated_polygon(tmp_path):
