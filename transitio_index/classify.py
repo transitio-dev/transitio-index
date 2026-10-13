@@ -152,10 +152,9 @@ RAIL_BOUND = frozenset({"tram", "subway", "rail"})
 # Another feed runs a route when its route of the same family and line name
 # has stops in the place within this many degrees of the route's stop box.
 OVERLAP_NEAR_DEG = 0.003
-# An edge lists the other feeds running at least this share of its
-# departures, at most this many, largest first.
+# An edge lists every other feed running at least this share of its
+# departures, largest first.
 OVERLAP_MIN_SHARE = 0.01
-OVERLAP_MAX_FEEDS = 10
 # Rows per box test in the place pass.
 _OVERLAP_BLOCK = 2048
 
@@ -1178,7 +1177,7 @@ def _overlap_block(rows, matched, other, names, modes):
     listed = sorted(
         np.flatnonzero(overall >= OVERLAP_MIN_SHARE),
         key=lambda i: (-overall[i], names[i]),
-    )[:OVERLAP_MAX_FEEDS]
+    )
     return {
         "departures": {
             modes[int(m)]: round(float(t), 1) for m, t in zip(mode_ids, totals)
@@ -1192,30 +1191,75 @@ def _overlap_block(rows, matched, other, names, modes):
     }
 
 
+def place_overlaps(feed_ids, row_sets, interned):
+    """The overlap block of each of a place's edges, given as its feed id
+    and its route rows (:func:`_overlap_rows`), measured against every other
+    feed's rows there; None for an edge whose feed has no calendar."""
+    modes = {i: name for name, i in interned.items() if isinstance(name, str)}
+    names = sorted(set(feed_ids))
+    index = {feed_id: i for i, feed_id in enumerate(names)}
+    sizes = [len(rows) for rows in row_sets]
+    stacked = np.concatenate(row_sets)
+    feeds = np.repeat([index[feed_id] for feed_id in feed_ids], sizes)
+    matched, other = _overlap_matches(stacked, feeds, len(names))
+    bounds = np.cumsum([0] + sizes)
+    cuts = np.searchsorted(matched, bounds)
+    blocks = []
+    for rows, low, lo, hi in zip(row_sets, bounds, cuts, cuts[1:]):
+        if np.isnan(rows[:, 2]).any():
+            blocks.append(None)
+            continue
+        blocks.append(
+            _overlap_block(rows, matched[lo:hi] - low, other[lo:hi], names, modes)
+        )
+    return blocks
+
+
+def overlap_routes(rows, interned):
+    """An edge's route ``rows`` as ``evidence["overlap_routes"]`` keeps them,
+    so a merge of builds can measure overlap across them: per route its line
+    name (None without one), mode, departures a day in the place and stop
+    box, None where a value is missing."""
+    names = {i: key for key, i in interned.items()}
+    kept = []
+    for row in rows:
+        line = None if row[0] < 0 else names[int(row[0])][1]
+        values = [None if np.isnan(v) else float(v) for v in row[2:]]
+        kept.append([line, names[int(row[1])], *values])
+    return kept
+
+
+def route_rows(routes, interned):
+    """The route rows :func:`overlap_routes` kept, interned in ``interned``
+    as :func:`_overlap_rows` interns them."""
+    rows = np.full((len(routes), 7), np.nan)
+    for row, (line, mode, *values) in zip(rows, routes):
+        family = "rail-bound" if mode in RAIL_BOUND else mode
+        row[0] = interned.setdefault((family, line), len(interned)) if line else -1
+        row[1] = interned.setdefault(mode, len(interned))
+        row[2:] = [np.nan if v is None else v for v in values]
+    return rows
+
+
 def _overlaps(by_place, interned):
     """Write ``evidence["overlap"]`` on the edges :func:`_overlap_rows` gave
     rows, one place at a time, emptying ``by_place`` (``{place_id: [(edge,
-    rows)]}``) as it goes; how many edges got a block. An edge whose feed
-    has no calendar gets none."""
-    modes = {i: name for name, i in interned.items() if isinstance(name, str)}
+    rows)]}``) as it goes, and keep every such edge's rows under
+    ``evidence["overlap_routes"]``; how many edges got a block. An edge whose
+    feed has no calendar gets none."""
     written = 0
     for place_id in sorted(by_place):
         pairs = by_place.pop(place_id)
-        names = sorted({edge["feed_id"] for edge, _ in pairs})
-        index = {feed_id: i for i, feed_id in enumerate(names)}
-        sizes = [len(rows) for _, rows in pairs]
-        stacked = np.concatenate([rows for _, rows in pairs])
-        feeds = np.repeat([index[edge["feed_id"]] for edge, _ in pairs], sizes)
-        matched, other = _overlap_matches(stacked, feeds, len(names))
-        bounds = np.cumsum([0] + sizes)
-        cuts = np.searchsorted(matched, bounds)
-        for (edge, rows), low, lo, hi in zip(pairs, bounds, cuts, cuts[1:]):
-            if np.isnan(rows[:, 2]).any():
-                continue
-            edge["evidence"]["overlap"] = _overlap_block(
-                rows, matched[lo:hi] - low, other[lo:hi], names, modes
-            )
-            written += 1
+        blocks = place_overlaps(
+            [edge["feed_id"] for edge, _ in pairs],
+            [rows for _, rows in pairs],
+            interned,
+        )
+        for (edge, rows), block in zip(pairs, blocks):
+            edge["evidence"]["overlap_routes"] = overlap_routes(rows, interned)
+            if block is not None:
+                edge["evidence"]["overlap"] = block
+                written += 1
     return written
 
 
@@ -2032,7 +2076,6 @@ def classify(
                 "overlap_settings": {
                     "near_deg": OVERLAP_NEAR_DEG,
                     "min_share": OVERLAP_MIN_SHARE,
-                    "max_feeds": OVERLAP_MAX_FEEDS,
                 },
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc

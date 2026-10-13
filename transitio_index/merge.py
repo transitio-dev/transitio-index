@@ -86,8 +86,9 @@ OVERRIDE_FIELDS = (
 # 17: schema 12, boundaries and edge details in tables of their own, zstd.
 # 18: a feed without a home gets the country with the most of its stops,
 # else its one declared country, and each edge's cross_border follows.
-# 19: a place's only stale feed of a mode keeps its share.
-MERGE_FORMAT = 19
+# 19: a place's only stale feed of a mode keeps its share. 20: overlap is
+# measured across builds from the edges' route rows, which do not ship.
+MERGE_FORMAT = 20
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
@@ -420,6 +421,42 @@ def _merged_overlaps(edges, mapping, feed_ids, measured=None):
     return _replaced(edges, "evidence", values)
 
 
+def _cross_build_overlaps(edges):
+    """``edges`` with the overlap block of every edge carrying route rows
+    (``evidence["overlap_routes"]``, see :func:`classify.overlap_routes`)
+    measured again against every other such edge at its place, whichever
+    build classified it, its ``compared`` listing those edges' other feeds;
+    the route rows go from every edge. An edge without them keeps its
+    build's block as :func:`_merged_overlaps` left it."""
+    if "evidence" not in edges.column_names:
+        return edges
+    evidence = _json_records(edges, "evidence")
+    feed_ids = edges["feed_id"].to_pylist()
+    interned = {}
+    by_place = collections.defaultdict(list)
+    for i, (place_id, record) in enumerate(
+        zip(edges["place_id"].to_pylist(), evidence)
+    ):
+        routes = record.pop("overlap_routes", None)
+        if routes is not None:
+            by_place[place_id].append((i, classify.route_rows(routes, interned)))
+    if not by_place:
+        return edges
+    for pairs in by_place.values():
+        feeds = [feed_ids[i] for i, _ in pairs]
+        blocks = classify.place_overlaps(feeds, [rows for _, rows in pairs], interned)
+        measured = set(feeds)
+        for (i, _), block in zip(pairs, blocks):
+            if block is None:
+                evidence[i].pop("overlap", None)
+                continue
+            block["compared"] = sorted(measured - {feed_ids[i]})
+            evidence[i]["overlap"] = block
+    return _replaced(
+        edges, "evidence", [publish._json_block(record) for record in evidence]
+    )
+
+
 def merge_tables(sources, skipped=()):
     """The catalogue's ``(snapshot, tables)`` over loaded ``sources``, each a
     ``(build_id, snapshot, tables)`` as ``load_tables`` returns them.
@@ -562,11 +599,13 @@ def merge_tables(sources, skipped=()):
         .agg(set)
         .to_dict()
     )
-    tables["edges.parquet"] = _merged_overlaps(
-        tables["edges.parquet"],
-        mapping,
-        tables["feeds.parquet"]["feed_id"].to_pylist(),
-        measured,
+    tables["edges.parquet"] = _cross_build_overlaps(
+        _merged_overlaps(
+            tables["edges.parquet"],
+            mapping,
+            tables["feeds.parquet"]["feed_id"].to_pylist(),
+            measured,
+        )
     )
     tables["edges.parquet"], relevance = _rescored(
         tables["edges.parquet"], tables["places.parquet"]

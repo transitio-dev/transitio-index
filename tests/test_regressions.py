@@ -2490,3 +2490,40 @@ def test_a_stop_at_sea_lies_in_the_division_whose_waters_hold_it(tmp_path):
         lookup.ensure([(24.0, 59.0, 25.5, 60.35)])
         at_sea = lookup.divisions_at(24.5, 59.5)
         assert [r["division_id"] for r in at_sea] == ["fi-hel", "fi"]
+
+
+def test_the_merge_measures_overlap_across_builds():
+    """Overlap was measured within each build only, so at Munich the MVV feed
+    of one build and DELFI of another were never compared, and recommend()
+    left MVV out as "not compared"."""
+    import json
+
+    from transitio_index import merge
+
+    box = [11.5, 48.1, 11.6, 48.2]
+    old = {"with": {}, "departures": {"tram": 5.0}, "compared": []}
+    evidence = [
+        {"overlap": {"with": {}, "departures": {"rail": 100.0}}},
+        {"overlap": {"with": {}, "departures": {"rail": 80.0, "bus": 20.0}}},
+        {"overlap": old},
+    ]
+    evidence[0]["overlap_routes"] = [["s1", "rail", 100.0, *box]]
+    evidence[1]["overlap_routes"] = [
+        ["s1", "rail", 80.0, *box],
+        ["x1", "bus", 20.0, *box],
+    ]
+    edges = pa.table(
+        {
+            "place_id": ["muc", "muc", "muc"],
+            "feed_id": ["f-mvv", "f-delfi", "f-old"],
+            "evidence": [json.dumps(e) for e in evidence],
+        }
+    )
+    merged = merge._cross_build_overlaps(edges)
+    found = [json.loads(e) for e in merged["evidence"].to_pylist()]
+    assert found[0]["overlap"]["with"] == {"f-delfi": {"rail": 1.0}}
+    assert found[1]["overlap"]["with"] == {"f-mvv": {"rail": 1.0}}
+    assert found[0]["overlap"]["compared"] == ["f-delfi"]
+    # The route rows do not ship; an edge without them keeps its block.
+    assert not any("overlap_routes" in e for e in found)
+    assert found[2]["overlap"] == old

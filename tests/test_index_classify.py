@@ -1381,7 +1381,7 @@ def _lines(cache, feed_id, lines, xs=(10.0, 10.01), calendar=True):
         ("other name", {"rail": 1.0}),
         ("far", {}),
         ("no calendar", {"rail": 1.0, "bus": 1.0}),
-        ("trimmed", {"rail": 1.0, "bus": 1.0}),
+        ("a third feed", {"rail": 1.0, "bus": 1.0}),
         ("blocks of one", {"rail": 1.0, "bus": 1.0}),
         ("across 180", {}),
     ],
@@ -1403,8 +1403,7 @@ def test_an_edge_records_how_much_of_it_other_feeds_run(
             ),
         ),
     ]
-    if case == "trimmed":
-        monkeypatch.setattr(classify, "OVERLAP_MAX_FEEDS", 1)
+    if case == "a third feed":
         built.append(_lines(cache, "f-third", [("S1", 2), ("10", 3)]))
     if case == "blocks of one":
         monkeypatch.setattr(classify, "_OVERLAP_BLOCK", 1)
@@ -1426,9 +1425,14 @@ def test_an_edge_records_how_much_of_it_other_feeds_run(
     found = {}
     for tier in ("regional", "local"):
         others = blocks[("f-copy", tier)]["with"]
-        assert set(others) <= {"f-big"}
+        # Every feed running the lines is listed, however many.
+        third = {"f-third"} if case == "a third feed" else set()
+        assert set(others) - {"f-big"} == third
         found.update(others.get("f-big", {}))
     assert found == named
+    # The route rows each edge was measured from stay with it.
+    routes = {(e["feed_id"], e["tier"]): e["evidence"]["overlap_routes"] for e in edges}
+    assert routes[("f-copy", "regional")][0][:2] == ["s1", "rail"]
     if case == "no calendar":
         assert ("f-big", "local") not in blocks
     else:

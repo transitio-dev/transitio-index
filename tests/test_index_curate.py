@@ -86,6 +86,11 @@ def test_set_tiers_redefines_the_pair_and_stamps_it(tmp_path):
     assert regional["evidence"]["stops_in_place"] == 3
     assert set(regional["evidence"]["classified"]) == {"local", "national"}
     assert regional["evidence"]["classified"]["national"]["spread_km"] > 1000
+    # Without the route rows the merge measures overlap from: they never ship.
+    assert "overlap_routes" in a[("Q-city", "local")]["evidence"]
+    assert not any(
+        "overlap_routes" in e for e in regional["evidence"]["classified"].values()
+    )
     local = a[("Q-city", "local")]
     assert local["method"] == "human" and local["curation"] == STAMP
     assert local["tier_confidence"] == pytest.approx(0.90)
