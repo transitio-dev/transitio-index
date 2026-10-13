@@ -2699,3 +2699,51 @@ def test_a_marked_feed_carries_its_mark_to_the_published_summary(tmp_path):
     }
     assert summaries["f-shuttle"]["mark"] == "private"
     assert "mark" not in summaries["f-bus"]
+
+
+def test_gtfs_files_in_a_deeper_folder_or_another_case_are_read(tmp_path):
+    """Inglewood's and Metro's archives keep their files two folders deep,
+    Conroe names its stops ``Stops.txt``: the crawl read none of them."""
+    cache = tmp_path / "cache"
+    deep = {f"feed/gtfs/{name}": data for name, data in crt.FULL_MEMBERS.items()}
+    deep["__MACOSX/feed/gtfs/._stops.txt"] = b"x"
+    cased = {
+        ("Stops.txt" if name == "stops.txt" else name): data
+        for name, data in crt.FULL_MEMBERS.items()
+    }
+    server = crt._server(
+        {
+            "/deep.zip": (crt._zip_bytes(deep), '"v1"'),
+            "/whole.zip": (crt._zip_bytes(deep), None),
+            "/cased.zip": (crt._zip_bytes(cased), None),
+        }
+    )
+    crt._publish_resolved(
+        cache,
+        [
+            crt._feed("f-deep", "https://feeds.example/deep.zip"),
+            crt._feed("f-whole", "https://feeds.example/whole.zip"),
+            crt._feed("f-cased", "https://feeds.example/cased.zip"),
+        ],
+    )
+    _, log = crt._crawl(cache, server, range_threshold=1)
+    for feed_id in ("f-deep", "f-whole", "f-cased"):
+        assert log[feed_id]["members"] == sorted(crt.FULL_MEMBERS), feed_id
+        stops = crt._feed_dir(cache, feed_id) / "stops.txt"
+        assert stops.read_bytes() == crt.STOPS, feed_id
+    # Two names alike but for case: the first is read, and each is probed on
+    # its own bytes when the archive's files are listed.
+    both = {**cased, "stops.txt": b"stop_id,stop_lat,stop_lon\n"}
+    crt._publish_resolved(
+        tmp_path / "two", [crt._feed("f-two", "https://feeds.example/two.zip")]
+    )
+    _, log = crt._crawl(
+        tmp_path / "two",
+        crt._server({"/two.zip": (crt._zip_bytes(both), '"v1"')}),
+        range_threshold=1,
+    )
+    assert log["f-two"]["method"] == "range"
+    state = json.loads(
+        (crt._feed_dir(tmp_path / "two", "f-two") / "state.json").read_text()
+    )
+    assert state["empty_files"] == ["stops.txt"]

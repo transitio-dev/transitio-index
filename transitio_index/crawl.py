@@ -686,21 +686,39 @@ def _fragment(url):
 
 def _archive_root(names, folder=None):
     """The prefix the GTFS members live under: the fragment's folder when the
-    archive has it, else ``""`` when a member is at the root, else the single
-    top-level folder holding one; ``""`` otherwise."""
-    names = list(names)
+    archive has it, else ``""`` when a member is at the root, else the
+    shallowest folder holding one when no other folder at its depth does;
+    ``""`` otherwise. Names are compared without case, and macOS resource
+    folders (``__MACOSX/``) are ignored."""
+    names = [name for name in names if not name.startswith("__MACOSX/")]
     if folder is not None:
         prefix = folder + "/"
         if any(name.startswith(prefix) for name in names):
             return prefix
-    if any(name in MEMBERS for name in names):
+    if any(name.lower() in MEMBERS for name in names):
         return ""
-    firsts = {name.split("/", 1)[0] for name in names if name}
-    if len(firsts) == 1:
-        prefix = firsts.pop() + "/"
-        if any(name[len(prefix) :] in MEMBERS for name in names):
-            return prefix
-    return ""
+    holders = {
+        name[: len(name) - len(name.rsplit("/", 1)[-1])]
+        for name in names
+        if "/" in name and name.rsplit("/", 1)[-1].lower() in MEMBERS
+    }
+    if not holders:
+        return ""
+    depth = min(prefix.count("/") for prefix in holders)
+    shallowest = [prefix for prefix in holders if prefix.count("/") == depth]
+    return shallowest[0] if len(shallowest) == 1 else ""
+
+
+def _members_under(names, root):
+    """``{member: archive name}`` for the GTFS members directly beneath
+    ``root``, names compared without case (of two names differing only in
+    case, the first)."""
+    found = {}
+    for name in names:
+        rest = name[len(root) :] if name.startswith(root) else None
+        if rest and rest.lower() in MEMBERS:
+            found.setdefault(rest.lower(), name)
+    return found
 
 
 def _under(names, root):
@@ -794,18 +812,20 @@ def _write_ranged(fetcher, url, probe, feed_dir, decide, fragment=None):
     read = fetcher.range_reader(url, validator=_range_validator(probe))
     directory = ziprange.central_directory(read, probe["size"])
     root = _archive_root(directory, fragment[1] if fragment else None)
+    found = _members_under(directory, root)
     digests = {}
     small = {}
 
     def write(name):
-        entry = directory.get(root + name)
+        entry = directory.get(found.get(name))
         if entry is None:
             return
         data = ziprange.read_member(read, entry, max_member_bytes=RANGED_MEMBER_BYTES)
         store.write_bytes(feed_dir, name, data)
         digests[name] = hashlib.sha256(data).hexdigest()
         if entry["uncompressed_size"] <= EMPTY_PROBE_BYTES:
-            small[name] = data
+            # Keyed by the archive's own name, the one the record probes.
+            small[found[name][len(root) :]] = data
 
     for name in CHEAP_MEMBERS:
         write(name)
@@ -916,15 +936,15 @@ def _extract_members(feed_dir, decide, fragment=None, check=None):
         root = _archive_root(
             names, fragment[1] if fragment and fragment[0] == "folder" else None
         )
+        found = _members_under(names, root)
         files = _root_files(_under(names, root))
         if check is not None:
             check(files)
 
         def extract(name):
-            try:
-                info = archive.getinfo(root + name)
-            except KeyError:
+            if name not in found:
                 return
+            info = archive.getinfo(found[name])
             partial, digest = _write_member(feed_dir, archive, info)
             try:
                 feed_dir.replace(partial, name)
