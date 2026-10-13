@@ -2948,3 +2948,82 @@ def test_a_feeds_access_follows_what_its_crawl_read(tmp_path):
         "keyed": ["f-401"],
         "refused_open": {"f-403": "GET https://toscana/gtfs.zip: HTTP 403 Forbidden"},
     }
+
+
+def test_a_feed_the_breaker_refused_is_asked_again(tmp_path):
+    """After three feeds on one host failed to connect, the breaker refused
+    every later feed on it for the rest of the run, and nothing asked them
+    again: 21 feeds stayed unread. The run now asks each refused feed once
+    more at its end, every host's failures forgotten before each."""
+    cache = tmp_path / "cache"
+    names = "abcdefg"
+    feeds = [crt._feed(f"f-{n}", f"https://feeds.example/{n}.zip") for n in names]
+    crt._publish_resolved(cache, feeds)
+    served = {f"/{n}.zip": (httpx.ConnectError, None) for n in names[:-1]}
+    served["/g.zip"] = (crt._zip_bytes(), None)
+    summary, log = crt._crawl(cache, crt._server(served))
+    # a, b and c's probe fail, so c's download and d to g are refused; asked
+    # again, c to f fail to connect once more, more than the breaker allows,
+    # and g is still asked and read.
+    retried = [log[f"f-{n}"].get("retried_after_breaker") for n in names]
+    assert retried == [None, None, True, True, True, True, True]
+    assert "stops.txt" in log["f-g"]["members"]
+    assert summary["retried_after_breaker"] == 5 and summary["host_refused"] == 0
+
+
+@pytest.mark.parametrize("range_threshold", [10**9, 1])
+def test_an_archive_holding_one_inner_archive_is_read_inside(tmp_path, range_threshold):
+    """The Buenos Aires Subte's archive holds one file, ``subte_gtfs``, itself
+    a zip: the crawl read no stops and the Subte had no edge."""
+    cache = tmp_path / "cache"
+    crt._publish_resolved(cache, [crt._feed("f-subte", "https://feeds.example/s.zip")])
+    outer = crt._zip_bytes({"subte_gtfs": crt._zip_bytes()})
+    _, log = crt._crawl(
+        cache,
+        crt._server({"/s.zip": (outer, '"v1"')}),
+        range_threshold=range_threshold,
+    )
+    assert "stops.txt" in log["f-subte"]["members"]
+    assert log["f-subte"]["method"] == "download"
+
+
+def test_an_archive_without_stops_falls_back_to_the_hosted_copy(tmp_path):
+    """A producer archive read without error but without ``stops.txt`` was
+    taken as the feed, and the hosted copy was read only when the producer
+    failed; the hosted read also dropped the URL's ``#fragment``, so PTV's
+    one feed among several was read as nothing."""
+    cache = tmp_path / "cache"
+    feed = crt._feed("f-ptv", "https://feeds.example/p.zip#7")
+    # An empty fragment of its own takes the producer's.
+    feed["mdb"] = {"urls": {"latest": "https://hosted.example/latest.zip#"}}
+    crt._publish_resolved(cache, [feed])
+    producer = crt._zip_bytes({"README.txt": b"see the folders\n"})
+    hosted = crt._zip_bytes(
+        {
+            **{f"7/{name}": data for name, data in crt.FULL_MEMBERS.items()},
+            **{f"8/{name}": data for name, data in crt.FULL_MEMBERS.items()},
+        }
+    )
+    server = crt._server({"/p.zip": (producer, None), "/latest.zip": (hosted, None)})
+    _, log = crt._crawl(cache, server)
+    record = log["f-ptv"]
+    assert record["fetched_from"] == crawl.HOSTED_COPY
+    assert record["producer_failure"] == "no stops.txt in the producer's archive"
+    assert "stops.txt" in record["members"]
+    # A feed without a producer URL reads its hosted copy, saying so.
+    cache = tmp_path / "no-url"
+    feed = crt._feed("f-none", None)
+    feed["mdb"] = {"urls": {"latest": "https://hosted.example/latest.zip#7"}}
+    crt._publish_resolved(cache, [feed])
+    _, log = crt._crawl(cache, server)
+    assert log["f-none"]["fetched_from"] == crawl.HOSTED_COPY
+    assert log["f-none"]["producer_failure"] == "no download URL"
+    # A producer URL that does not parse is a failed read, never an
+    # unexpected error of the run; its ValueError is no producer failure
+    # (``_producer_failed``), so no hosted copy is read.
+    cache = tmp_path / "malformed"
+    feed = crt._feed("f-bad", "https://[bad/p.zip#7")
+    feed["mdb"] = {"urls": {"latest": "https://hosted.example/latest.zip"}}
+    crt._publish_resolved(cache, [feed])
+    _, log = crt._crawl(cache, server)
+    assert log["f-bad"]["method"] == "failed"

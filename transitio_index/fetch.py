@@ -114,6 +114,13 @@ def _failure(message, *, status=None, transport=False):
     return error
 
 
+class HostRefused(FetchError):
+    """The breaker refused a host on which several URLs failed in a row this
+    run; nothing was requested."""
+
+    transport = True
+
+
 class RangeUnsupported(FetchError):
     """The server did not honour a range request; download the file whole."""
 
@@ -293,15 +300,19 @@ def _attempt_error(url, first, last):
     attempt's failure kept in front when it said something different — the
     breaker's refusal or a short body would otherwise hide the transport error
     that started it. The last attempt's status and transport failure carry
-    over."""
+    over, and so does a refusal (:class:`HostRefused`)."""
     kind = {
         "status": getattr(last, "status", None),
         "transport": isinstance(last, httpx.TransportError)
         or getattr(last, "transport", False),
     }
     if first is None or str(first) == str(last):
-        return _failure(f"GET {url}: {last}", **kind)
-    return _failure(f"GET {url}: {first}; last attempt: {last}", **kind)
+        message = f"GET {url}: {last}"
+    else:
+        message = f"GET {url}: {first}; last attempt: {last}"
+    if isinstance(last, HostRefused):
+        return HostRefused(message)
+    return _failure(message, **kind)
 
 
 def _retried(error, keyed):
@@ -454,11 +465,15 @@ class Fetcher:
         with self._failures_lock:
             failures = len(self._failures.get(host, ()))
         if failures >= self._host_failures:
-            raise _failure(
+            raise HostRefused(
                 f"{method} {url}: host {host} unreachable this run "
-                f"({failures} URLs failed consecutively); not tried",
-                transport=True,
+                f"({failures} URLs failed consecutively); not tried"
             )
+
+    def reset_hosts(self):
+        """Forget every host's failures, so a refused host is asked again."""
+        with self._failures_lock:
+            self._failures.clear()
 
     def _note(self, host, url, *, failed):
         with self._failures_lock:
