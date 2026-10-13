@@ -1462,7 +1462,7 @@ def test_a_route_across_a_border_counts_its_departures_at_its_own_tier(
 ):
     # A tram across two regions with two of its four stops abroad keeps its
     # own tier, compared with its reference, and also serves at the
-    # international tier; its departures stay with its own.
+    # international tier.
     monkeypatch.setattr(
         classify, "route_span_reference", lambda: {("*", "tram"): 10000.0}
     )
@@ -1478,9 +1478,14 @@ def test_a_route_across_a_border_counts_its_departures_at_its_own_tier(
     assert by_tier["international"]["scale_tiers"] == ["regional"]
     for evidence in by_tier.values():
         assert evidence["reference_km"] == [10000.0]
-    # One trip a day over four stops, one of them in the place.
+    # One trip a day over four stops, one of them in the place: on the
+    # regional edge, and apart on the international one under regional.
     assert by_tier["regional"]["overlap"]["departures"] == {"tram": 1.0}
     assert "overlap" not in by_tier["international"]
+    repeats = by_tier["international"]["overlap_repeats"]
+    assert repeats == {"regional": by_tier["regional"]["overlap"]}
+    kept = by_tier["international"]["overlap_repeats_routes"]
+    assert kept == {"regional": by_tier["regional"]["overlap_routes"]}
 
 
 def test_publish_refuses_edges_from_another_places_generation(tmp_path):

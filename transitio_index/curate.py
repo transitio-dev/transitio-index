@@ -108,7 +108,14 @@ def _canonical(value):
 
 
 # Evidence about the other feeds at the place, or kept only to measure it.
-_OVERLAP_KEYS = ("overlap", "overlap_routes")
+_OVERLAP_KEYS = (
+    "overlap",
+    "overlap_routes",
+    "overlap_repeats",
+    "overlap_repeats_routes",
+)
+# The route rows the merge measures overlap from; they never ship.
+_ROUTE_ROWS = ("overlap_routes", "overlap_repeats_routes")
 
 
 def _own_evidence(evidence):
@@ -427,7 +434,7 @@ class _Curator:
                 t: {
                     k: v
                     for k, v in (e.get("evidence") or {}).items()
-                    if k != "overlap_routes"
+                    if k not in _ROUTE_ROWS
                 }
                 for t, e in sorted(classified.items())
             }

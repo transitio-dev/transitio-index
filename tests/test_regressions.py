@@ -2820,3 +2820,60 @@ def test_route_tiers_follow_the_declared_class_the_places_and_the_country(
         route_type, countries, span, local, regions, reference
     )
     assert (decision["tier"], decision["international"]) == (tier, international)
+
+
+def test_a_route_across_a_border_counts_its_departures_once(tmp_path):
+    """A route across a border was international only, out of its city's
+    local and regional selections. It now keeps its own tier and serves at
+    the international one too, its departures on its own tier's edge and,
+    apart, on the international edge by that tier: they stay when a curator
+    keeps the international tier only, and the merge measures them again
+    across builds without counting them twice."""
+    from test_index_classify import LOOKUP, _coverage, _lines
+    from test_index_curate import ENTRY, _overrides
+
+    from transitio_index import curate, merge
+
+    cache = tmp_path / "cache"
+    feed, candidate = _lines(cache, "f-x", [("D", 0)], xs=(10.0, 10.01, 60.0, 60.0))
+    _coverage(cache, [feed], [candidate])
+    classify.classify(cache, lookup=LOOKUP)
+    entry = {"feed": "f-x", "place": "Q-city", "set_tiers": ["international"]}
+    curate.curate(cache, overrides_dir=_overrides(tmp_path, [{**entry, **ENTRY}]))
+    edges, _ = store.read_jsonl(
+        cache / "curate", "edges_final.json", "edges_final.jsonl"
+    )
+    (edge,) = edges
+    assert edge["tier"] == "international"
+    departures = edge["evidence"]["overlap_repeats"]["regional"]["departures"]
+    assert departures == {"tram": 2.0}
+
+    box = [10.0, 1.0, 10.01, 1.0]
+    evidence = [
+        {"overlap_routes": [["d", "tram", 2.0, *box]]},
+        {
+            "overlap_repeats": {"regional": {"stale": True}},
+            "overlap_repeats_routes": {"regional": [["d", "tram", 2.0, *box]]},
+        },
+        {"overlap_routes": [["d", "tram", 3.0, *box]]},
+    ]
+    table = pa.table(
+        {
+            "place_id": ["Q-city"] * 3,
+            "feed_id": ["f-x", "f-x", "f-y"],
+            "evidence": [json.dumps(e) for e in evidence],
+        }
+    )
+    found = [
+        json.loads(e)
+        for e in merge._cross_build_overlaps(table)["evidence"].to_pylist()
+    ]
+    own = found[0]["overlap"]
+    assert own == {
+        "departures": {"tram": 2.0},
+        "with": {"f-y": {"tram": 1.0}},
+        "compared": ["f-y"],
+    }
+    assert found[1] == {"overlap_repeats": {"regional": own}}
+    # f-x's route counts once against f-y, however many of its edges hold it.
+    assert found[2]["overlap"]["with"] == {"f-x": {"tram": 1.0}}

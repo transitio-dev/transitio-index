@@ -111,6 +111,7 @@ SUMMARY_KEYS = (
     "nominal_window",
     "carried_by",
     "overlap",
+    "overlap_repeats",
     "mark",
 )
 DETAIL_COLUMNS = (

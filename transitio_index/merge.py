@@ -87,8 +87,9 @@ OVERRIDE_FIELDS = (
 # 18: a feed without a home gets the country with the most of its stops,
 # else its one declared country, and each edge's cross_border follows.
 # 19: a place's only stale feed of a mode keeps its share. 20: overlap is
-# measured across builds from the edges' route rows, which do not ship.
-MERGE_FORMAT = 20
+# measured across builds from the edges' route rows, which do not ship. 21:
+# so are the international edges' repeat blocks.
+MERGE_FORMAT = 21
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
@@ -426,8 +427,10 @@ def _cross_build_overlaps(edges):
     (``evidence["overlap_routes"]``, see :func:`classify.overlap_routes`)
     measured again against every other such edge at its place, whichever
     build classified it, its ``compared`` listing those edges' other feeds;
-    the route rows go from every edge. An edge without them keeps its
-    build's block as :func:`_merged_overlaps` left it."""
+    so is each ``overlap_repeats`` block of an international edge from its
+    ``overlap_repeats_routes``. The route rows go from every edge. An edge
+    without them keeps its build's block as :func:`_merged_overlaps` left
+    it."""
     if "evidence" not in edges.column_names:
         return edges
     evidence = _json_records(edges, "evidence")
@@ -439,19 +442,31 @@ def _cross_build_overlaps(edges):
     ):
         routes = record.pop("overlap_routes", None)
         if routes is not None:
-            by_place[place_id].append((i, classify.route_rows(routes, interned)))
+            by_place[place_id].append((i, None, classify.route_rows(routes, interned)))
+        repeats = record.pop("overlap_repeats_routes", None)
+        if isinstance(repeats, dict):
+            record.pop("overlap_repeats", None)
+            for tier, routes in sorted(repeats.items()):
+                rows = classify.route_rows(routes, interned)
+                by_place[place_id].append((i, tier, rows))
     if not by_place:
         return edges
-    for pairs in by_place.values():
-        feeds = [feed_ids[i] for i, _ in pairs]
-        blocks = classify.place_overlaps(feeds, [rows for _, rows in pairs], interned)
+    for entries in by_place.values():
+        feeds = [feed_ids[i] for i, _, _ in entries]
+        blocks = classify.place_overlaps(
+            feeds, [rows for _, _, rows in entries], interned
+        )
         measured = set(feeds)
-        for (i, _), block in zip(pairs, blocks):
-            if block is None:
+        for (i, tier, _), block in zip(entries, blocks):
+            if block is not None:
+                block["compared"] = sorted(measured - {feed_ids[i]})
+            if tier is not None:
+                if block is not None:
+                    evidence[i].setdefault("overlap_repeats", {})[tier] = block
+            elif block is None:
                 evidence[i].pop("overlap", None)
-                continue
-            block["compared"] = sorted(measured - {feed_ids[i]})
-            evidence[i]["overlap"] = block
+            else:
+                evidence[i]["overlap"] = block
     return _replaced(
         edges, "evidence", [publish._json_block(record) for record in evidence]
     )

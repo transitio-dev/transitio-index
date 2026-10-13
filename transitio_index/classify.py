@@ -56,7 +56,11 @@ casefolded) whose stops in the place come within ``OVERLAP_NEAR_DEG`` of the
 route's stop box there. A route's departures are its calendar-weighted
 stop-events spread evenly over its stops, times its stops in the place; a
 feed without a calendar gets no block, but its routes still count for the
-others.
+others. A route across a border counts in the block of its own tier's edge;
+the international edge keeps the same routes' block apart, by their own
+tier, under ``evidence["overlap_repeats"]``, so a selection matching only
+the international tier sees their departures and one matching both counts
+them once.
 
 The stage also decides each feed's home country from its stops: the distinct
 scheduled stops per country (``country_stops``), their shares, the country
@@ -139,8 +143,10 @@ DEPARTURES_VERSION = 2
 # the border share and records every route's scale; 4 leaves stops at the
 # placeholder position out of a route's span and spacing; 5 decides by the
 # declared class, one city or metro, and the top-level regions and the
-# country's reference span, and adds international instead of replacing.
-RULES_VERSION = 5
+# country's reference span, and adds international instead of replacing; 6
+# keeps the departures of routes across a border apart on the international
+# edge, by their own tier.
+RULES_VERSION = 6
 
 # The route-span reference (written by ``scripts/route_span_reference.py``):
 # per home country and basic mode, the 90th percentile of the spans of the
@@ -1317,21 +1323,30 @@ def route_rows(routes, interned):
 def _overlaps(by_place, interned):
     """Write ``evidence["overlap"]`` on the edges :func:`_overlap_rows` gave
     rows, one place at a time, emptying ``by_place`` (``{place_id: [(edge,
-    rows)]}``) as it goes, and keep every such edge's rows under
+    tier, rows)]}``) as it goes, and keep every such edge's rows under
     ``evidence["overlap_routes"]``; how many edges got a block. An edge whose
-    feed has no calendar gets none."""
+    feed has no calendar gets none. Rows given with a ``tier`` are the
+    international edge's routes of that tier across the border, written
+    under ``overlap_repeats`` and ``overlap_repeats_routes`` by that tier."""
     written = 0
     for place_id in sorted(by_place):
-        pairs = by_place.pop(place_id)
+        entries = by_place.pop(place_id)
         blocks = place_overlaps(
-            [edge["feed_id"] for edge, _ in pairs],
-            [rows for _, rows in pairs],
+            [edge["feed_id"] for edge, _, _ in entries],
+            [rows for _, _, rows in entries],
             interned,
         )
-        for (edge, rows), block in zip(pairs, blocks):
-            edge["evidence"]["overlap_routes"] = overlap_routes(rows, interned)
+        for (edge, tier, rows), block in zip(entries, blocks):
+            evidence = edge["evidence"]
+            kept = overlap_routes(rows, interned)
+            if tier is not None:
+                evidence.setdefault("overlap_repeats_routes", {})[tier] = kept
+                if block is not None:
+                    evidence.setdefault("overlap_repeats", {})[tier] = block
+                continue
+            evidence["overlap_routes"] = kept
             if block is not None:
-                edge["evidence"]["overlap"] = block
+                evidence["overlap"] = block
                 written += 1
     return written
 
@@ -1426,7 +1441,9 @@ def _classify_feed(
     serves anything, but the feed's membership is not a vanished edge.
 
     With ``interned`` (the line keys and modes interned so far), each
-    route-level tier edge carries its :func:`_overlap_rows` as ``_overlap``.
+    route-level tier edge carries its :func:`_overlap_rows` as ``_overlap``,
+    and an international edge the rows of its routes of other tiers across
+    the border as ``_overlap_repeats``, by tier.
     ``metros`` is :func:`metros_of` over ``places``.
     """
     mode = (state.get("stop_times") or {}).get("state")
@@ -1681,21 +1698,23 @@ def _classify_feed(
         )
         if interned is not None:
             by_tier = collections.defaultdict(list)
+            across = collections.defaultdict(list)
             for route in contributing:
                 by_tier[route["decision"]["tier"]].append(route)
+                if route["decision"]["international"]:
+                    across[route["decision"]["tier"]].append(route)
+            shared = (place_id, place, coords, parsed.get("route_events"), interned)
             for edge in tier_edges:
                 # An international edge holding only routes of other tiers
-                # across the border has no rows of its own.
-                if not by_tier[edge["tier"]]:
-                    continue
-                edge["_overlap"] = _overlap_rows(
-                    by_tier[edge["tier"]],
-                    place_id,
-                    place,
-                    coords,
-                    parsed.get("route_events"),
-                    interned,
-                )
+                # across the border has no rows of its own; it keeps theirs
+                # apart, by their own tier.
+                if by_tier[edge["tier"]]:
+                    edge["_overlap"] = _overlap_rows(by_tier[edge["tier"]], *shared)
+                if edge["tier"] == "international" and across:
+                    edge["_overlap_repeats"] = {
+                        tier: _overlap_rows(routes, *shared)
+                        for tier, routes in sorted(across.items())
+                    }
         edges.extend(tier_edges)
     return (
         edges,
@@ -2126,7 +2145,10 @@ def classify(
                     for edge in classified:
                         rows = edge.pop("_overlap", None)
                         if rows is not None:
-                            by_place[edge["place_id"]].append((edge, rows))
+                            by_place[edge["place_id"]].append((edge, None, rows))
+                        repeats = edge.pop("_overlap_repeats", {})
+                        for tier, rows in repeats.items():
+                            by_place[edge["place_id"]].append((edge, tier, rows))
                     routes_classified += routes
                     edges_dropped += dropped
                     for key, value in (gaps or {}).items():
