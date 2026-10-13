@@ -5,10 +5,12 @@ Fixtures are imported from the stage test modules rather than duplicated.
 
 import hashlib
 import http.client
+import io
 import json
 import logging
 import math
 import os
+import zipfile
 from pathlib import Path
 
 import httpx
@@ -3027,3 +3029,108 @@ def test_an_archive_without_stops_falls_back_to_the_hosted_copy(tmp_path):
     crt._publish_resolved(cache, [feed])
     _, log = crt._crawl(cache, server)
     assert log["f-bad"]["method"] == "failed"
+
+
+def test_a_feeds_crawl_status_says_why_it_has_no_read(tmp_path):
+    """The index published ``crawl_status`` "ok" or null, and the release
+    report gave 534 feeds "no reason recorded": failed reads, pages instead
+    of archives, feeds without a URL and archives without stops.txt looked
+    alike. The status now names the outcome, and the merged manifest lists
+    the feeds without a read by cause."""
+    from transitio_index import merge
+
+    cache = tmp_path / "cache"
+    (cache / "crawl").mkdir(parents=True)
+    failed = [
+        {"feed_id": "f-failed", "method": "failed", "failure": "failed"},
+        # A log written before the failure field: told from its reason.
+        {
+            "feed_id": "f-page",
+            "method": "failed",
+            "fallback_reason": "GET https://x: an HTML page, not a zip archive",
+        },
+        {
+            "feed_id": "f-nourl",
+            "method": "skipped",
+            "fallback_reason": "no download URL",
+        },
+        # A malformed record never publishes a status of its own.
+        {
+            "feed_id": "f-bogus",
+            "method": "failed",
+            "failure": "ok",
+            "fallback_reason": 5,
+        },
+    ]
+    (cache / "crawl" / "crawl_log.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in failed)
+    )
+    names = (
+        "f-ok",
+        "f-empty",
+        "f-broken",
+        "f-failed",
+        "f-page",
+        "f-nourl",
+        "f-bogus",
+        "f-never",
+    )
+    _, covered, _ = ct._cover(
+        tmp_path,
+        feeds=[ct._feed(name) for name in names],
+        placements=[],
+        crawls={name: ct._rows(3, 10.0) for name in ("f-ok", "f-empty", "f-broken")},
+        # Read, but the archive held no stops.txt.
+        states={"f-empty": {"members": ["agency.txt"]}},
+        # A cache that no longer verifies, on a feed without a declared place.
+        tamper="f-broken",
+        lookup=ct.LOOKUP,
+    )
+    statuses = {name: covered[name].get("crawl_status") for name in names}
+    assert statuses == {
+        "f-ok": "ok",
+        "f-empty": "no_gtfs_files",
+        "f-broken": "unreadable",
+        "f-failed": "failed",
+        "f-page": "unreadable",
+        "f-nourl": "no_url",
+        "f-bogus": "failed",
+        "f-never": None,
+    }
+    table = pa.table(
+        {
+            "feed_id": list(names),
+            "crawl_status": [statuses[name] for name in names],
+            "uncrawlable_reason": [None] * 7 + ["requires authentication"],
+        }
+    )
+    assert merge._not_crawled(table) == {
+        "failed": {"count": 2, "feeds": ["f-bogus", "f-failed"]},
+        "no_gtfs_files": {"count": 1, "feeds": ["f-empty"]},
+        "no_url": {"count": 1, "feeds": ["f-nourl"]},
+        "requires authentication": {"count": 1, "feeds": ["f-never"]},
+        "unreadable": {"count": 2, "feeds": ["f-broken", "f-page"]},
+    }
+
+
+def test_a_corrupt_lzma_member_is_unreadable_and_falls_back(tmp_path):
+    """A corrupt LZMA member escaped the crawl's error handling, so the run
+    called the feed an unexpected error and never read its hosted copy."""
+    sink = io.BytesIO()
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_LZMA) as archive:
+        for name, data in crt.FULL_MEMBERS.items():
+            archive.writestr(name, data * 50)
+    raw = bytearray(sink.getvalue())
+    with zipfile.ZipFile(io.BytesIO(bytes(raw))) as archive:
+        info = archive.getinfo("stops.txt")
+    start = info.header_offset + 30 + len(info.filename) + len(info.extra)
+    for i in range(start + 20, start + 40):
+        raw[i] ^= 0xFF
+    cache = tmp_path / "cache"
+    feed = crt._feed("f-lzma", "https://feeds.example/l.zip")
+    feed["mdb"] = {"urls": {"latest": "https://hosted.example/latest.zip"}}
+    crt._publish_resolved(cache, [feed])
+    served = {"/l.zip": (bytes(raw), None), "/latest.zip": (crt._zip_bytes(), None)}
+    _, log = crt._crawl(cache, crt._server(served))
+    assert log["f-lzma"]["fetched_from"] == crawl.HOSTED_COPY
+    assert "Corrupt input data" in log["f-lzma"]["producer_failure"]

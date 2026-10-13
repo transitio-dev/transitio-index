@@ -40,7 +40,17 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from transitio.index import fingerprint
 
-from . import classify, coverage, crosswalk, licensing, overrides, publish, rank, store
+from . import (
+    classify,
+    coverage,
+    crawl,
+    crosswalk,
+    licensing,
+    overrides,
+    publish,
+    rank,
+    store,
+)
 from .builds import (
     _EPOCH,
     _SNAPSHOT_ERRORS,
@@ -88,8 +98,9 @@ OVERRIDE_FIELDS = (
 # else its one declared country, and each edge's cross_border follows.
 # 19: a place's only stale feed of a mode keeps its share. 20: overlap is
 # measured across builds from the edges' route rows, which do not ship. 21:
-# so are the international edges' repeat blocks.
-MERGE_FORMAT = 21
+# so are the international edges' repeat blocks. 22: the manifest lists the
+# feeds without a read by cause.
+MERGE_FORMAT = 22
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
@@ -1327,6 +1338,30 @@ def _report_check(check, log):
         log(f"label {label} was built from another cut")
 
 
+def _not_crawled(feeds):
+    """``{cause: {"count", "feeds"}}`` over the merged feeds the index holds
+    no read of, by :func:`crawl.unread_cause`."""
+    columns = feeds.column_names
+
+    def column(name):
+        return feeds[name].to_pylist() if name in columns else [None] * len(feeds)
+
+    found = collections.defaultdict(list)
+    rows = zip(
+        feeds["feed_id"].to_pylist(),
+        column("crawl_status"),
+        column("uncrawlable_reason"),
+    )
+    for feed_id, status, reason in rows:
+        cause = crawl.unread_cause(status, reason)
+        if cause is not None:
+            found[cause].append(feed_id)
+    return {
+        cause: {"count": len(ids), "feeds": sorted(ids)}
+        for cause, ids in sorted(found.items())
+    }
+
+
 def assemble(loaded, tables, notice, alias_conflicts=(), catalogue_check=None):
     """``(manifest, files)`` of the merged snapshot: the partition tables as
     Parquet bytes keyed ``(partition, table)`` and the manifest that lists
@@ -1391,6 +1426,7 @@ def assemble(loaded, tables, notice, alias_conflicts=(), catalogue_check=None):
         "stale_overrides": sum(stale.values()),
         "alias_conflicts": [list(group) for group in alias_conflicts],
         "catalogue_check": catalogue_check,
+        "not_crawled": _not_crawled(tables["feeds.parquet"]),
         "merged": [
             {
                 "label": s["label"],

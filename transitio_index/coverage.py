@@ -777,7 +777,7 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
         read = expand._stop_points(feed_dir, state)
         if read is None:
             mismatches += 1
-            crawl_fields[feed_id] = {"crawl_status": "state_mismatch"}
+            crawl_fields[feed_id] = {"crawl_status": "unreadable"}
             continue
         points, dropped = read
         # The hull leaves out stops at a placeholder position.
@@ -1055,6 +1055,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             }
             folded, twins = {}, {}
             access = [], [], {}
+            # Read without stops.txt, and the failed reads by kind.
+            without_stops, logged = set(), {}
             near = []
             contained = {}
             content = {}
@@ -1085,6 +1087,13 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     states, unmatched = crawled_states(cache_dir, feeds)
                     committed = crawled_states(cache_dir, feeds, stops=False)[0]
                     read = set(committed)
+                    without_stops = read - set(states)
+                    canonical = _canonical_ids(feeds)
+                    logged = {
+                        canonical[feed_id]: failure
+                        for feed_id, failure in crawl.failures(cache_dir).items()
+                        if feed_id in canonical
+                    }
                     exempt = access_exempt(feeds, feed_overrides)
                     anonymous = anonymous_reads(feeds, committed)
                     folded, twins = fold_duplicates(feeds, states, anonymous, exempt)
@@ -1180,6 +1189,16 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     feed.update(fields)
                 else:
                     feed["coverage_source"] = None
+                if not feed.get("crawl_status"):
+                    # ok and unreadable come with the crawl's fields, which a
+                    # feed without an edge has not taken.
+                    fields = crawl_report["crawl_fields"].get(feed["feed_id"]) or {}
+                    if fields.get("crawl_status"):
+                        feed["crawl_status"] = fields["crawl_status"]
+                    elif feed["feed_id"] in without_stops:
+                        feed["crawl_status"] = "no_gtfs_files"
+                    elif feed["feed_id"] in logged:
+                        feed["crawl_status"] = logged[feed["feed_id"]]
                 if (
                     feed.get("crawlable")
                     and feed.get("access") == "key"

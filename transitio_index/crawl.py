@@ -150,6 +150,11 @@ class HtmlPage(fetch.FetchError):
     place of a file it moved or removed."""
 
 
+# A read whose bytes are no archive the crawl can open (a page, a broken zip):
+# the record's ``failure`` is "unreadable", any other failure "failed".
+UNREADABLE = (HtmlPage, zipfile.BadZipFile, zlib.error, lzma.LZMAError)
+
+
 def feed_url(feed):
     """The URL to crawl: the ``download_url`` resolve settled (a published
     row's too), else a curated feed's own, else the Atlas static feed, else
@@ -175,7 +180,13 @@ def _producer_failed(error):
     archive. The crawler's own byte ceilings, local I/O and memory are not."""
     return isinstance(
         error,
-        (fetch.FetchError, zipfile.BadZipFile, ziprange.RangeReadError, zlib.error),
+        (
+            fetch.FetchError,
+            zipfile.BadZipFile,
+            ziprange.RangeReadError,
+            zlib.error,
+            lzma.LZMAError,
+        ),
     ) and not isinstance(error, fetch.TooLarge)
 
 
@@ -351,6 +362,31 @@ def reading(cache_dir):
         directory.close()
 
 
+def _log_records(crawl_root):
+    """The records of the crawl log under ``crawl_root``, in order; none when
+    the root or the log is a symlink or missing. One corrupt line skips that
+    line, never every consumer."""
+    if crawl_root.is_symlink() or not crawl_root.is_dir():
+        return []
+    try:
+        handle = store.open_nofollow(crawl_root / LOG_FILE)
+    except OSError:
+        return []
+    with os.fdopen(handle, "rb") as opened:
+        raw = opened.read()
+    records = []
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
 def crawled_feeds(cache_dir, *, stops=True, name="crawl"):
     """``(feed_dir, state)`` for crawled feeds whose state records stops, or
     with ``stops=False`` for every committed crawl; ``name`` is the crawl
@@ -365,26 +401,8 @@ def crawled_feeds(cache_dir, *, stops=True, name="crawl"):
     if name != "crawl" and not PARKED_CRAWL.fullmatch(name):
         raise ValueError(f"not a crawl directory: {name!r}")
     crawl_root = cache_dir / name
-    if crawl_root.is_symlink() or not crawl_root.is_dir():
-        return []
-    log_path = crawl_root / LOG_FILE
-    try:
-        handle = store.open_nofollow(log_path)
-    except OSError:
-        return []
-    with os.fdopen(handle, "rb") as opened:
-        raw = opened.read()
     found = []
-    for line in raw.split(b"\n"):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            # One corrupt log line skips one feed, never every consumer.
-            continue
-        if not isinstance(record, dict):
-            continue
+    for record in _log_records(crawl_root):
         name = record.get("directory")
         if not isinstance(name, str) or not _CRAWL_DIR.fullmatch(name):
             continue
@@ -402,6 +420,49 @@ def crawled_feeds(cache_dir, *, stops=True, name="crawl"):
         if not stops or "stops.txt" in state["members"]:
             found.append((feed_dir, state))
     return found
+
+
+# A failed read's kinds, as the log records them.
+FAILURES = ("failed", "no_url", "unreadable")
+
+
+def _failure_of(record):
+    """A failed read's kind: its ``failure``, or for a log written before the
+    field, ``no_url``, ``unreadable`` or ``failed`` from its reason."""
+    if record.get("failure") in FAILURES:
+        return record["failure"]
+    reason = record.get("fallback_reason")
+    reason = reason if isinstance(reason, str) else ""
+    if reason == "no download URL":
+        return "no_url"
+    if "an HTML page" in reason or "not a zip" in reason:
+        return "unreadable"
+    return "failed"
+
+
+def unread_cause(status, uncrawlable_reason):
+    """Why the index holds no read of a feed, from its published
+    ``crawl_status`` (``failed``, ``no_url``, ``unreadable``,
+    ``no_gtfs_files``), else its ``uncrawlable_reason``; None for a feed
+    read (``ok``)."""
+    if status == "ok":
+        return None
+    for value in (status, uncrawlable_reason):
+        # A table's missing value may read as NaN.
+        if isinstance(value, str) and value:
+            return value
+    return "no reason recorded"
+
+
+def failures(cache_dir):
+    """``{feed_id: failure}`` from the crawl log, by the id the crawl saw:
+    the kind (:data:`FAILURES`) of each read that was skipped or failed."""
+    return {
+        record["feed_id"]: _failure_of(record)
+        for record in _log_records(cache_dir / "crawl")
+        if isinstance(record.get("feed_id"), str)
+        and record.get("method") in ("failed", "skipped")
+    }
 
 
 def cluster_boxes(points):
@@ -1178,6 +1239,7 @@ def _crawl_from(
     if not url:
         record["method"] = "skipped"
         record["fallback_reason"] = "no download URL"
+        record["failure"] = "no_url"
         return record, None
 
     feed_dir = None
@@ -1399,12 +1461,14 @@ def _crawl_from(
         LookupError,
         TypeError,
         zlib.error,
+        lzma.LZMAError,
         # A member below the byte ceiling can still exhaust memory when
         # buffered; that is this feed's failure, never the run's.
         MemoryError,
     ) as error:
         record["method"] = "failed"
         record["fallback_reason"] = str(error)
+        record["failure"] = "unreadable" if isinstance(error, UNREADABLE) else "failed"
         # The previous crawl still stands in for the feed: give it the
         # identity and source record it predates when its members verify.
         if feed_dir is not None and state and _members_intact(feed_dir, state):
@@ -1436,6 +1500,7 @@ def _safe_crawl_one(fetcher, cache_dir, feed, **options):
             "bytes_fetched": 0,
             "bytes_saved": 0,
             "fallback_reason": f"unexpected error: {error}",
+            "failure": "failed",
             "members": [],
             "files": [],
             "stop_times": None,
