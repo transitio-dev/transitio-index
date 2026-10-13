@@ -300,6 +300,71 @@ ROWS = [
             ("fi-turku", "locality", "Turku"),
         ),
     ),
+    fx.division(
+        "fi-lapland",
+        "FI",
+        "region",
+        wikidata="Q5700",
+        name="Lapland",
+        admin_level=1,
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"), ("fi-lapland", "region", "Lapland")
+        ),
+    ),
+    # Porvoo beside its own QID-less county, which contains it.
+    fx.division(
+        "fi-porvoo-county",
+        "FI",
+        "county",
+        wikidata=None,
+        name="Porvoo",
+        admin_level=2,
+        sources=[
+            {"dataset": "geoBoundaries", "license": "CC-BY-4.0", "record_id": "P"}
+        ],
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-porvoo-county", "county", "Porvoo"),
+        ),
+    ),
+    fx.division(
+        "fi-porvoo",
+        "FI",
+        "locality",
+        wikidata="Q207584",
+        name="Porvoo",
+        admin_level=3,
+        hierarchies=fx.chain(
+            ("fi", "country", "Finland"),
+            ("fi-uusimaa", "region", "Uusimaa"),
+            ("fi-porvoo-county", "county", "Porvoo"),
+            ("fi-porvoo", "locality", "Porvoo"),
+        ),
+    ),
+    # Washington the state and Washington the county.
+    fx.division(
+        "us-wa", "US", "region", wikidata="Q1223", name="Washington", admin_level=1
+    ),
+    fx.division(
+        "us-wa-county",
+        "US",
+        "county",
+        wikidata="Q501157",
+        name="Washington",
+        admin_level=2,
+    ),
+    # The Mexico City region carries the country's name too.
+    fx.division("mx", "MX", "country", wikidata="Q96", name="Mexico"),
+    fx.division(
+        "mx-cdmx",
+        "MX",
+        "region",
+        wikidata="Q1489",
+        name="Ciudad de México",
+        common={"en": "Mexico"},
+        admin_level=1,
+    ),
 ]
 
 
@@ -325,7 +390,7 @@ FEEDS = [
     {"feed_id": "f-nowhere", "mdb": _mdb("US", "Illinois", "Nowheresville")},
     {"feed_id": "f-nolocation", "mdb": _mdb(None, None, None)},
     {"feed_id": "f-subdiv", "mdb": _mdb("FI", "Uusimaa", None)},
-    {"feed_id": "f-vantaa", "mdb": _mdb("FI", "Uusimaa", "Vantaa")},
+    {"feed_id": "f-vantaa", "mdb": _mdb("FI", None, "Vantaa")},
     {"feed_id": "f-abo", "mdb": _mdb("FI", "Uusimaa", "Åbo")},
     {"feed_id": "f-wrongsub", "mdb": _mdb("FI", "Lapland", "Espoo")},
     {"feed_id": "f-country", "mdb": _mdb("SE", None, None)},
@@ -338,6 +403,11 @@ FEEDS = [
     {"feed_id": "f-lahti", "mdb": _mdb("FI", None, "Lahti")},
     {"feed_id": "f-manchester", "mdb": _mdb("GB", None, "Manchester")},
     {"feed_id": "f-uusimaa-muni", "mdb": _mdb("FI", "Uusimaa", "Uusimaa")},
+    {"feed_id": "f-porvoo", "mdb": _mdb("FI", None, "Porvoo")},
+    {"feed_id": "f-leinster", "mdb": _mdb("FI", "Leinster", "Espoo")},
+    {"feed_id": "f-washington", "mdb": _mdb("US", "Washington", None)},
+    {"feed_id": "f-toluca", "mdb": _mdb("MX", "Mexico", "Toluca")},
+    {"feed_id": "f-uusimaa-atlantis", "mdb": _mdb("FI", "Uusimaa", "Atlantis")},
 ]
 
 
@@ -541,13 +611,11 @@ def test_a_municipality_naming_a_district_places_the_feed_there(tmp_path):
         "level": "district",
     }
     assert "district" in coverage.DECLARED_LEVELS  # the coverage stage accepts it
-    # The declared subdivision must corroborate a district too, and a name
+    # The declared subdivision must corroborate a district too: Keski-Uusimaa
+    # declared in Lapland is placed at Lapland, not at the district; a name
     # found at neither level says so.
+    assert by_feed["f-district-wrongsub"]["place_id"] == "Q5700"
     reasons = {r["feed_id"]: r["reason"] for r in report}
-    assert (
-        reasons["f-district-wrongsub"]
-        == "the declared subdivision matches no same-name division"
-    )
     assert (
         reasons["f-atlantis"]
         == "no locality or district of that name in the declared country"
@@ -573,18 +641,48 @@ def test_a_name_shared_by_a_city_and_its_own_district_is_the_city(tmp_path):
     assert manchester["parent_id"] == "overture:gb-man-county"
     assert "f-manchester" not in reasons
     # A municipality field naming the region, beside a QID-less hamlet of that
-    # name, is reported rather than placed at the hamlet; the declared
-    # subdivision corroborates the region by its own name.
-    assert reasons["f-uusimaa-muni"] == "the name also matches a division without a QID"
+    # name, is never placed at the hamlet: it falls back to the declared
+    # region.
+    assert "f-uusimaa-muni" not in reasons
     assert "overture:fi-uusimaa-x" not in places
 
 
-def test_a_lone_city_in_the_wrong_subdivision_is_reported(tmp_path):
+def test_a_lone_city_in_the_wrong_subdivision_falls_back_to_it(tmp_path):
     # Espoo is unique, but the feed declares it in Lapland, not Uusimaa; the
-    # subdivision must corroborate even a unique match, so it is reported.
+    # subdivision must corroborate even a unique match, so the feed takes its
+    # declared subdivision instead.
     _, _, report = _seed(tmp_path)
-    entry = next(r for r in report if r["feed_id"] == "f-wrongsub")
-    assert entry["reason"] == "the declared subdivision matches no same-name division"
+    assert "f-wrongsub" not in {r["feed_id"] for r in report}
+    placements, _ = store.read_jsonl(
+        tmp_path / "cache" / "gazetteer", "seed.json", "feed_places.jsonl"
+    )
+    by_feed = {p["feed_id"]: (p["place_id"], p["level"]) for p in placements}
+    assert by_feed["f-wrongsub"] == ("Q5700", "subdivision")
+    assert by_feed["f-uusimaa-muni"] == ("Q1508", "subdivision")
+
+
+def test_the_placement_rules_recover_declared_locations(tmp_path):
+    """1,380 MDB rows declaring a municipality were unplaced: a city beside a
+    same-name county (Saitama, Barcelona), a subdivision no division of the
+    country carries (Leinster), "Washington" matching the state and a county,
+    and a municipality matching nothing beside a usable subdivision."""
+    manifest, _, report = _seed(tmp_path)
+    placements, _ = store.read_jsonl(
+        tmp_path / "cache" / "gazetteer", "seed.json", "feed_places.jsonl"
+    )
+    by_feed = {p["feed_id"]: (p["place_id"], p["level"]) for p in placements}
+    assert by_feed["f-porvoo"] == ("Q207584", "municipality")
+    assert by_feed["f-leinster"] == ("Q13291", "municipality")
+    assert by_feed["f-washington"] == ("Q1223", "subdivision")
+    # A municipality matching nothing takes its declared subdivision.
+    assert by_feed["f-uusimaa-atlantis"] == ("Q1508", "subdivision")
+    # "Mexico" names the country: Toluca stays unplaced, not in Mexico City.
+    reasons = {r["feed_id"]: r["reason"] for r in report}
+    assert "f-toluca" not in by_feed
+    assert reasons["f-toluca"] == (
+        "no locality or district of that name in the declared country"
+    )
+    assert manifest["placed_at_subdivision_fallback"] == 4
 
 
 def test_a_subdivision_only_feed_places_its_region(tmp_path):

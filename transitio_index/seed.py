@@ -364,6 +364,36 @@ def _lookup(index, country, name):
     return list(seen.values())
 
 
+def _names_country(name, country):
+    """Whether ``name`` is a name of the ``country`` division (None: no)."""
+    return country is not None and _norm(name) in _name_variants(country)
+
+
+def _regions(index, country, name):
+    """The regions and counties named ``name`` in ``country``, the regions
+    alone when there are any: "Washington" is the state, not the county."""
+    found = _lookup(index, country, name)
+    top = [record for record in found if record.get("subtype") == "region"]
+    return top or found
+
+
+def _city_over_district(cities, districts):
+    """The one QID-bearing city the ``cities`` agree on when every same-name
+    district in ``districts`` contains it or shares its QID (Barcelona in its
+    province), else None: a QID-less hamlet named like its region is not the
+    region's city."""
+    city, _ = _unique_identity(cities)
+    if city is None or not city["qid"]:
+        return None
+    inside = {ancestor.get("overture_id") for ancestor in city.get("ancestors", [])}
+    if all(
+        d["overture_id"] in inside or (d["qid"] and d["qid"] == city["qid"])
+        for d in districts
+    ):
+        return city
+    return None
+
+
 def match(
     index, country, subdivision, municipality, skeleton, what="locality", districts=None
 ):
@@ -375,18 +405,23 @@ def match(
     districts and regions join the candidates: a QID a city shares with its own
     district marks the principal place (see ``_unique_identity``), and a
     municipality field naming a region beside a same-name hamlet is reported
-    rather than placed at the hamlet.
+    rather than placed at the hamlet. When they give no single identity, the
+    city still wins if the city-level candidates give one and every
+    same-name district of the country contains it (``_city_over_district``).
 
     A declared subdivision must corroborate the match: it is required to name
     one of the candidate's region/county ancestors — or the candidate itself,
     for a region — so a lone same-name city in a different subdivision is
-    reported rather than accepted.
+    rejected rather than accepted (the caller then falls back to the declared
+    subdivision).
     """
     candidates = _lookup(index, country, municipality)
     if not candidates:
         return None, f"no {what} of that name in the declared country"
+    same_name = []
     if districts is not None:
-        candidates += _lookup(districts, country, municipality)
+        same_name = _lookup(districts, country, municipality)
+        candidates += same_name
     if subdivision:
         folded = _norm(subdivision)
         narrowed = [
@@ -398,7 +433,13 @@ def match(
         if not narrowed:
             return None, "the declared subdivision matches no same-name division"
         candidates = narrowed
-    return _unique_identity(candidates)
+    found, why = _unique_identity(candidates)
+    if found is None and same_name:
+        cities = [c for c in candidates if c["subtype"] in CITY_SUBTYPES]
+        city = _city_over_district(cities, same_name) if cities else None
+        if city is not None:
+            return city, None
+    return found, why
 
 
 def place_key(record):
@@ -1099,7 +1140,9 @@ def resolve_seed(
     when no locality carries the name, to a skeleton region or county, placed at
     level ``district`` — (its subdivision to a region, or its country to a
     country, when no finer level is declared), and emits that place with its
-    administrative ancestors; unmatched feeds go to ``seed_report.jsonl``. The
+    administrative ancestors. A municipality that places nothing falls back
+    to the declared subdivision, unless the subdivision's name is a name of
+    the country too ("Mexico"); unmatched feeds go to ``seed_report.jsonl``. The
     capitals and the cities of at least ``ucdb.MIN_POPULATION`` people in
     ``seed_countries`` (codes the skeleton has a country for) are seeded too,
     from the GHS-UCDB centres ``prepare_centres`` matches (``ucdb_pins`` the
@@ -1164,19 +1207,25 @@ def resolve_seed(
     places = {}
     report = []
     placements = []
+    fell_back = set()
     for location in progress(locations, "seed"):
+        country, subdivision = location["country"], location["subdivision"]
         if location["municipality"]:
+            # A subdivision naming no region or county of the country cannot
+            # corroborate a match ("Leinster"): the match runs without it.
+            known = subdivision and _lookup(region_index, country, subdivision)
+            corroborating = subdivision if known else None
             level = "municipality"
             division, reason = match(
                 city_index,
-                location["country"],
-                location["subdivision"],
+                country,
+                corroborating,
                 location["municipality"],
                 skeleton,
                 districts=region_index,
             )
             if division is None and not _lookup(
-                city_index, location["country"], location["municipality"]
+                city_index, country, location["municipality"]
             ):
                 # A municipality no locality is named by may name a district
                 # or region the skeleton resolved — "Augsburg (district)",
@@ -1184,17 +1233,29 @@ def resolve_seed(
                 level = "district"
                 division, reason = match(
                     region_index,
-                    location["country"],
-                    location["subdivision"],
+                    country,
+                    corroborating,
                     location["municipality"],
                     skeleton,
                     what="locality or district",
                 )
-        elif location["subdivision"]:
+            if (
+                division is None
+                and known
+                and not _names_country(subdivision, country_index.get(country))
+            ):
+                # The municipality placed nothing: the feed takes its declared
+                # subdivision — unless that names the country too, as MDB's
+                # "Mexico" for Toluca matches only the Mexico City region.
+                fallback, _ = _unique_identity(
+                    _regions(region_index, country, subdivision)
+                )
+                if fallback is not None:
+                    level, division = "subdivision", fallback
+                    fell_back.add(location["feed_id"])
+        elif subdivision:
             level = "subdivision"
-            regions = _lookup(
-                region_index, location["country"], location["subdivision"]
-            )
+            regions = _regions(region_index, country, subdivision)
             if regions:
                 division, reason = _unique_identity(regions)
             else:
@@ -1204,7 +1265,7 @@ def resolve_seed(
                 )
         else:
             level = "country"
-            division = country_index.get(location["country"])
+            division = country_index.get(country)
             reason = None if division else "no country division for the declared code"
         if division is None:
             report.append(
@@ -1280,6 +1341,10 @@ def resolve_seed(
         "crosswalk_generation": crosswalk_manifest.get("generation"),
         "feeds_with_location": len(locations),
         "feeds_placed": len(placements),
+        # Over the placements kept: a registry conflict drops its place.
+        "placed_at_subdivision_fallback": sum(
+            1 for p in placements if p["feed_id"] in fell_back
+        ),
         "places": len(places),
         "reported": len(report),
         "seed_countries": sorted(seed_countries),
