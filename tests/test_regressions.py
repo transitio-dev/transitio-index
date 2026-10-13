@@ -1553,7 +1553,7 @@ def test_a_padded_member_reads_as_the_clean_one(read, members):
     assert read(*(io.BytesIO(_padded(m)) for m in members)) == clean
     if members[0] == _CALENDAR:
         weights = classify._calendar_weights(clean, {"t1": "s1"})
-        assert weights == {"s1": pytest.approx(12 / 13)}
+        assert weights == {"s1": pytest.approx(1.0)}
         assert [d.isoformat() for d in clean.span] == ["2026-09-29", "2026-10-11"]
 
 
@@ -2544,3 +2544,24 @@ def test_a_stop_at_zero_zero_is_left_out_of_the_measures(tmp_path):
     _, covered, _ = ct._cover(tmp_path, crawls={"f-city": rows}, lookup=ct.LOOKUP)
     hull = shapely.from_wkb(bytes.fromhex(covered["f-city"]["coverage"]))
     assert hull.bounds[0] == 10.0 and covered["f-city"]["stop_count"] == 3
+
+
+def test_departures_a_day_are_a_working_days(tmp_path):
+    """Departures a day averaged every day of a period set by the whole feed,
+    weekends and holidays included, so Barcelona's ATM feed counted 49 % and
+    TMB 86 % of a real Wednesday's stop events."""
+    import io
+
+    calendar = classify._read_calendar(
+        io.BytesIO(
+            b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            b"sunday,start_date,end_date\n"
+            b"wk,1,1,1,1,1,0,0,20260901,20260930\n"
+            b"wkend,0,0,0,0,0,1,1,20260901,20260930\n"
+            b"long,1,1,1,1,1,1,1,20260101,20261231\n"
+        ),
+        None,
+    )
+    trips = {f"w{i}": "wk" for i in range(10)} | {"s1": "wkend", "s2": "wkend"}
+    weights = classify._calendar_weights(calendar, trips | {"l1": "long"})
+    assert weights == {"long": 1.0, "wk": 1.0, "wkend": 0.0}

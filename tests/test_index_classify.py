@@ -1108,12 +1108,16 @@ def test_calendar_days_are_counted_not_walked():
     )
     calendar = classify._read_calendar(calendar, dates)
     assert calendar.span == (datetime.date(1, 1, 1), datetime.date(9999, 12, 31))
-    # Every day runs a trip, so the period covered is the whole calendar, as
-    # it is when no day runs one.
-    days = 3652059
-    expected = {"all": 1.0, "wk": 10 / days, "lone": 1 / days}
-    for trips in ({"t1": "all", "t2": "wk", "t3": "lone"}, {}):
-        assert classify._calendar_weights(calendar, trips) == pytest.approx(expected)
+    # The busiest week starts on Monday 31 August: each service weighs the
+    # share of its five weekdays it runs. Without a trip no weekday runs
+    # one, and the first week's seven days are averaged.
+    trips = {"t1": "all", "t2": "wk", "t3": "lone"}
+    assert classify._calendar_weights(calendar, trips) == pytest.approx(
+        {"all": 1.0, "wk": 4 / 5, "lone": 1 / 5}
+    )
+    assert classify._calendar_weights(calendar, {}) == pytest.approx(
+        {"all": 1.0, "wk": 0.0, "lone": 0.0}
+    )
 
 
 def test_the_service_span_is_the_effective_first_and_last_date():
@@ -1296,9 +1300,10 @@ def test_a_curated_boundary_places_the_stops_inside_it(tmp_path):
 
 
 def test_departures_per_day_are_weighted_by_the_calendar(tmp_path):
-    # Two weeks: a weekday service minus one removed day (9 dates) and a
-    # Sunday service plus one added date (3 dates); each trip visits both
-    # stops once, so the place sees 2 * (9 + 3) / 14 stop-events a day.
+    # A weekday service minus one removed Monday and a Sunday service plus
+    # one added Tuesday: the busiest week, from Monday 31 August, runs the
+    # weekday trip on four weekdays and the Sunday trip on the added one;
+    # each trip visits both stops once: 2 * 5 / 5 stop-events a weekday.
     cache = tmp_path / "cache"
     feeds = [
         {"feed_id": "f-cal", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
@@ -1332,7 +1337,7 @@ def test_departures_per_day_are_weighted_by_the_calendar(tmp_path):
     assert edge["service"] == {
         "stops": 2,
         "routes": 1,
-        "departures_per_day": pytest.approx(24 / 14),
+        "departures_per_day": pytest.approx(2.0),
     }
     # The feed carries the span the same calendar gives: the added Sunday
     # opens it, the last weekday closes it.

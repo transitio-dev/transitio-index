@@ -27,9 +27,10 @@ the edge keeps its membership and the coverage stage's service level — not
 knowing a route's tier says nothing about whether the feed serves the place.
 Every tier edge of a ``(place, feed)`` pair carries the same ``service``
 struct: the pair's scheduled stops and serving routes in the place, and its
-stop-events per day when the calendar was crawled, averaged over the period
-the timetable covers: from the first to the last date running at least
-``COVERED_SHARE`` of the busiest day's trips, quieter days inside it included.
+stop-events a day when the calendar was crawled: the Monday-to-Friday
+average of the timetable's busiest week (the Monday-to-Sunday week running
+the most trips), or the average of all its seven days when that week runs no
+weekday trip.
 Selectors and fingerprints are decided here, from the same evidence. A
 route-level feed gives each tier edge a ``complete`` selector — exactly the
 route ids that serve the place at that tier — and a ``route_stops``
@@ -123,9 +124,10 @@ SPAN_MAX_STOPS = 2048
 # deterministic sample of trips (PATTERN_SAMPLE per distinct length, for
 # the PATTERN_SAMPLE longest lengths).
 PATTERN_SAMPLE = 8
-# A timetable covers the dates from the first to the last running at least
-# this share of its busiest day's trips; departures per day average over them.
-COVERED_SHARE = 0.25
+# How departures a day are averaged: 1 over every day from the first to the
+# last running a quarter of the busiest day's trips; 2 over the weekdays of
+# the busiest week.
+DEPARTURES_VERSION = 2
 # The decision table's version: bumped whenever a rule, a range or the way a
 # signal feeds a rule changes, so two snapshots' tiers can be told apart from
 # their manifests alone. 1 was the table shipped in schemas 6–9; 2 decides
@@ -183,7 +185,7 @@ def classifier_settings(route_min_stops=ROUTE_MIN_STOPS):
         "bus_regional_span_km": BUS_REGIONAL_SPAN_KM,
         "span_max_stops": SPAN_MAX_STOPS,
         "pattern_sample": PATTERN_SAMPLE,
-        "covered_share": COVERED_SHARE,
+        "departures_version": DEPARTURES_VERSION,
     }
 
 
@@ -429,10 +431,10 @@ def _read_trips(opened, routes):
 Calendar = collections.namedtuple("Calendar", ["windows", "added", "removed", "span"])
 # A calendar over day numbers counted from its first date: per service its
 # window bounds (0 and -1 without one) and weekday flags indexed by day number
-# modulo 7, and every exception that changes whether it runs as
-# ``(service, day, delta)`` arrays.
+# modulo 7, every exception that changes whether it runs as
+# ``(service, day, delta)`` arrays, and the weekday of day 0 (Monday 0).
 _Days = collections.namedtuple(
-    "_Days", ["services", "start", "end", "flags", "exceptions", "length"]
+    "_Days", ["services", "start", "end", "flags", "exceptions", "length", "weekday"]
 )
 
 
@@ -547,7 +549,15 @@ def _calendar_days(calendar):
         np.concatenate([a_day[plus], r_day[minus]]),
         np.repeat([1.0, -1.0], [plus.sum(), minus.sum()]),
     )
-    return _Days(services, start, end, flags, exceptions, int(bounds.max()) - first + 1)
+    return _Days(
+        services,
+        start,
+        end,
+        flags,
+        exceptions,
+        int(bounds.max()) - first + 1,
+        datetime.date.fromordinal(first).weekday(),
+    )
 
 
 def _weeks(low, high, offset):
@@ -556,14 +566,10 @@ def _weeks(low, high, offset):
     return -((offset - low) // 7), (high - offset) // 7
 
 
-def _covered_period(days, trips):
-    """``(first, last)``: the first and last day number running at least
-    ``COVERED_SHARE`` of the busiest day's trips, ``trips`` holding the trip
-    count of each of ``days.services``; every day when none runs a trip.
-
-    The trips per day are one dense array: each weekday's days are a stride
-    of it, filled by a cumulative sum over the windows' bounds.
-    """
+def _daily_trips(days, trips):
+    """The trips each day number runs, ``trips`` holding the trip count of
+    each of ``days.services``: one dense array, each weekday's days a stride
+    of it, filled by a cumulative sum over the windows' bounds."""
     daily = np.zeros(days.length)
     for offset in range(7):
         on = days.flags[:, offset]
@@ -576,11 +582,7 @@ def _covered_period(days, trips):
         stride += np.cumsum(steps)[:-1]
     service, day, delta = days.exceptions
     daily += np.bincount(day, delta * trips[service], days.length)
-    peak = daily.max()
-    if peak <= 0:
-        return 0, days.length - 1
-    covered = np.flatnonzero(daily >= COVERED_SHARE * peak)
-    return int(covered[0]), int(covered[-1])
+    return daily
 
 
 def _running(window, removed, step):
@@ -626,7 +628,8 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     different patterns of the very same length can still compete for that
     length's slots — a bounded approximation, never unbounded memory.
 
-    ``weights`` maps a service id to its share of the covered days; with it,
+    ``weights`` maps a service id to its share of the averaged days (see
+    :func:`_calendar_weights`); with it,
     every scheduled stop-event adds that share to its stop's departures per
     day as the row streams by, one float per stop — the fourth result, or
     None without a calendar. The fifth result is every served stop id the
@@ -801,26 +804,33 @@ def _calendar(feed_dir, state):
 
 
 def _calendar_weights(calendar, trip_services):
-    """``{service_id: share of the covered days it runs}`` from a read
-    calendar, the period found by :func:`_covered_period` from the trips per
-    service in ``trip_services``; None without a calendar or a date, so no
-    departure count can be measured."""
+    """``{service_id: share of the averaged days it runs}`` from a read
+    calendar, the trips per service in ``trip_services``; None without a
+    calendar or a date, so no departure count can be measured.
+
+    The averaged days are the weekdays of the busiest week — the
+    Monday-to-Sunday week running the most trips, the earliest of equals —
+    so a stop's departures a day are a working day's; a week without a
+    weekday trip averages all its seven days."""
     days = None if calendar is None else _calendar_days(calendar)
     if days is None:
         return None
     per_service = collections.Counter(trip_services.values())
     trips = np.array([per_service[s] for s in days.services], float)
-    first, last = _covered_period(days, trips)
-    low, high = np.maximum(days.start, first), np.minimum(days.end, last)
+    daily = _daily_trips(days, trips)
+    numbers = np.arange(days.length)
+    week = (days.weekday + numbers) // 7
+    busiest = int(np.argmax(np.bincount(week, daily)))
+    chosen = numbers[week == busiest]
+    weekdays = chosen[(days.weekday + chosen) % 7 < 5]
+    averaged, width = (weekdays, 5) if daily[weekdays].sum() > 0 else (chosen, 7)
     count = np.zeros(len(days.services))
-    for offset in range(7):
-        first_week, last_week = _weeks(low, high, offset)
-        weeks = np.maximum(last_week - first_week + 1, 0)
-        count += days.flags[:, offset] * weeks
+    for day in averaged:
+        count += (days.start <= day) & (day <= days.end) & days.flags[:, day % 7]
     service, day, delta = days.exceptions
-    inside = (first <= day) & (day <= last)
+    inside = np.isin(day, averaged)
     count += np.bincount(service[inside], delta[inside], len(days.services))
-    return dict(zip(days.services, (count / (last - first + 1)).tolist()))
+    return dict(zip(days.services, (count / width).tolist()))
 
 
 def _service_span(calendar):
