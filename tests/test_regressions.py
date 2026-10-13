@@ -2443,3 +2443,40 @@ def test_a_geohash_alone_does_not_pair_two_feeds_of_one_host():
     )
     assert summary["geohash_pairs"] == 0
     assert {record["feed_id"] for record in records} == {feed_id, "f-mdb-2638"}
+
+
+def test_a_places_only_stale_feed_of_a_mode_keeps_its_share():
+    """A feed stale when indexed scored 0 and left its place's totals even
+    where it was the only feed of its mode, so a city whose only rail or only
+    feed was stale showed none of that service."""
+    from transitio_index import rank
+
+    def edge(feed_id, place_id, departures, modes, stale):
+        evidence = {"share_of_feed": 0.5}
+        if modes:
+            evidence["overlap"] = {"departures": dict.fromkeys(modes, departures)}
+        if stale:
+            evidence["stale_when_indexed"] = "2025-01-01"
+        return {
+            "feed_id": feed_id,
+            "place_id": place_id,
+            "tier": "local",
+            "service": {"stops": 5, "routes": 1, "departures_per_day": departures},
+            "evidence": evidence,
+        }
+
+    places = {p: {"place_id": p, "kind": "city", "country_code": "FI"} for p in "pq"}
+    scored, _, _ = rank.score_edges(
+        [
+            edge("bus", "p", 60.0, ["bus"], False),
+            edge("old-bus", "p", 40.0, ["bus"], True),
+            edge("rail", "p", 40.0, ["rail"], True),
+            # No mode evidence: kept only where no fresh feed serves the place.
+            edge("old", "q", 10.0, [], True),
+        ],
+        places,
+    )
+    share = {e["feed_id"]: e["evidence"]["share_of_place"] for e in scored}
+    assert share == {"bus": 0.6, "old-bus": 0.0, "rail": 0.4, "old": 1.0}
+    relevance = {e["feed_id"]: e["relevance"] for e in scored}
+    assert relevance["old-bus"] == 0.0 and relevance["rail"] > 0.0

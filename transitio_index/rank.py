@@ -16,13 +16,17 @@ once and each of its edges gets that score. For city, metro and region places
 of the place lacks a crawled calendar — one basis per place, recorded as
 ``share_basis``) over the place total; ``share_of_feed`` is the pair's stops
 over the feed's stops in its home country when the feed is domestic (in all
-its countries otherwise). For country places ``share_of_feed`` is replaced by breadth: the
-cities the feed serves in the country over all served cities there. A feed
-stale when indexed — its ``service_end`` more than ``STALE_DAYS`` before its
-``last_crawled`` — scores 0 on every edge, so it sorts last in its category
-with its tier and category unchanged; the edge's evidence records that
-``service_end`` as ``stale_when_indexed``, and its pairs stay out of the
-place totals with a ``share_of_place`` of 0. The weights live here and nothing
+its countries otherwise). For country places ``share_of_feed`` is replaced by
+breadth: the cities the feed serves in the country over all served cities
+there. A feed stale when indexed — its ``service_end`` more than
+``STALE_DAYS`` before its ``last_crawled`` — has that ``service_end``
+recorded as ``stale_when_indexed`` in its edges' evidence. A stale pair is
+set aside — it scores 0, so it sorts last in its category with its tier and
+category unchanged, and stays out of the place totals with a
+``share_of_place`` of 0 — unless it runs a mode no fresh pair of its place
+runs (its overlap evidence names the modes), or, without mode evidence, its
+place has no fresh pair: the place's only feed of a mode keeps its share.
+The weights live here and nothing
 else in the pipeline reads them; the merge rescores merged edges through
 :func:`score_edges`, the half of the scoring that depends on the place.
 """
@@ -167,19 +171,22 @@ def score_edges(edges, places):
     ``relevance_category``, ``relevance`` and ``needs_review``. A city, metro
     or region edge without ``share_of_feed`` scores 0 for it and carries the
     ``no_share_of_feed`` note unless it has a note; ``unscored`` counts them.
-    A stale pair (:func:`is_stale`) has a ``share_of_place`` of 0 and counts
-    toward neither its place's total nor, while the place has a pair that is
-    not stale, its basis.
+    A stale pair (:func:`is_stale`) set aside by :func:`_set_aside` has a
+    ``share_of_place`` of 0 and counts toward neither its place's total nor,
+    while the place has a pair that is not set aside, its basis.
     """
-    pairs, stale = {}, set()
+    pairs, stale, modes = {}, set(), collections.defaultdict(set)
     for edge in edges:
         key = (edge["feed_id"], edge["place_id"])
         pairs.setdefault(key, edge.get("service") or {})
+        overlap = (edge.get("evidence") or {}).get("overlap") or {}
+        modes[key].update(overlap.get("departures") or ())
         if is_stale(edge):
             stale.add(key)
     by_place = collections.defaultdict(list)
     for key in pairs:
         by_place[key[1]].append(key)
+    stale = _set_aside(by_place, stale, modes)
     basis, totals = {}, {}
     for place_id, keys in by_place.items():
         fresh = [k for k in keys if k not in stale]
@@ -242,6 +249,23 @@ def score_edges(edges, places):
             }
         )
     return scored, basis, unscored
+
+
+def _set_aside(by_place, stale, modes):
+    """The stale pairs that score 0: all but those running a mode in
+    ``modes`` that no fresh pair of their place runs, or, without modes, at a
+    place with no fresh pair."""
+    aside = set()
+    for keys in by_place.values():
+        fresh = [key for key in keys if key not in stale]
+        fresh_modes = set().union(*(modes[key] for key in fresh))
+        for key in keys:
+            if key not in stale:
+                continue
+            alone = modes[key] - fresh_modes if modes[key] else not fresh
+            if not alone:
+                aside.add(key)
+    return aside
 
 
 def _quantiles(values):

@@ -86,7 +86,8 @@ OVERRIDE_FIELDS = (
 # 17: schema 12, boundaries and edge details in tables of their own, zstd.
 # 18: a feed without a home gets the country with the most of its stops,
 # else its one declared country, and each edge's cross_border follows.
-MERGE_FORMAT = 18
+# 19: a place's only stale feed of a mode keeps its share.
+MERGE_FORMAT = 19
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
