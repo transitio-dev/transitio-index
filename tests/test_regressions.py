@@ -2527,3 +2527,20 @@ def test_the_merge_measures_overlap_across_builds():
     # The route rows do not ship; an edge without them keeps its block.
     assert not any("overlap_routes" in e for e in found)
     assert found[2]["overlap"] == old
+
+
+def test_a_stop_at_zero_zero_is_left_out_of_the_measures(tmp_path):
+    """57 feeds place stops at exactly (0, 0), a stand-in for a missing
+    position, which stretched routes past 5,000 km (BreizhGo's TER routes
+    rated national) and coverage hulls to the Gulf of Guinea."""
+    near, far, zero = (10.0, 1.0), (10.1, 1.0), (0.0, 0.0)
+    coords = {"a": near, "b": far, "z": zero}
+    span, median, count = classify._route_geography(
+        {"a", "b", "z"}, [("a", "b", "z")], coords
+    )
+    leg = classify.haversine_km(near, far)
+    assert (span, median, count) == (pytest.approx(leg), pytest.approx(leg), 3)
+    rows = ["s1,1.0,10.0\n", "s2,1.0,10.1\n", "s0,0.0,0.0\n"]
+    _, covered, _ = ct._cover(tmp_path, crawls={"f-city": rows}, lookup=ct.LOOKUP)
+    hull = shapely.from_wkb(bytes.fromhex(covered["f-city"]["coverage"]))
+    assert hull.bounds[0] == 10.0 and covered["f-city"]["stop_count"] == 3

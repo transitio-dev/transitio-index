@@ -686,6 +686,8 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
             crawl_fields[feed_id] = {"crawl_status": "state_mismatch"}
             continue
         points, dropped = read
+        # The hull leaves out stops at a placeholder position.
+        placed = [p for p in points if p != crawl.PLACEHOLDER_POSITION]
         superseded.add(feed_id)
         # The schema's crawl bookkeeping, from the state that verified the
         # evidence: measured hull, stop count, validators, retrieval time.
@@ -695,7 +697,7 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
         own = state.get("url") == urls.get(feed_id)
         crawl_fields[feed_id] = {
             "stop_count": len(points) + dropped,
-            "coverage": (shapely.to_wkb(_stop_hull(points)).hex() if points else None),
+            "coverage": (shapely.to_wkb(_stop_hull(placed)).hex() if placed else None),
             "etag": state.get("etag") if own else None,
             "last_modified": state.get("last_modified") if own else None,
             "last_crawled": state.get("retrieved_at"),

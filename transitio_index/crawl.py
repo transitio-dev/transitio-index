@@ -215,6 +215,11 @@ def member_rows(opened):
         text.detach()
 
 
+# A stop at exactly (0, 0) stands in for a position the feed lacks: it stays
+# in the stops the fingerprint reads, and is left out of every measure.
+PLACEHOLDER_POSITION = (0.0, 0.0)
+
+
 def stop_rows(source):
     """``(rows, dropped)`` parsed from ``stops.txt`` bytes or a binary file.
 

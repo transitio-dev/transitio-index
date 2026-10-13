@@ -131,8 +131,9 @@ COVERED_SHARE = 0.25
 # their manifests alone. 1 was the table shipped in schemas 6–9; 2 decides
 # extended types by family, covers basic types 5–7, 11 and 12, and marks air,
 # taxi and miscellaneous services unclassifiable (rule 10); 3 gates rule 1 on
-# the border share and records every route's scale.
-RULES_VERSION = 3
+# the border share and records every route's scale; 4 leaves stops at the
+# placeholder position out of a route's span and spacing.
+RULES_VERSION = 4
 
 # Basic modes over GTFS route types, the reader's table: railway 100s and
 # suburban railway 300s are rail; urban railway 400s, metro 500s,
@@ -747,28 +748,33 @@ def _route_geography(stop_ids, sequences, coords):
 
     ``stop_count`` is every distinct stop the route lists — the service
     denominator — while the geometry is a missing signal (``None``) unless
-    EVERY stop has usable coordinates: a span or median over a subset would
-    be presented as complete when it is not.
+    every stop has usable coordinates: a span or median over a subset would
+    be presented as complete when it is not. A stop at the placeholder
+    position (``crawl.PLACEHOLDER_POSITION``) has none to give and is left
+    out of the span, and its legs out of the median.
     """
-    points = [coords[s] for s in stop_ids if s in coords]
-    if not points or len(points) < len(stop_ids):
+    held = {s for s in stop_ids if coords.get(s) == crawl.PLACEHOLDER_POSITION}
+    points = [coords[s] for s in stop_ids if s in coords and s not in held]
+    if not points or len(points) < len(stop_ids) - len(held):
         return None, None, len(stop_ids)
     span = _span_km(points)
     if span is None:
         # Unmeasurable geometry: every geography-dependent rule must skip.
-        return None, None, len(points)
+        return None, None, len(stop_ids)
     if any(s not in coords for sequence in sequences for s in sequence):
         # A pattern stop without coordinates — a traversal-only stop sits in
         # the patterns but not the scheduled set — would leave the legs a
         # subset presented as complete: no median.
-        return span, None, len(points)
+        return span, None, len(stop_ids)
     legs = [
         haversine_km(coords[a], coords[b])
         for sequence in sequences
         for a, b in zip(sequence, sequence[1:])
+        if coords[a] != crawl.PLACEHOLDER_POSITION
+        and coords[b] != crawl.PLACEHOLDER_POSITION
     ]
     median = statistics.median(legs) if legs else None
-    return span, median, len(points)
+    return span, median, len(stop_ids)
 
 
 def _calendar(feed_dir, state):
@@ -1032,6 +1038,10 @@ def _tier_edges(
         evidence = dict(candidate.get("evidence") or {})
         if border:
             evidence["border_stops"] = dict(sorted(border.items()))
+        # Stops at the placeholder position, left out of the routes' spans.
+        held = sum(item.get("placeholder_stops", 0) for item in items)
+        if held:
+            evidence["placeholder_stops"] = held
         evidence.update(
             {
                 "matched_route_types": sorted(t for t in types if t < 100),
@@ -1483,6 +1493,9 @@ def _classify_feed(
             "span_km": span,
             "median_km": median,
             "stop_count": count,
+            "placeholder_stops": sum(
+                coords.get(s) == crawl.PLACEHOLDER_POSITION for s in stop_ids
+            ),
             "place_stops": place_stops,
         }
     # The fingerprint describes the feed, not the place: one digest over
