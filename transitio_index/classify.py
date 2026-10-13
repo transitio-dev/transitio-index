@@ -68,9 +68,11 @@ trips of a route-level feed, or null whenever the counts are empty.
 import collections
 import contextlib
 import datetime
+import functools
 import heapq
 import json
 import os
+import pathlib
 import stat
 import math
 import statistics
@@ -78,7 +80,7 @@ import statistics
 import numpy as np
 
 from transitio.index import fingerprint
-from transitio_index import coverage, crawl, overrides, store
+from transitio_index import coverage, crawl, csv_source, overrides, store
 from transitio_index.crosswalk import declared_countries
 from transitio_index.progress import progress
 
@@ -137,6 +139,13 @@ DEPARTURES_VERSION = 2
 # placeholder position out of a route's span and spacing.
 RULES_VERSION = 4
 
+# The route-span reference (written by ``scripts/route_span_reference.py``):
+# per home country and basic mode, the 90th percentile of the spans of the
+# distinct routes in km; a country with fewer than ``MIN_REFERENCE_ROUTES``
+# of a mode has no row, and ``*`` stands for every country.
+REFERENCE_TABLE = pathlib.Path(__file__).with_name("route_span_reference.csv")
+REFERENCE_COLUMNS = ("country", "mode", "routes", "p90_km")
+MIN_REFERENCE_ROUTES = 100
 # Basic modes over GTFS route types, the reader's table: railway 100s and
 # suburban railway 300s are rail; urban railway 400s, metro 500s,
 # underground 600s and monorail join subway; coach 200s, bus 700s and
@@ -347,6 +356,16 @@ def route_serves(stops_in_place, route_stops, *, route_min_stops=ROUTE_MIN_STOPS
     """Whether a route with ``route_stops`` stops serves a place holding
     ``stops_in_place`` of its scheduled stops."""
     return route_stops > 0 and stops_in_place >= route_min_stops
+
+
+@functools.cache
+def route_span_reference():
+    """``{(country, mode): 90th percentile span in km}`` from the reference
+    table, its ``#`` comment lines skipped; ``*`` stands for every country."""
+    lines = REFERENCE_TABLE.read_text(encoding="utf-8").splitlines(keepends=True)
+    text = "".join(line for line in lines if not line.startswith("#"))
+    rows = csv_source.read_rows(text, REFERENCE_COLUMNS)
+    return {(row["country"], row["mode"]): float(row["p90_km"]) for row in rows}
 
 
 def basic_mode(route_type):

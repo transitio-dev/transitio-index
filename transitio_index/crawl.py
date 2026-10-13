@@ -98,6 +98,8 @@ PAD_DEG = 0.05
 # The only directory shape the crawl produces; anything else in the log is
 # refused rather than joined into a path.
 _CRAWL_DIR = re.compile(r"\Aid-[0-9a-f]{64}\Z")
+# A crawl directory parked after its run, which no crawl writes again.
+PARKED_CRAWL = re.compile(r"\Acrawl\.[A-Za-z0-9_-]+\.bak\Z")
 
 # What a corrupt crawled member can raise while being read as evidence; a
 # programming defect is deliberately NOT in this tuple, so it surfaces.
@@ -349,16 +351,20 @@ def reading(cache_dir):
         directory.close()
 
 
-def crawled_feeds(cache_dir, *, stops=True):
+def crawled_feeds(cache_dir, *, stops=True, name="crawl"):
     """``(feed_dir, state)`` for crawled feeds whose state records stops, or
-    with ``stops=False`` for every committed crawl.
+    with ``stops=False`` for every committed crawl; ``name`` is the crawl
+    directory under ``cache_dir``, ``crawl`` or a parked crawl
+    (:data:`PARKED_CRAWL`).
 
     The per-feed ``state.json`` is the crawl's commit point, so it — not the
     run-level log alone — decides what may be read as evidence. Every path
     component is refused when symlinked, and one corrupt log line or state
     skips one feed, never the caller's run.
     """
-    crawl_root = cache_dir / "crawl"
+    if name != "crawl" and not PARKED_CRAWL.fullmatch(name):
+        raise ValueError(f"not a crawl directory: {name!r}")
+    crawl_root = cache_dir / name
     if crawl_root.is_symlink() or not crawl_root.is_dir():
         return []
     log_path = crawl_root / LOG_FILE

@@ -361,6 +361,12 @@ def test_a_corrupt_log_line_or_state_shape_skips_only_that_feed(tmp_path):
         + "\n"
     )
     assert [d for d, _ in crawl.crawled_feeds(cache)] == [good]
+    # A parked crawl reads the same way; a name outside the cache is refused.
+    (cache / "crawl").rename(cache / "crawl.fi.bak")
+    parked = crawl.crawled_feeds(cache, name="crawl.fi.bak")
+    assert [d for d, _ in parked] == [cache / "crawl.fi.bak" / good.name]
+    with pytest.raises(ValueError):
+        crawl.crawled_feeds(cache, name="../crawl.fi.bak")
 
 
 def test_a_small_feed_downloads_whole_and_extracts(tmp_path):
