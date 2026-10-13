@@ -419,19 +419,24 @@ def cluster_boxes(points):
 
 
 def _fixed_tier(route_type):
-    """The tier a route type settles with no route geography, or None.
+    """The tier a route type settles with no route geography when every stop
+    lies in one city, as the predicate requires, or None.
 
-    The geography-free rules, ranges exactly as the classifier's: tram/subway
-    (rule 3) and the fixed-tier half of rule 2 — coach 200-209 national;
-    urban rail 400-405, bus 700-716, trolleybus 800s and tram 900s local.
-    Anything else (717-799 included) is unknown to the classifier too.
+    For tram, subway, coach 200-209, urban rail 400-405, bus 700-716,
+    trolleybus 800s and tram 900s: the class the type declares
+    (``classify.DECLARED_TIERS``), else local by the classifier's one-city
+    rule. Any other type is read with its route geography.
     """
-    if route_type in (0, 1) or 400 <= route_type <= 405:
-        return "local"
-    if 700 <= route_type <= 716 or 800 <= route_type <= 999:
-        return "local"
-    if 200 <= route_type <= 209:
-        return "national"
+    from transitio_index import classify
+
+    if (
+        route_type in (0, 1)
+        or 200 <= route_type <= 209
+        or 400 <= route_type <= 405
+        or 700 <= route_type <= 716
+        or 800 <= route_type <= 999
+    ):
+        return classify.DECLARED_TIERS.get(route_type, "local")
     return None
 
 

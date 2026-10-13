@@ -176,6 +176,18 @@ def test_a_single_city_fixed_tier_feed_skips_stop_times(tmp_path, range_threshol
     assert state["stop_times"] == {"state": "skipped", "reason": None}
 
 
+def test_a_fixed_type_takes_its_declared_class_in_the_skip():
+    # In one city a bus is local and a bus declared regional (701) regional:
+    # 701 alone is one tier, with 700 two.
+    lookup = StubLookup({24.9: CITY_RECORDS})
+    stop = [(24.9, 60.1)]
+    assert crawl.skip_predicate([701, 701], stop, 0, lookup) == (True, None)
+    assert crawl.skip_predicate([700, 701], stop, 0, lookup) == (
+        False,
+        "route types span tiers",
+    )
+
+
 TWO_STOPS = b"stop_id,stop_lat,stop_lon\ns1,60.1,24.9\ns2,60.1,25.9\n"
 OTHER_CITY = [
     {"country": "AA", "kind": "city", "overture_id": "aa-other", "wikidata": "Q3"}

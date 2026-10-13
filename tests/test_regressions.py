@@ -1052,20 +1052,18 @@ def test_every_gtfs_route_type_decides_a_tier_or_is_out_of_scope_by_design():
     """A route type the decision table did not list fell through to
     ``unknown`` silently: funiculars, trolleybuses, ferries and monorails
     did, in 271 edges over ten archived builds. Every enumerated type now
-    decides a tier given full signals, or is unclassifiable by design (rule
-    10) and lies in the table's out-of-scope ranges."""
+    decides a tier given full signals, or is unclassifiable by design (out of
+    scope) and lies in the table's out-of-scope ranges."""
     for route_type in (*GTFS_BASIC_ROUTE_TYPES, *GTFS_EXTENDED_ROUTE_TYPES):
-        decision = classify.classify_route(
-            route_type, {"AA": frozenset({"s"})}, 10.0, 1.0
-        )
+        decision = classify.classify_route(route_type, {"AA": frozenset({"s"})}, 10.0)
         out_of_scope = any(
             low <= route_type <= high for low, high in classify.UNCLASSIFIABLE_RANGES
         )
         if out_of_scope:
-            assert (decision["tier"], decision["rule"]) == ("unknown", 10), route_type
+            expected = ("unknown", "out_of_scope")
+            assert (decision["tier"], decision["rule"]) == expected, route_type
         else:
             assert decision["tier"] != "unknown", route_type
-            assert decision["rule"] != 10, route_type
 
 
 @pytest.mark.parametrize(
@@ -1124,16 +1122,19 @@ def test_a_complete_crawl_without_a_schedule_keeps_its_edges_and_home(
 
 
 @pytest.mark.parametrize(
-    ("abroad", "tier"), [(1, "local"), (3, "international")], ids=["one-stop", "three"]
+    ("abroad", "tiers"),
+    [(1, ["regional"]), (3, ["international", "regional"])],
+    ids=["one-stop", "three"],
 )
 def test_one_stop_across_a_boundary_does_not_make_a_route_international(
-    tmp_path, abroad, tier
+    tmp_path, abroad, tiers
 ):
     """Rule 1 fired on any second country among a route's stops, so a stop on
     the wrong side of a simplified boundary, or on an overlap sliver resolving
     to two countries, made a city route international at 0.95 and hid its
-    scale. The gate needs two minority stops and a tenth of the route, the
-    scale is recorded either way, and the artefacts are counted per feed."""
+    scale. The gate needs two minority stops and a tenth of the route, a
+    route past it keeps its own tier too, and the artefacts are counted per
+    feed."""
     from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
 
     cache = tmp_path / "cache"
@@ -1165,9 +1166,10 @@ def test_one_stop_across_a_boundary_does_not_make_a_route_international(
     edges, _ = store.read_jsonl(
         cache / "classify", "edges.json", classify.EDGES_ARTIFACT
     )
-    (edge,) = edges
-    assert edge["tier"] == tier and edge["evidence"]["scale_tiers"] == ["local"]
-    assert edge["evidence"].get("border_stops") == ({"BB": 1} if abroad == 1 else None)
+    assert [edge["tier"] for edge in edges] == tiers
+    assert all(e["evidence"]["scale_tiers"] == ["regional"] for e in edges)
+    regional = edges[-1]["evidence"]
+    assert regional.get("border_stops") == ({"BB": 1} if abroad == 1 else None)
     records, _ = store.read_jsonl(
         cache / "classify", "edges.json", classify.FEEDS_ARTIFACT
     )
@@ -2747,3 +2749,74 @@ def test_gtfs_files_in_a_deeper_folder_or_another_case_are_read(tmp_path):
         (crt._feed_dir(tmp_path / "two", "f-two") / "state.json").read_text()
     )
     assert state["empty_files"] == ["stops.txt"]
+
+
+# Countries, top-level regions and cities, with Strasbourg's metro reaching
+# Kehl across the border and New York's holding Mineola but not Montauk.
+TIER_PLACES = {
+    place_id: {"kind": kind, "parent_id": parent, "country_code": code, **extra}
+    for place_id, kind, parent, code, extra in [
+        ("FR", "country", None, "FR", {}),
+        ("DE", "country", None, "DE", {}),
+        ("US", "country", None, "US", {}),
+        ("grand-est", "region", "FR", "FR", {}),
+        ("bw", "region", "DE", "DE", {}),
+        ("st", "region", "DE", "DE", {}),
+        ("ni", "region", "DE", "DE", {}),
+        ("ny", "region", "US", "US", {}),
+        ("strasbourg", "city", "grand-est", "FR", {"metro_ids": ["m-str"]}),
+        ("kehl", "city", "bw", "DE", {}),
+        ("ilsenburg", "city", "st", "DE", {}),
+        ("bad-harzburg", "city", "ni", "DE", {}),
+        ("new-york", "city", "ny", "US", {}),
+        ("mineola", "city", "ny", "US", {}),
+        ("montauk", "city", "ny", "US", {}),
+        ("m-str", "metro", None, "FR", {"member_ids": ["strasbourg", "kehl"]}),
+        ("m-ny", "metro", None, "US", {"member_ids": ["new-york", "mineola"]}),
+    ]
+}
+
+
+@pytest.mark.parametrize(
+    ("route_type", "cities", "span", "reference", "tier", "international"),
+    [
+        # Strasbourg tram D into Kehl: local in one metro, and international.
+        (0, ["strasbourg"] * 3 + ["kehl"] * 2, 9.0, 20.2, "local", True),
+        # S-Bahn Rhein-Neckar declares regional rail across Länder.
+        (109, ["kehl", "ilsenburg"], 200.0, 140.8, "regional", False),
+        # A Long Island branch within New York's metro, and Montauk beyond it.
+        (2, ["new-york", "mineola"], 30.0, 606.2, "local", False),
+        (2, ["new-york", "mineola", "montauk"], 190.0, 60.0, "regional", False),
+        # A 13 km bus across two Länder; a long train across them.
+        (3, ["ilsenburg", "bad-harzburg"], 13.0, 22.7, "regional", False),
+        (2, ["ilsenburg", "bad-harzburg"], 300.0, 140.8, "national", False),
+        # Long-distance trains declare national, however short.
+        (101, ["ilsenburg", "ilsenburg"], 5.0, 140.8, "national", False),
+        # One stop in Kehl does not give a German route a second region.
+        (3, ["ilsenburg"] * 9 + ["strasbourg"], 300.0, 22.7, "regional", False),
+    ],
+)
+def test_route_tiers_follow_the_declared_class_the_places_and_the_country(
+    route_type, cities, span, reference, tier, international
+):
+    """Global distance cuts made the S-Bahn Rhein-Neckar national, Long
+    Island commuter rail national, short buses across Länder national and a
+    tram into Kehl international only. The tier now follows the declared
+    class, one city or metro, and, across top-level regions, the span against
+    the reference of the feed's country and mode."""
+    metros = classify.metros_of(TIER_PLACES)
+    reach, countries = {}, {}
+    for i, city in enumerate(cities):
+        place = TIER_PLACES[city]
+        hit = {city, place["parent_id"], place["country_code"]}
+        reach[f"s{i}"] = classify._stop_reach(hit, TIER_PLACES, metros)
+        countries.setdefault(place["country_code"], set()).add(f"s{i}")
+    countries = {code: frozenset(ids) for code, ids in countries.items()}
+    majority, _ = classify._border(countries)
+    local, regions = classify._route_places(
+        list(reach), countries, majority, reach, TIER_PLACES
+    )
+    decision = classify.classify_route(
+        route_type, countries, span, local, regions, reference
+    )
+    assert (decision["tier"], decision["international"]) == (tier, international)
