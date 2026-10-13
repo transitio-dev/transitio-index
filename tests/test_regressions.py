@@ -2415,3 +2415,31 @@ def test_a_feed_split_across_countries_gets_a_home_in_the_merge():
     # takes its one declared country, and none of several.
     assert feeds["home_country"].to_pylist() == ["FI", "EE", "FI", "SE", None]
     assert edges["cross_border"].to_pylist() == [False, True, False, False, True, True]
+
+
+def test_a_geohash_alone_does_not_pair_two_feeds_of_one_host():
+    """Dublin's Express Bus feed carried the LUAS tram's MDB record: one
+    download host and one geohash cell, but no name or file name alike."""
+    import test_index_crosswalk as cwt
+
+    geohash = crosswalk._geohash_encode(53.35, -6.26, 4)
+    feed_id = f"f-{geohash}-expressbus"
+    records, summary = crosswalk.build_records(
+        [
+            cwt.atlas_feed(
+                feed_id,
+                url="https://t.example/GTFS_Express_Bus.zip",
+                name="Express Bus",
+            )
+        ],
+        [
+            cwt.mdb_feed(
+                "mdb-2638",
+                url="https://t.example/GTFS_LUAS.zip",
+                provider="LUAS",
+                bounding_box=cwt.point_box(53.35, -6.26),
+            )
+        ],
+    )
+    assert summary["geohash_pairs"] == 0
+    assert {record["feed_id"] for record in records} == {feed_id, "f-mdb-2638"}
