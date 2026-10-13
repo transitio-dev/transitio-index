@@ -2601,3 +2601,57 @@ def test_a_window_of_placeholder_dates_is_flagged_nominal():
     }
     flagged = {f for f, summary in summaries.items() if summary.get("nominal_window")}
     assert flagged == {"from-1970", "to-2099"}
+
+
+@pytest.mark.parametrize("padded", [False, True], ids=["clean", "padded"])
+def test_padded_ids_join_and_match_the_readers_fingerprint(tmp_path, padded):
+    """Renfe pads the route ids of routes.txt but not those of trips.txt, so
+    no trip of its Cercanías, Rodalies or Feve feeds joined a route and they
+    served no place; Metra writes a space after each comma."""
+    import collections
+    import io
+    import zipfile
+
+    from transitio.index import fingerprint
+
+    def pad(value):
+        return f"{value}  " if padded else value
+
+    members = {
+        "routes.txt": f"route_id,agency_id,route_type\n{pad('r1')},a,2\n",
+        "stops.txt": f"stop_id,stop_lat,stop_lon\n{pad('s1')},40.4,-3.7\ns2,40.5,-3.6\n",
+        # A later row of the same trimmed id naming an unknown route leaves
+        # the trip on its route, as the reader reads it.
+        "trips.txt": "route_id,service_id,trip_id\n"
+        + ("r1,c, t1\nzz,c,t1\n" if padded else "r1,c,t1\n"),
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "t1,08:00:00,08:00:00,s1,1\nt1,08:10:00,08:10:00,s2,2\n"
+        ),
+    }
+
+    def member(name):
+        return io.BytesIO(members[name].encode())
+
+    counted = collections.Counter()
+    routes, _ = classify._read_routes(member("routes.txt"), counted)
+    rows, _ = crawl.stop_rows(member("stops.txt"), counted)
+    coords = {stop_id: (x, y) for stop_id, x, y in rows}
+    trip_routes, services, _ = classify._read_trips(
+        member("trips.txt"), routes, counted
+    )
+    served = classify._read_stop_times(
+        member("stop_times.txt"), trip_routes, services, padded=counted
+    )[0]
+    assert served == {"r1": {"s1", "s2"}}
+    # A clean feed keeps version 1, which older readers verify.
+    kind = classify._fingerprint_kind("route_stops", counted)
+    assert kind == ("route_stops@2" if padded else "route_stops")
+    archive = tmp_path / "feed.zip"
+    with zipfile.ZipFile(archive, "w") as written:
+        for name, text in members.items():
+            written.writestr(name, text)
+    assert fingerprint.from_feed(archive, kind) == (
+        fingerprint.compute(kind, routes, coords, served),
+        {"r1"},
+    )

@@ -383,46 +383,48 @@ class _LaterFirst:
         return self.value == other.value
 
 
-def _read_routes(opened):
+def _read_routes(opened, padded=None):
     """``({route_id: {"route_type", "agency_id", "name"}}, route_types)`` —
     an unparsable type is a missing signal (None), never a guessed one; ids
-    stay verbatim; ``name`` is the :func:`_line_name`. ``route_types`` lists
-    every row's type, id or not, as the crawl's skip predicate saw them."""
+    trimmed (see :func:`crawl.member_id`); ``name`` is the
+    :func:`_line_name`. ``route_types`` lists every row's type, id or not, as
+    the crawl's skip predicate saw them."""
     routes = {}
     route_types = []
     for row in crawl.member_rows(opened):
         value = (row.get("route_type") or "").strip()
         route_type = int(value) if value.isdigit() else None
         route_types.append(route_type)
-        route_id = row.get("route_id") or ""
+        route_id = crawl.member_id(row, "route_id", padded, "routes.txt")
         if not route_id:
             continue
         routes[route_id] = {
             "route_type": route_type,
-            "agency_id": row.get("agency_id") or "",
+            "agency_id": crawl.member_id(row, "agency_id", padded, "routes.txt"),
             "name": _line_name(row),
         }
     return routes, route_types
 
 
-def _read_trips(opened, routes):
+def _read_trips(opened, routes, padded=None):
     """``({trip_id: route_id}, {trip_id: service_id}, orphans)`` for trips of
-    known routes, ids verbatim; ``orphans`` is the set of trip ids naming a
-    route the feed lacks."""
+    known routes, ids trimmed, the last row of an id naming a known route
+    winning as in the reader's fingerprint; ``orphans`` is the set of trip
+    ids naming only routes the feed lacks."""
     trips = {}
     services = {}
     orphans = set()
     for row in crawl.member_rows(opened):
-        trip_id = row.get("trip_id") or ""
-        route_id = row.get("route_id") or ""
+        trip_id = crawl.member_id(row, "trip_id", padded, "trips.txt")
+        route_id = crawl.member_id(row, "route_id", padded, "trips.txt")
         if not trip_id:
             continue
         if route_id in routes:
             trips[trip_id] = route_id
-            services[trip_id] = row.get("service_id") or ""
+            services[trip_id] = crawl.member_id(row, "service_id")
         else:
             orphans.add(trip_id)
-    return trips, services, orphans
+    return trips, services, orphans - trips.keys()
 
 
 # A read calendar: per service id its window ``(start, end, weekday flags)``
@@ -450,7 +452,7 @@ def _read_calendar(calendar, calendar_dates):
     windows = {}
     if calendar is not None:
         for row in crawl.member_rows(calendar):
-            service_id = row.get("service_id") or ""
+            service_id = crawl.member_id(row, "service_id")
             start = _date(row.get("start_date"))
             end = _date(row.get("end_date"))
             if not service_id or start is None or end is None or end < start:
@@ -472,7 +474,7 @@ def _read_calendar(calendar, calendar_dates):
     removed = collections.defaultdict(set)
     if calendar_dates is not None:
         for row in crawl.member_rows(calendar_dates):
-            service_id = row.get("service_id") or ""
+            service_id = crawl.member_id(row, "service_id")
             date = _date(row.get("date"))
             kind = (row.get("exception_type") or "").strip()
             if not service_id or date is None:
@@ -612,7 +614,9 @@ def _date(value):
         return None
 
 
-def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=None):
+def _read_stop_times(
+    opened, trip_routes, trip_services, weights=None, trips=None, padded=None
+):
     """Per route, its distinct stop ids and its longest DISTINCT stop
     patterns, in two streamed passes — the file is never held whole.
 
@@ -636,7 +640,8 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     file schedules for a trip the feed declares (``trips``, default the
     joined ones), whether or not that trip joins a route: the feed's
     country evidence must not shrink with a partial join. The sixth is the
-    same weighted stop-events per route, or None without a calendar.
+    same weighted stop-events per route, or None without a calendar. Ids
+    are trimmed, padded ones counted in ``padded``.
     """
     stops = collections.defaultdict(set)
     scheduled = set()
@@ -646,9 +651,9 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     events = collections.Counter()
     dangling = 0
     for row in crawl.member_rows(opened):
-        trip_id = row.get("trip_id") or ""
+        trip_id = crawl.member_id(row, "trip_id", padded, "stop_times.txt")
         route_id = trip_routes.get(trip_id)
-        stop_id = row.get("stop_id") or ""
+        stop_id = crawl.member_id(row, "stop_id", padded, "stop_times.txt")
         traversal = (row.get("pickup_type") or "").strip() == "1" and (
             row.get("drop_off_type") or ""
         ).strip() == "1"
@@ -696,8 +701,8 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     rows = collections.defaultdict(list)
     unordered = set()
     for row in crawl.member_rows(opened):
-        trip_id = row.get("trip_id") or ""
-        stop_id = row.get("stop_id") or ""
+        trip_id = crawl.member_id(row, "trip_id")
+        stop_id = crawl.member_id(row, "stop_id")
         if trip_id not in wanted:
             continue
         value = (row.get("stop_sequence") or "").strip()
@@ -854,23 +859,27 @@ def _members(feed_dir, state, names, calendar=None):
             f"{state.get('feed_id')}: the crawl state predates the current "
             "member set; re-run the crawl stage"
         )
-    parsed = {}
+    # The ids trimming changed, per member: a feed with any reads under the
+    # version-2 fingerprint kinds.
+    parsed = {"padded": collections.Counter()}
     try:
         with crawl.verified_member(feed_dir, state, "stops.txt") as opened:
             if opened is None:
                 return None
-            rows, parsed["stops_dropped"] = crawl.stop_rows(opened)
+            rows, parsed["stops_dropped"] = crawl.stop_rows(opened, parsed["padded"])
         parsed["coords"] = {stop_id: (x, y) for stop_id, x, y in rows if stop_id}
         with crawl.verified_member(feed_dir, state, "routes.txt") as opened:
             if opened is None:
                 return None
-            parsed["routes"], parsed["route_types"] = _read_routes(opened)
+            parsed["routes"], parsed["route_types"] = _read_routes(
+                opened, parsed["padded"]
+            )
         if "trips.txt" in names:
             with crawl.verified_member(feed_dir, state, "trips.txt") as opened:
                 if opened is None:
                     return None
                 trip_routes, trip_services, orphans = _read_trips(
-                    opened, parsed["routes"]
+                    opened, parsed["routes"], parsed["padded"]
                 )
             # The calendar's weights so each stop-event is weighted as it
             # streams by: one float per stop, never an event table.
@@ -891,6 +900,7 @@ def _members(feed_dir, state, names, calendar=None):
                     trip_services,
                     weights,
                     trips=trip_routes.keys() | orphans,
+                    padded=parsed["padded"],
                 )
             parsed["join_gaps"] = {
                 "orphan_trips": len(orphans),
@@ -899,6 +909,22 @@ def _members(feed_dir, state, names, calendar=None):
     except crawl.MEMBER_ERRORS:
         return None
     return parsed
+
+
+# The members each fingerprint kind reads.
+FINGERPRINT_MEMBERS = {
+    "feed_stops": ("routes.txt", "stops.txt"),
+    "route_stops": ("routes.txt", "stops.txt", "trips.txt", "stop_times.txt"),
+}
+
+
+def _fingerprint_kind(kind, padded):
+    """``kind``, or its version 2 when trimming changed an id of a member it
+    reads, so the reader recomputes the digest from trimmed ids; a feed
+    without padded ids keeps version 1, which older readers verify."""
+    if any(padded.get(member) for member in FINGERPRINT_MEMBERS[kind]):
+        return f"{kind}@2"
+    return kind
 
 
 def _edge(candidate, tier, tier_confidence, evidence, needs_review):
@@ -1415,11 +1441,10 @@ def _classify_feed(
             "routes": len(routes),
             "departures_per_day": None,
         }
+        kind = _fingerprint_kind("feed_stops", parsed["padded"])
         stamp = {
-            "classification_fingerprint": fingerprint.compute(
-                "feed_stops", routes, coords
-            ),
-            "fingerprint_kind": "feed_stops",
+            "classification_fingerprint": fingerprint.compute(kind, routes, coords),
+            "fingerprint_kind": kind,
         }
         for candidate in candidates.values():
             edges.extend(
@@ -1510,11 +1535,12 @@ def _classify_feed(
         }
     # The fingerprint describes the feed, not the place: one digest over
     # every route's served stops and every stop's coordinates, on all edges.
+    kind = _fingerprint_kind("route_stops", parsed["padded"])
     stamp = {
         "classification_fingerprint": fingerprint.compute(
-            "route_stops", routes, coords, parsed["stops"]
+            kind, routes, coords, parsed["stops"]
         ),
-        "fingerprint_kind": "route_stops",
+        "fingerprint_kind": kind,
     }
 
     edges = []

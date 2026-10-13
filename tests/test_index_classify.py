@@ -289,16 +289,15 @@ def test_the_cli_refuses_to_lose_the_golden_gate(tmp_path):
     )
 
 
-def test_ids_are_joined_verbatim():
+def test_route_ids_are_read_trimmed():
     import io
 
     routes, route_types = classify._read_routes(
         io.BytesIO(b"route_id,agency_id,route_type\na ,x,3\na,,0\n,,7\n")
     )
-    assert routes == {
-        "a ": {"route_type": 3, "agency_id": "x", "name": ""},
-        "a": {"route_type": 0, "agency_id": "", "name": ""},
-    }
+    # Ids alike once trimmed are one route, the later row's, as the reader's
+    # version-2 fingerprint reads them.
+    assert routes == {"a": {"route_type": 0, "agency_id": "", "name": ""}}
     # The id-less row still counts for the skip predicate's tier check.
     assert route_types == [3, 0, 7]
 

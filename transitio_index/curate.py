@@ -205,7 +205,9 @@ def _sole_agency(feed_dir, state):
         with crawl.verified_member(feed_dir, state, "agency.txt") as opened:
             if opened is None:
                 return None
-            ids = {row.get("agency_id") or "" for row in crawl.member_rows(opened)}
+            ids = {
+                crawl.member_id(row, "agency_id") for row in crawl.member_rows(opened)
+            }
     except crawl.MEMBER_ERRORS:
         return None
     return next(iter(ids)) if len(ids) == 1 else None
@@ -219,11 +221,11 @@ def _read_feed(feed_dir, state):
         return None
     sole = _sole_agency(feed_dir, state)
     if mode == "complete":
-        return _Feed(
-            parsed["routes"], parsed["coords"], parsed["stops"], "route_stops", sole
-        )
+        kind = classify._fingerprint_kind("route_stops", parsed["padded"])
+        return _Feed(parsed["routes"], parsed["coords"], parsed["stops"], kind, sole)
     if mode == "skipped":
-        return _Feed(parsed["routes"], parsed["coords"], None, "feed_stops", sole)
+        kind = classify._fingerprint_kind("feed_stops", parsed["padded"])
+        return _Feed(parsed["routes"], parsed["coords"], None, kind, sole)
     return None
 
 
