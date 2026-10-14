@@ -90,6 +90,10 @@ MEMBERS = (
 
 STOP_TIMES = "stop_times.txt"
 CHEAP_MEMBERS = tuple(name for name in MEMBERS if name != STOP_TIMES)
+# The GTFS-Flex files that place a demand-responsive trip: its service zones
+# and the stops of its stop groups. Read when an archive holds them, outside
+# ``MEMBERS``, so a crawl without them stays complete.
+ZONE_MEMBERS = ("locations.geojson", "location_group_stops.txt")
 
 # Stop clusters become grid cells of this size, padded into lookup boxes.
 GRID_DEG = 0.2
@@ -513,6 +517,9 @@ def _skip_stop_times(feed_dir, digests, lookup, force):
         return False, "recrawl requested"
     if "routes.txt" not in digests or "stops.txt" not in digests:
         return False, "routes or stops member missing"
+    if any(name in digests for name in ZONE_MEMBERS):
+        # A zone may reach beyond the one city the predicate proves.
+        return False, "demand-responsive zones need the complete read"
     try:
         routes_path = feed_dir.path / "routes.txt"
         stops_path = feed_dir.path / "stops.txt"
@@ -607,6 +614,10 @@ def _cache_reusable(feed_dir, state, url, force, lookup):
     if _sizes(state) is None:
         # A state written before the sizes were recorded is re-fetched once.
         return False
+    listed = {name.lower() for name in _manifest_list(state.get("files")) or []}
+    if any(name in listed and name not in state["members"] for name in ZONE_MEMBERS):
+        # Written before the crawl read the Flex files: fetched once more.
+        return False
     if (state.get("stop_times") or {}).get("state") == "skipped":
         still_skipped, _ = _skip_stop_times(
             feed_dir, state.get("member_sha256") or {}, lookup, force
@@ -673,7 +684,8 @@ def _members_intact(feed_dir, state):
     digests = state.get("member_sha256") or {}
     # Persisted state never chooses paths: names outside the fixed member set
     # (or a malformed list) mean a corrupt state, not a valid cache.
-    if not isinstance(names, list) or not all(name in MEMBERS for name in names):
+    known = MEMBERS + ZONE_MEMBERS
+    if not isinstance(names, list) or not all(name in known for name in names):
         return False
     if not names or not isinstance(digests, dict) or set(digests) != set(names):
         return False
@@ -735,7 +747,7 @@ def _prune_members(feed_dir, kept):
     A symlink (broken or not) or special file under a member name goes too;
     a directory is left for the intact-check to refuse.
     """
-    for name in MEMBERS:
+    for name in MEMBERS + ZONE_MEMBERS:
         if name in kept:
             continue
         try:
@@ -802,7 +814,7 @@ def _members_under(names, root):
     found = {}
     for name in names:
         rest = name[len(root) :] if name.startswith(root) else None
-        if rest and rest.lower() in MEMBERS:
+        if rest and rest.lower() in MEMBERS + ZONE_MEMBERS:
             found.setdefault(rest.lower(), name)
     return found
 
@@ -916,7 +928,7 @@ def _write_ranged(fetcher, url, probe, feed_dir, decide, fragment=None):
             # Keyed by the archive's own name, the one the record probes.
             small[found[name][len(root) :]] = data
 
-    for name in CHEAP_MEMBERS:
+    for name in CHEAP_MEMBERS + ZONE_MEMBERS:
         write(name)
     skipped, reason = decide(feed_dir, digests)
     if not skipped:
@@ -1055,7 +1067,7 @@ def _extract_members(feed_dir, decide, fragment=None, check=None):
                 store.unlink(feed_dir, partial)
             digests[name] = digest
 
-        for name in CHEAP_MEMBERS:
+        for name in CHEAP_MEMBERS + ZONE_MEMBERS:
             extract(name)
         skipped, reason = decide(feed_dir, digests)
         if not skipped:
