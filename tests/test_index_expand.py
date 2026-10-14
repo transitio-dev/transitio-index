@@ -617,8 +617,10 @@ def test_a_discovered_city_gains_the_eurostat_metro_the_run_derived(tmp_path):
     )
     assert metro["member_ids"] == ["Q40840"]
     assert places["Q40840"]["metro_ids"] == ["eurostat_metro:FI002M"]
-    # Drawn from its member's shipped boundary, so the licence stage keeps it.
-    assert metro["geometry_source"] == "member_union"
+    # Drawn over the municipalities mostly inside its official area — here
+    # Tampere's two parts — so the licence stage keeps it.
+    assert metro["official_parts"] == ["fi-tre"]
+    assert metro["geometry_source"] == geometry.OFFICIAL_AREA
     boundary = shapely.from_wkb(bytes.fromhex(metro["geometry"]))
     assert boundary.covers(shapely.Point(23.8, 61.5))
     assert manifest["metros_added"] == 1
@@ -672,7 +674,11 @@ def test_a_discovered_city_gains_the_functional_urban_area_the_run_derived(
     assert metro["country_code"] == "FI"
     assert metro["member_ids"] == (["Q1", "Q40840"] if seeded else ["Q40840"])
     assert places["Q40840"]["metro_ids"] == ["eurostat_fua:FI002F"]
-    assert metro["geometry_source"] == "member_union"
+    # A metro minted here takes its official area; one the seed published
+    # and this expansion joined keeps the boundary its run gave it.
+    assert metro["geometry_source"] == (
+        "member_union" if seeded else geometry.OFFICIAL_AREA
+    )
     assert manifest["metros_added"] == (0 if seeded else 1)
 
 

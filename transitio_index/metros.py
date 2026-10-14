@@ -19,8 +19,10 @@ its region also takes the region-kind place in that country holding the
 region's centre as a core member. The Eurostat and FAO branches publish only
 while their derived inputs are allowlisted. Every member carries its
 metros in ``metro_ids`` — one per definition it falls in. This stage adds
-membership only; the geometry stage draws a metro from its members' shipped
-polygons.
+membership, and the parts of each US and Eurostat metro's official area
+(``official_parts``: its delineated counties, the municipalities mostly
+inside its regions); the geometry stage draws a metro over those parts, else
+from its members' shipped polygons.
 """
 
 import collections
@@ -506,6 +508,93 @@ def official_parts(rows, delineation, wikidata, skeleton, places_by_qid):
         row["official_parts"] = sorted(parts)
         took += bool(parts)
     return took, missing
+
+
+def eurostat_parts(rows, definition, inputs, lookup, cache_dir, dataset, land=None):
+    """Give each ``definition`` row whose code ``inputs``' composition lists
+    the parts of its official area — the union of its regions' polygons —
+    as ``official_parts``: the Overture ids of the city-kind divisions the
+    ``lookup`` finds reaching into an official area whose land the area holds
+    the largest share of, at least ``urau.MIN_SHARE`` (shares per metro, the
+    land inside the NUTS-3 regions of ``land`` when given, as
+    :func:`eurostat.assign` measures them; footprints from
+    ``geometry.place_areas`` over ``dataset``). A row none joins keeps an
+    empty list. Returns ``(took, empty)``: rows with parts and without."""
+    from transitio_index import crawl
+
+    composition, boundaries, _ = inputs
+    wanted = collections.defaultdict(list)
+    for row in rows:
+        code = row.get("statistical_area_id")
+        if row.get("source_subtype") == definition.subtype and code in composition:
+            wanted[code].append(row)
+    if not wanted:
+        return 0, 0
+    official = {
+        code: shapely.union_all(
+            [boundaries[r] for r in composition[code]["nuts3"] if r in boundaries]
+        )
+        for code in sorted(wanted)
+    }
+    lookup.ensure(crawl.zone_boxes(official.values()))
+    records = {
+        record["overture_id"]: record
+        for area in official.values()
+        for record in lookup.divisions_reached(area)
+        if record.get("kind") == "city" and record.get("overture_id")
+    }
+    candidates = sorted(records)
+    # The read is scoped to the candidates' countries: an area may cross a
+    # border.
+    countries = {r.get("country") for r in records.values()} - {None}
+    areas = geometry.place_areas(
+        cache_dir, dataset, [{"country_code": c} for c in sorted(countries)], candidates
+    )
+    footprints = [eurostat._footprint(areas.get(i)) for i in candidates]
+    chosen = eurostat._by_share(
+        eurostat.Containment(official), footprints, urau.MIN_SHARE, land
+    )
+    parts = collections.defaultdict(set)
+    for division_id, code in zip(candidates, chosen):
+        if code is not None:
+            parts[code].add(division_id)
+    took = empty = 0
+    for code, code_rows in sorted(wanted.items()):
+        for row in code_rows:
+            row["official_parts"] = sorted(parts[code])
+        took += len(code_rows) if parts[code] else 0
+        empty += 0 if parts[code] else len(code_rows)
+    return took, empty
+
+
+def _eurostat_official_areas(rows, branches, cache_dir, dataset, divisions, land):
+    """:func:`eurostat_parts` for each definition of ``branches`` whose
+    inputs were read, through one boundary lookup opened only when a row of
+    one is there; ``{subtype: {"took", "empty"}}``."""
+    rows = list(rows)
+    found = {}
+    wanted = [
+        (definition, inputs)
+        for definition, inputs in branches
+        if inputs is not None
+        and any(r.get("source_subtype") == definition.subtype for r in rows)
+    ]
+    if not wanted:
+        return found
+    from transitio_index import boundaries
+
+    with boundaries.BoundaryLookup(
+        cache_dir,
+        area_dataset=dataset
+        or geometry.division_area_dataset(overture.OVERTURE_RELEASE),
+        division_dataset=divisions or overture.overture_dataset(),
+    ) as lookup:
+        for definition, inputs in wanted:
+            took, empty = eurostat_parts(
+                rows, definition, inputs, lookup, cache_dir, dataset, land
+            )
+            found[definition.subtype] = {"took": took, "empty": empty}
+    return found
 
 
 def _crosswalk(place_overrides, composition, by_id, metros, scheme):
@@ -1197,6 +1286,7 @@ def attach_metros(
     derive_urau=True,
     cbsa_pins=None,
     derive_cbsa=True,
+    division_dataset=None,
 ):
     """Add metro places and memberships to the seed places.
 
@@ -1214,7 +1304,10 @@ def attach_metros(
     lists (``cbsa_pins``, the module's by default) records its counties'
     divisions as ``official_parts`` (:func:`official_parts`), the area the
     geometry stage draws it over; ``derive_cbsa`` reads the delineation (on
-    by default). One writer lock spans the seed read, the live
+    by default). A Eurostat metro records the municipalities mostly inside
+    its official area the same way (:func:`eurostat_parts`), found through a
+    boundary lookup over ``dataset`` and ``division_dataset`` (the release's
+    division theme by default). One writer lock spans the seed read, the live
     queries and the publish, so a concurrent gazetteer run cannot shift the
     seed under it. With a ``registry`` session every metro row gets its
     registry id and ``wikidata_id``. ``fao_files``, ``fao_pins`` and
@@ -1472,7 +1565,21 @@ def attach_metros(
                     raise overrides.OverrideError(
                         f"place {place_id!r}: set_place_members needs a seeded metro"
                     )
-            # The US metros' official areas, over the survivors of every pass.
+            # The official areas, over the survivors of every pass; a seeded
+            # metro a branch joined is in both lists: once.
+            surviving = {
+                p["place_id"]: p
+                for p in [*places, *metros.values()]
+                if p["kind"] == "metro" and p["place_id"] not in dropped
+            }
+            eurostat_areas = _eurostat_official_areas(
+                surviving.values(),
+                branches,
+                cache_dir,
+                dataset,
+                division_dataset,
+                euro[1] if land is not None else None,
+            )
             parts = 0
             if delineation is not None:
                 skeleton, _ = store.read_jsonl(
@@ -1481,12 +1588,6 @@ def attach_metros(
                     "overture_divisions.jsonl",
                     generations=run,
                 )
-                # A seeded metro the US branch joined is in both lists: once.
-                surviving = {
-                    p["place_id"]: p
-                    for p in [*places, *metros.values()]
-                    if p["kind"] == "metro" and p["place_id"] not in dropped
-                }
                 parts, missing = official_parts(
                     list(surviving.values()),
                     delineation[0],
@@ -1555,8 +1656,10 @@ def attach_metros(
                 ),
                 "reported": len(report),
                 "us": us_summary,
-                # The US metros drawn over their delineated counties.
+                # The US metros drawn over their delineated counties, and the
+                # Eurostat ones over their municipalities, by definition.
                 "official_areas": parts,
+                "eurostat_official_areas": eurostat_areas,
                 "eurostat": summaries[METROPOLITAN_REGION.subtype],
                 "urau": summaries[FUNCTIONAL_URBAN_AREA.subtype],
                 "fao": fao_summary,

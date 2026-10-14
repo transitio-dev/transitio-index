@@ -305,6 +305,7 @@ def _run(
         urau_pins=urau_pins,
         derive_urau=urau is not None,
         derive_cbsa=False,
+        division_dataset=dataset,
     )
     places, _ = store.read_jsonl(
         cache / "gazetteer", "metros.json", "places_seed.jsonl"
@@ -1588,3 +1589,62 @@ def test_the_delineation_keeps_the_metropolitan_counties():
     ):
         with pytest.raises(cbsa.CbsaError):
             cbsa.read_delineation(broken)
+
+
+def test_a_eurostat_metro_takes_the_municipalities_mostly_inside_its_area(tmp_path):
+    # AA001F is one area; AA002M is two NUTS-3 regions, R1 and R2; R0 is land
+    # in no metro. m-in lies inside AA001F, m-split half in R1 and half in R2
+    # (all in AA002M), m-out 40 % inside AA001F and the rest in R0, and
+    # m-coast 40 % in R2 and the rest at sea, outside every land region.
+    regions = {
+        "AA001F": shapely.box(0, 0, 2, 2),
+        "R1": shapely.box(4, 0, 6, 2),
+        "R2": shapely.box(6, 0, 7.6, 2),
+    }
+    towns = {
+        "m-in": shapely.box(0.5, 0.5, 1.5, 1.5),
+        "m-split": shapely.box(5.5, 0.5, 6.5, 1.5),
+        "m-out": shapely.box(1.6, 0.5, 2.6, 1.5),
+        "m-coast": shapely.box(7.2, 0.5, 8.2, 1.5),
+    }
+
+    class Lookup:
+        def ensure(self, boxes):
+            return 0
+
+        def divisions_reached(self, shape):
+            return [
+                {"overture_id": key, "kind": "city", "country": "AA"}
+                for key, town in towns.items()
+                if town.intersects(shape) and not town.touches(shape)
+            ]
+
+    composition = {
+        "AA001F": {"nuts3": ["AA001F"]},
+        "AA002M": {"nuts3": ["R1", "R2"]},
+    }
+    dataset = fx.write_area_dataset(
+        tmp_path / "areas.parquet",
+        [
+            fx.area(key, shapely.to_wkb(town), [], country="AA")
+            for key, town in towns.items()
+        ],
+    )
+    definition = metros.Definition("b", "area", "ns", (), (), 0.5)
+    rows = [
+        {"source_subtype": "area", "statistical_area_id": code}
+        for code in ("AA001F", "AA002M", "ZZ999F")
+    ]
+    took, empty = metros.eurostat_parts(
+        rows,
+        definition,
+        (composition, regions, {}),
+        Lookup(),
+        tmp_path / "cache",
+        dataset,
+        land={**regions, "R0": shapely.box(2, 0, 4, 2)},
+    )
+    assert (took, empty) == (2, 0)
+    assert rows[0]["official_parts"] == ["m-in"]
+    assert rows[1]["official_parts"] == ["m-coast", "m-split"]
+    assert "official_parts" not in rows[2]

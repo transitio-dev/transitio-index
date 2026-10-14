@@ -820,7 +820,8 @@ def _discover(
         euro, urau_inputs, fao_inputs, names, centres, delineation = _derived_inputs(
             cache_dir, derived
         )
-    # One join per Eurostat definition the run derived, over the same cities.
+    # One join per Eurostat definition the run derived, over the same cities;
+    # a metro minted here takes its official area, as the metros stage's.
     eurostat_metros, eurostat_touched, assignments = [], set(), []
     for definition, inputs in (
         (metros.METROPOLITAN_REGION, euro),
@@ -829,6 +830,16 @@ def _discover(
         added, touched, rows = _attach_eurostat_metros(
             places_by_id, codes, city_rows, areas, inputs, definition, land=euro
         )
+        if added:
+            metros.eurostat_parts(
+                [places_by_id[key] for key in added],
+                definition,
+                inputs,
+                lookup,
+                cache_dir,
+                area_dataset,
+                euro[1] if euro is not None else None,
+            )
         eurostat_metros += added
         eurostat_touched |= touched
         assignments += rows
