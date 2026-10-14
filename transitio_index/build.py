@@ -104,6 +104,7 @@ def run_ingest(arguments):
                 arguments.cache_dir,
                 csv_path=arguments.mdb_csv,
                 allow_empty=arguments.allow_empty_mdb,
+                catalogue_path=arguments.mdb_catalogue,
             )
         )
     if "gbfs" in arguments.sources:
@@ -398,6 +399,12 @@ def parse_args(argv=None):
         "--mdb-csv",
         type=pathlib.Path,
         help="ingest this local feeds_v2.csv instead of downloading it",
+    )
+    parser.add_argument(
+        "--mdb-catalogue",
+        type=pathlib.Path,
+        help="the whole feeds_v2.csv a sampled --mdb-csv was cut from: an "
+        "Atlas-only feed takes the location of its MDB twin in it",
     )
     parser.add_argument(
         "--allow-empty-mdb",

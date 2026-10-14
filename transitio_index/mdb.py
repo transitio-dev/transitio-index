@@ -14,6 +14,8 @@ from transitio_index.csv_source import IngestError
 from transitio_index.progress import progress
 
 CSV_URL = "https://files.mobilitydatabase.org/feeds_v2.csv"
+# The whole catalogue beside a sampled cut, in the cut's generation.
+CATALOGUE_ARTIFACT = "mdb_catalogue.jsonl"
 # A human tag for the fetch; the manifest's csv_sha256 is the real identity
 # (feeds_v2.csv is always-latest, carrying no immutable version of its own).
 DEFAULT_LABEL = "2026-08-28"
@@ -204,11 +206,15 @@ def ingest(
     label=DEFAULT_LABEL,
     expected_sha256=None,
     allow_empty=False,
+    catalogue_path=None,
 ):
     """Run the MDB ingest, publishing a ``mdb.json`` generation.
 
     ``allow_empty`` permits a header-only CSV (zero feeds): the default refuses
     it as a broken export, but an Atlas-only sample legitimately has no MDB rows.
+    ``catalogue_path`` is the whole catalogue a sampled CSV was cut from,
+    published beside it as ``mdb_catalogue.jsonl``: the crosswalk finds an
+    Atlas-only feed's twins there.
     """
     return csv_source.ingest_csv(
         cache_dir,
@@ -222,4 +228,7 @@ def ingest(
         csv_path=csv_path,
         expected_sha256=expected_sha256,
         allow_empty=allow_empty,
+        companion=(
+            None if catalogue_path is None else (CATALOGUE_ARTIFACT, catalogue_path)
+        ),
     )

@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -7,7 +8,7 @@ import tarfile
 
 import pytest
 
-from transitio_index import crosswalk, gbfs, mdb, store  # noqa: E402
+from transitio_index import crosswalk, csv_source, gbfs, mdb, store  # noqa: E402
 
 
 @pytest.fixture(params=["descriptor", "paths"], autouse=True)
@@ -1332,6 +1333,109 @@ def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
     assert sorted(s["feed_id"] for s in systems) == ["f-gbfs-s", "f-gbfs-t"]
 
 
+@pytest.mark.parametrize(
+    "whole", ["catalogue", "same-as-cut", None], ids=["catalogue", "same", "cut-only"]
+)
+def test_an_atlas_only_feed_takes_its_mdb_twins_location(tmp_path, whole):
+    # The cut holds f-pair's MDB record, no twin; the whole catalogue holds
+    # f-cur's by its current URL, f-past's two by a past one (agreeing on the
+    # state only, its code in either case) and f-split's two in two
+    # countries.
+    from transitio_index import atlas
+
+    cache = tmp_path / "cache"
+
+    def feed(feed_id, current, *past):
+        urls = {"static_current": current, "static_historic": list(past)}
+        return {"id": feed_id, "spec": "gtfs", "urls": urls}
+
+    atlas.ingest(
+        cache,
+        archive=atlas_archive(
+            tmp_path,
+            [
+                feed("f-pair", "https://m.example/x.zip"),
+                feed("f-cur", "https://a.example/1.zip"),
+                feed("f-past", "https://a.example/2.zip", "https://a.example/3.zip"),
+                feed("f-split", "https://a.example/4.zip", "https://a.example/5.zip"),
+                feed("f-none", "https://a.example/6.zip"),
+            ],
+        ),
+        commit="a" * 40,
+    )
+
+    def row(mdb_id, url, country, state="", city=""):
+        return {
+            "id": mdb_id,
+            "data_type": "gtfs",
+            "urls.direct_download": url,
+            "location.country_code": country,
+            "location.subdivision_name": state,
+            "location.municipality": city,
+        }
+
+    cut = [row("mdb-1", "https://m.example/x.zip", "US", "Oregon", "Salem")]
+    catalogue = cut + [
+        row("mdb-10", "https://a.example/1.zip", "us", "California", "Avalon"),
+        row("mdb-11", "https://a.example/3.zip", "US", "California", "Los Angeles"),
+        row("mdb-12", "https://a.example/3.zip", "us", "California", "Long Beach"),
+        row("mdb-13", "https://a.example/5.zip", "US", "Maine"),
+        row("mdb-14", "https://a.example/5.zip", "CA", "Quebec"),
+    ]
+    whole_csv = _write(tmp_path / "all.csv", mdb_csv(*catalogue))
+    cut_csv = _write(tmp_path / "m.csv", mdb_csv(*cut))
+    if whole == "catalogue":
+        # A catalogue lacking a row of the cut is not the one it was cut from.
+        stale = _write(tmp_path / "stale.csv", mdb_csv(*catalogue[1:]))
+        with pytest.raises(csv_source.IngestError, match="was cut from"):
+            mdb.ingest(cache, csv_path=cut_csv, catalogue_path=stale)
+    mdb.ingest(
+        cache,
+        csv_path=cut_csv,
+        catalogue_path={"catalogue": whole_csv, "same-as-cut": cut_csv}.get(whole),
+    )
+    ingest_gbfs(cache, tmp_path)
+    manifest = crosswalk.crosswalk(cache)
+    generation, _ = store.resolve(cache / "crosswalk", "feeds.json")
+    with generation:
+        records = by_feed_id(
+            json.loads(line)
+            for line in generation.read_bytes("feeds.jsonl").decode().splitlines()
+        )
+    # A paired feed keeps its own record's location.
+    assert records["f-pair"]["source"] == "both"
+    assert "mdb_twins" not in records["f-pair"]
+    assert crosswalk.declared_location(records["f-pair"])["municipality"] == "Salem"
+    located = {
+        feed_id: crosswalk.declared_location(record)
+        for feed_id, record in records.items()
+        if feed_id != "f-pair"
+    }
+    if whole != "catalogue":
+        assert manifest["atlas_twin_locations"] == 0
+        assert "mdb_catalogue" not in manifest["sources"]
+        assert located == dict.fromkeys(located, {})
+        return
+    assert manifest["atlas_twin_locations"] == 2
+    digest = hashlib.sha256(whole_csv.read_bytes()).hexdigest()
+    assert manifest["sources"]["mdb_catalogue"]["csv_sha256"] == digest
+    assert records["f-past"]["mdb_twins"]["mdb_ids"] == ["mdb-11", "mdb-12"]
+    assert located == {
+        "f-cur": {
+            "country_code": "US",
+            "subdivision_name": "California",
+            "municipality": "Avalon",
+        },
+        "f-past": {
+            "country_code": "US",
+            "subdivision_name": "California",
+            "municipality": None,
+        },
+        "f-split": {},
+        "f-none": {},
+    }
+
+
 def test_curated_feeds_join_the_builds_of_their_country(tmp_path):
     import yaml
 
@@ -1472,7 +1576,11 @@ def test_only_empty_catalogues_crosswalk_to_no_feeds(tmp_path, systems):
     archive = tmp_path / "atlas.tar.gz"
     tarfile.open(archive, "w:gz").close()  # no DMFR file
     atlas.ingest(cache, archive=archive, commit="a" * 40)
-    mdb.ingest(cache, csv_path=_write(tmp_path / "m.csv", mdb_csv()), allow_empty=True)
+    empty = _write(tmp_path / "m.csv", mdb_csv())
+    # An empty cut may be allowed; an empty whole catalogue never is.
+    with pytest.raises(csv_source.IngestError, match="mdb_catalogue.jsonl"):
+        mdb.ingest(cache, csv_path=empty, allow_empty=True, catalogue_path=empty)
+    mdb.ingest(cache, csv_path=empty, allow_empty=True)
     gbfs.ingest(cache, csv_path=_write(tmp_path / "s.csv", gbfs_csv(*systems)))
     if systems:
         # GBFS systems alone are no transit feeds.

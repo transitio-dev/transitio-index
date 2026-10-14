@@ -100,7 +100,8 @@ OVERRIDE_FIELDS = (
 # measured across builds from the edges' route rows, which do not ship. 21:
 # so are the international edges' repeat blocks. 22: the manifest lists the
 # feeds without a read by cause. 23: feeds whose zones differ never fold.
-MERGE_FORMAT = 23
+# 24: the NOTICE credits the whole MDB catalogue a build found twins in.
+MERGE_FORMAT = 24
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
@@ -1149,6 +1150,7 @@ def _shares(edges):
 CATALOGUE_PINS = {
     "atlas": ("commit", "archive_sha256", "commit_verified"),
     "mdb": ("csv_label", "csv_sha256"),
+    "mdb_catalogue": ("csv_label", "csv_sha256"),
     "gbfs": ("csv_label", "csv_sha256"),
 }
 
@@ -1472,6 +1474,7 @@ PROVIDER_LINES = ("      notice: ", "      feed: ")
 NOTICE_CATALOGUES = (
     ("Transitland Atlas", "atlas", "archive_sha256", "archive sha256"),
     ("Mobility Database catalog", "mdb", "csv_sha256", "sha256"),
+    ("Mobility Database catalog", "mdb_catalogue", "csv_sha256", "sha256"),
     ("GBFS systems.csv", "gbfs", "csv_sha256", "sha256"),
 )
 
@@ -1554,11 +1557,13 @@ def _catalogue_lines(loaded):
                     f"{source['build_id']}: {catalogue} {key} is not a SHA-256: {digest!r}"
                 )
             digests[catalogue].add(digest)
-    return [
+    # A digest one build cut and another read whole is credited once.
+    lines = [
         f"  - {dataset}, {called} {digest}"
         for dataset, catalogue, _, called in NOTICE_CATALOGUES
         for digest in sorted(digests[catalogue])
     ]
+    return list(dict.fromkeys(lines))
 
 
 def _provider_entries(lines, build_id):

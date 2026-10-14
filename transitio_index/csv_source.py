@@ -10,6 +10,7 @@ import csv
 import datetime
 import hashlib
 import io
+import json
 import logging
 import os
 
@@ -167,6 +168,7 @@ def ingest_csv(
     csv_path=None,
     expected_sha256=None,
     allow_empty=False,
+    companion=None,
 ):
     """Fetch (or reuse) the source CSV, normalize it, and publish a generation.
 
@@ -181,6 +183,12 @@ def ingest_csv(
     exact bytes that produced the records, and ``pinned`` says whether they
     matched an ``expected_sha256`` the caller asserted. ``label`` is a
     human tag only, never a content claim.
+
+    ``companion`` is ``(artifact, csv_path)``: the whole CSV the source CSV
+    was cut from, parsed the same way and published in the same generation,
+    its digest and record count under ``companion_sha256`` and
+    ``companion_records``; refused when empty or when it lacks one of the
+    source's records as parsed.
     """
     raw = cache_dir / "raw"
     # Reach `raw` through `cache_dir` so a symlink at the cache root cannot
@@ -233,12 +241,26 @@ def ingest_csv(
                 "records": len(records),
                 **extra,
             }
-            return store.publish(
-                raw,
-                pointer,
-                {artifact: store.jsonl_chunks(records)},
-                manifest,
-                held=directory,
-            )
+            artifacts = {artifact: store.jsonl_chunks(records)}
+            if companion is not None:
+                name, path = companion
+                other = _read_local(path)
+                companions, _ = parse_rows(read_rows(other, required_headers), source)
+                if not companions:
+                    # Never optional: an empty one would stand in for the
+                    # records and erase what they hold.
+                    raise IngestError(f"{source}: {name}: no rows found")
+                whole = {json.dumps(r, sort_keys=True) for r in companions}
+                if any(json.dumps(r, sort_keys=True) not in whole for r in records):
+                    raise IngestError(
+                        f"{source}: {name}: not the catalogue the source CSV "
+                        "was cut from (a record of it is missing or differs)"
+                    )
+                artifacts[name] = store.jsonl_chunks(companions)
+                manifest["companion_sha256"] = hashlib.sha256(
+                    other.encode("utf-8")
+                ).hexdigest()
+                manifest["companion_records"] = len(companions)
+            return store.publish(raw, pointer, artifacts, manifest, held=directory)
     finally:
         directory.close()

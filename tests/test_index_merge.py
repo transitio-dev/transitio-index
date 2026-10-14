@@ -993,7 +993,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
     read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
     assert set(read["snapshot"].to_pylist()) == {snapshot_id}
-    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 23
+    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 24
     assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
     assert manifest["min_reader_version"] == MIN_READER_VERSIONS[12]
     assert manifest["built_with"] == transitio.__version__

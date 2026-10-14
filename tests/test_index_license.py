@@ -759,3 +759,24 @@ def test_a_changed_judgement_is_a_new_snapshot_even_for_feeds_only(
     newer = publish.publish(cache)
     assert newer["license_policy"] == licensing.POLICY_VERSION
     assert newer["snapshot_id"] != after["snapshot_id"]
+
+
+def test_the_whole_mdb_catalogue_is_credited_and_pinned():
+    from transitio_index import publish
+
+    sources = {
+        "atlas": {"commit": "c" * 40},
+        "mdb": {"csv_sha256": "a" * 64},
+        "gbfs": {},
+    }
+    whole = {**sources, "mdb_catalogue": {"csv_sha256": "b" * 64}}
+    credits = [
+        line
+        for line in licensing._notice(None, whole, []).splitlines()
+        if "Mobility Database" in line
+    ]
+    assert credits == [
+        f"  - Mobility Database catalog, sha256 {'a' * 64}",
+        f"  - Mobility Database catalog, sha256 {'b' * 64}",
+    ]
+    assert publish._snapshot_id(whole) != publish._snapshot_id(sources)

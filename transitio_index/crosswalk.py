@@ -41,7 +41,7 @@ import re
 import unicodedata
 import urllib.parse
 
-from transitio_index import overrides, store
+from transitio_index import mdb, overrides, store
 from transitio_index.progress import progress
 
 log = logging.getLogger(__name__)
@@ -129,6 +129,64 @@ def _match_url(value):
     return f"{scheme}://{userinfo}{at}{host}{path}{tail}"
 
 
+def _read_mdb(cache_dir):
+    """MDB feeds, the whole catalogue they were cut from (the feeds
+    themselves when the ingest published none) and the manifest, from one
+    generation."""
+    generation, manifest = store.resolve(cache_dir / "raw", "mdb.json")
+    with generation:
+        feeds = store.parse_jsonl(generation.read_bytes("mdb_feeds.jsonl"))
+        catalogue = feeds
+        if manifest.get("companion_sha256"):
+            catalogue = store.parse_jsonl(generation.read_bytes(mdb.CATALOGUE_ARTIFACT))
+    return feeds, catalogue, manifest
+
+
+def _twin_locations(records, catalogue):
+    """Give each Atlas-only GTFS record whose current or past download URLs
+    are an MDB GTFS record's in ``catalogue`` (its twins) the location they
+    agree on (:func:`_agreed_location`), as ``mdb_twins``; returns how many
+    took one."""
+    by_url = collections.defaultdict(list)
+    for feed in catalogue:
+        url = _mdb_url(feed)
+        if feed.get("spec") == "gtfs" and url is not None:
+            by_url[url].append(feed)
+    located = 0
+    for record in records:
+        if record["source"] != "atlas" or record["spec"] != "gtfs":
+            continue
+        twins = {
+            feed["mdb_id"]: feed
+            for url in dict.fromkeys(_atlas_urls(record["atlas"]))
+            if url is not None
+            for feed in by_url.get(url, ())
+        }
+        location = _agreed_location(twins.values())
+        if location is not None:
+            record["mdb_twins"] = {"mdb_ids": sorted(twins), "location": location}
+            located += 1
+    return located
+
+
+def _agreed_location(twins):
+    """The finest location every twin declares alike — its country, then its
+    subdivision, then its municipality, each only when every twin names the
+    same one and the coarser levels agreed — or None without a common
+    country."""
+    location = dict.fromkeys(("country_code", "subdivision_name", "municipality"))
+    for key in location:
+        values = {
+            ((twin.get("location") or {}).get(key) or "").strip() for twin in twins
+        }
+        if key == "country_code":
+            values = {value.upper() for value in values}
+        if len(values) != 1 or "" in values:
+            break
+        location[key] = values.pop()
+    return location if location["country_code"] is not None else None
+
+
 def _read_atlas(cache_dir):
     """Atlas feeds, operators and manifest from one generation.
 
@@ -155,6 +213,17 @@ def _source_versions(atlas, mdb, gbfs):
             "archive_sha256": atlas.get("archive_sha256"),
         },
         "mdb": {"csv_sha256": mdb.get("csv_sha256"), "csv_label": mdb.get("csv_label")},
+        **(
+            {
+                "mdb_catalogue": {
+                    "csv_sha256": mdb["companion_sha256"],
+                    "csv_label": mdb.get("csv_label"),
+                }
+            }
+            if mdb.get("companion_sha256")
+            and mdb["companion_sha256"] != mdb.get("csv_sha256")
+            else {}
+        ),
         "gbfs": {
             "csv_sha256": gbfs.get("csv_sha256"),
             "csv_label": gbfs.get("csv_label"),
@@ -1185,8 +1254,10 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
 
 def declared_location(feed):
     """The location a feed record declares in the Mobility Database's shape:
-    its MDB row's, or a curated feed's own; empty when it has neither."""
-    return (feed.get("mdb") or feed.get("curated") or {}).get("location") or {}
+    its MDB row's, or a curated feed's own, else, for an Atlas-only feed, its
+    MDB twins' (:func:`_twin_locations`); empty when it has none."""
+    found = (feed.get("mdb") or feed.get("curated") or {}).get("location")
+    return found or (feed.get("mdb_twins") or {}).get("location") or {}
 
 
 def declared_countries(feed):
@@ -1257,9 +1328,7 @@ def crosswalk(cache_dir, *, overrides_dir=None):
     and the GBFS systems in their own artifact."""
     feed_overrides, _ = overrides.load_feed_overrides(overrides_dir)
     atlas_feeds, atlas_operators, atlas_manifest = _read_atlas(cache_dir)
-    mdb_feeds, mdb_manifest = store.read_jsonl(
-        cache_dir / "raw", "mdb.json", "mdb_feeds.jsonl"
-    )
+    mdb_feeds, catalogue, mdb_manifest = _read_mdb(cache_dir)
     systems, gbfs_manifest = store.read_jsonl(
         cache_dir / "raw", "gbfs.json", "gbfs_systems.jsonl"
     )
@@ -1269,6 +1338,8 @@ def crosswalk(cache_dir, *, overrides_dir=None):
     if not records and (atlas_feeds or mdb_feeds or systems):
         raise CrosswalkError("crosswalk produced no transit feeds")
     records.extend(curated_records(feed_overrides, records))
+    # After the curated feeds: a twin's country adds none to the build.
+    summary["atlas_twin_locations"] = _twin_locations(records, catalogue)
     _require_unique_namespace(records)
     # The summary's feed counts describe the transit feeds the stage ships;
     # the systems have their own count (the gbfs_* keys describe their linking).
