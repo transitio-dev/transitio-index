@@ -689,9 +689,10 @@ def place_qids(places):
 
 
 def curated_boundaries(places):
-    """``(tree, place_ids)`` over the boundaries curators drew and the
-    seeded cities' urban centres, or None: no Overture division stands for
-    such a boundary, so a stop reaches its place by lying inside it."""
+    """``(tree, place_ids)`` over the boundaries curators drew, the seeded
+    cities' urban centres and the metros' official areas, or None: no
+    Overture division stands for such a boundary, so a stop reaches its
+    place by lying inside it."""
     import shapely
 
     from transitio_index import geometry
@@ -699,7 +700,8 @@ def curated_boundaries(places):
     ids = [
         place_id
         for place_id, place in places.items()
-        if place.get("geometry_source") in (geometry.CURATED, geometry.UCDB)
+        if place.get("geometry_source")
+        in (geometry.CURATED, geometry.UCDB, geometry.OFFICIAL_AREA)
         and place.get("geometry")
     ]
     if not ids:
@@ -850,17 +852,25 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
     # crawl artifacts exist; the declared path stays importable without them.
     import shapely
 
-    from transitio_index import crawl, expand
+    from transitio_index import crawl, expand, geometry
 
     by_overture = place_index(places)
     curated = curated_boundaries(places)
     by_qid = place_qids(places)
     # Minted metros have no geometry: a stop is inside a metro when it is
-    # inside ANY member city — counted once however many members it hits.
+    # inside ANY member city — counted once however many members it hits. A
+    # metro drawn over its official area counts by that polygon alone.
+    official = {
+        place_id
+        for place_id, place in places.items()
+        if place.get("geometry_source") == geometry.OFFICIAL_AREA
+    }
     metro_members = {
         place_id: set(place.get("member_ids") or [])
         for place_id, place in places.items()
-        if place.get("kind") == "metro" and place.get("member_ids")
+        if place.get("kind") == "metro"
+        and place.get("member_ids")
+        and place_id not in official
     }
     by_key = {}
     superseded = set()
@@ -955,7 +965,7 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
                 targets.extend(
                     metro_id
                     for metro_id in places[place_id].get("metro_ids") or []
-                    if metro_id in places
+                    if metro_id in places and metro_id not in official
                 )
             for target in targets:
                 key = (target, feed_id)

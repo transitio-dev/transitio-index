@@ -32,6 +32,7 @@ import hashlib
 import shapely
 
 from transitio_index import (
+    cbsa,
     country_codes,
     csv_source,
     eurostat,
@@ -461,6 +462,50 @@ def _attach_us(places, by_id, metros, codes, report, wikidata, registry=None):
             _take_msa(metro, record)
             published.add(metro["place_id"])
     return {"metros_published": len(published), "metros_reported": len(reported_metros)}
+
+
+def official_parts(rows, delineation, wikidata, skeleton, places_by_qid):
+    """Give each US MSA row whose CBSA code ``delineation`` lists
+    (:func:`cbsa.read_delineation`) the parts of its official area: the
+    Overture ids of the ``skeleton`` divisions below country level whose QID
+    carries one of its counties' FIPS codes, else of the city or region
+    ``places_by_qid`` holds under that QID (a consolidated city-county), as
+    ``official_parts``; a code neither carries is left out. Returns
+    ``(took, missing)``: how many rows took parts, and the ``(place_id,
+    fips)`` pairs left out."""
+    wanted = [
+        row
+        for row in rows
+        if row.get("source_subtype") == "metropolitan statistical area"
+        and row.get("statistical_area_id") in delineation
+    ]
+    codes = {code for row in wanted for code in delineation[row["statistical_area_id"]]}
+    items = wikidata.fips_items(codes) if codes else {}
+    divisions = collections.defaultdict(set)
+    for record in skeleton:
+        # A metro's CBSA code shares the property: only divisions count,
+        # under the QID they resolved to.
+        qid = record.get("qid") or record.get("wikidata")
+        if qid and record.get("kind") not in (None, "country"):
+            divisions[qid].add(record["overture_id"])
+    took, missing = 0, []
+    for row in wanted:
+        parts = set()
+        for code in delineation[row["statistical_area_id"]]:
+            found = {o for qid in items.get(code, ()) for o in divisions.get(qid, ())}
+            if not found:
+                found = {
+                    place["overture_id"]
+                    for qid in items.get(code, ())
+                    if (place := places_by_qid.get(qid) or {}).get("overture_id")
+                    and place.get("kind") in ("city", "region")
+                }
+            if not found:
+                missing.append((row["place_id"], code))
+            parts |= found
+        row["official_parts"] = sorted(parts)
+        took += bool(parts)
+    return took, missing
 
 
 def _crosswalk(place_overrides, composition, by_id, metros, scheme):
@@ -1150,6 +1195,8 @@ def attach_metros(
     derive_fao=True,
     urau_pins=None,
     derive_urau=True,
+    cbsa_pins=None,
+    derive_cbsa=True,
 ):
     """Add metro places and memberships to the seed places.
 
@@ -1163,7 +1210,11 @@ def attach_metros(
     city land areas from (the pinned release by default), ``pins`` the
     Eurostat inputs' digests and ``urau_pins`` the Urban Audit input's (the
     modules' pins by default); ``derive_urau`` runs the functional urban
-    areas (on by default). One writer lock spans the seed read, the live
+    areas (on by default). A US metro whose CBSA code the OMB delineation
+    lists (``cbsa_pins``, the module's by default) records its counties'
+    divisions as ``official_parts`` (:func:`official_parts`), the area the
+    geometry stage draws it over; ``derive_cbsa`` reads the delineation (on
+    by default). One writer lock spans the seed read, the live
     queries and the publish, so a concurrent gazetteer run cannot shift the
     seed under it. With a ``registry`` session every metro row gets its
     registry id and ``wikidata_id``. ``fao_files``, ``fao_pins`` and
@@ -1178,6 +1229,7 @@ def attach_metros(
         wikidata = overture.WikidataClient()
     pins = dict(pins or eurostat.PINS)
     urau_pins = dict(urau_pins or urau.PINS)
+    cbsa_pins = dict(cbsa_pins or cbsa.PINS)
     from transitio_index import fao, ucdb
 
     fao_pins = dict(fao_pins or fao.PINS)
@@ -1187,6 +1239,8 @@ def attach_metros(
     # verified is left unprepared: the load under the lock then disables its
     # branch rather than aborting the stage.
     _available(lambda: eurostat.prepare_inputs(cache_dir, expected=pins))
+    if derive_cbsa:
+        _available(lambda: cbsa.prepare_inputs(cache_dir, expected=cbsa_pins))
     if derive_urau:
         _available(lambda: urau.prepare_inputs(cache_dir, expected=urau_pins))
     if derive_fao:
@@ -1233,6 +1287,11 @@ def attach_metros(
             # rather than aborting the stage. Names are a derived use of the
             # UCDB, read only while its allowlist entry stands.
             euro = _available(lambda: eurostat.load_inputs(cache_dir, expected=pins))
+            delineation = None
+            if derive_cbsa and cbsa.DERIVED in geometry.DERIVED_SOURCE_ALLOWLIST:
+                delineation = _available(
+                    lambda: cbsa.load_inputs(cache_dir, expected=cbsa_pins)
+                )
             urau_inputs = None
             if derive_urau:
                 urau_inputs = _available(
@@ -1413,7 +1472,48 @@ def attach_metros(
                     raise overrides.OverrideError(
                         f"place {place_id!r}: set_place_members needs a seeded metro"
                     )
+            # The US metros' official areas, over the survivors of every pass.
+            parts = 0
+            if delineation is not None:
+                skeleton, _ = store.read_jsonl(
+                    cache_dir / "gazetteer",
+                    "overture.json",
+                    "overture_divisions.jsonl",
+                    generations=run,
+                )
+                # A seeded metro the US branch joined is in both lists: once.
+                surviving = {
+                    p["place_id"]: p
+                    for p in [*places, *metros.values()]
+                    if p["kind"] == "metro" and p["place_id"] not in dropped
+                }
+                parts, missing = official_parts(
+                    list(surviving.values()),
+                    delineation[0],
+                    wikidata,
+                    skeleton,
+                    by_id,
+                )
+                report.extend(
+                    {
+                        "branch": "us",
+                        "metro_id": metro_id,
+                        "fips": code,
+                        "reason": "county without a division",
+                    }
+                    for metro_id, code in missing
+                )
+                consumed.append(
+                    {
+                        cbsa.DERIVED: (
+                            delineation[1]["digests"][cbsa.DELINEATION_FILE],
+                            parts,
+                        )
+                    }
+                )
+
             derived_inputs = {
+                "cbsa": delineation[1]["digests"] if delineation is not None else None,
                 "eurostat": _snapshot(euro, EUROSTAT_DERIVED),
                 "urau": _snapshot(urau_inputs, URAU_DERIVED),
                 "fao": _snapshot(fao_inputs, FAO_DERIVED),
@@ -1455,6 +1555,8 @@ def attach_metros(
                 ),
                 "reported": len(report),
                 "us": us_summary,
+                # The US metros drawn over their delineated counties.
+                "official_areas": parts,
                 "eurostat": summaries[METROPOLITAN_REGION.subtype],
                 "urau": summaries[FUNCTIONAL_URBAN_AREA.subtype],
                 "fao": fao_summary,

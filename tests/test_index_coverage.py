@@ -469,6 +469,29 @@ def test_an_onestop_cell_places_its_feed_at_the_place_holding_it(tmp_path):
     assert set(edges["f-none"]) == {"Q-c"}
 
 
+def test_a_stop_in_a_metros_official_area_counts_for_it(tmp_path):
+    # The stop lies in no division the stub knows, but inside Q-metro's
+    # official area, which no member city covers.
+    import shapely
+
+    official = {
+        "geometry": shapely.to_wkb(shapely.box(29.0, 0.0, 31.0, 2.0)).hex(),
+        "geometry_source": geometry.OFFICIAL_AREA,
+    }
+    places = [{**p, **official} if p["place_id"] == "Q-metro" else p for p in PLACES]
+    _, _, edges = _cover(
+        tmp_path,
+        places=places,
+        crawls={"f-none": _rows(1, 30.0), "f-city": _rows(1, 10.0)},
+        lookup=LOOKUP,
+    )
+    assert set(edges["f-none"]) == {"Q-metro"}
+    assert edges["f-none"]["Q-metro"]["service"]["stops"] == 1
+    # A member city outside the official area gives the metro nothing; its
+    # other metro, a member union, still follows the city.
+    assert "Q-metro" not in edges["f-city"] and "Q-csa" in edges["f-city"]
+
+
 def test_a_stop_in_a_council_area_reaches_the_city_shipping_its_boundary(tmp_path):
     council = {**_place("tp_council", "region"), "overture_id": "ov-council"}
     city = {

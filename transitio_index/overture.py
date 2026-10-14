@@ -371,7 +371,8 @@ class WikidataClient:
     """Batched lookups against the Wikidata SPARQL endpoint.
 
     Resolves OSM relations to QIDs (``p402``), a city's US metropolitan area
-    (``statistical_metros``), its metro-like candidates (``metro_candidates``),
+    (``statistical_metros``), a county's item by its FIPS code
+    (``fips_items``), its metro-like candidates (``metro_candidates``),
     an entity's area (``areas``) and coordinates (``coordinates``) and a
     place's labels and aliases (``labels_and_aliases``), each in id-keyed
     batches. Only the Overture release is pinned; these endpoints are live, so
@@ -424,6 +425,31 @@ class WikidataClient:
                 for metro, info in sorted(found.items())
             ]
         return result
+
+    def fips_items(self, codes):
+        """``{code: sorted QIDs}`` — the items whose FIPS code (P882) is one
+        of the five-digit ``codes``. A metro's CBSA code shares the property,
+        so a caller keeps the items it knows as counties; a code no item
+        carries is absent."""
+        codes = sorted({str(code) for code in codes if code})
+        invalid = [code for code in codes if not (len(code) == 5 and code.isdigit())]
+        if invalid:
+            raise GazetteerError(f"not FIPS codes: {invalid[:5]}")
+        found = {}
+        for start in progress(range(0, len(codes), self.batch_size), "wikidata fips"):
+            values = " ".join(
+                f'"{code}"' for code in codes[start : start + self.batch_size]
+            )
+            query = (
+                "SELECT ?item ?code WHERE { "
+                f"VALUES ?code {{ {values} }} ?item wdt:P882 ?code . }}"
+            )
+            for binding in self._get(query):
+                code = binding.get("code", {}).get("value")
+                qid = binding.get("item", {}).get("value", "").rsplit("/", 1)[-1]
+                if code in codes and QID_PATTERN.match(qid):
+                    found.setdefault(code, set()).add(qid)
+        return {code: sorted(qids) for code, qids in sorted(found.items())}
 
     def metro_candidates(self, city_qids):
         """``{city_qid: [{"qid", "name"}, ...]}`` — metro-like entities per city.

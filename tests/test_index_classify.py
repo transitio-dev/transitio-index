@@ -1865,3 +1865,21 @@ def test_a_foreign_stop_that_breaks_a_skip_is_counted_as_a_border_stop(tmp_path)
     )
     (feed,) = records
     assert feed["border_stops"] == 1 and feed["stops_in_several_countries"] == 0
+
+
+def test_an_official_area_metro_holds_its_own_polygons_stops_only():
+    from transitio_index import geometry
+
+    places = {
+        "city": {"kind": "city", "metro_ids": ["drawn", "union"]},
+        "drawn": {
+            "kind": "metro",
+            "member_ids": ["city"],
+            "geometry_source": geometry.OFFICIAL_AREA,
+        },
+        "union": {"kind": "metro", "member_ids": ["city"]},
+    }
+    assert classify.metros_of(places)["city"] == {"union"}
+    route = {"place_stops": {"city": {"s1"}, "drawn": {"s2"}, "union": set()}}
+    assert classify._place_stop_ids(route, "drawn", places["drawn"]) == {"s2"}
+    assert classify._place_stop_ids(route, "union", places["union"]) == {"s1"}

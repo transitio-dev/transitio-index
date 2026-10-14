@@ -27,6 +27,7 @@ import shapely
 from transitio_index import registry as _registry
 from transitio_index import (
     boundaries,
+    cbsa,
     crawl,
     geometry,
     metros,
@@ -285,9 +286,10 @@ def _shipped_footprint(place):
 
 
 def _derived_inputs(cache_dir, recorded):
-    """The Eurostat, Urban Audit and FAO inputs, the UCDB names and the FAO
-    centres the metros stage published metros from: ``(eurostat, urau, fao,
-    names, centres)``, loaded under the digests the run's ``derived_inputs``
+    """The Eurostat, Urban Audit and FAO inputs, the UCDB names, the FAO
+    centres and the CBSA delineation the metros stage published metros from:
+    ``(eurostat, urau, fao, names, centres, delineation)``, loaded under the
+    digests the run's ``derived_inputs``
     recorded — so expansion derives metros from the run's snapshot, never
     from the modules' current pins — each None (the names empty) where the
     run records none, that definition or branch having published none. A
@@ -341,7 +343,10 @@ def _derived_inputs(cache_dir, recorded):
             lambda pins: ucdb.centre_points(cache_dir, expected=pins),
         )
     names = names[0] if names is not None else {}
-    return euro, urau_inputs, fao_inputs, names, centres
+    delineation = load(
+        "cbsa", (cbsa.DERIVED,), lambda pins: cbsa.load_inputs(cache_dir, expected=pins)
+    )
+    return euro, urau_inputs, fao_inputs, names, centres, delineation
 
 
 class _SeededPlacement:
@@ -808,11 +813,11 @@ def _discover(
     new_metros, metro_pairs = _attach_metros(
         places_by_id, codes, new_cities, wikidata, report, registry
     )
-    euro = urau_inputs = fao_inputs = centres = None
+    euro = urau_inputs = fao_inputs = centres = delineation = None
     names = {}
     # A discovered region may hold a FAO metro's centre.
     if city_rows or any(places_by_id[q].get("kind") == "region" for q in new_ids):
-        euro, urau_inputs, fao_inputs, names, centres = _derived_inputs(
+        euro, urau_inputs, fao_inputs, names, centres, delineation = _derived_inputs(
             cache_dir, derived
         )
     # One join per Eurostat definition the run derived, over the same cities.
@@ -855,6 +860,37 @@ def _discover(
         report,
         fao=None if fao_inputs is None else (names, fao_inputs[0]),
     )
+    # A US metro minted here takes its official area, as the metros stage's.
+    us_minted = [
+        places_by_id[key]
+        for key in new_metros
+        if key not in dropped
+        and places_by_id[key].get("source_subtype") == "metropolitan statistical area"
+    ]
+    if delineation is not None and us_minted:
+        # The skeleton of the gazetteer run the names belong to: its run
+        # manifest names the generation, whatever the pointer says since.
+        gazetteer = cache_dir / "gazetteer"
+        run = store.run_generations(gazetteer)
+        if not run or "overture.json" not in run:
+            raise overture.GazetteerError(
+                "no gazetteer run names the skeleton; rerun the gazetteer"
+            )
+        skeleton, _ = store.read_jsonl(
+            gazetteer, "overture.json", "overture_divisions.jsonl", generations=run
+        )
+        _, missing = metros.official_parts(
+            us_minted, delineation[0], wikidata, skeleton, places_by_id
+        )
+        report.extend(
+            {
+                "kind": "metro",
+                "metro_id": metro_id,
+                "fips": code,
+                "reason": "county without a division",
+            }
+            for metro_id, code in missing
+        )
     minted = [key for key in eurostat_metros + fao_metros if key not in dropped]
     new_metros = [key for key in new_metros if key not in dropped] + minted
     metro_pairs = [key for key in metro_pairs if key not in dropped]
@@ -898,6 +934,8 @@ def _discover(
         chunk=geometry.AREA_CHUNK,
         release=release,
         reopen=reopen,
+        inventory=inventory,
+        shipped_sources=shipped,
     )
     if centres is not None:
         metros.fao_centres(

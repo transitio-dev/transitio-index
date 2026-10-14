@@ -488,6 +488,46 @@ def test_a_metro_is_its_members_union_holed_only_around_other_cities(tmp_path):
     assert manifest["member_union_geometry"] == 1
 
 
+def test_an_official_area_metro_is_drawn_over_its_audited_parts_alone(tmp_path):
+    # Two counties no place holds, one from a source not allowlisted and
+    # holding a hole, and a member city outside both: the metro is the
+    # allowed county alone, its hole kept.
+    allowed = shapely.box(0, 0, 2, 2).difference(shapely.box(0.5, 0.5, 1, 1))
+    records = [
+        _place("Q_city", "city", overture_id="city"),
+        {
+            **_place("Q_MSA", "metro", members=("Q_city",)),
+            "official_parts": ["county-a", "county-b"],
+        },
+    ]
+    cache = tmp_path / "cache"
+    _publish(cache, records)
+    denied = {"dataset": "Mystery Maps", "license": "proprietary", "record_id": "x"}
+    rows = [
+        fx.area("county-a", shapely.to_wkb(allowed), [_osm()]),
+        fx.area("county-b", shapely.to_wkb(shapely.box(2, 0, 4, 2)), [denied]),
+        fx.area("city", shapely.to_wkb(shapely.box(10, 10, 11, 11)), [_osm()]),
+    ]
+    dataset = fx.write_area_dataset(tmp_path / "areas.parquet", rows)
+    manifest = geometry.attach_geometry(cache, dataset=dataset)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    metro = {p["place_id"]: p for p in places}["Q_MSA"]
+    assert metro["geometry_source"] == geometry.OFFICIAL_AREA
+    assert shapely.from_wkb(metro["geometry"]).equals(allowed)
+    assert manifest["member_union_geometry"] == 1
+    inventory, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    assert any(row["dataset"] == "Mystery Maps" for row in inventory)
+    # A metro a curator drew is never redrawn.
+    curated = {**metro, "geometry": "ff", "geometry_source": geometry.CURATED}
+    by_id = {"Q_MSA": curated}
+    assert geometry.draw_member_unions(cache, dataset, by_id, ["Q_MSA"]) == 0
+    assert by_id["Q_MSA"]["geometry"] == "ff"
+
+
 def test_a_city_without_an_area_ships_its_twins_or_council_areas_boundary(tmp_path):
     from test_index_place_overrides import write_overrides
 

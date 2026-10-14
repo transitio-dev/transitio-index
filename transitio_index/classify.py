@@ -1257,9 +1257,10 @@ def _tier_edges(
 def _place_stop_ids(route, place_id, place):
     """The route's scheduled stops inside the place. A metro adds the union
     over its member cities to whatever its own polygon (if it has one)
-    placed — a minted member-union metro has no geometry of its own."""
+    placed — a minted member-union metro has no geometry of its own — unless
+    it is drawn over its official area, which alone holds its stops."""
     inside = set(route["place_stops"].get(place_id, ()))
-    if place.get("kind") == "metro":
+    if place.get("kind") == "metro" and not _by_polygon(place):
         for member in place.get("member_ids") or []:
             inside.update(route["place_stops"].get(member, ()))
     return inside
@@ -1471,14 +1472,23 @@ def _overlaps(by_place, interned):
 
 def metros_of(places):
     """``{place_id: metro ids}``: the metros a city lies in, by its own
-    ``metro_ids`` or a metro's ``member_ids``."""
+    ``metro_ids`` or a metro's ``member_ids`` — never a metro drawn over its
+    official area, which holds a stop by that polygon alone."""
+    official = {p for p, place in places.items() if _by_polygon(place)}
     found = collections.defaultdict(set)
     for place_id, place in places.items():
-        found[place_id].update(place.get("metro_ids") or ())
-        if place.get("kind") == "metro":
+        found[place_id].update(set(place.get("metro_ids") or ()) - official)
+        if place.get("kind") == "metro" and place_id not in official:
             for member in place.get("member_ids") or ():
                 found[member].add(place_id)
     return found
+
+
+def _by_polygon(place):
+    """Whether a metro holds a stop by its official area alone."""
+    from transitio_index import geometry
+
+    return place.get("geometry_source") == geometry.OFFICIAL_AREA
 
 
 def _top_level(place_id, places):
