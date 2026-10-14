@@ -439,6 +439,46 @@ def test_a_zone_discovers_the_places_it_reaches_into(tmp_path):
     assert manifest["zone_failures"] == []
 
 
+def test_an_onestop_cell_discovers_the_place_holding_it(tmp_path):
+    # The crawl's one stop lies in no city; an Atlas-only feed's Onestop ID
+    # names a cell inside Tampere, in the crosswalk the seed read. A later
+    # crosswalk naming a cell in Nowhere is not read.
+    cache = tmp_path / "cache"
+
+    def publish(subdir, pointer, artifact, records, manifest):
+        directory = store.open_subdir(cache, subdir)
+        try:
+            with store.exclusive_writer(directory):
+                return store.publish(
+                    cache / subdir,
+                    pointer,
+                    {artifact: store.jsonl_chunks(records)},
+                    manifest,
+                    held=directory,
+                )
+        finally:
+            directory.close()
+
+    def crosswalk(cell):
+        feeds = [{"feed_id": "f-tre", "onestop_cell": cell}]
+        return publish("crosswalk", "feeds.json", "feeds.jsonl", feeds, {})
+
+    read = crosswalk([23.7, 61.45, 23.8, 61.5])
+    seed = publish(
+        "gazetteer",
+        "seed.json",
+        "feed_places.jsonl",
+        [],
+        {"crosswalk_generation": read["generation"]},
+    )
+    crosswalk([26.1, 62.05, 26.2, 62.1])
+    _publish_names(cache, SEED_PLACES, seed_generation=seed["generation"])
+    _write_crawl(cache, "f-other", ["s1,63.0,25.0\n"])
+    _, places, _ = _expand(tmp_path, cache)
+    assert {"Q40840", "Q5697"} <= set(places)
+    assert "Nowhere" not in {place.get("name") for place in places.values()}
+
+
 @pytest.mark.parametrize("kind", ["region", "city"], ids=["seeded", "conflicting"])
 def test_a_stop_in_a_council_area_discovers_its_city(tmp_path, kind):
     from transitio_index import coverage, registry

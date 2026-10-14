@@ -1333,6 +1333,30 @@ def test_crosswalk_stage_over_ingested_catalogues(tmp_path):
     assert sorted(s["feed_id"] for s in systems) == ["f-gbfs-s", "f-gbfs-t"]
 
 
+def test_an_atlas_only_feed_without_twins_reads_its_onestop_id():
+    def record(onestop_id, source="atlas", **extra):
+        return {"onestop_id": onestop_id, "source": source, "spec": "gtfs", **extra}
+
+    records = [
+        record("f-9q5b-avalon~ca~us"),
+        record("f-airdrie~ab~ca"),
+        record("f-newark~airtrain~nj"),
+        record("f-9q5-short~us"),
+        record("f-9q5b-twin~us", mdb_twins={"location": {"country_code": "US"}}),
+        record("f-9q5b-paired~us", source="both"),
+    ]
+    assert crosswalk._id_locations(records) == (1, 3)
+    lat_low, lat_high, lon_low, lon_high = crosswalk._geohash_bounds("9q5b")
+    assert records[0]["onestop_cell"] == [lon_low, lat_low, lon_high, lat_high]
+    assert crosswalk.declared_location(records[0])["country_code"] == "US"
+    assert crosswalk.declared_location(records[1])["country_code"] == "CA"
+    # A bare US state is no country; a short geohash names too large a cell.
+    assert crosswalk.declared_location(records[2]) == {}
+    assert "onestop_cell" not in records[3]
+    for twinned in records[4:]:
+        assert "onestop_cell" not in twinned and "onestop_location" not in twinned
+
+
 @pytest.mark.parametrize(
     "whole", ["catalogue", "same-as-cut", None], ids=["catalogue", "same", "cut-only"]
 )

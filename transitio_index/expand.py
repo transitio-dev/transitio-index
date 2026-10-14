@@ -153,6 +153,28 @@ def _zone_shapes(feed_dir, state):
         return None
 
 
+def _onestop_cells(cache_dir, seed_generation):
+    """The ``onestop_cell`` boxes (:func:`crosswalk._id_locations`) of the
+    feeds of the crosswalk generation the seed ``seed_generation`` read —
+    never a later one; none without a seed naming one. A generation gone
+    since is an error: the stages ran out of order."""
+    if not seed_generation:
+        return []
+    seed_run, seed_manifest = store.resolve_generation(
+        cache_dir / "gazetteer", seed_generation
+    )
+    with seed_run:
+        crosswalk_generation = seed_manifest.get("crosswalk_generation")
+    if not crosswalk_generation:
+        return []
+    generation, _ = store.resolve_generation(
+        cache_dir / "crosswalk", crosswalk_generation
+    )
+    with generation:
+        feeds = store.parse_jsonl(generation.read_bytes("feeds.jsonl"))
+    return [shapely.box(*f["onestop_cell"]) for f in feeds if f.get("onestop_cell")]
+
+
 def _attach_boundary(place, rows, inventory, shipped):
     """The division's licence-audited, simplified boundary onto the place.
 
@@ -533,17 +555,21 @@ def _discover(
     derived,
     reopen=None,
     curated=(),
+    seed_generation=None,
 ):
     """Resolve crawled stops and fold the missing places in; returns counts.
     With ``registry``, every discovered place is identified through it;
     ``derived`` is the run's ``derived_inputs`` — the digests the metros stage
     derived metros from — ``reopen`` reopens ``area_dataset`` when its S3
-    scan stalls, and ``curated`` holds the ``set_boundary`` entries a
-    discovered place takes."""
+    scan stalls, ``curated`` holds the ``set_boundary`` entries a
+    discovered place takes, and ``seed_generation`` names the seed whose
+    crosswalk the Onestop ID cells are read from."""
     # Two passes, one feed's stops and zones in memory at a time — never every
     # crawled feed's at once: first the lookup boxes, then, with the boxes
     # ensured, the per-point and per-zone division resolution. A feed whose
-    # zones fail to read keeps its stops.
+    # zones fail to read keeps its stops. The cells Onestop IDs name for
+    # Atlas-only feeds without twins discover the places holding them.
+    cells = _onestop_cells(cache_dir, seed_generation)
     crawled = crawl.crawled_feeds(cache_dir)
     stops_read = 0
     zones_read = 0
@@ -567,7 +593,7 @@ def _discover(
         boxes.extend(crawl.zone_boxes(zones[0].values()))
         # Only zones whose cells were ensured are resolved.
         usable.append((feed_dir, state, bool(zones[0])))
-    lookup.ensure(boxes)
+    lookup.ensure(boxes + crawl.zone_boxes(cells))
 
     divisions = {}
     for feed_dir, state, zoned in progress(usable, "expand resolve"):
@@ -587,6 +613,9 @@ def _discover(
         for shape in zones[0].values():
             for record in lookup.divisions_reached(geometry.zone_core(shape)):
                 divisions[record["division_id"]] = record
+    for cell in cells:
+        for record in lookup.divisions_covering(geometry.zone_core(cell)):
+            divisions[record["division_id"]] = record
 
     candidates = [dict(record) for record in divisions.values() if record.get("kind")]
     seed._resolve_candidates(candidates, wikidata)
@@ -944,6 +973,7 @@ def _expanded(
     digest,
     derived,
     curated,
+    seed_generation=None,
 ):
     """Discovery under the crawl lock; ``(crawl_digest, counts, mode)``.
 
@@ -987,6 +1017,7 @@ def _expanded(
                 derived,
                 reopen,
                 curated,
+                seed_generation,
             )
     finally:
         if opened_lookup is not None:
@@ -1097,6 +1128,7 @@ def expand(
                     digest,
                     derived,
                     overrides.by_operation(place_overrides, "set_boundary"),
+                    names_manifest.get("seed_generation"),
                 )
             # Saved before the generation is visible, as the gazetteer run
             # does: a crash between the two leaves rows a rerun reproduces.

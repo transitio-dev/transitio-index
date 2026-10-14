@@ -1006,6 +1006,68 @@ def _placed_elsewhere(feeds, places, feed_overrides, own_ids):
     }
 
 
+# The declared level of a place holding an Onestop ID's cell, by its kind.
+CELL_LEVELS = {"city": "municipality", "region": "subdivision", "country": "country"}
+
+
+def _cell_placements(feeds, placements, places, lookup):
+    """Place each feed with an ``onestop_cell`` (an Atlas-only feed without
+    twins, by its Onestop ID's geohash) at the most specific place holding
+    the whole cell (:func:`zone_holders`) — the one with the most ancestors,
+    a city before a region before a country, never a metro — instead of its
+    seed placements, the ID's country or none; a feed whose cell no place
+    holds keeps them. Returns how many were placed."""
+    import shapely
+
+    from transitio_index import crawl
+
+    cells = {
+        feed["feed_id"]: shapely.box(*feed["onestop_cell"])
+        for feed in feeds
+        if feed.get("onestop_cell")
+    }
+    if not cells:
+        return 0
+    lookup.ensure(crawl.zone_boxes(cells.values()))
+    refs = _canonical_ids(feeds)
+    by_overture, by_qid = place_index(places), place_qids(places)
+    curated = curated_boundaries(places)
+
+    def depth(place_id):
+        seen = set()
+        while place_id in places and place_id not in seen:
+            seen.add(place_id)
+            place_id = places[place_id].get("parent_id")
+        return len(seen)
+
+    kinds = list(CELL_LEVELS)
+    placed = 0
+    for feed_id, cell in sorted(cells.items()):
+        held = [
+            place_id
+            for place_id in zone_holders(lookup, cell, by_overture, by_qid, curated)
+            if places[place_id].get("kind") in CELL_LEVELS
+        ]
+        if not held:
+            continue
+        best = min(
+            held,
+            key=lambda p: (-depth(p), kinds.index(places[p]["kind"]), p),
+        )
+        placements[:] = [
+            p for p in placements if refs.get(p["feed_id"], p["feed_id"]) != feed_id
+        ]
+        placements.append(
+            {
+                "feed_id": feed_id,
+                "place_id": best,
+                "level": CELL_LEVELS[places[best]["kind"]],
+            }
+        )
+        placed += 1
+    return placed
+
+
 def _set_coverage(
     feeds, placements, places, feed_overrides, report, crawled, crawl_fields, own_ids
 ):
@@ -1168,6 +1230,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             named_after_provider = _name_after_provider(feeds)
 
             crawled_by_key = {}
+            cell_placements = 0
             crawl_report = {
                 "superseded": set(),
                 "state_mismatches": 0,
@@ -1253,6 +1316,9 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                             "stops; run the expand stage first"
                         ) from error
                     crawl_report["unmatched_crawl_ids"] = sorted(unmatched - elsewhere)
+                    cell_placements = _cell_placements(
+                        feeds, placements, places, lookup
+                    )
             finally:
                 crawl_lock.__exit__(None, None, None)
                 if opened_lookup is not None:
@@ -1382,6 +1448,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 # simplification, left out.
                 "zone_failures": crawl_report["zone_failures"],
                 "zone_slivers": crawl_report["zone_slivers"],
+                # Atlas-only feeds placed by the cell their Onestop ID names.
+                "onestop_cell_placements": cell_placements,
                 "edges": len(edges),
                 "edges_by_place_kind": dict(
                     collections.Counter(places[e["place_id"]]["kind"] for e in edges)

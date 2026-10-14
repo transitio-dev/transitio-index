@@ -344,6 +344,9 @@ class ZoneLookup(StubLookup):
             if polygon.intersects(shape) and not polygon.touches(shape)
         ]
 
+    def divisions_covering(self, shape):
+        return [record for polygon, record in self.polygons if polygon.covers(shape)]
+
 
 def _geojson(zones):
     import shapely
@@ -423,6 +426,47 @@ def test_a_zone_places_its_feed_like_a_stop(tmp_path):
     # The unreadable zones are reported; the stop still places the feed.
     assert manifest["zone_failures"] == ["f-reg"]
     assert "Q-city" in edges["f-reg"]
+
+
+def test_an_onestop_cell_places_its_feed_at_the_place_holding_it(tmp_path):
+    # f-reg's cell lies in Q-city; f-none's crosses from Q-c into another
+    # country, so it keeps its seed placement at the country. Neither crawl
+    # places a stop.
+    import shapely
+
+    def division(division_id, kind, qid):
+        return {"division_id": division_id, "kind": kind, "wikidata": qid}
+
+    lookup = ZoneLookup(
+        LOOKUP.by_x,
+        [
+            (shapely.box(9.0, -1.0, 11.0, 1.0), division("d-city", "city", "Q-city")),
+            (shapely.box(0.0, -5.0, 30.0, 5.0), division("d-reg", "region", "Q-reg")),
+            (shapely.box(0.0, -5.0, 30.0, 5.0), division("d-c", "country", "Q-c")),
+        ],
+    )
+    feeds = [
+        {**_feed("f-reg"), "onestop_cell": [9.5, 0.0, 9.7, 0.2]},
+        {**_feed("f-none"), "onestop_cell": [29.9, 0.0, 30.1, 0.2]},
+        *(f for f in FEEDS if f["feed_id"] not in ("f-reg", "f-none")),
+    ]
+    placements = [
+        *PLACEMENTS,
+        {"feed_id": "f-none", "place_id": "Q-c", "level": "country"},
+    ]
+    manifest, _, edges = _cover(
+        tmp_path,
+        feeds=feeds,
+        placements=placements,
+        crawls={"f-city": _rows(1, 10.0), "f-reg": _rows(1, 99.0)},
+        lookup=lookup,
+    )
+    assert manifest["onestop_cell_placements"] == 1
+    assert edges["f-reg"]["Q-city"]["evidence"] == {
+        "declared_level": "municipality",
+        "declared_place_id": "Q-city",
+    }
+    assert set(edges["f-none"]) == {"Q-c"}
 
 
 def test_a_stop_in_a_council_area_reaches_the_city_shipping_its_boundary(tmp_path):

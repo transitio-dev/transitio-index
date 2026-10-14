@@ -41,7 +41,7 @@ import re
 import unicodedata
 import urllib.parse
 
-from transitio_index import mdb, overrides, store
+from transitio_index import country_codes, mdb, overrides, store
 from transitio_index.progress import progress
 
 log = logging.getLogger(__name__)
@@ -515,6 +515,13 @@ def _geohash_encode(lat, lon, precision):
 
 def _geohash_decode(geohash):
     """The centre ``(lat, lon)`` of the cell ``geohash`` names."""
+    lat_low, lat_high, lon_low, lon_high = _geohash_bounds(geohash)
+    return (lat_low + lat_high) / 2, (lon_low + lon_high) / 2
+
+
+def _geohash_bounds(geohash):
+    """``(lat_low, lat_high, lon_low, lon_high)`` of the cell ``geohash``
+    names."""
     lat_low, lat_high = -90.0, 90.0
     lon_low, lon_high = -180.0, 180.0
     even = True
@@ -529,7 +536,43 @@ def _geohash_decode(geohash):
                 mid = (lat_low + lat_high) / 2
                 lat_low, lat_high = (mid, lat_high) if high else (lat_low, mid)
             even = not even
-    return (lat_low + lat_high) / 2, (lon_low + lon_high) / 2
+    return lat_low, lat_high, lon_low, lon_high
+
+
+def _id_locations(records):
+    """Give each Atlas-only GTFS record without twins what its Onestop ID
+    tells of where it runs: ``onestop_cell``, the ``[xmin, ymin, xmax,
+    ymax]`` of its geohash prefix of ``GEOHASH_PRECISION`` to 12 characters
+    (a longer token is a name), and ``onestop_location``, the country of its
+    last ``~`` token when that is a country code (a bare US state's is not);
+    returns how many took each."""
+    codes = country_codes.codes()
+    cells = countries = 0
+    for record in records:
+        if (
+            record["source"] != "atlas"
+            or record["spec"] != "gtfs"
+            or "mdb_twins" in record
+        ):
+            continue
+        onestop_id = record.get("onestop_id") or ""
+        name = onestop_id[2:]
+        match = _ONESTOP_GEOHASH.match(onestop_id)
+        if match is not None:
+            name = onestop_id[match.end() :]
+            if GEOHASH_PRECISION <= len(match.group(1)) <= 12:
+                lat_low, lat_high, lon_low, lon_high = _geohash_bounds(match.group(1))
+                record["onestop_cell"] = [lon_low, lat_low, lon_high, lat_high]
+                cells += 1
+        tokens = name.split("~")
+        if len(tokens) >= 2 and tokens[-1].upper() in codes:
+            record["onestop_location"] = {
+                "country_code": tokens[-1].upper(),
+                "subdivision_name": None,
+                "municipality": None,
+            }
+            countries += 1
+    return cells, countries
 
 
 def _onestop_geohash(onestop_id):
@@ -1255,15 +1298,22 @@ def build_records(atlas_feeds, mdb_feeds, operators=(), systems=()):
 def declared_location(feed):
     """The location a feed record declares in the Mobility Database's shape:
     its MDB row's, or a curated feed's own, else, for an Atlas-only feed, its
-    MDB twins' (:func:`_twin_locations`); empty when it has none."""
+    MDB twins' (:func:`_twin_locations`), else its Onestop ID's country
+    (:func:`_id_locations`); empty when it has none."""
     found = (feed.get("mdb") or feed.get("curated") or {}).get("location")
-    return found or (feed.get("mdb_twins") or {}).get("location") or {}
+    return (
+        found
+        or (feed.get("mdb_twins") or {}).get("location")
+        or feed.get("onestop_location")
+        or {}
+    )
 
 
 def declared_countries(feed):
-    """The country codes the catalogues claim for ``feed`` — MDB
-    ``location.country_code`` (a curated feed's own), GBFS ``country_code``;
-    Atlas records carry none — upper-cased and sorted."""
+    """The country codes the catalogues claim for ``feed`` — its
+    :func:`declared_location`'s (MDB, a curated feed's own, an Atlas-only
+    feed's twins' or Onestop ID's; Atlas records themselves carry none),
+    GBFS ``country_code`` — upper-cased and sorted."""
     codes = {
         declared_location(feed).get("country_code"),
         (feed.get("gbfs") or {}).get("country_code"),
@@ -1340,6 +1390,7 @@ def crosswalk(cache_dir, *, overrides_dir=None):
     records.extend(curated_records(feed_overrides, records))
     # After the curated feeds: a twin's country adds none to the build.
     summary["atlas_twin_locations"] = _twin_locations(records, catalogue)
+    summary["onestop_cells"], summary["onestop_countries"] = _id_locations(records)
     _require_unique_namespace(records)
     # The summary's feed counts describe the transit feeds the stage ships;
     # the systems have their own count (the gbfs_* keys describe their linking).
