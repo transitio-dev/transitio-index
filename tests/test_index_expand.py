@@ -286,20 +286,23 @@ def _publish_names(cache, places, **manifest):
         directory.close()
 
 
-def _write_crawl(cache, feed_id, stops_rows):
+def _write_crawl(cache, feed_id, stops_rows, members=None):
     feed_dir = cache / "crawl" / crawl._dir_name(feed_id)
     feed_dir.mkdir(parents=True, exist_ok=True)
     stops_text = "stop_id,stop_lat,stop_lon\n" + "".join(stops_rows)
     # Bytes, not text: the state digest is over exact bytes, and Windows
     # text mode would rewrite the newlines.
-    (feed_dir / "stops.txt").write_bytes(stops_text.encode())
+    files = {"stops.txt": stops_text.encode(), **(members or {})}
+    for name, data in files.items():
+        (feed_dir / name).write_bytes(data)
     (feed_dir / "state.json").write_text(
         json.dumps(
             {
                 "feed_id": feed_id,
-                "members": ["stops.txt"],
+                "members": sorted(files),
                 "member_sha256": {
-                    "stops.txt": hashlib.sha256(stops_text.encode()).hexdigest()
+                    name: hashlib.sha256(data).hexdigest()
+                    for name, data in files.items()
                 },
             }
         )
@@ -307,7 +310,7 @@ def _write_crawl(cache, feed_id, stops_rows):
     log = {
         "feed_id": feed_id,
         "directory": crawl._dir_name(feed_id),
-        "members": ["stops.txt"],
+        "members": sorted(files),
         "method": "download",
     }
     log_path = cache / "crawl" / "crawl_log.jsonl"
@@ -365,6 +368,7 @@ def test_no_crawl_artifacts_pass_the_seed_through(tmp_path):
     assert manifest["mode"] == "declared"
     assert manifest["simplify_tolerance_deg"] == geometry.SIMPLIFY_TOLERANCE_DEG
     assert manifest["places_added"] == 0
+    assert (manifest["zones_read"], manifest["zone_failures"]) == (0, [])
     assert manifest["licence_sources"] == manifest["licence_inventory"] == []
     assert set(places) == {"Q33"}
     assert report == []
@@ -403,6 +407,36 @@ def test_a_crawled_stop_discovers_an_unseeded_city(tmp_path):
     # The country was already seeded and is not duplicated or replaced.
     assert places["Q33"] is not tampere
     assert manifest["places_added"] == 2  # the city and its region
+
+
+def test_a_zone_discovers_the_places_it_reaches_into(tmp_path):
+    # The feed's one stop lies in no city; one zone reaches 0.1° into
+    # Tampere, the other 0.0003° into Nowhere, less than the boundary
+    # simplification: only Tampere and its region are discovered.
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES)
+    zones = [
+        ("deep", shapely.box(23.9, 61.45, 24.2, 61.55)),
+        ("sliver", shapely.box(25.6, 62.05, 26.0003, 62.15)),
+    ]
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "id": zone_id, "geometry": shapely.geometry.mapping(z)}
+            for zone_id, z in zones
+        ],
+    }
+    _write_crawl(
+        cache,
+        "f-flex",
+        ["s1,63.0,25.0\n"],
+        {"locations.geojson": json.dumps(geojson).encode()},
+    )
+    manifest, places, _ = _expand(tmp_path, cache)
+    assert {"Q40840", "Q5697"} <= set(places)
+    assert "Nowhere" not in {place.get("name") for place in places.values()}
+    assert manifest["zones_read"] == 2
+    assert manifest["zone_failures"] == []
 
 
 @pytest.mark.parametrize("kind", ["region", "city"], ids=["seeded", "conflicting"])

@@ -65,7 +65,13 @@ WILDCARD = "*"
 # The order operations compose in, whatever the file order.
 PHASES = ("set_tiers", "add_edge", "set_selector", "remove_edge")
 # The coverage stage's evidence keys: facts about the pair, not a tier.
-PAIR_EVIDENCE = ("stops_in_place", "stop_share", "declared_level", "declared_place_id")
+PAIR_EVIDENCE = (
+    "stops_in_place",
+    "stop_share",
+    "zones_in_place",
+    "declared_level",
+    "declared_place_id",
+)
 
 
 class CurateError(RuntimeError):

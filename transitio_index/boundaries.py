@@ -646,7 +646,27 @@ class BoundaryLookup:
         for index in self._tree.query(point, predicate="covered_by"):
             record = self._tree_entries[index]
             found[record["division_id"]] = record
-        return sorted(
-            found.values(),
-            key=lambda r: (_SPECIFICITY.get(r.get("subtype"), 8), r["division_id"]),
-        )
+        return _most_specific(found)
+
+    def divisions_reached(self, shape):
+        """The divisions a polygon reaches into, most specific first: those
+        whose polygons share interior with ``shape``
+        (:func:`geometry.interior_hits`); call :meth:`ensure` for its cells
+        first."""
+        if self._tree is None:
+            self._build_tree()
+        if self._tree_empty:
+            return []
+        found = {}
+        for index in geometry.interior_hits(self._tree, shape):
+            record = self._tree_entries[index]
+            found[record["division_id"]] = record
+        return _most_specific(found)
+
+
+def _most_specific(found):
+    """The division records ``{division_id: record}``, most specific first."""
+    return sorted(
+        found.values(),
+        key=lambda r: (_SPECIFICITY.get(r.get("subtype"), 8), r["division_id"]),
+    )

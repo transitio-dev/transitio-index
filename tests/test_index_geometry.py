@@ -877,3 +877,18 @@ def test_the_area_scan_is_narrowed_to_the_places_countries(tmp_path):
     )
     assert seen["filter"].equals(expected)
     assert set(areas) == {"A", "B"}  # B has no country and is still read
+
+
+def test_a_zone_core_keeps_thin_parts_and_reaches_interiors_only():
+    tol = geometry.SIMPLIFY_TOLERANCE_DEG
+    thick = shapely.box(0.0, 0.0, 1.0, 1.0)
+    thin = shapely.box(2.0, 0.0, 2.0 + tol, 1.0)
+    core = geometry.zone_core(shapely.MultiPolygon([thick, thin]))
+    # Each part shrinks on its own; the thin one keeps its outline.
+    assert core.covers(thin)
+    assert core.intersection(thick).equals(shapely.box(tol, tol, 1 - tol, 1 - tol))
+    # Touching a boundary is not reaching into it.
+    tree = shapely.STRtree(
+        [shapely.box(1.0 - tol, 0.0, 2.0, 1.0), shapely.box(0.5, 0.5, 3.0, 3.0)]
+    )
+    assert geometry.interior_hits(tree, core).tolist() == [1]

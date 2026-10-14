@@ -1704,3 +1704,72 @@ def test_a_maintainer_key_appears_in_no_output(tmp_path, monkeypatch, caplog):
     texts = [*states, json.dumps(summary), caplog.text]
     texts.append((cache / "crawl" / crawl.LOG_FILE).read_text())
     assert not any(form in text for text in texts for form in (SENTINEL, ENCODED))
+
+
+def test_zone_shapes_keep_the_polygons_and_count_the_rest():
+    import shapely
+
+    square = {
+        "type": "Polygon",
+        "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+    }
+    bowtie = {
+        "type": "Polygon",
+        "coordinates": [[[0, 0], [1, 1], [1, 0], [0, 1], [0, 0]]],
+    }
+    pair = {
+        "type": "MultiPolygon",
+        "coordinates": [square["coordinates"], [[[2, 0], [3, 0], [3, 1], [2, 0]]]],
+    }
+    far = {"type": "Polygon", "coordinates": [[[0, 0], [200, 0], [200, 1], [0, 0]]]}
+    features = [
+        {"id": "square", "geometry": square},
+        {"id": 7, "geometry": pair},
+        {"id": "bowtie", "geometry": bowtie},
+        {"geometry": square},
+        {"id": "point", "geometry": {"type": "Point", "coordinates": [0, 0]}},
+        {"id": "far", "geometry": far},
+        {"id": "square", "geometry": pair},
+        {"id": "broken", "geometry": {"type": "Polygon", "coordinates": [[1]]}},
+        {"id": "broken", "geometry": square},
+        {
+            "id": "nan",
+            "geometry": {
+                **square,
+                "coordinates": [[[0, 0], [1, 0], [1, float("nan")], [0, 0]]],
+            },
+        },
+        {
+            "id": "third-ordinate",
+            "geometry": {
+                **square,
+                "coordinates": [[[0, 0, 0], [1, 0, 1e400], [1, 1, 0], [0, 0, 0]]],
+            },
+        },
+        "not a feature",
+    ]
+    zones, dropped = crawl.zone_shapes(json.dumps({"features": features}).encode())
+    assert sorted(zones) == ["7", "bowtie", "square"]
+    assert zones["square"].area == 1.0
+    assert zones["7"].geom_type == "MultiPolygon"
+    # The self-crossing ring is repaired into its two triangles.
+    assert zones["bowtie"].is_valid and zones["bowtie"].area == pytest.approx(0.5)
+    assert dropped == 9
+    assert isinstance(zones["square"], shapely.Polygon)
+    for document in (b"[]", b'{"features": {}}'):
+        with pytest.raises(ValueError):
+            crawl.zone_shapes(document)
+
+
+def test_zone_boxes_cover_the_cells_each_part_touches():
+    import shapely
+
+    far = shapely.MultiPolygon(
+        [
+            shapely.box(-170.05, 0.05, -170.01, 0.1),
+            shapely.box(170.01, 0.05, 170.05, 0.1),
+        ]
+    )
+    # One padded cell under each part, none of the cells between them.
+    corners = [(round(x, 9), round(y, 9)) for x, y, *_ in crawl.zone_boxes([far])]
+    assert corners == [(-170.25, -0.05), (169.95, -0.05)]

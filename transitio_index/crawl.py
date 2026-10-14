@@ -280,6 +280,113 @@ def stop_coordinates(source):
     return [(x, y) for _, x, y in rows], dropped
 
 
+def zone_shapes(source):
+    """``(zones, dropped)`` parsed from ``locations.geojson`` bytes or a
+    binary file: ``{location_id: polygon}`` for each feature with a string or
+    integer ``id`` and a Polygon or MultiPolygon geometry.
+
+    A feature without an id, with another geometry, a coordinate that is not
+    finite or out of range, an id already taken or nothing polygonal left
+    after repair is dropped and counted. A file larger than
+    ``RANGED_MEMBER_BYTES``, or that is not an object with a ``features``
+    list, raises ValueError.
+    """
+    stream = io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source
+    data = stream.read(RANGED_MEMBER_BYTES + 1)
+    if len(data) > RANGED_MEMBER_BYTES:
+        raise ValueError("locations.geojson is larger than a member read whole")
+    try:
+        document = json.loads(data.decode("utf-8-sig"))
+    except RecursionError as error:
+        raise ValueError("locations.geojson nests too deeply") from error
+    features = document.get("features") if isinstance(document, dict) else None
+    if not isinstance(features, list):
+        raise ValueError("locations.geojson holds no features list")
+    zones = {}
+    seen = set()
+    dropped = 0
+    for feature in features:
+        found = feature.get("id") if isinstance(feature, dict) else None
+        geometry = feature.get("geometry") if isinstance(feature, dict) else None
+        location_id = (
+            str(found).strip()
+            if isinstance(found, (str, int)) and not isinstance(found, bool)
+            else ""
+        )
+        shape = None
+        if location_id and location_id not in seen and isinstance(geometry, dict):
+            shape = _zone_polygon(geometry)
+        seen.add(location_id)
+        if shape is None:
+            dropped += 1
+            continue
+        zones[location_id] = shape
+    return zones, dropped
+
+
+def _zone_polygon(geometry):
+    """The polygonal shape of a GeoJSON Polygon or MultiPolygon whose every
+    coordinate is finite and in range, repaired when invalid; None for
+    anything else, whatever fails on the way."""
+    import shapely
+    import shapely.errors
+    import shapely.geometry
+
+    kind = geometry.get("type")
+    if kind not in ("Polygon", "MultiPolygon"):
+        return None
+    try:
+        found = geometry["coordinates"]
+        polygons = [found] if kind == "Polygon" else found
+        if not all(
+            _position_ok(position)
+            for polygon in polygons
+            for ring in polygon
+            for position in ring
+        ):
+            return None
+        shape = shapely.geometry.shape(geometry)
+        if shape.is_empty:
+            return None
+        if not shape.is_valid:
+            shape = shapely.make_valid(shape)
+        parts = [
+            part
+            for part in shapely.get_parts(shapely.get_parts(shape))
+            if part.geom_type == "Polygon" and not part.is_empty
+        ]
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else shapely.MultiPolygon(parts)
+    except (
+        TypeError,
+        ValueError,
+        AttributeError,
+        IndexError,
+        KeyError,
+        OverflowError,
+        RecursionError,
+        MemoryError,
+        shapely.errors.ShapelyError,
+    ):
+        return None
+
+
+def _position_ok(position):
+    """Whether a GeoJSON position holds finite numbers only, its longitude
+    and latitude in range."""
+    if not isinstance(position, list) or len(position) < 2:
+        return False
+    if not all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        for value in position
+    ):
+        return False
+    return abs(position[0]) <= 180.0 and abs(position[1]) <= 90.0
+
+
 @contextlib.contextmanager
 def verified_member(feed_dir, state, name):
     """A crawled member opened for binary reading after digest verification.
@@ -472,6 +579,34 @@ def failures(cache_dir):
 def cluster_boxes(points):
     """Padded grid-cell boxes covering the points, one box per occupied cell."""
     cells = {(math.floor(x / GRID_DEG), math.floor(y / GRID_DEG)) for x, y in points}
+    return _cell_boxes(cells)
+
+
+def zone_boxes(shapes):
+    """Padded grid-cell boxes covering the zones, one box per cell a zone's
+    polygon touches, found part by part and one row of cells at a time."""
+    import numpy as np
+    import shapely
+
+    cells = set()
+    for part in shapely.get_parts(list(shapes)):
+        xmin, ymin, xmax, ymax = part.bounds
+        columns = np.arange(
+            math.floor(xmin / GRID_DEG), math.floor(xmax / GRID_DEG) + 1
+        )
+        shapely.prepare(part)
+        for cy in range(math.floor(ymin / GRID_DEG), math.floor(ymax / GRID_DEG) + 1):
+            row = shapely.box(
+                columns * GRID_DEG,
+                cy * GRID_DEG,
+                (columns + 1) * GRID_DEG,
+                (cy + 1) * GRID_DEG,
+            )
+            cells.update((int(cx), cy) for cx in columns[shapely.intersects(row, part)])
+    return _cell_boxes(cells)
+
+
+def _cell_boxes(cells):
     return [
         (
             cx * GRID_DEG - PAD_DEG,

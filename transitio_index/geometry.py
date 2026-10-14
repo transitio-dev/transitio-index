@@ -196,6 +196,26 @@ URAU_DERIVED = ("GISCO Urban Audit 2024", "EuroGeographics-NC")
 # both countries or in neither; classify counts those artefacts.
 SIMPLIFY_TOLERANCE_DEG = 0.0005
 
+
+def zone_core(shape):
+    """A demand-responsive zone shrunk by ``SIMPLIFY_TOLERANCE_DEG``: a
+    simplified boundary may cross a zone drawn along it by that much, so only
+    the core tells which places the zone reaches into. Each polygon is shrunk
+    on its own; one thinner than twice the tolerance keeps its own outline."""
+    parts = shapely.get_parts(shape)
+    cores = shapely.buffer(parts, -SIMPLIFY_TOLERANCE_DEG)
+    return shapely.union_all(np.where(shapely.is_empty(cores), parts, cores))
+
+
+def interior_hits(tree, shape):
+    """The indices of the ``tree`` geometries sharing interior with
+    ``shape``: intersecting it, not only touching its boundary."""
+    return np.setdiff1d(
+        tree.query(shape, predicate="intersects"),
+        tree.query(shape, predicate="touches"),
+    )
+
+
 # The geometry source of a city that ships its council area's boundary.
 COUNCIL_AREA = "council_area"
 # The geometry source of a boundary a curator drew.

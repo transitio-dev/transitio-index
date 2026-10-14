@@ -330,6 +330,101 @@ def test_a_single_stop_inside_a_place_admits_the_feed(tmp_path):
     assert tiny["Q-other"]["evidence"]["stop_share"] == pytest.approx(2 / 3)
 
 
+class ZoneLookup(StubLookup):
+    """The stub's points, and zones answered from division polygons."""
+
+    def __init__(self, by_x, polygons):
+        super().__init__(by_x)
+        self.polygons = polygons
+
+    def divisions_reached(self, shape):
+        return [
+            record
+            for polygon, record in self.polygons
+            if polygon.intersects(shape) and not polygon.touches(shape)
+        ]
+
+
+def _geojson(zones):
+    import shapely
+
+    return json.dumps(
+        {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "id": zone_id,
+                    "geometry": shapely.geometry.mapping(z),
+                }
+                for zone_id, z in zones.items()
+            ],
+        }
+    ).encode()
+
+
+def test_a_zone_places_its_feed_like_a_stop(tmp_path):
+    # f-city: one stop in Q-city, a zone deep in Q-other and one reaching
+    # 0.0003° into Q-city and into a hamlet no place names, less than the
+    # boundary simplification, both in Q-reg. f-reg: one stop and an
+    # unreadable locations.geojson; f-none: one stop and only a dropped zone.
+    import shapely
+
+    def division(division_id, kind, qid):
+        return {"division_id": division_id, "kind": kind, "wikidata": qid}
+
+    lookup = ZoneLookup(
+        LOOKUP.by_x,
+        [
+            (shapely.box(9.0, -1.0, 11.0, 1.0), division("d-city", "city", "Q-city")),
+            (shapely.box(12.0, -1.0, 13.0, 1.0), division("d-hamlet", "city", None)),
+            (
+                shapely.box(19.0, -1.0, 21.0, 1.0),
+                division("d-other", "city", "Q-other"),
+            ),
+            (shapely.box(0.0, -5.0, 30.0, 5.0), division("d-reg", "region", "Q-reg")),
+            (shapely.box(0.0, -5.0, 30.0, 5.0), division("d-c", "country", "Q-c")),
+        ],
+    )
+    zones = {
+        "deep": shapely.box(19.5, 0.0, 20.5, 0.5),
+        "sliver": shapely.box(11.0 - 0.0003, 0.0, 12.0 + 0.0003, 0.5),
+    }
+    manifest, covered, edges = _cover(
+        tmp_path,
+        crawls={feed_id: _rows(1, 10.0) for feed_id in ("f-city", "f-reg", "f-none")},
+        members={
+            "f-city": {"locations.geojson": _geojson(zones)},
+            "f-reg": {"locations.geojson": b"{not json"},
+            "f-none": {"locations.geojson": b'{"features": [{"id": "x"}]}'},
+        },
+        lookup=lookup,
+    )
+    flex = edges["f-city"]
+    assert set(flex) == {"Q-city", "Q-other", "Q-reg", "Q-c", "Q-metro", "Q-csa"}
+    assert flex["Q-other"]["evidence"] == {
+        "stops_in_place": 1,
+        "stop_share": pytest.approx(1 / 3),
+        "zones_in_place": 1,
+    }
+    assert flex["Q-city"]["evidence"]["zones_in_place"] == 0
+    assert flex["Q-reg"]["service"]["stops"] == 3
+    assert flex["Q-reg"]["evidence"]["zones_in_place"] == 2
+    hull = shapely.from_wkb(bytes.fromhex(covered["f-city"]["coverage"]))
+    assert hull.covers(shapely.Point(20.4, 0.4))
+    # The dropped zone stays in the share's denominator.
+    assert edges["f-none"]["Q-city"]["evidence"] == {
+        "stops_in_place": 1,
+        "stop_share": 0.5,
+        "zones_in_place": 0,
+    }
+    # Q-city and the hamlet, touched by less than the margin.
+    assert manifest["zone_slivers"] == 2
+    # The unreadable zones are reported; the stop still places the feed.
+    assert manifest["zone_failures"] == ["f-reg"]
+    assert "Q-city" in edges["f-reg"]
+
+
 def test_a_stop_in_a_council_area_reaches_the_city_shipping_its_boundary(tmp_path):
     council = {**_place("tp_council", "region"), "overture_id": "ov-council"}
     city = {
@@ -504,6 +599,13 @@ ALL = ["f-atlas", "f-mdb-1", "f-mdb-2"]
             [(["f-atlas", "f-mdb-2"], ["stop_times.txt"])],
         ),
         (3, TABLES, REPACKAGED, {"f-mdb-1": "f-atlas", "f-mdb-2": "f-atlas"}, []),
+        (
+            3,
+            TABLES,
+            {**TABLES, "locations.geojson": b'{"features": []}'},
+            {"f-mdb-1": "f-atlas"},
+            [(["f-atlas", "f-mdb-2"], ["locations.geojson"])],
+        ),
         (1, TABLES, TABLES, {}, []),
         (
             3,
@@ -513,7 +615,14 @@ ALL = ["f-atlas", "f-mdb-1", "f-mdb-2"]
             [],
         ),
     ],
-    ids=["same-data", "other-schedule", "repackaged", "one-stop", "no-stop-times"],
+    ids=[
+        "same-data",
+        "other-schedule",
+        "repackaged",
+        "other-zones",
+        "one-stop",
+        "no-stop-times",
+    ],
 )
 def test_feeds_whose_crawls_hold_the_same_data_fold_into_one(
     tmp_path, stops, tables, copy_tables, folded, near
@@ -575,10 +684,20 @@ def test_a_catalogue_feed_keeps_its_id_over_a_curated_copy(tmp_path):
     assert covered["f-mdb-9"]["aliases"] == ["f-curated-a"]
 
 
+def test_feeds_whose_zones_were_not_read_never_fold():
+    same = {"stops.txt": "s", "routes.txt": "r", "trips.txt": "t", "calendar.txt": "c"}
+    identities = {"a": same, "b": same, "c": same}
+    assert coverage.content_groups(identities) == [["a", "b", "c"]]
+    listed = {"a": ["stops.txt"], "b": ["feed/Locations.GeoJSON"]}
+    assert coverage.content_groups(identities, listed) == [["a", "c"]]
+
+
 def test_only_a_current_identity_counts():
     found = {"stops.txt": "s", "routes.txt": "r"}
     current = {"identity": found, "identity_version": fingerprint.IDENTITY_VERSION}
     assert coverage._identity(current) == found
+    zoned = {**current, "member_sha256": {"locations.geojson": "z"}}
+    assert coverage._identity(zoned) == {**found, "locations.geojson": "z"}
     for version in (0, True, float(fingerprint.IDENTITY_VERSION)):
         assert coverage._identity({**current, "identity_version": version}) is None
     assert coverage._identity({**current, "identity": ["s"]}) is None

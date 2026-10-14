@@ -1,8 +1,10 @@
 """Stage 2b: gazetteer expansion from crawled stops.
 
 The declared seed only knows places feeds *declare*; the crawl shows where
-they actually stop. This stage reads each crawled feed's ``stops.txt``,
-resolves the stop clusters through the boundary lookup, and adds every
+they actually stop. This stage reads each crawled feed's ``stops.txt`` and
+its demand-responsive zones (``locations.geojson``), resolves the stop
+clusters and the places each zone reaches into through the boundary lookup,
+and adds every
 QID-bearing admin unit the seed missed — running the same ancestor-and-metro
 expansion the seed uses, so a crawl-discovered city arrives with its region,
 country and any metro — US, Eurostat or FAO — that contains it, its boundary
@@ -130,6 +132,23 @@ def _stop_points(feed_dir, state):
             if opened is None:
                 return None
             return crawl.stop_coordinates(opened)
+    except crawl.MEMBER_ERRORS:
+        return None
+
+
+def _zone_shapes(feed_dir, state):
+    """``(zones, dropped)`` for one crawled feed's demand-responsive zones
+    (:func:`crawl.zone_shapes`), ``({}, 0)`` when its crawl holds none, or
+    None when the member fails verification or parsing, as
+    :func:`_stop_points`."""
+    digests = state.get("member_sha256")
+    if not isinstance(digests, dict) or "locations.geojson" not in digests:
+        return {}, 0
+    try:
+        with crawl.verified_member(feed_dir, state, "locations.geojson") as opened:
+            if opened is None:
+                return None
+            return crawl.zone_shapes(opened)
     except crawl.MEMBER_ERRORS:
         return None
 
@@ -521,11 +540,14 @@ def _discover(
     derived metros from — ``reopen`` reopens ``area_dataset`` when its S3
     scan stalls, and ``curated`` holds the ``set_boundary`` entries a
     discovered place takes."""
-    # Two passes, one feed's stops in memory at a time — never every crawled
-    # feed's stops at once: first the lookup boxes, then, with the boxes
-    # ensured, the per-point division resolution.
+    # Two passes, one feed's stops and zones in memory at a time — never every
+    # crawled feed's at once: first the lookup boxes, then, with the boxes
+    # ensured, the per-point and per-zone division resolution. A feed whose
+    # zones fail to read keeps its stops.
     crawled = crawl.crawled_feeds(cache_dir)
     stops_read = 0
+    zones_read = 0
+    zone_failures = set()
     state_mismatches = 0
     boxes = []
     usable = []
@@ -535,21 +557,35 @@ def _discover(
             state_mismatches += 1
             continue
         points, _ = read
+        zones = _zone_shapes(feed_dir, state)
+        if zones is None:
+            zone_failures.add(state.get("feed_id"))
+            zones = {}, 0
         stops_read += len(points)
+        zones_read += len(zones[0])
         boxes.extend(crawl.cluster_boxes(points))
-        usable.append((feed_dir, state))
+        boxes.extend(crawl.zone_boxes(zones[0].values()))
+        # Only zones whose cells were ensured are resolved.
+        usable.append((feed_dir, state, bool(zones[0])))
     lookup.ensure(boxes)
 
     divisions = {}
-    for feed_dir, state in progress(usable, "expand resolve"):
+    for feed_dir, state, zoned in progress(usable, "expand resolve"):
         read = _stop_points(feed_dir, state)
+        zones = _zone_shapes(feed_dir, state) if zoned else ({}, 0)
         if read is None:
             # Changed between the passes: no longer trustworthy evidence.
             state_mismatches += 1
             continue
+        if zones is None:
+            zone_failures.add(state.get("feed_id"))
+            zones = {}, 0
         points, _ = read
         for x, y in points:
             for record in lookup.divisions_at(x, y):
+                divisions[record["division_id"]] = record
+        for shape in zones[0].values():
+            for record in lookup.divisions_reached(geometry.zone_core(shape)):
                 divisions[record["division_id"]] = record
 
     candidates = [dict(record) for record in divisions.values() if record.get("kind")]
@@ -877,6 +913,8 @@ def _discover(
     return {
         "feeds_scanned": len(crawled),
         "stops_read": stops_read,
+        "zones_read": zones_read,
+        "zone_failures": sorted(str(feed_id) for feed_id in zone_failures),
         "state_mismatches": state_mismatches,
         "divisions_hit": len(divisions),
         "places_added": len(new_ids) + len(new_metros),
@@ -1036,6 +1074,8 @@ def expand(
             counts = {
                 "feeds_scanned": 0,
                 "stops_read": 0,
+                "zones_read": 0,
+                "zone_failures": [],
                 "divisions_hit": 0,
                 "places_added": 0,
                 "metros_added": 0,
