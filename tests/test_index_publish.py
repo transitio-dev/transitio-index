@@ -2107,10 +2107,12 @@ def test_margin_share_is_measured_over_the_edges_that_ship(tmp_path, monkeypatch
     import test_index_classify as classify_tests
     from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
 
-    # Through classify: a bus decided within MARGIN of a threshold, a tram far
-    # from every threshold, and a companion whose declared edge publish drops
-    # before counting. The coverage names this suite's sources.
+    # Through classify: a bus decided within MARGIN of its reference, a tram
+    # in one city, and a companion whose declared edge publish drops before
+    # counting. The coverage names this suite's sources.
     monkeypatch.setattr(classify_tests, "SOURCES", SOURCES)
+    near = classify_tests.NEAR_REFERENCE
+    monkeypatch.setattr(classify, "route_span_reference", lambda: near)
     cache = tmp_path / "cache"
     feeds = [
         _covered_feed("f-near", coverage_source="crawl"),
@@ -2121,10 +2123,7 @@ def test_margin_share_is_measured_over_the_edges_that_ship(tmp_path, monkeypatch
         cache,
         "f-near",
         {
-            "stops.txt": (
-                b"stop_id,stop_lat,stop_lon\n"
-                b"n1,1.0,10.0\nn2,1.0126,10.0\nn3,1.0252,10.0\n"
-            ),
+            "stops.txt": classify_tests.NEAR_STOPS,
             "routes.txt": b"route_id,route_type\nbus,3\n",
             "trips.txt": b"trip_id,route_id\nt,bus\n",
             "stop_times.txt": (
@@ -2146,7 +2145,7 @@ def test_margin_share_is_measured_over_the_edges_that_ship(tmp_path, monkeypatch
     )
     places = [
         dict(p, country_code=p.get("country_code") or "AA")
-        for p in classify_tests.PLACES
+        for p in classify_tests.PLACES + classify_tests.FAR_PLACES
     ]
     _coverage(
         cache,
@@ -2158,7 +2157,10 @@ def test_margin_share_is_measured_over_the_edges_that_ship(tmp_path, monkeypatch
         ],
         places=places,
     )
-    classified = classify.classify(cache, lookup=LOOKUP)
+    lookup = classify_tests.StubLookup(
+        {**LOOKUP.by_x, 50.0: classify_tests.FAR_RECORDS}
+    )
+    classified = classify.classify(cache, lookup=lookup)
     assert classified["edges_near_threshold"] == 1
     manifest = publish.publish(cache)
     assert manifest["counts"]["edges"] == 2  # the companion's edge does not ship

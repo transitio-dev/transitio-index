@@ -6,25 +6,31 @@ gives that town a national edge, and the edge's ``service`` struct says how
 much service that is. For every crawled feed with complete
 ``stop_times.txt`` the stage rebuilds each route's geography from the crawl —
 its stops, span (greatest distance between any two stops), median inter-stop
-distance and the countries its stops fall in — and runs the plan's decision
-table over it, with the margin penalty for a route decided within 20 % of a
-threshold. A route is ``international`` only past the border gate — at least
-``BORDER_STOPS`` and ``BORDER_SHARE`` of its located stops outside its majority
-country — so one stop across a simplified boundary decides nothing; every
-decision records the route's scale, and each feed counts the boundary
-artefacts among its stops (in several countries, in none, on a route's
-minority side). A route serves a place when enough of its stops lie
-inside it; a feed then gets one edge per ``(place, tier)`` for which a serving
-route classifies to that tier, its ``tier_confidence`` the stop-share-weighted
-mean of those routes. A feed that skipped ``stop_times.txt`` under the crawl
-predicate is single-place and fixed-tier by construction, so every route serves
-every candidate place at its geography-free tier.
+distance and the places and countries its stops fall in — and decides its
+tier: the class its GTFS type declares; else ``local`` when one city or one
+metro holds every located stop; else ``national`` when its stops in its
+majority country lie in more than one top-level region and its span exceeds
+the 90th percentile of the route spans of its feed's home country and mode
+(``route_span_reference.csv``), with the margin penalty within 20 % of that
+value; else ``regional``. A route past the border gate — at least
+``BORDER_STOPS`` and ``BORDER_SHARE`` of its located stops outside its
+majority country — keeps its tier and serves at the ``international`` tier
+too, so one stop across a simplified boundary decides nothing; each feed
+counts the boundary artefacts among its stops (in several countries, in
+none, on a route's minority side). A route serves a place when enough of its
+stops lie inside it; a feed then gets one edge per ``(place, tier)`` for
+which a serving route classifies to that tier, its ``tier_confidence`` the
+stop-share-weighted mean of those routes. A feed that skipped
+``stop_times.txt`` under the crawl predicate lies in one city and is
+fixed-tier by construction, so every route serves every candidate place at
+its declared class, else locally.
 
-``unknown`` is an explicit tier, never a null: a route missing a signal a rule
-needs, a feed without route evidence, and every declared-only feed yield
-``tier = "unknown"`` with ``tier_confidence = 0.0`` and ``needs_review``, while
-the edge keeps its membership and the coverage stage's service level — not
-knowing a route's tier says nothing about whether the feed serves the place.
+``unknown`` is an explicit tier, never a null: a route without a type or of
+no known mode, a feed without route evidence, and every declared-only feed
+yield ``tier = "unknown"`` with ``tier_confidence = 0.0`` and
+``needs_review``, while the edge keeps its membership and the coverage
+stage's service level — not knowing a route's tier says nothing about
+whether the feed serves the place.
 Every tier edge of a ``(place, feed)`` pair carries the same ``service``
 struct: the pair's scheduled stops and serving routes in the place, and its
 stop-events a day when the calendar was crawled: the Monday-to-Friday
@@ -50,7 +56,11 @@ casefolded) whose stops in the place come within ``OVERLAP_NEAR_DEG`` of the
 route's stop box there. A route's departures are its calendar-weighted
 stop-events spread evenly over its stops, times its stops in the place; a
 feed without a calendar gets no block, but its routes still count for the
-others.
+others. A route across a border counts in the block of its own tier's edge;
+the international edge keeps the same routes' block apart, by their own
+tier, under ``evidence["overlap_repeats"]``, so a selection matching only
+the international tier sees their departures and one matching both counts
+them once.
 
 The stage also decides each feed's home country from its stops: the distinct
 scheduled stops per country (``country_stops``), their shares, the country
@@ -68,9 +78,12 @@ trips of a route-level feed, or null whenever the counts are empty.
 import collections
 import contextlib
 import datetime
+import functools
+import hashlib
 import heapq
 import json
 import os
+import pathlib
 import stat
 import math
 import statistics
@@ -78,7 +91,7 @@ import statistics
 import numpy as np
 
 from transitio.index import fingerprint
-from transitio_index import coverage, crawl, overrides, store
+from transitio_index import coverage, crawl, csv_source, overrides, store
 from transitio_index.crosswalk import declared_countries
 from transitio_index.progress import progress
 
@@ -109,12 +122,6 @@ MARGIN_PENALTY = 0.7
 BORDER_SHARE = 0.10
 BORDER_STOPS = 2
 
-RAIL_SPAN_KM = 150.0
-WATER_SPAN_KM = 50.0
-BUS_LOCAL_MEDIAN_KM = 1.5
-BUS_LOCAL_SPAN_KM = 40.0
-BUS_REGIONAL_MEDIAN_KM = 10.0
-BUS_REGIONAL_SPAN_KM = 200.0
 # A route's span is exact over every pair of its distinct stops up to this
 # many; past it the span is unmeasurable within bounds and stays a missing
 # signal — no geometric shortcut is used.
@@ -134,9 +141,33 @@ DEPARTURES_VERSION = 2
 # extended types by family, covers basic types 5–7, 11 and 12, and marks air,
 # taxi and miscellaneous services unclassifiable (rule 10); 3 gates rule 1 on
 # the border share and records every route's scale; 4 leaves stops at the
-# placeholder position out of a route's span and spacing.
-RULES_VERSION = 4
+# placeholder position out of a route's span and spacing; 5 decides by the
+# declared class, one city or metro, and the top-level regions and the
+# country's reference span, and adds international instead of replacing; 6
+# keeps the departures of routes across a border apart on the international
+# edge, by their own tier.
+RULES_VERSION = 6
 
+# The route-span reference (written by ``scripts/route_span_reference.py``):
+# per home country and basic mode, the 90th percentile of the spans of the
+# distinct routes in km; a country with fewer than ``MIN_REFERENCE_ROUTES``
+# of a mode has no row, and ``*`` stands for every country.
+REFERENCE_TABLE = pathlib.Path(__file__).with_name("route_span_reference.csv")
+REFERENCE_COLUMNS = ("country", "mode", "routes", "p90_km")
+MIN_REFERENCE_ROUTES = 100
+# Read once: the settings' digest and the values come from the same bytes.
+_REFERENCE_BYTES = REFERENCE_TABLE.read_bytes()
+# The table's SHA-256 as the integer of its first 13 hex digits: the
+# classifier settings are JSON numbers.
+ROUTE_SPAN_REFERENCE = int(hashlib.sha256(_REFERENCE_BYTES).hexdigest()[:13], 16)
+# The tier a GTFS extended route type declares; any other type states a mode
+# only.
+DECLARED_TIERS = {
+    **dict.fromkeys((101, 102, 103, 105, 114, 202), "national"),
+    201: "international",
+    **dict.fromkeys((106, 109, 204, 208, 701, 903), "regional"),
+    **dict.fromkeys((108, *range(400, 406), 704, 901, 902), "local"),
+}
 # Basic modes over GTFS route types, the reader's table: railway 100s and
 # suburban railway 300s are rail; urban railway 400s, metro 500s,
 # underground 600s and monorail join subway; coach 200s, bus 700s and
@@ -177,12 +208,8 @@ def classifier_settings(route_min_stops=ROUTE_MIN_STOPS):
         "margin_penalty": MARGIN_PENALTY,
         "border_share": BORDER_SHARE,
         "border_stops": BORDER_STOPS,
-        "rail_span_km": RAIL_SPAN_KM,
-        "water_span_km": WATER_SPAN_KM,
-        "bus_local_median_km": BUS_LOCAL_MEDIAN_KM,
-        "bus_local_span_km": BUS_LOCAL_SPAN_KM,
-        "bus_regional_median_km": BUS_REGIONAL_MEDIAN_KM,
-        "bus_regional_span_km": BUS_REGIONAL_SPAN_KM,
+        "route_span_reference": ROUTE_SPAN_REFERENCE,
+        "min_reference_routes": MIN_REFERENCE_ROUTES,
         "span_max_stops": SPAN_MAX_STOPS,
         "pattern_sample": PATTERN_SAMPLE,
         "departures_version": DEPARTURES_VERSION,
@@ -222,26 +249,27 @@ def _decide(tier, confidence, rule, pairs=()):
     }
 
 
-_UNKNOWN = {"tier": "unknown", "tier_confidence": 0.0, "rule": 9, "margin": False}
+_UNKNOWN = {
+    "tier": "unknown",
+    "tier_confidence": 0.0,
+    "rule": "unknown",
+    "margin": False,
+}
 # Out of scope by design, not a missing signal: air, taxi and miscellaneous
 # services. Table structure, versioned by RULES_VERSION.
 _UNCLASSIFIABLE = {
     "tier": "unknown",
     "tier_confidence": 0.0,
-    "rule": 10,
+    "rule": "out_of_scope",
     "margin": False,
 }
 UNCLASSIFIABLE_RANGES = ((1100, 1199), (1500, 1599), (1600, 1799))
-# Basic types local by nature: tram, subway, cable tram, aerial lift,
-# funicular, trolleybus, monorail.
-_LOCAL_BASIC_TYPES = (0, 1, 5, 6, 7, 11, 12)
-# Extended types by hundred: railway and suburban railway; coach; urban
-# railway, metro, underground, bus, trolleybus, tram, aerial lift and
-# funicular; water transport and ferry.
-_RAIL_FAMILIES = (1, 3)
-_COACH_FAMILIES = (2,)
-_LOCAL_FAMILIES = (4, 5, 6, 7, 8, 9, 13, 14)
-_WATER_FAMILIES = (10, 12)
+# The route types that state a mode: basic tram, subway, rail, bus, ferry,
+# cable tram, aerial lift, funicular, trolleybus and monorail; extended
+# railway, coach, suburban railway, urban railway, metro, underground, bus,
+# trolleybus, tram, water, ferry, aerial lift and funicular, by hundred.
+_MODE_BASIC_TYPES = (0, 1, 2, 3, 4, 5, 6, 7, 11, 12)
+_MODE_FAMILIES = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14)
 
 
 def _border(countries):
@@ -253,40 +281,38 @@ def _border(countries):
     return majority, minority
 
 
-def classify_route(route_type, countries, span_km, median_km):
-    """The decision table; ``{tier, tier_confidence, rule, margin, scale_tier,
-    scale_rule, border_stops}``.
+def classify_route(
+    route_type, countries, span_km, local=None, regions=0, reference=None
+):
+    """The decision table; ``{tier, tier_confidence, rule, margin,
+    border_stops, international}``.
 
-    The scale decision — the type rules over the route's own geometry — is
-    always taken and recorded as ``scale_tier`` and ``scale_rule``. Rule 1
-    then overrides it with ``international`` when ``countries`` (each code's
-    located stop ids on the route, or None) puts at least ``BORDER_STOPS``
-    and ``BORDER_SHARE`` of the distinct located stops outside the majority
-    country; below that gate the scale decision stands and ``border_stops``
+    A type that declares a class takes it (``declared``). Any other type of a
+    known mode is ``local`` when ``local`` names the rule holding every
+    located stop of the route in one place (``one_city``, ``one_metro``);
+    otherwise ``national`` when its stops in its majority country lie in more
+    than one top-level region (``regions``) and its span exceeds
+    ``reference``, the 90th percentile of the spans of its feed's home
+    country and mode (``regions_and_span``), else ``regional``, with less
+    confidence when the span or the reference is missing. A route without a
+    type, or of no known mode, is ``unknown``; air, taxi and miscellaneous
+    services are out of scope by design (``out_of_scope``).
+
+    ``international`` says the route also serves at the international tier:
+    ``countries`` (each code's located stop ids on the route, or None) puts
+    at least ``BORDER_STOPS`` and ``BORDER_SHARE`` of its distinct located
+    stops outside the majority country. Below that gate ``border_stops``
     counts the minority stops per country.
-
-    A rule whose signal is missing (``None``) is skipped rather than decided;
-    rules 6–8 are guarded on both bus signals being known, so an unmeasured
-    bus route can never be swallowed as ``national``. Extended route types
-    decide by family (the hundreds); a sub-type never changes the decision.
-    Air, taxi and miscellaneous services are out of scope by design (rule 10),
-    unlike a type the table does not know (rule 9).
     """
-    decision = _scale(route_type, span_km, median_km)
-    decision.update(
-        scale_tier=decision["tier"], scale_rule=decision["rule"], border_stops={}
-    )
+    decision = _scale(route_type, span_km, local, regions, reference)
+    decision.update(border_stops={}, international=False)
     if not countries:
         return decision
     majority, minority = _border(countries)
     total = len(minority) + len(countries[majority])
     if len(minority) >= BORDER_STOPS and len(minority) >= BORDER_SHARE * total:
-        return {
-            **_decide("international", 0.95, 1),
-            "scale_tier": decision["tier"],
-            "scale_rule": decision["rule"],
-            "border_stops": {},
-        }
+        decision["international"] = decision["tier"] != "international"
+        return decision
     held = countries[majority]
     decision["border_stops"] = {
         code: len(stops - held)
@@ -296,57 +322,48 @@ def classify_route(route_type, countries, span_km, median_km):
     return decision
 
 
-def _scale(route_type, span_km, median_km):
-    """The scale decision: rules 2–10 over the route's type and geometry."""
-    if route_type is not None and route_type >= 100:
-        family = route_type // 100
-        if family in _RAIL_FAMILIES:
-            if span_km is None:
-                return dict(_UNKNOWN)
-            tier = "regional" if span_km <= RAIL_SPAN_KM else "national"
-            return _decide(tier, 0.95, 2, [(span_km, RAIL_SPAN_KM)])
-        if family in _COACH_FAMILIES:
-            return _decide("national", 0.95, 2)
-        if family in _LOCAL_FAMILIES:
-            return _decide("local", 0.95, 2)
-        if family in _WATER_FAMILIES:
-            if span_km is None:
-                return dict(_UNKNOWN)
-            tier = "local" if span_km <= WATER_SPAN_KM else "regional"
-            return _decide(tier, 0.95, 2, [(span_km, WATER_SPAN_KM)])
-        if any(low <= route_type <= high for low, high in UNCLASSIFIABLE_RANGES):
-            return dict(_UNCLASSIFIABLE)
+def _scale(route_type, span_km, local, regions, reference):
+    """The tier before the border: the rules over the route's type, the
+    places holding its stops and its span."""
+    if route_type is None:
         return dict(_UNKNOWN)
-    if route_type in _LOCAL_BASIC_TYPES:
-        return _decide("local", 0.90, 3)
-    if route_type == 2 and span_km is not None:
-        tier = "regional" if span_km <= RAIL_SPAN_KM else "national"
-        return _decide(tier, 0.75, 4, [(span_km, RAIL_SPAN_KM)])
-    if route_type == 4 and span_km is not None:
-        tier = "local" if span_km <= WATER_SPAN_KM else "regional"
-        return _decide(tier, 0.75, 5, [(span_km, WATER_SPAN_KM)])
-    if route_type == 3 and span_km is not None and median_km is not None:
-        # "Any threshold it was decided by": rules 6–8 are decided against
-        # every bus threshold, passed or failed, so the borderline coach that
-        # looks like a long city bus is penalised whichever side it lands.
-        pairs = [
-            (median_km, BUS_LOCAL_MEDIAN_KM),
-            (span_km, BUS_LOCAL_SPAN_KM),
-            (median_km, BUS_REGIONAL_MEDIAN_KM),
-            (span_km, BUS_REGIONAL_SPAN_KM),
-        ]
-        if median_km <= BUS_LOCAL_MEDIAN_KM and span_km <= BUS_LOCAL_SPAN_KM:
-            return _decide("local", 0.85, 6, pairs)
-        if median_km <= BUS_REGIONAL_MEDIAN_KM and span_km <= BUS_REGIONAL_SPAN_KM:
-            return _decide("regional", 0.65, 7, pairs)
-        return _decide("national", 0.60, 8, pairs)
-    return dict(_UNKNOWN)
+    if route_type in DECLARED_TIERS:
+        return _decide(DECLARED_TIERS[route_type], 0.95, "declared")
+    if any(low <= route_type <= high for low, high in UNCLASSIFIABLE_RANGES):
+        return dict(_UNCLASSIFIABLE)
+    family = route_type // 100 if route_type >= 100 else None
+    if route_type not in _MODE_BASIC_TYPES and family not in _MODE_FAMILIES:
+        return dict(_UNKNOWN)
+    if local == "one_city":
+        return _decide("local", 0.90, "one_city")
+    if local == "one_metro":
+        return _decide("local", 0.85, "one_metro")
+    if regions < 2:
+        return _decide("regional", 0.75, "regional")
+    if span_km is None or reference is None:
+        return _decide("regional", 0.60, "regional")
+    tier, rule = "regional", "regional"
+    if span_km > reference:
+        tier, rule = "national", "regions_and_span"
+    decision = _decide(tier, 0.75, rule, [(span_km, reference)])
+    decision["reference_km"] = reference
+    return decision
 
 
 def route_serves(stops_in_place, route_stops, *, route_min_stops=ROUTE_MIN_STOPS):
     """Whether a route with ``route_stops`` stops serves a place holding
     ``stops_in_place`` of its scheduled stops."""
     return route_stops > 0 and stops_in_place >= route_min_stops
+
+
+@functools.cache
+def route_span_reference():
+    """``{(country, mode): 90th percentile span in km}`` from the reference
+    table, its ``#`` comment lines skipped; ``*`` stands for every country."""
+    lines = _REFERENCE_BYTES.decode("utf-8").splitlines(keepends=True)
+    text = "".join(line for line in lines if not line.startswith("#"))
+    rows = csv_source.read_rows(text, REFERENCE_COLUMNS)
+    return {(row["country"], row["mode"]): float(row["p90_km"]) for row in rows}
 
 
 def basic_mode(route_type):
@@ -738,8 +755,8 @@ def _span_km(points):
     Exact, always: no hull, projection or sampling stands between the
     stops and the answer, so no metric mismatch can hide the true farthest
     pair. The scan is bounded by the cap squared; a route past the cap (an
-    absurd or hostile feed) gets a MISSING span and classifies as unknown
-    rather than to a guessed tier.
+    absurd or hostile feed) gets a MISSING span, which no rule reads as long
+    or short.
     """
     points = list(set(points))
     if len(points) > SPAN_MAX_STOPS:
@@ -767,7 +784,7 @@ def _route_geography(stop_ids, sequences, coords):
         return None, None, len(stop_ids)
     span = _span_km(points)
     if span is None:
-        # Unmeasurable geometry: every geography-dependent rule must skip.
+        # Unmeasurable geometry: no rule compares the span.
         return None, None, len(stop_ids)
     if any(s not in coords for sequence in sequences for s in sequence):
         # A pattern stop without coordinates — a traversal-only stop sits in
@@ -953,7 +970,7 @@ def _country_evidence(stop_ids, stop_countries, basis):
 
 
 def _country_sets(stop_ids, stop_countries):
-    """``{code: frozenset(stop ids)}`` over ``stop_ids`` — the shape rule 1
+    """``{code: frozenset(stop ids)}`` over ``stop_ids`` — the shape the border gate
     judges — or None when no stop resolved to a country."""
     sets = collections.defaultdict(set)
     for stop_id in stop_ids:
@@ -1032,7 +1049,9 @@ def _tier_edges(
     selector_mode=None,
 ):
     """One edge per tier over the contributing ``(route, decision, weight,
-    signals)`` tuples, ``tier_confidence`` the weight-averaged decision.
+    signals)`` tuples, ``tier_confidence`` the weight-averaged decision; a
+    route flagged ``international`` counts at its own tier and, by the
+    ``border`` rule, at the international tier.
 
     ``stamp`` holds the feed's fingerprint fields, identical on every edge.
     ``selector_mode`` is ``"complete"`` when each tier's selector is exactly
@@ -1041,7 +1060,16 @@ def _tier_edges(
     """
     by_tier = collections.defaultdict(list)
     for item in contributing:
-        by_tier[item["decision"]["tier"]].append(item)
+        decision = item["decision"]
+        by_tier[decision["tier"]].append(item)
+        if decision.get("international"):
+            # A route across a border keeps its tier and serves at the
+            # international tier too.
+            border = _decide("international", 0.95, "border")
+            border["scale_tier"] = decision["tier"]
+            if "reference_km" in decision:
+                border["reference_km"] = decision["reference_km"]
+            by_tier["international"].append({**item, "decision": border})
     edges = []
     for tier in sorted(by_tier):
         items = by_tier[tier]
@@ -1064,9 +1092,10 @@ def _tier_edges(
         rules_count = collections.Counter(
             str(item["decision"]["rule"]) for item in items
         )
-        # The scale behind the tier (equal to it unless rule 1 overrode it),
-        # and the stops the contributing routes had outside their majority
-        # country, below the border gate.
+        # The routes' own tiers (on the international edge, those of the
+        # routes it holds for crossing a border), and the stops the
+        # contributing routes had outside their majority country, below the
+        # border gate.
         scales = {i["decision"].get("scale_tier", i["decision"]["tier"]) for i in items}
         border = collections.Counter()
         for item in items:
@@ -1078,6 +1107,10 @@ def _tier_edges(
         held = sum(item.get("placeholder_stops", 0) for item in items)
         if held:
             evidence["placeholder_stops"] = held
+        # The reference spans the routes crossing regions were compared with.
+        compared = {i["decision"].get("reference_km") for i in items} - {None}
+        if compared:
+            evidence["reference_km"] = sorted(compared)
         evidence.update(
             {
                 "matched_route_types": sorted(t for t in types if t < 100),
@@ -1290,23 +1323,86 @@ def route_rows(routes, interned):
 def _overlaps(by_place, interned):
     """Write ``evidence["overlap"]`` on the edges :func:`_overlap_rows` gave
     rows, one place at a time, emptying ``by_place`` (``{place_id: [(edge,
-    rows)]}``) as it goes, and keep every such edge's rows under
+    tier, rows)]}``) as it goes, and keep every such edge's rows under
     ``evidence["overlap_routes"]``; how many edges got a block. An edge whose
-    feed has no calendar gets none."""
+    feed has no calendar gets none. Rows given with a ``tier`` are the
+    international edge's routes of that tier across the border, written
+    under ``overlap_repeats`` and ``overlap_repeats_routes`` by that tier."""
     written = 0
     for place_id in sorted(by_place):
-        pairs = by_place.pop(place_id)
+        entries = by_place.pop(place_id)
         blocks = place_overlaps(
-            [edge["feed_id"] for edge, _ in pairs],
-            [rows for _, rows in pairs],
+            [edge["feed_id"] for edge, _, _ in entries],
+            [rows for _, _, rows in entries],
             interned,
         )
-        for (edge, rows), block in zip(pairs, blocks):
-            edge["evidence"]["overlap_routes"] = overlap_routes(rows, interned)
+        for (edge, tier, rows), block in zip(entries, blocks):
+            evidence = edge["evidence"]
+            kept = overlap_routes(rows, interned)
+            if tier is not None:
+                evidence.setdefault("overlap_repeats_routes", {})[tier] = kept
+                if block is not None:
+                    evidence.setdefault("overlap_repeats", {})[tier] = block
+                continue
+            evidence["overlap_routes"] = kept
             if block is not None:
-                edge["evidence"]["overlap"] = block
+                evidence["overlap"] = block
                 written += 1
     return written
+
+
+def metros_of(places):
+    """``{place_id: metro ids}``: the metros a city lies in, by its own
+    ``metro_ids`` or a metro's ``member_ids``."""
+    found = collections.defaultdict(set)
+    for place_id, place in places.items():
+        found[place_id].update(place.get("metro_ids") or ())
+        if place.get("kind") == "metro":
+            for member in place.get("member_ids") or ():
+                found[member].add(place_id)
+    return found
+
+
+def _top_level(place_id, places):
+    """Whether the place is a region, or a city, directly under its country."""
+    place = places.get(place_id) or {}
+    parent = places.get(place.get("parent_id")) or {}
+    return place.get("kind") in ("region", "city") and parent.get("kind") == "country"
+
+
+def _stop_reach(hit, places, metros):
+    """``(cities, metros, top-level regions)`` holding a stop that lies in the
+    places ``hit``; a metro holds it by its own polygon or as a metro of a
+    city holding it."""
+    kinds = {place_id: (places.get(place_id) or {}).get("kind") for place_id in hit}
+    cities = frozenset(p for p, kind in kinds.items() if kind == "city")
+    held = {p for p, kind in kinds.items() if kind == "metro"}
+    for city in cities:
+        held.update(metros.get(city, ()))
+    tops = frozenset(p for p in hit if _top_level(p, places))
+    return cities, frozenset(held), tops
+
+
+def _route_places(stop_ids, countries, majority, reach, places):
+    """``(local, regions)`` for a route: ``one_city`` when one city holds
+    every located stop of it, else ``one_metro`` when one metro does, else
+    None; and how many top-level regions of its majority country hold its
+    stops there."""
+    located = [reach[s] for s in stop_ids if s in reach]
+    local = None
+    if located and frozenset.intersection(*(r[0] for r in located)):
+        local = "one_city"
+    elif located and frozenset.intersection(*(r[1] for r in located)):
+        local = "one_metro"
+    regions = set()
+    for stop_id in countries[majority] if countries else ():
+        if stop_id in reach:
+            regions.update(
+                p
+                for p in reach[stop_id][2]
+                if places[p].get("country_code") == majority
+            )
+    return local, len(regions)
 
 
 def _classify_feed(
@@ -1322,6 +1418,7 @@ def _classify_feed(
     calendar=None,
     curated=None,
     interned=None,
+    metros=None,
 ):
     """The classified edges for one crawled feed; ``(edges, status, routes,
     dropped, join_gaps, country_stops, country_basis)`` — ``dropped`` counting
@@ -1344,7 +1441,10 @@ def _classify_feed(
     serves anything, but the feed's membership is not a vanished edge.
 
     With ``interned`` (the line keys and modes interned so far), each
-    route-level tier edge carries its :func:`_overlap_rows` as ``_overlap``.
+    route-level tier edge carries its :func:`_overlap_rows` as ``_overlap``,
+    and an international edge the rows of its routes of other tiers across
+    the border as ``_overlap_repeats``, by tier.
+    ``metros`` is :func:`metros_of` over ``places``.
     """
     mode = (state.get("stop_times") or {}).get("state")
     names = ("trips.txt",) if mode == "complete" else ()
@@ -1425,9 +1525,12 @@ def _classify_feed(
                 None,
                 _stop_artefacts(stop_countries, border),
             )
+        # The predicate proved every stop in one city.
         contributing = [
             {
-                "decision": classify_route(route_type, feed_countries, None, None),
+                "decision": classify_route(
+                    route_type, feed_countries, None, "one_city"
+                ),
                 "weight": 1.0,
                 "route_type": route_type,
                 "span_km": None,
@@ -1503,6 +1606,13 @@ def _classify_feed(
         )
 
     # Per-route measurement, then service to each candidate place.
+    reach = {
+        stop_id: _stop_reach(stop_places[stop_id], places, metros or {})
+        for stop_id, position in coords.items()
+        if position != crawl.PLACEHOLDER_POSITION
+    }
+    home = home_country(_country_stops(parsed["scheduled"], stop_countries), ())
+    references = route_span_reference()
     measured = {}
     minority_stops = set()
     for route_id, info in routes.items():
@@ -1512,15 +1622,25 @@ def _classify_feed(
             stop_ids, parsed["sequences"].get(route_id, []), coords
         )
         countries = _country_sets(stop_ids, stop_countries)
+        majority = None
         if countries:
-            minority_stops |= _border(countries)[1]
+            majority, minority = _border(countries)
+            minority_stops |= minority
+        local, regions = _route_places(stop_ids, countries, majority, reach, places)
+        mode_key = basic_mode(route_type)
+        reference = references.get((home, mode_key), references.get(("*", mode_key)))
         place_stops = collections.defaultdict(set)
         for stop_id in stop_ids:
             for hit in stop_places.get(stop_id, ()):
                 place_stops[hit].add(stop_id)
         measured[route_id] = {
             "decision": classify_route(
-                route_type, countries if count else None, span, median
+                route_type,
+                countries if count else None,
+                span,
+                local,
+                regions,
+                reference,
             ),
             "route_id": route_id,
             "route_type": route_type,
@@ -1578,17 +1698,23 @@ def _classify_feed(
         )
         if interned is not None:
             by_tier = collections.defaultdict(list)
+            across = collections.defaultdict(list)
             for route in contributing:
                 by_tier[route["decision"]["tier"]].append(route)
+                if route["decision"]["international"]:
+                    across[route["decision"]["tier"]].append(route)
+            shared = (place_id, place, coords, parsed.get("route_events"), interned)
             for edge in tier_edges:
-                edge["_overlap"] = _overlap_rows(
-                    by_tier[edge["tier"]],
-                    place_id,
-                    place,
-                    coords,
-                    parsed.get("route_events"),
-                    interned,
-                )
+                # An international edge holding only routes of other tiers
+                # across the border has no rows of its own; it keeps theirs
+                # apart, by their own tier.
+                if by_tier[edge["tier"]]:
+                    edge["_overlap"] = _overlap_rows(by_tier[edge["tier"]], *shared)
+                if edge["tier"] == "international" and across:
+                    edge["_overlap_repeats"] = {
+                        tier: _overlap_rows(routes, *shared)
+                        for tier, routes in sorted(across.items())
+                    }
         edges.extend(tier_edges)
     return (
         edges,
@@ -1956,6 +2082,7 @@ def classify(
             by_overture = coverage.place_index(places)
             by_qid = coverage.place_qids(places)
             curated = coverage.curated_boundaries(places)
+            metros = metros_of(places)
             crawl_lock = crawl.reading(cache_dir)
             crawl_lock.__enter__()
             if coverage_manifest.get("crawl_digest") != crawl.states_digest(cache_dir):
@@ -2012,12 +2139,16 @@ def classify(
                             calendar=calendar,
                             curated=curated,
                             interned=interned,
+                            metros=metros,
                         )
                     )
                     for edge in classified:
                         rows = edge.pop("_overlap", None)
                         if rows is not None:
-                            by_place[edge["place_id"]].append((edge, rows))
+                            by_place[edge["place_id"]].append((edge, None, rows))
+                        repeats = edge.pop("_overlap_repeats", {})
+                        for tier, rows in repeats.items():
+                            by_place[edge["place_id"]].append((edge, tier, rows))
                     routes_classified += routes
                     edges_dropped += dropped
                     for key, value in (gaps or {}).items():

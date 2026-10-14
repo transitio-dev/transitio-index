@@ -98,6 +98,8 @@ PAD_DEG = 0.05
 # The only directory shape the crawl produces; anything else in the log is
 # refused rather than joined into a path.
 _CRAWL_DIR = re.compile(r"\Aid-[0-9a-f]{64}\Z")
+# A crawl directory parked after its run, which no crawl writes again.
+PARKED_CRAWL = re.compile(r"\Acrawl\.[A-Za-z0-9_-]+\.bak\Z")
 
 # What a corrupt crawled member can raise while being read as evidence; a
 # programming defect is deliberately NOT in this tuple, so it surfaces.
@@ -148,6 +150,11 @@ class HtmlPage(fetch.FetchError):
     place of a file it moved or removed."""
 
 
+# A read whose bytes are no archive the crawl can open (a page, a broken zip):
+# the record's ``failure`` is "unreadable", any other failure "failed".
+UNREADABLE = (HtmlPage, zipfile.BadZipFile, zlib.error, lzma.LZMAError)
+
+
 def feed_url(feed):
     """The URL to crawl: the ``download_url`` resolve settled (a published
     row's too), else a curated feed's own, else the Atlas static feed, else
@@ -173,7 +180,13 @@ def _producer_failed(error):
     archive. The crawler's own byte ceilings, local I/O and memory are not."""
     return isinstance(
         error,
-        (fetch.FetchError, zipfile.BadZipFile, ziprange.RangeReadError, zlib.error),
+        (
+            fetch.FetchError,
+            zipfile.BadZipFile,
+            ziprange.RangeReadError,
+            zlib.error,
+            lzma.LZMAError,
+        ),
     ) and not isinstance(error, fetch.TooLarge)
 
 
@@ -349,36 +362,47 @@ def reading(cache_dir):
         directory.close()
 
 
-def crawled_feeds(cache_dir, *, stops=True):
-    """``(feed_dir, state)`` for crawled feeds whose state records stops, or
-    with ``stops=False`` for every committed crawl.
-
-    The per-feed ``state.json`` is the crawl's commit point, so it — not the
-    run-level log alone — decides what may be read as evidence. Every path
-    component is refused when symlinked, and one corrupt log line or state
-    skips one feed, never the caller's run.
-    """
-    crawl_root = cache_dir / "crawl"
+def _log_records(crawl_root):
+    """The records of the crawl log under ``crawl_root``, in order; none when
+    the root or the log is a symlink or missing. One corrupt line skips that
+    line, never every consumer."""
     if crawl_root.is_symlink() or not crawl_root.is_dir():
         return []
-    log_path = crawl_root / LOG_FILE
     try:
-        handle = store.open_nofollow(log_path)
+        handle = store.open_nofollow(crawl_root / LOG_FILE)
     except OSError:
         return []
     with os.fdopen(handle, "rb") as opened:
         raw = opened.read()
-    found = []
+    records = []
     for line in raw.split(b"\n"):
         if not line.strip():
             continue
         try:
             record = json.loads(line)
         except ValueError:
-            # One corrupt log line skips one feed, never every consumer.
             continue
-        if not isinstance(record, dict):
-            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def crawled_feeds(cache_dir, *, stops=True, name="crawl"):
+    """``(feed_dir, state)`` for crawled feeds whose state records stops, or
+    with ``stops=False`` for every committed crawl; ``name`` is the crawl
+    directory under ``cache_dir``, ``crawl`` or a parked crawl
+    (:data:`PARKED_CRAWL`).
+
+    The per-feed ``state.json`` is the crawl's commit point, so it — not the
+    run-level log alone — decides what may be read as evidence. Every path
+    component is refused when symlinked, and one corrupt log line or state
+    skips one feed, never the caller's run.
+    """
+    if name != "crawl" and not PARKED_CRAWL.fullmatch(name):
+        raise ValueError(f"not a crawl directory: {name!r}")
+    crawl_root = cache_dir / name
+    found = []
+    for record in _log_records(crawl_root):
         name = record.get("directory")
         if not isinstance(name, str) or not _CRAWL_DIR.fullmatch(name):
             continue
@@ -398,6 +422,49 @@ def crawled_feeds(cache_dir, *, stops=True):
     return found
 
 
+# A failed read's kinds, as the log records them.
+FAILURES = ("failed", "no_url", "unreadable")
+
+
+def _failure_of(record):
+    """A failed read's kind: its ``failure``, or for a log written before the
+    field, ``no_url``, ``unreadable`` or ``failed`` from its reason."""
+    if record.get("failure") in FAILURES:
+        return record["failure"]
+    reason = record.get("fallback_reason")
+    reason = reason if isinstance(reason, str) else ""
+    if reason == "no download URL":
+        return "no_url"
+    if "an HTML page" in reason or "not a zip" in reason:
+        return "unreadable"
+    return "failed"
+
+
+def unread_cause(status, uncrawlable_reason):
+    """Why the index holds no read of a feed, from its published
+    ``crawl_status`` (``failed``, ``no_url``, ``unreadable``,
+    ``no_gtfs_files``), else its ``uncrawlable_reason``; None for a feed
+    read (``ok``)."""
+    if status == "ok":
+        return None
+    for value in (status, uncrawlable_reason):
+        # A table's missing value may read as NaN.
+        if isinstance(value, str) and value:
+            return value
+    return "no reason recorded"
+
+
+def failures(cache_dir):
+    """``{feed_id: failure}`` from the crawl log, by the id the crawl saw:
+    the kind (:data:`FAILURES`) of each read that was skipped or failed."""
+    return {
+        record["feed_id"]: _failure_of(record)
+        for record in _log_records(cache_dir / "crawl")
+        if isinstance(record.get("feed_id"), str)
+        and record.get("method") in ("failed", "skipped")
+    }
+
+
 def cluster_boxes(points):
     """Padded grid-cell boxes covering the points, one box per occupied cell."""
     cells = {(math.floor(x / GRID_DEG), math.floor(y / GRID_DEG)) for x, y in points}
@@ -413,19 +480,24 @@ def cluster_boxes(points):
 
 
 def _fixed_tier(route_type):
-    """The tier a route type settles with no route geography, or None.
+    """The tier a route type settles with no route geography when every stop
+    lies in one city, as the predicate requires, or None.
 
-    The geography-free rules, ranges exactly as the classifier's: tram/subway
-    (rule 3) and the fixed-tier half of rule 2 — coach 200-209 national;
-    urban rail 400-405, bus 700-716, trolleybus 800s and tram 900s local.
-    Anything else (717-799 included) is unknown to the classifier too.
+    For tram, subway, coach 200-209, urban rail 400-405, bus 700-716,
+    trolleybus 800s and tram 900s: the class the type declares
+    (``classify.DECLARED_TIERS``), else local by the classifier's one-city
+    rule. Any other type is read with its route geography.
     """
-    if route_type in (0, 1) or 400 <= route_type <= 405:
-        return "local"
-    if 700 <= route_type <= 716 or 800 <= route_type <= 999:
-        return "local"
-    if 200 <= route_type <= 209:
-        return "national"
+    from transitio_index import classify
+
+    if (
+        route_type in (0, 1)
+        or 200 <= route_type <= 209
+        or 400 <= route_type <= 405
+        or 700 <= route_type <= 716
+        or 800 <= route_type <= 999
+    ):
+        return classify.DECLARED_TIERS.get(route_type, "local")
     return None
 
 
@@ -686,21 +758,53 @@ def _fragment(url):
 
 def _archive_root(names, folder=None):
     """The prefix the GTFS members live under: the fragment's folder when the
-    archive has it, else ``""`` when a member is at the root, else the single
-    top-level folder holding one; ``""`` otherwise."""
-    names = list(names)
+    archive has it, else ``""`` when a member is at the root, else the
+    shallowest folder holding one when no other folder at its depth does;
+    ``""`` otherwise. Names are compared without case, and macOS resource
+    folders (``__MACOSX/``) are ignored."""
+    names = [name for name in names if not name.startswith("__MACOSX/")]
     if folder is not None:
         prefix = folder + "/"
         if any(name.startswith(prefix) for name in names):
             return prefix
-    if any(name in MEMBERS for name in names):
+    if any(name.lower() in MEMBERS for name in names):
         return ""
-    firsts = {name.split("/", 1)[0] for name in names if name}
-    if len(firsts) == 1:
-        prefix = firsts.pop() + "/"
-        if any(name[len(prefix) :] in MEMBERS for name in names):
-            return prefix
-    return ""
+    holders = {
+        name[: len(name) - len(name.rsplit("/", 1)[-1])]
+        for name in names
+        if "/" in name and name.rsplit("/", 1)[-1].lower() in MEMBERS
+    }
+    if not holders:
+        return ""
+    depth = min(prefix.count("/") for prefix in holders)
+    shallowest = [prefix for prefix in holders if prefix.count("/") == depth]
+    return shallowest[0] if len(shallowest) == 1 else ""
+
+
+def _lone_entry(names):
+    """The archive's one file when it holds nothing else and it is no GTFS
+    member — a feed zipped inside a zip, as the Buenos Aires Subte's
+    ``subte_gtfs`` — else None; macOS resource folders are ignored."""
+    files = [
+        name
+        for name in names
+        if not name.startswith("__MACOSX/") and not name.endswith("/")
+    ]
+    if len(files) == 1 and files[0].rsplit("/", 1)[-1].lower() not in MEMBERS:
+        return files[0]
+    return None
+
+
+def _members_under(names, root):
+    """``{member: archive name}`` for the GTFS members directly beneath
+    ``root``, names compared without case (of two names differing only in
+    case, the first)."""
+    found = {}
+    for name in names:
+        rest = name[len(root) :] if name.startswith(root) else None
+        if rest and rest.lower() in MEMBERS:
+            found.setdefault(rest.lower(), name)
+    return found
 
 
 def _under(names, root):
@@ -794,18 +898,23 @@ def _write_ranged(fetcher, url, probe, feed_dir, decide, fragment=None):
     read = fetcher.range_reader(url, validator=_range_validator(probe))
     directory = ziprange.central_directory(read, probe["size"])
     root = _archive_root(directory, fragment[1] if fragment else None)
+    found = _members_under(directory, root)
+    if not found and fragment is None and _lone_entry(directory) is not None:
+        # The download path reads the archive inside.
+        raise ziprange.RangeReadError("a lone inner archive")
     digests = {}
     small = {}
 
     def write(name):
-        entry = directory.get(root + name)
+        entry = directory.get(found.get(name))
         if entry is None:
             return
         data = ziprange.read_member(read, entry, max_member_bytes=RANGED_MEMBER_BYTES)
         store.write_bytes(feed_dir, name, data)
         digests[name] = hashlib.sha256(data).hexdigest()
         if entry["uncompressed_size"] <= EMPTY_PROBE_BYTES:
-            small[name] = data
+            # Keyed by the archive's own name, the one the record probes.
+            small[found[name][len(root) :]] = data
 
     for name in CHEAP_MEMBERS:
         write(name)
@@ -916,15 +1025,29 @@ def _extract_members(feed_dir, decide, fragment=None, check=None):
         root = _archive_root(
             names, fragment[1] if fragment and fragment[0] == "folder" else None
         )
+        found = _members_under(names, root)
+        lone = None if found or fragment else _lone_entry(names)
+        if lone is not None:
+            # A feed zipped inside a zip, the archive's one file: read in the
+            # outer one's place when it is a zip archive.
+            inner, _ = _write_member(feed_dir, archive, archive.getinfo(lone))
+            stack.callback(store.unlink, feed_dir, inner)
+            try:
+                archive = stack.enter_context(_open_archive(stack, feed_dir, inner))
+            except zipfile.BadZipFile:
+                pass
+            else:
+                names = archive.namelist()
+                root = _archive_root(names)
+                found = _members_under(names, root)
         files = _root_files(_under(names, root))
         if check is not None:
             check(files)
 
         def extract(name):
-            try:
-                info = archive.getinfo(root + name)
-            except KeyError:
+            if name not in found:
                 return
+            info = archive.getinfo(found[name])
             partial, digest = _write_member(feed_dir, archive, info)
             try:
                 feed_dir.replace(partial, name)
@@ -949,17 +1072,49 @@ def _extract_members(feed_dir, decide, fragment=None, check=None):
     return digests, record, skipped, reason
 
 
+def _at_fragment(hosted, url):
+    """``hosted`` at ``url``'s fragment when it has none of its own; as it is
+    when either does not parse, for the read to report."""
+    if not hosted:
+        return hosted
+    try:
+        fragment = urllib.parse.urlsplit(url or "").fragment
+        parts = urllib.parse.urlsplit(hosted)
+    except ValueError:
+        return hosted
+    if fragment and not parts.fragment:
+        return parts._replace(fragment=fragment).geturl()
+    return hosted
+
+
 def _crawl_keyless(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
     """Crawl one feed without a key; returns its log record.
 
     The producer URL is read first, without credentials. When that read fails
-    on the producer's side (:func:`_producer_failed`), the MDB-hosted copy is
-    read once in its place; the record keeps the producer URL and its failure.
+    on the producer's side (:func:`_producer_failed`), reads an archive
+    without ``stops.txt``, or there is no URL to read, the MDB-hosted copy is
+    read once in its place, at
+    the producer URL's fragment when it has none of its own; the record keeps
+    the producer URL and its failure. ``host_refused`` marks a feed the
+    breaker refused on the producer's host and no copy was read for.
     """
     options = {"force": force, "range_threshold": range_threshold, "lookup": lookup}
-    record, error = _crawl_from(fetcher, cache_dir, feed, feed_url(feed), **options)
-    hosted = _hosted_url(feed)
-    if not _producer_failed(error) or not hosted or hosted == record["url"]:
+    url = feed_url(feed)
+    record, error = _crawl_from(fetcher, cache_dir, feed, url, **options)
+    refused = isinstance(error, fetch.HostRefused)
+    if error is None:
+        if "stops.txt" in record["members"]:
+            return record
+        failure = record["fallback_reason"] if record["method"] == "skipped" else None
+        failure = failure or "no stops.txt in the producer's archive"
+    elif _producer_failed(error):
+        failure = record["fallback_reason"]
+    else:
+        return record
+    hosted = _at_fragment(_hosted_url(feed), url)
+    if not hosted or hosted == record["url"]:
+        if refused:
+            record["host_refused"] = True
         return record
     retry, _ = _crawl_from(
         fetcher,
@@ -967,11 +1122,13 @@ def _crawl_keyless(fetcher, cache_dir, feed, *, force, range_threshold, lookup):
         feed,
         hosted,
         fetched_from=HOSTED_COPY,
-        producer_failure=record["fallback_reason"],
+        producer_failure=failure,
         **options,
     )
     retry["url"] = record["url"]
     retry["bytes_fetched"] += record["bytes_fetched"]
+    if refused and retry["fetched_from"] is None:
+        retry["host_refused"] = True
     return retry
 
 
@@ -1082,6 +1239,7 @@ def _crawl_from(
     if not url:
         record["method"] = "skipped"
         record["fallback_reason"] = "no download URL"
+        record["failure"] = "no_url"
         return record, None
 
     feed_dir = None
@@ -1303,12 +1461,14 @@ def _crawl_from(
         LookupError,
         TypeError,
         zlib.error,
+        lzma.LZMAError,
         # A member below the byte ceiling can still exhaust memory when
         # buffered; that is this feed's failure, never the run's.
         MemoryError,
     ) as error:
         record["method"] = "failed"
         record["fallback_reason"] = str(error)
+        record["failure"] = "unreadable" if isinstance(error, UNREADABLE) else "failed"
         # The previous crawl still stands in for the feed: give it the
         # identity and source record it predates when its members verify.
         if feed_dir is not None and state and _members_intact(feed_dir, state):
@@ -1340,6 +1500,7 @@ def _safe_crawl_one(fetcher, cache_dir, feed, **options):
             "bytes_fetched": 0,
             "bytes_saved": 0,
             "fallback_reason": f"unexpected error: {error}",
+            "failure": "failed",
             "members": [],
             "files": [],
             "stop_times": None,
@@ -1453,11 +1614,33 @@ def crawl(
                             total=len(eligible),
                         ):
                             log[futures[future]] = future.result()
+                # A feed whose host the breaker refused is asked once more,
+                # one at a time in feed order, every host's failures forgotten
+                # before each.
+                refused = [
+                    i for i, record in enumerate(log) if record.get("host_refused")
+                ]
+                for ordinal in refused:
+                    feed, force = eligible[ordinal]
+                    fetcher.reset_hosts()
+                    first = log[ordinal]
+                    log[ordinal] = _safe_crawl_one(
+                        fetcher,
+                        cache_dir,
+                        feed,
+                        force=force,
+                        range_threshold=range_threshold,
+                        lookup=lookup,
+                        keys=keys,
+                    )
+                    log[ordinal]["retried_after_breaker"] = True
+                    log[ordinal]["bytes_fetched"] += first["bytes_fetched"]
                 # Keyed reads follow every keyless one, one at a time in feed
                 # order: a budget or a refused key then settles the same
                 # feeds at any worker count.
                 for ordinal, (feed, force) in enumerate(eligible):
                     if feed.get("access") == "key" and "key_crawl" not in log[ordinal]:
+                        retried = log[ordinal].get("retried_after_breaker")
                         log[ordinal] = _safe_crawl_one(
                             fetcher,
                             cache_dir,
@@ -1468,6 +1651,8 @@ def crawl(
                             keys=keys,
                             keyless=log[ordinal],
                         )
+                        if retried:
+                            log[ordinal]["retried_after_breaker"] = True
                 if keys is not None:
                     log = [keys.redact(record) for record in log]
                 store.write_file(
@@ -1549,6 +1734,9 @@ def crawl(
         "by_method": methods,
         "by_key_crawl": dict(key_crawls),
         "stop_times_skipped": sum(1 for r in log if r.get("stop_times") == "skipped"),
+        # Refused by the breaker, asked again at the end; still refused.
+        "retried_after_breaker": sum(1 for r in log if r.get("retried_after_breaker")),
+        "host_refused": sum(1 for r in log if r.get("host_refused")),
         "bytes_fetched": sum(r["bytes_fetched"] for r in log),
         "bytes_saved": sum(r["bytes_saved"] for r in log),
         "recrawl_requested": len(recrawl),

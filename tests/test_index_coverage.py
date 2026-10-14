@@ -413,18 +413,35 @@ def test_the_hull_frame_survives_a_greenwich_and_dateline_mix(tmp_path):
     assert not hull.covers(shapely.Point(90.0, 1.0))
 
 
-def test_all_unparsable_stops_still_supersede_declared(tmp_path):
-    # A digest-valid stops.txt whose rows are all unparsable is the crawl's
-    # answer: declared edges go, the row count is kept, nothing is placed.
+@pytest.mark.parametrize(
+    "rows",
+    [["s%d,not-a-lat,10.0\n" % i for i in range(4)], _rows(4, 30.0)],
+    ids=["unparsable", "in-no-place"],
+)
+def test_a_crawl_that_places_no_stop_keeps_the_declared_places(tmp_path, rows):
+    # A digest-valid stops.txt whose rows are all unparsable, or whose stops
+    # lie in no known place, places nothing: a feed keeps its declared or
+    # curated places, with the crawl's row count but not its hull. A feed
+    # whose declared place is unknown has no edge to keep and stays crawled.
+    from test_index_place_overrides import write_overrides
+
+    curated = [
+        {"feed": "f-reg", "set_coverage": {"level": "subdivision", "place_id": "Q-reg"}}
+    ]
     manifest, covered, edges = _cover(
         tmp_path,
-        crawls={"f-city": ["s%d,not-a-lat,10.0\n" % i for i in range(4)]},
+        crawls={feed_id: rows for feed_id in ("f-city", "f-reg", "f-lost")},
         lookup=LOOKUP,
+        overrides_dir=write_overrides(tmp_path, feeds=curated),
     )
-    assert covered["f-city"]["coverage_source"] == "crawl"
-    assert covered["f-city"]["stop_count"] == 4
-    assert covered["f-city"]["coverage"] is None
-    assert "f-city" not in edges
+    for feed_id in ("f-city", "f-reg"):
+        assert covered[feed_id]["coverage_source"] == "declared"
+        assert covered[feed_id]["stop_count"] == 4
+        assert covered[feed_id].get("coverage") is None
+    assert edges["f-city"]["Q-city"]["evidence"]["declared_level"] == "municipality"
+    assert edges["f-reg"]["Q-reg"]["evidence"]["declared_level"] == "subdivision"
+    assert covered["f-lost"]["coverage_source"] == "crawl"
+    assert manifest["crawled_unplaced_declared"] == ["f-city", "f-reg"]
 
 
 def test_a_metro_counts_the_stops_of_all_its_members(tmp_path):

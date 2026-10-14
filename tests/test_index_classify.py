@@ -16,56 +16,46 @@ def _stops(**counts):
 
 
 @pytest.mark.parametrize(
-    ("route_type", "countries", "span", "median", "tier", "confidence", "rule"),
+    ("route_type", "local", "regions", "span", "tier", "confidence", "rule"),
     [
-        (3, _stops(AA=2, BB=2), 5.0, 1.0, "international", 0.95, 1),  # rule 1 wins
-        (109, _stops(AA=1), 100.0, None, "regional", 0.95, 2),
-        (109, _stops(AA=1), 400.0, None, "national", 0.95, 2),
-        (109, _stops(AA=1), None, None, "unknown", 0.0, 9),  # span needed
-        (204, None, None, None, "national", 0.95, 2),
-        (715, None, None, None, "local", 0.95, 2),
-        (1000, _stops(AA=1), 20.0, None, "local", 0.95, 2),
-        (300, _stops(AA=1), 100.0, None, "regional", 0.95, 2),  # suburban railway
-        (300, _stops(AA=1), 400.0, None, "national", 0.95, 2),
-        (500, None, None, None, "local", 0.95, 2),  # metro service
-        (1200, _stops(AA=1), 20.0, None, "local", 0.95, 2),  # ferry, as water
-        (1200, _stops(AA=1), 80.0, None, "regional", 0.95, 2),
-        (1301, None, None, None, "local", 0.95, 2),  # telecabin sub-type
-        (1100, _stops(AA=1), 20.0, None, "unknown", 0.0, 10),  # air: out of scope
-        (1501, _stops(AA=1), 20.0, 1.0, "unknown", 0.0, 10),  # taxi: out of scope
-        (1800, _stops(AA=1), 20.0, 1.0, "unknown", 0.0, 9),  # not a GTFS type
-        (1, None, None, None, "local", 0.90, 3),
-        (5, None, None, None, "local", 0.90, 3),  # cable tram
-        (11, None, None, None, "local", 0.90, 3),  # trolleybus
-        (2, _stops(AA=1), 100.0, None, "regional", 0.75, 4),
-        (4, _stops(AA=1), 80.0, None, "regional", 0.75, 5),
-        (3, _stops(AA=1), 30.0, 1.0, "local", 0.85, 6),
-        (3, _stops(AA=1), 150.0, 5.0, "regional", 0.65, 7),
-        (3, _stops(AA=1), 1000.0, 50.0, "national", 0.60, 8),
-        (3, _stops(AA=1), None, 1.0, "unknown", 0.0, 9),  # bus without span
-        (None, _stops(AA=1), 30.0, 1.0, "unknown", 0.0, 9),
+        (101, None, 0, None, "national", 0.95, "declared"),
+        (201, None, 0, None, "international", 0.95, "declared"),
+        (109, "one_city", 1, 5.0, "regional", 0.95, "declared"),  # beats one city
+        (704, None, 3, 500.0, "local", 0.95, "declared"),
+        (3, "one_city", 1, 5.0, "local", 0.90, "one_city"),
+        (2, "one_metro", 2, 90.0, "local", 0.85, "one_metro"),
+        (3, None, 1, 300.0, "regional", 0.75, "regional"),  # one region
+        (3, None, 2, 13.0, "regional", 0.75, "regional"),  # two, but short
+        (2, None, 2, 400.0, "national", 0.75, "regions_and_span"),
+        (3, None, 2, None, "regional", 0.60, "regional"),  # span unmeasured
+        (1301, None, 2, 400.0, "regional", 0.60, "regional"),  # no reference
+        (1100, "one_city", 1, 5.0, "unknown", 0.0, "out_of_scope"),  # air
+        (1800, "one_city", 1, 5.0, "unknown", 0.0, "unknown"),  # not a type
+        (8, "one_city", 1, 5.0, "unknown", 0.0, "unknown"),
+        (None, "one_city", 1, 5.0, "unknown", 0.0, "unknown"),
     ],
 )
-def test_the_decision_table(
-    route_type, countries, span, median, tier, confidence, rule
-):
-    decision = classify.classify_route(route_type, countries, span, median)
+def test_the_decision_table(route_type, local, regions, span, tier, confidence, rule):
+    # A reference of 140 km for the route's country and mode; none for 1301.
+    reference = None if route_type == 1301 else 140.0
+    decision = classify.classify_route(
+        route_type, _stops(AA=2), span, local, regions, reference
+    )
     assert decision["tier"] == tier
     assert decision["tier_confidence"] == pytest.approx(confidence)
     assert decision["rule"] == rule
     assert decision["margin"] is False
+    assert decision["international"] is False
 
 
-def test_the_margin_penalty_applies_within_a_fifth_of_a_threshold():
-    # 36 km is within 20 % of the 40 km local span threshold.
-    decision = classify.classify_route(3, _stops(AA=1), 36.0, 1.0)
-    assert decision["tier"] == "local"
-    assert decision["margin"] is True
-    assert decision["tier_confidence"] == pytest.approx(0.85 * 0.7)
-    # A rail route right past 150 km is penalised on the other side too.
-    decision = classify.classify_route(2, _stops(AA=1), 160.0, None)
-    assert decision["tier"] == "national"
-    assert decision["margin"] is True
+def test_the_margin_penalty_applies_within_a_fifth_of_the_reference():
+    # 150 km is within 20 % of a 140 km reference, on either side.
+    for span, tier in ((150.0, "national"), (130.0, "regional")):
+        decision = classify.classify_route(3, _stops(AA=1), span, None, 2, 140.0)
+        assert decision["tier"] == tier
+        assert decision["margin"] is True
+        assert decision["tier_confidence"] == pytest.approx(0.75 * 0.7)
+        assert decision["reference_km"] == 140.0
 
 
 def test_the_span_is_exact_or_missing(monkeypatch):
@@ -321,6 +311,7 @@ def _place(place_id, kind, *, parent_id=None, metro_ids=(), member_ids=()):
         "place_id": place_id,
         "kind": kind,
         "name": place_id,
+        "country_code": "AA",
         "parent_id": parent_id,
         "metro_ids": list(metro_ids),
         "member_ids": list(member_ids),
@@ -391,6 +382,21 @@ LOOKUP = StubLookup(
 )
 
 
+# A second top-level region, for a route across two.
+FAR_RECORDS = [
+    {"kind": "city", "wikidata": "Q-far", "country": "AA", "overture_id": "ov-Q-far"},
+    {"kind": "region", "wikidata": "Q-reg2", "country": "AA"},
+    {"kind": "country", "wikidata": "Q-c", "country": "AA"},
+]
+FAR_PLACES = [
+    _place("Q-reg2", "region", parent_id="Q-c"),
+    _place("Q-far", "city", parent_id="Q-reg2"),
+]
+# A bus from Q-city to Q-far, 4447 km: within MARGIN of a 4000 km reference.
+NEAR_STOPS = b"stop_id,stop_lat,stop_lon\nn1,1.0,10.0\nn2,1.0,10.01\nn3,1.0,50.0\n"
+NEAR_REFERENCE = {("*", "bus"): 4000.0}
+
+
 def _publish(cache, subdir, pointer, artifacts, manifest):
     directory = store.open_subdir(cache, subdir)
     try:
@@ -447,7 +453,7 @@ STOPS_A = (
     b"stop_id,stop_lat,stop_lon\n"
     b"s1,1.0,10.0\ns2,1.0,10.01\ns3,1.0,10.02\nb2,1.0,10.3\nb3,1.0,20.0\n"
 )
-ROUTES_A = b"route_id,route_type\ntram,0\nbus,3\n"
+ROUTES_A = b"route_id,route_type\ntram,0\nbus,202\n"
 TRIPS_A = b"trip_id,route_id\nt1,tram\nt2,bus\nt0,bus\n"
 STOP_TIMES_A = (
     b"trip_id,stop_id,stop_sequence\n"
@@ -564,7 +570,8 @@ def _build(tmp_path):
 def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
     _, manifest, edges = _build(tmp_path)
     a = edges["f-a"]
-    # The tram (rule 3) and the long bus (rule 8) each serve the city.
+    # The tram (in one city) and the national coach (declared) each serve
+    # the city.
     local = a[("Q-city", "local")]
     assert local["tier_confidence"] == pytest.approx(0.90)
     assert local["needs_review"] is False
@@ -572,8 +579,9 @@ def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
     assert local["evidence"]["serving_routes"] == 1
     assert local["evidence"]["route_min_stops"] == 1
     national = a[("Q-city", "national")]
-    assert national["tier_confidence"] == pytest.approx(0.60)
-    assert national["needs_review"] is True
+    assert national["tier_confidence"] == pytest.approx(0.95)
+    assert national["needs_review"] is False
+    assert national["evidence"]["rules"] == ["declared"]
     assert national["evidence"]["spread_km"] > 1000
     # Legs come from every sampled pattern, each sorted by sequence: the
     # short t0 (one 33 km leg) and the out-of-order t2 (33 km and 1078 km).
@@ -590,7 +598,7 @@ def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
         "routes": 1,
         "departures_per_day": None,
     }
-    assert a[("Q-city", "local")]["service"] == a[("Q-city", "national")]["service"]
+    assert a[("Q-city", "local")]["service"] == national["service"]
     # Each tier's selector is exactly its serving routes; the fingerprint
     # describes the feed, so every edge of it carries the same digest.
     assert local["selector_state"] == "complete"
@@ -850,9 +858,10 @@ def test_a_crawl_that_changed_after_coverage_is_refused(tmp_path):
 
 
 def test_tier_confidence_is_weighted_by_stop_share(tmp_path):
-    # A tram entirely inside the city (share 1.0, 0.90) and a long extended
-    # bus with two of a hundred stops inside (share 0.02, 0.95): the share
-    # weighting keeps the mean near the tram, raw counts would not.
+    # A tram entirely inside the city (share 1.0, 0.90) and a long bus
+    # declared local (704) with two of a hundred stops inside (share 0.02,
+    # 0.95): the share weighting keeps the mean near the tram, raw counts
+    # would not.
     cache = tmp_path / "cache"
     feeds = [
         {"feed_id": "f-w", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
@@ -865,7 +874,7 @@ def test_tier_confidence_is_weighted_by_stop_share(tmp_path):
         {
             "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n"
             + far,
-            "routes.txt": b"route_id,route_type\ntram,0\nbus,715\n",
+            "routes.txt": b"route_id,route_type\ntram,0\nbus,704\n",
             "trips.txt": b"trip_id,route_id\nt,tram\nb,bus\n",
             "stop_times.txt": (
                 b"trip_id,stop_id,stop_sequence\nt,s1,1\nt,s2,2\nb,s1,1\nb,s2,2\n"
@@ -881,7 +890,7 @@ def test_tier_confidence_is_weighted_by_stop_share(tmp_path):
     assert edge["tier"] == "local"
     assert edge["tier_confidence"] == pytest.approx((0.90 * 1.0 + 0.95 * 0.02) / 1.02)
     # The spread behind the mean: one route per rule, 0.90 to 0.95.
-    assert edge["evidence"]["rules_count"] == {"2": 1, "3": 1}
+    assert edge["evidence"]["rules_count"] == {"declared": 1, "one_city": 1}
     assert edge["evidence"]["confidence_min"] == pytest.approx(0.90)
     assert edge["evidence"]["confidence_max"] == pytest.approx(0.95)
 
@@ -931,7 +940,7 @@ def test_a_state_rewritten_after_coverage_makes_the_edges_stale(tmp_path):
 def test_a_trip_without_stop_sequences_gives_no_legs(tmp_path):
     # Row order is arbitrary in GTFS, so a trip with a blank stop_sequence
     # contributes its stops but no legs: the bus keeps its span but has no
-    # median, and rule 6-8 cannot fire.
+    # median.
     cache = tmp_path / "cache"
     feeds = [
         {"feed_id": "f-q", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
@@ -950,7 +959,9 @@ def test_a_trip_without_stop_sequences_gives_no_legs(tmp_path):
     _coverage(cache, feeds, [_candidate("Q-city", "f-q")])
     classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
-    assert [(e["place_id"], e["tier"]) for e in edges] == [("Q-city", "unknown")]
+    (edge,) = edges
+    assert edge["evidence"]["spread_km"] > 0
+    assert edge["evidence"]["median_interstop_km"] is None
 
 
 def test_a_stop_in_two_members_counts_once_for_the_metro(tmp_path):
@@ -984,7 +995,7 @@ def test_a_stop_in_two_members_counts_once_for_the_metro(tmp_path):
     manifest = classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     (edge,) = edges
-    assert (edge["place_id"], edge["tier"]) == ("Q-metro", "local")
+    assert (edge["place_id"], edge["tier"]) == ("Q-metro", "regional")
     assert edge["service"] == {"stops": 1, "routes": 1, "departures_per_day": None}
     assert manifest["edges_dropped_no_serving_route"] == 0
 
@@ -1001,7 +1012,8 @@ def test_a_stop_in_two_members_counts_once_for_the_metro(tmp_path):
 )
 def test_a_route_with_an_unlocated_stop_has_no_geometry(tmp_path, stop_times):
     # One stop id without coordinates: the service denominator still counts
-    # it, but span and median are missing signals, so the bus is unknown.
+    # it, but span and median are missing signals; the located stops still
+    # lie in one city.
     cache = tmp_path / "cache"
     feeds = [
         {"feed_id": "f-u", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
@@ -1020,7 +1032,9 @@ def test_a_route_with_an_unlocated_stop_has_no_geometry(tmp_path, stop_times):
     _coverage(cache, feeds, [_candidate("Q-city", "f-u")])
     classify.classify(cache, lookup=LOOKUP)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
-    assert [(e["place_id"], e["tier"]) for e in edges] == [("Q-city", "unknown")]
+    (edge,) = edges
+    assert (edge["place_id"], edge["tier"]) == ("Q-city", "local")
+    assert edge["evidence"]["median_interstop_km"] is None
 
 
 def test_a_vanished_upstream_pointer_is_refused(tmp_path):
@@ -1079,8 +1093,8 @@ def test_a_traversal_only_stop_is_no_service_and_the_metro_sums_members(tmp_path
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     by_place = {e["place_id"]: e for e in edges}
     assert [(e["place_id"], e["tier"]) for e in edges] == [
-        ("Q-city", "local"),
-        ("Q-metro", "local"),
+        ("Q-city", "regional"),
+        ("Q-metro", "regional"),
     ]
     assert by_place["Q-metro"]["service"]["stops"] == 1
     assert manifest["edges_dropped_no_serving_route"] == 1
@@ -1443,6 +1457,37 @@ def test_an_edge_records_how_much_of_it_other_feeds_run(
         assert blocks[("f-big", "local")]["departures"] == {"tram": 2.0, "bus": 2.0}
 
 
+def test_a_route_across_a_border_counts_its_departures_at_its_own_tier(
+    tmp_path, monkeypatch
+):
+    # A tram across two regions with two of its four stops abroad keeps its
+    # own tier, compared with its reference, and also serves at the
+    # international tier.
+    monkeypatch.setattr(
+        classify, "route_span_reference", lambda: {("*", "tram"): 10000.0}
+    )
+    cache = tmp_path / "cache"
+    xs = (10.0, 50.0, 60.0, 60.0)
+    feed, candidate = _lines(cache, "f-x", [("D", 0)], xs=xs)
+    _coverage(cache, [feed], [candidate], places=PLACES + FAR_PLACES)
+    classify.classify(cache, lookup=StubLookup({**LOOKUP.by_x, 50.0: FAR_RECORDS}))
+    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    by_tier = {e["tier"]: e["evidence"] for e in edges}
+    assert set(by_tier) == {"regional", "international"}
+    assert by_tier["international"]["rules"] == ["border"]
+    assert by_tier["international"]["scale_tiers"] == ["regional"]
+    for evidence in by_tier.values():
+        assert evidence["reference_km"] == [10000.0]
+    # One trip a day over four stops, one of them in the place: on the
+    # regional edge, and apart on the international one under regional.
+    assert by_tier["regional"]["overlap"]["departures"] == {"tram": 1.0}
+    assert "overlap" not in by_tier["international"]
+    repeats = by_tier["international"]["overlap_repeats"]
+    assert repeats == {"regional": by_tier["regional"]["overlap"]}
+    kept = by_tier["international"]["overlap_repeats_routes"]
+    assert kept == {"regional": by_tier["regional"]["overlap_routes"]}
+
+
 def test_publish_refuses_edges_from_another_places_generation(tmp_path):
     cache, _, _ = _build(tmp_path)
     _publish(
@@ -1539,7 +1584,7 @@ def test_every_decider_constant_is_published_in_the_classifier_settings():
         if isinstance(getattr(classify, name, None), (int, float))
         and not isinstance(getattr(classify, name), bool)
     }
-    assert {"RAIL_SPAN_KM", "MARGIN", "MARGIN_PENALTY"} <= numeric
+    assert {"BORDER_STOPS", "MARGIN", "MARGIN_PENALTY"} <= numeric
     assert {name.lower() for name in numeric} <= set(settings)
     # And every published number is the module's constant, as run.
     for key, value in settings.items():
@@ -1547,10 +1592,13 @@ def test_every_decider_constant_is_published_in_the_classifier_settings():
         assert getattr(classify, key.upper()) == value
 
 
-def test_near_threshold_decisions_are_flagged_and_counted(tmp_path):
-    # A bus whose median leg (1.40 km) lies within MARGIN of
-    # BUS_LOCAL_MEDIAN_KM is flagged and penalised; a tram far from every
-    # threshold and a declared-only feed are not; the manifest counts them.
+def test_near_threshold_decisions_are_flagged_and_counted(tmp_path, monkeypatch):
+    # A bus across two top-level regions whose span (4447 km) lies within
+    # MARGIN of its reference (4000 km) is flagged and penalised; a tram in
+    # one city and a declared-only feed are not; the manifest counts them.
+    monkeypatch.setattr(classify, "route_span_reference", lambda: NEAR_REFERENCE)
+    lookup = StubLookup({**LOOKUP.by_x, 50.0: FAR_RECORDS})
+    places = PLACES + FAR_PLACES
     cache = tmp_path / "cache"
     feeds = [
         {
@@ -1572,10 +1620,7 @@ def test_near_threshold_decisions_are_flagged_and_counted(tmp_path):
         cache,
         "f-near",
         {
-            "stops.txt": (
-                b"stop_id,stop_lat,stop_lon\n"
-                b"n1,1.0,10.0\nn2,1.0126,10.0\nn3,1.0252,10.0\n"
-            ),
+            "stops.txt": NEAR_STOPS,
             "routes.txt": b"route_id,route_type\nbus,3\n",
             "trips.txt": b"trip_id,route_id\nt,bus\n",
             "stop_times.txt": (
@@ -1600,13 +1645,14 @@ def test_near_threshold_decisions_are_flagged_and_counted(tmp_path):
         _candidate("Q-city", "f-far", 2),
         _candidate("Q-other", "f-dec"),
     ]
-    _coverage(cache, feeds, candidates)
-    manifest = classify.classify(cache, lookup=LOOKUP)
+    _coverage(cache, feeds, candidates, places=places)
+    manifest = classify.classify(cache, lookup=lookup)
     edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
     by_feed = {e["feed_id"]: e for e in edges}
     near = by_feed["f-near"]
-    assert near["tier"] == "local" and near["evidence"]["near_threshold"] is True
-    assert near["tier_confidence"] == pytest.approx(0.85 * classify.MARGIN_PENALTY)
+    assert near["tier"] == "national" and near["evidence"]["near_threshold"] is True
+    assert near["evidence"]["reference_km"] == [4000.0]
+    assert near["tier_confidence"] == pytest.approx(0.75 * classify.MARGIN_PENALTY)
     assert near["needs_review"] is True
     far = by_feed["f-far"]
     assert far["evidence"]["near_threshold"] is False and far["needs_review"] is False
@@ -1644,26 +1690,28 @@ def test_scheduled_stops_resolving_to_no_country_leave_no_basis(tmp_path):
 
 
 def test_the_border_gate_needs_two_minority_stops_and_a_tenth():
-    # One stop abroad among twenty: the scale decision stands and records it.
-    decision = classify.classify_route(0, _stops(AA=19, BB=1), None, None)
-    assert (decision["tier"], decision["rule"]) == ("local", 3)
-    assert decision["border_stops"] == {"BB": 1} and decision["scale_tier"] == "local"
-    # Three among twenty: international, with the scale kept.
-    decision = classify.classify_route(0, _stops(AA=17, BB=3), None, None)
-    assert (decision["tier"], decision["rule"]) == ("international", 1)
-    assert (decision["scale_tier"], decision["scale_rule"]) == ("local", 3)
-    assert decision["border_stops"] == {}
+    def route(countries, route_type=0):
+        return classify.classify_route(route_type, countries, None, "one_city")
+
+    # One stop abroad among twenty: no border crossing, the stop recorded.
+    decision = route(_stops(AA=19, BB=1))
+    assert (decision["tier"], decision["international"]) == ("local", False)
+    assert decision["border_stops"] == {"BB": 1}
+    # Three among twenty: the route keeps its tier and crosses the border.
+    decision = route(_stops(AA=17, BB=3))
+    assert (decision["tier"], decision["rule"]) == ("local", "one_city")
+    assert decision["international"] is True and decision["border_stops"] == {}
     # Two of ten is a fifth; two of forty is a twentieth.
-    assert (
-        classify.classify_route(0, _stops(AA=8, BB=2), None, None)["tier"]
-        == "international"
-    )
-    far = classify.classify_route(0, _stops(AA=38, BB=2), None, None)
-    assert far["tier"] == "local" and far["border_stops"] == {"BB": 2}
+    assert route(_stops(AA=8, BB=2))["international"] is True
+    far = route(_stops(AA=38, BB=2))
+    assert far["international"] is False and far["border_stops"] == {"BB": 2}
     # A stop on a boundary sliver sits in both countries: never a minority stop.
     sliver = {"AA": frozenset({"a0", "a1", "x"}), "BB": frozenset({"x"})}
-    decision = classify.classify_route(0, sliver, None, None)
-    assert decision["tier"] == "local" and decision["border_stops"] == {}
+    decision = route(sliver)
+    assert decision["international"] is False and decision["border_stops"] == {}
+    # A route declared international is not added a second time.
+    declared = route(_stops(AA=17, BB=3), route_type=201)
+    assert (declared["tier"], declared["international"]) == ("international", False)
 
 
 def test_a_foreign_stop_that_breaks_a_skip_is_counted_as_a_border_stop(tmp_path):

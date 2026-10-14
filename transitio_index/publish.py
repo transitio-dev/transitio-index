@@ -25,7 +25,8 @@ ran is feeds only, and the reader treats the missing tables the same way.
 Each feed carries the first and last date its services run and each place
 the windows over which its feeds' spans overlap (schema 9). From schema 11 a
 feed carries the URL the crawl reads and its access details, a place its
-centre point and its urban centre's population, and
+centre point and its own population (its urban centre's for a city of its
+own), and
 ``access_providers.parquet`` at the root lists the providers whose
 credentials the feeds take. A curated feed's ``atlas`` block holds its
 licence only, in the Atlas shape, so the NOTICE and the reader read it as an
@@ -110,6 +111,8 @@ SUMMARY_KEYS = (
     "nominal_window",
     "carried_by",
     "overlap",
+    "overlap_repeats",
+    "mark",
 )
 DETAIL_COLUMNS = (
     "evidence",

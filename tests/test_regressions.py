@@ -5,10 +5,12 @@ Fixtures are imported from the stage test modules rather than duplicated.
 
 import hashlib
 import http.client
+import io
 import json
 import logging
 import math
 import os
+import zipfile
 from pathlib import Path
 
 import httpx
@@ -1052,20 +1054,18 @@ def test_every_gtfs_route_type_decides_a_tier_or_is_out_of_scope_by_design():
     """A route type the decision table did not list fell through to
     ``unknown`` silently: funiculars, trolleybuses, ferries and monorails
     did, in 271 edges over ten archived builds. Every enumerated type now
-    decides a tier given full signals, or is unclassifiable by design (rule
-    10) and lies in the table's out-of-scope ranges."""
+    decides a tier given full signals, or is unclassifiable by design (out of
+    scope) and lies in the table's out-of-scope ranges."""
     for route_type in (*GTFS_BASIC_ROUTE_TYPES, *GTFS_EXTENDED_ROUTE_TYPES):
-        decision = classify.classify_route(
-            route_type, {"AA": frozenset({"s"})}, 10.0, 1.0
-        )
+        decision = classify.classify_route(route_type, {"AA": frozenset({"s"})}, 10.0)
         out_of_scope = any(
             low <= route_type <= high for low, high in classify.UNCLASSIFIABLE_RANGES
         )
         if out_of_scope:
-            assert (decision["tier"], decision["rule"]) == ("unknown", 10), route_type
+            expected = ("unknown", "out_of_scope")
+            assert (decision["tier"], decision["rule"]) == expected, route_type
         else:
             assert decision["tier"] != "unknown", route_type
-            assert decision["rule"] != 10, route_type
 
 
 @pytest.mark.parametrize(
@@ -1124,16 +1124,19 @@ def test_a_complete_crawl_without_a_schedule_keeps_its_edges_and_home(
 
 
 @pytest.mark.parametrize(
-    ("abroad", "tier"), [(1, "local"), (3, "international")], ids=["one-stop", "three"]
+    ("abroad", "tiers"),
+    [(1, ["regional"]), (3, ["international", "regional"])],
+    ids=["one-stop", "three"],
 )
 def test_one_stop_across_a_boundary_does_not_make_a_route_international(
-    tmp_path, abroad, tier
+    tmp_path, abroad, tiers
 ):
     """Rule 1 fired on any second country among a route's stops, so a stop on
     the wrong side of a simplified boundary, or on an overlap sliver resolving
     to two countries, made a city route international at 0.95 and hid its
-    scale. The gate needs two minority stops and a tenth of the route, the
-    scale is recorded either way, and the artefacts are counted per feed."""
+    scale. The gate needs two minority stops and a tenth of the route, a
+    route past it keeps its own tier too, and the artefacts are counted per
+    feed."""
     from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
 
     cache = tmp_path / "cache"
@@ -1165,9 +1168,10 @@ def test_one_stop_across_a_boundary_does_not_make_a_route_international(
     edges, _ = store.read_jsonl(
         cache / "classify", "edges.json", classify.EDGES_ARTIFACT
     )
-    (edge,) = edges
-    assert edge["tier"] == tier and edge["evidence"]["scale_tiers"] == ["local"]
-    assert edge["evidence"].get("border_stops") == ({"BB": 1} if abroad == 1 else None)
+    assert [edge["tier"] for edge in edges] == tiers
+    assert all(e["evidence"]["scale_tiers"] == ["regional"] for e in edges)
+    regional = edges[-1]["evidence"]
+    assert regional.get("border_stops") == ({"BB": 1} if abroad == 1 else None)
     records, _ = store.read_jsonl(
         cache / "classify", "edges.json", classify.FEEDS_ARTIFACT
     )
@@ -2655,3 +2659,478 @@ def test_padded_ids_join_and_match_the_readers_fingerprint(tmp_path, padded):
         fingerprint.compute(kind, routes, coords, served),
         {"r1"},
     )
+
+
+def test_a_marked_feed_carries_its_mark_to_the_published_summary(tmp_path):
+    """The reader leaves private or campus services and unofficial
+    compilations out by default, but the index marked none of them, so the
+    building shuttles at Chicago and the UIUC intercity-bus compilation were
+    taken like operators' feeds."""
+    import json
+
+    import test_index_resolve_stage as rst
+
+    from transitio_index import overrides, rank, resolve
+
+    for i, bad in enumerate(("x", ["private"])):
+        (tmp_path / f"bad{i}").mkdir()
+        entries = [{"feed": "f", "set_mark": bad}]
+        with pytest.raises(overrides.OverrideError, match="set_mark must be one of"):
+            overrides.load_feed_overrides(
+                rst._overrides_dir(tmp_path / f"bad{i}", entries)
+            )
+    cache = tmp_path / "cache"
+    rst._crosswalk(cache, [rst._feed("f-shuttle"), rst._feed("f-bus")])
+    marks = [{"feed": "f-shuttle", "set_mark": "private"}]
+    resolve.resolve(cache, overrides_dir=rst._overrides_dir(tmp_path, marks))
+    feeds, _ = rst._resolved(cache)
+    assert feeds["f-shuttle"]["mark"] == "private" and "mark" not in feeds["f-bus"]
+    places = {"c": {"place_id": "c", "kind": "city", "country_code": "FI"}}
+    edges = [
+        {
+            "feed_id": feed_id,
+            "place_id": "c",
+            "tier": "local",
+            "service": {"stops": 2, "routes": 1, "departures_per_day": 10.0},
+            "evidence": {},
+        }
+        for feed_id in feeds
+    ]
+    ranked, _ = rank.rank_edges(edges, list(feeds.values()), places)
+    summaries = {
+        e["feed_id"]: json.loads(publish._summary(json.dumps(e["evidence"])))
+        for e in ranked
+    }
+    assert summaries["f-shuttle"]["mark"] == "private"
+    assert "mark" not in summaries["f-bus"]
+
+
+def test_gtfs_files_in_a_deeper_folder_or_another_case_are_read(tmp_path):
+    """Inglewood's and Metro's archives keep their files two folders deep,
+    Conroe names its stops ``Stops.txt``: the crawl read none of them."""
+    cache = tmp_path / "cache"
+    deep = {f"feed/gtfs/{name}": data for name, data in crt.FULL_MEMBERS.items()}
+    deep["__MACOSX/feed/gtfs/._stops.txt"] = b"x"
+    cased = {
+        ("Stops.txt" if name == "stops.txt" else name): data
+        for name, data in crt.FULL_MEMBERS.items()
+    }
+    server = crt._server(
+        {
+            "/deep.zip": (crt._zip_bytes(deep), '"v1"'),
+            "/whole.zip": (crt._zip_bytes(deep), None),
+            "/cased.zip": (crt._zip_bytes(cased), None),
+        }
+    )
+    crt._publish_resolved(
+        cache,
+        [
+            crt._feed("f-deep", "https://feeds.example/deep.zip"),
+            crt._feed("f-whole", "https://feeds.example/whole.zip"),
+            crt._feed("f-cased", "https://feeds.example/cased.zip"),
+        ],
+    )
+    _, log = crt._crawl(cache, server, range_threshold=1)
+    for feed_id in ("f-deep", "f-whole", "f-cased"):
+        assert log[feed_id]["members"] == sorted(crt.FULL_MEMBERS), feed_id
+        stops = crt._feed_dir(cache, feed_id) / "stops.txt"
+        assert stops.read_bytes() == crt.STOPS, feed_id
+    # Two names alike but for case: the first is read, and each is probed on
+    # its own bytes when the archive's files are listed.
+    both = {**cased, "stops.txt": b"stop_id,stop_lat,stop_lon\n"}
+    crt._publish_resolved(
+        tmp_path / "two", [crt._feed("f-two", "https://feeds.example/two.zip")]
+    )
+    _, log = crt._crawl(
+        tmp_path / "two",
+        crt._server({"/two.zip": (crt._zip_bytes(both), '"v1"')}),
+        range_threshold=1,
+    )
+    assert log["f-two"]["method"] == "range"
+    state = json.loads(
+        (crt._feed_dir(tmp_path / "two", "f-two") / "state.json").read_text()
+    )
+    assert state["empty_files"] == ["stops.txt"]
+
+
+# Countries, top-level regions and cities, with Strasbourg's metro reaching
+# Kehl across the border and New York's holding Mineola but not Montauk.
+TIER_PLACES = {
+    place_id: {"kind": kind, "parent_id": parent, "country_code": code, **extra}
+    for place_id, kind, parent, code, extra in [
+        ("FR", "country", None, "FR", {}),
+        ("DE", "country", None, "DE", {}),
+        ("US", "country", None, "US", {}),
+        ("grand-est", "region", "FR", "FR", {}),
+        ("bw", "region", "DE", "DE", {}),
+        ("st", "region", "DE", "DE", {}),
+        ("ni", "region", "DE", "DE", {}),
+        ("ny", "region", "US", "US", {}),
+        ("strasbourg", "city", "grand-est", "FR", {"metro_ids": ["m-str"]}),
+        ("kehl", "city", "bw", "DE", {}),
+        ("ilsenburg", "city", "st", "DE", {}),
+        ("bad-harzburg", "city", "ni", "DE", {}),
+        ("new-york", "city", "ny", "US", {}),
+        ("mineola", "city", "ny", "US", {}),
+        ("montauk", "city", "ny", "US", {}),
+        ("m-str", "metro", None, "FR", {"member_ids": ["strasbourg", "kehl"]}),
+        ("m-ny", "metro", None, "US", {"member_ids": ["new-york", "mineola"]}),
+    ]
+}
+
+
+@pytest.mark.parametrize(
+    ("route_type", "cities", "span", "reference", "tier", "international"),
+    [
+        # Strasbourg tram D into Kehl: local in one metro, and international.
+        (0, ["strasbourg"] * 3 + ["kehl"] * 2, 9.0, 20.2, "local", True),
+        # S-Bahn Rhein-Neckar declares regional rail across Länder.
+        (109, ["kehl", "ilsenburg"], 200.0, 140.8, "regional", False),
+        # A Long Island branch within New York's metro, and Montauk beyond it.
+        (2, ["new-york", "mineola"], 30.0, 606.2, "local", False),
+        (2, ["new-york", "mineola", "montauk"], 190.0, 60.0, "regional", False),
+        # A 13 km bus across two Länder; a long train across them.
+        (3, ["ilsenburg", "bad-harzburg"], 13.0, 22.7, "regional", False),
+        (2, ["ilsenburg", "bad-harzburg"], 300.0, 140.8, "national", False),
+        # Long-distance trains declare national, however short.
+        (101, ["ilsenburg", "ilsenburg"], 5.0, 140.8, "national", False),
+        # One stop in Kehl does not give a German route a second region.
+        (3, ["ilsenburg"] * 9 + ["strasbourg"], 300.0, 22.7, "regional", False),
+    ],
+)
+def test_route_tiers_follow_the_declared_class_the_places_and_the_country(
+    route_type, cities, span, reference, tier, international
+):
+    """Global distance cuts made the S-Bahn Rhein-Neckar national, Long
+    Island commuter rail national, short buses across Länder national and a
+    tram into Kehl international only. The tier now follows the declared
+    class, one city or metro, and, across top-level regions, the span against
+    the reference of the feed's country and mode."""
+    metros = classify.metros_of(TIER_PLACES)
+    reach, countries = {}, {}
+    for i, city in enumerate(cities):
+        place = TIER_PLACES[city]
+        hit = {city, place["parent_id"], place["country_code"]}
+        reach[f"s{i}"] = classify._stop_reach(hit, TIER_PLACES, metros)
+        countries.setdefault(place["country_code"], set()).add(f"s{i}")
+    countries = {code: frozenset(ids) for code, ids in countries.items()}
+    majority, _ = classify._border(countries)
+    local, regions = classify._route_places(
+        list(reach), countries, majority, reach, TIER_PLACES
+    )
+    decision = classify.classify_route(
+        route_type, countries, span, local, regions, reference
+    )
+    assert (decision["tier"], decision["international"]) == (tier, international)
+
+
+def test_a_route_across_a_border_counts_its_departures_once(tmp_path):
+    """A route across a border was international only, out of its city's
+    local and regional selections. It now keeps its own tier and serves at
+    the international one too, its departures on its own tier's edge and,
+    apart, on the international edge by that tier: they stay when a curator
+    keeps the international tier only, and the merge measures them again
+    across builds without counting them twice."""
+    from test_index_classify import LOOKUP, _coverage, _lines
+    from test_index_curate import ENTRY, _overrides
+
+    from transitio_index import curate, merge
+
+    cache = tmp_path / "cache"
+    feed, candidate = _lines(cache, "f-x", [("D", 0)], xs=(10.0, 10.01, 60.0, 60.0))
+    _coverage(cache, [feed], [candidate])
+    classify.classify(cache, lookup=LOOKUP)
+    entry = {"feed": "f-x", "place": "Q-city", "set_tiers": ["international"]}
+    curate.curate(cache, overrides_dir=_overrides(tmp_path, [{**entry, **ENTRY}]))
+    edges, _ = store.read_jsonl(
+        cache / "curate", "edges_final.json", "edges_final.jsonl"
+    )
+    (edge,) = edges
+    assert edge["tier"] == "international"
+    departures = edge["evidence"]["overlap_repeats"]["regional"]["departures"]
+    assert departures == {"tram": 2.0}
+
+    box = [10.0, 1.0, 10.01, 1.0]
+    evidence = [
+        {"overlap_routes": [["d", "tram", 2.0, *box]]},
+        {
+            "overlap_repeats": {"regional": {"stale": True}},
+            "overlap_repeats_routes": {"regional": [["d", "tram", 2.0, *box]]},
+        },
+        {"overlap_routes": [["d", "tram", 3.0, *box]]},
+    ]
+    table = pa.table(
+        {
+            "place_id": ["Q-city"] * 3,
+            "feed_id": ["f-x", "f-x", "f-y"],
+            "evidence": [json.dumps(e) for e in evidence],
+        }
+    )
+    found = [
+        json.loads(e)
+        for e in merge._cross_build_overlaps(table)["evidence"].to_pylist()
+    ]
+    own = found[0]["overlap"]
+    assert own == {
+        "departures": {"tram": 2.0},
+        "with": {"f-y": {"tram": 1.0}},
+        "compared": ["f-y"],
+    }
+    assert found[1] == {"overlap_repeats": {"regional": own}}
+    # f-x's route counts once against f-y, however many of its edges hold it.
+    assert found[2]["overlap"]["with"] == {"f-x": {"tram": 1.0}}
+
+
+def test_a_feeds_access_follows_what_its_crawl_read(tmp_path):
+    """The index published each feed's access as its catalogue declared it:
+    PATH and seven more were `key` though the crawl read them without one,
+    Renfe Cercanías kept the keyed NAP URL of a file Renfe serves openly, and
+    two `open` feeds answered 401. Access now follows the anonymous crawl of
+    the URL the index publishes; a 403 is reported, and a curator's value
+    stands."""
+
+    def feed(feed_id, source, access, url):
+        record = {"urls": {"static_current": url, "direct_download": url}}
+        return {
+            **ct._feed(feed_id),
+            "source": source,
+            source: record,
+            **resolve._OPEN,
+            "access": access,
+        }
+
+    feeds = [
+        feed("f-path", "atlas", "key", "https://path/gtfs.zip"),
+        feed("f-nap", "atlas", "key", "https://nap/1130"),
+        feed("f-renfe", "mdb", "open", "https://renfe/cer.zip"),
+        feed("f-401", "mdb", "open", "https://ch/permalink"),
+        feed("f-403", "mdb", "open", "https://toscana/gtfs.zip"),
+        {**feed("f-cur", "curated", "key", None), "curated": {"url": "https://c"}},
+    ]
+    read = {"fetched_from": crawl.PRODUCER}
+    states = {
+        "f-path": {**read, "url": "https://path/gtfs.zip"},
+        "f-nap": {"fetched_from": crawl.MAINTAINER_KEY, "url": "https://nap/1130"},
+        "f-renfe": {**read, "url": "https://renfe/cer.zip"},
+        "f-401": {
+            "fetched_from": crawl.HOSTED_COPY,
+            "producer_failure": "GET https://ch/permalink: HTTP 401 Unauthorized",
+        },
+        "f-403": {
+            "fetched_from": crawl.HOSTED_COPY,
+            "producer_failure": "GET https://toscana/gtfs.zip: HTTP 403 Forbidden",
+        },
+        "f-cur": {**read, "url": "https://c"},
+    }
+    # Renfe's NAP and open copies hold the same data; the rest differ.
+    crawls = {f["feed_id"]: ct._rows(3, 10.0 + i) for i, f in enumerate(feeds)}
+    crawls["f-renfe"] = crawls["f-nap"]
+    manifest, covered, _ = ct._cover(
+        tmp_path,
+        feeds=feeds,
+        placements=[],
+        crawls=crawls,
+        members={"f-nap": ct.TABLES, "f-renfe": ct.TABLES},
+        states=states,
+        lookup=ct.LOOKUP,
+    )
+    assert manifest["folded_feeds"] == {"f-renfe": "f-nap"}
+    assert manifest["access_from_twin"] == {"f-nap": "f-renfe"}
+    assert covered["f-nap"]["download_url"] == "https://renfe/cer.zip"
+    access = {feed_id: f["access"] for feed_id, f in covered.items()}
+    assert access == {
+        "f-path": "open",
+        "f-nap": "open",
+        "f-401": "key",
+        "f-403": "open",
+        "f-cur": "key",
+    }
+    assert manifest["access_judged"] == {
+        "opened": ["f-nap", "f-path"],
+        "keyed": ["f-401"],
+        "refused_open": {"f-403": "GET https://toscana/gtfs.zip: HTTP 403 Forbidden"},
+    }
+
+
+def test_a_feed_the_breaker_refused_is_asked_again(tmp_path):
+    """After three feeds on one host failed to connect, the breaker refused
+    every later feed on it for the rest of the run, and nothing asked them
+    again: 21 feeds stayed unread. The run now asks each refused feed once
+    more at its end, every host's failures forgotten before each."""
+    cache = tmp_path / "cache"
+    names = "abcdefg"
+    feeds = [crt._feed(f"f-{n}", f"https://feeds.example/{n}.zip") for n in names]
+    crt._publish_resolved(cache, feeds)
+    served = {f"/{n}.zip": (httpx.ConnectError, None) for n in names[:-1]}
+    served["/g.zip"] = (crt._zip_bytes(), None)
+    summary, log = crt._crawl(cache, crt._server(served))
+    # a, b and c's probe fail, so c's download and d to g are refused; asked
+    # again, c to f fail to connect once more, more than the breaker allows,
+    # and g is still asked and read.
+    retried = [log[f"f-{n}"].get("retried_after_breaker") for n in names]
+    assert retried == [None, None, True, True, True, True, True]
+    assert "stops.txt" in log["f-g"]["members"]
+    assert summary["retried_after_breaker"] == 5 and summary["host_refused"] == 0
+
+
+@pytest.mark.parametrize("range_threshold", [10**9, 1])
+def test_an_archive_holding_one_inner_archive_is_read_inside(tmp_path, range_threshold):
+    """The Buenos Aires Subte's archive holds one file, ``subte_gtfs``, itself
+    a zip: the crawl read no stops and the Subte had no edge."""
+    cache = tmp_path / "cache"
+    crt._publish_resolved(cache, [crt._feed("f-subte", "https://feeds.example/s.zip")])
+    outer = crt._zip_bytes({"subte_gtfs": crt._zip_bytes()})
+    _, log = crt._crawl(
+        cache,
+        crt._server({"/s.zip": (outer, '"v1"')}),
+        range_threshold=range_threshold,
+    )
+    assert "stops.txt" in log["f-subte"]["members"]
+    assert log["f-subte"]["method"] == "download"
+
+
+def test_an_archive_without_stops_falls_back_to_the_hosted_copy(tmp_path):
+    """A producer archive read without error but without ``stops.txt`` was
+    taken as the feed, and the hosted copy was read only when the producer
+    failed; the hosted read also dropped the URL's ``#fragment``, so PTV's
+    one feed among several was read as nothing."""
+    cache = tmp_path / "cache"
+    feed = crt._feed("f-ptv", "https://feeds.example/p.zip#7")
+    # An empty fragment of its own takes the producer's.
+    feed["mdb"] = {"urls": {"latest": "https://hosted.example/latest.zip#"}}
+    crt._publish_resolved(cache, [feed])
+    producer = crt._zip_bytes({"README.txt": b"see the folders\n"})
+    hosted = crt._zip_bytes(
+        {
+            **{f"7/{name}": data for name, data in crt.FULL_MEMBERS.items()},
+            **{f"8/{name}": data for name, data in crt.FULL_MEMBERS.items()},
+        }
+    )
+    server = crt._server({"/p.zip": (producer, None), "/latest.zip": (hosted, None)})
+    _, log = crt._crawl(cache, server)
+    record = log["f-ptv"]
+    assert record["fetched_from"] == crawl.HOSTED_COPY
+    assert record["producer_failure"] == "no stops.txt in the producer's archive"
+    assert "stops.txt" in record["members"]
+    # A feed without a producer URL reads its hosted copy, saying so.
+    cache = tmp_path / "no-url"
+    feed = crt._feed("f-none", None)
+    feed["mdb"] = {"urls": {"latest": "https://hosted.example/latest.zip#7"}}
+    crt._publish_resolved(cache, [feed])
+    _, log = crt._crawl(cache, server)
+    assert log["f-none"]["fetched_from"] == crawl.HOSTED_COPY
+    assert log["f-none"]["producer_failure"] == "no download URL"
+    # A producer URL that does not parse is a failed read, never an
+    # unexpected error of the run; its ValueError is no producer failure
+    # (``_producer_failed``), so no hosted copy is read.
+    cache = tmp_path / "malformed"
+    feed = crt._feed("f-bad", "https://[bad/p.zip#7")
+    feed["mdb"] = {"urls": {"latest": "https://hosted.example/latest.zip"}}
+    crt._publish_resolved(cache, [feed])
+    _, log = crt._crawl(cache, server)
+    assert log["f-bad"]["method"] == "failed"
+
+
+def test_a_feeds_crawl_status_says_why_it_has_no_read(tmp_path):
+    """The index published ``crawl_status`` "ok" or null, and the release
+    report gave 534 feeds "no reason recorded": failed reads, pages instead
+    of archives, feeds without a URL and archives without stops.txt looked
+    alike. The status now names the outcome, and the merged manifest lists
+    the feeds without a read by cause."""
+    from transitio_index import merge
+
+    cache = tmp_path / "cache"
+    (cache / "crawl").mkdir(parents=True)
+    failed = [
+        {"feed_id": "f-failed", "method": "failed", "failure": "failed"},
+        # A log written before the failure field: told from its reason.
+        {
+            "feed_id": "f-page",
+            "method": "failed",
+            "fallback_reason": "GET https://x: an HTML page, not a zip archive",
+        },
+        {
+            "feed_id": "f-nourl",
+            "method": "skipped",
+            "fallback_reason": "no download URL",
+        },
+        # A malformed record never publishes a status of its own.
+        {
+            "feed_id": "f-bogus",
+            "method": "failed",
+            "failure": "ok",
+            "fallback_reason": 5,
+        },
+    ]
+    (cache / "crawl" / "crawl_log.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in failed)
+    )
+    names = (
+        "f-ok",
+        "f-empty",
+        "f-broken",
+        "f-failed",
+        "f-page",
+        "f-nourl",
+        "f-bogus",
+        "f-never",
+    )
+    _, covered, _ = ct._cover(
+        tmp_path,
+        feeds=[ct._feed(name) for name in names],
+        placements=[],
+        crawls={name: ct._rows(3, 10.0) for name in ("f-ok", "f-empty", "f-broken")},
+        # Read, but the archive held no stops.txt.
+        states={"f-empty": {"members": ["agency.txt"]}},
+        # A cache that no longer verifies, on a feed without a declared place.
+        tamper="f-broken",
+        lookup=ct.LOOKUP,
+    )
+    statuses = {name: covered[name].get("crawl_status") for name in names}
+    assert statuses == {
+        "f-ok": "ok",
+        "f-empty": "no_gtfs_files",
+        "f-broken": "unreadable",
+        "f-failed": "failed",
+        "f-page": "unreadable",
+        "f-nourl": "no_url",
+        "f-bogus": "failed",
+        "f-never": None,
+    }
+    table = pa.table(
+        {
+            "feed_id": list(names),
+            "crawl_status": [statuses[name] for name in names],
+            "uncrawlable_reason": [None] * 7 + ["requires authentication"],
+        }
+    )
+    assert merge._not_crawled(table) == {
+        "failed": {"count": 2, "feeds": ["f-bogus", "f-failed"]},
+        "no_gtfs_files": {"count": 1, "feeds": ["f-empty"]},
+        "no_url": {"count": 1, "feeds": ["f-nourl"]},
+        "requires authentication": {"count": 1, "feeds": ["f-never"]},
+        "unreadable": {"count": 2, "feeds": ["f-broken", "f-page"]},
+    }
+
+
+def test_a_corrupt_lzma_member_is_unreadable_and_falls_back(tmp_path):
+    """A corrupt LZMA member escaped the crawl's error handling, so the run
+    called the feed an unexpected error and never read its hosted copy."""
+    sink = io.BytesIO()
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_LZMA) as archive:
+        for name, data in crt.FULL_MEMBERS.items():
+            archive.writestr(name, data * 50)
+    raw = bytearray(sink.getvalue())
+    with zipfile.ZipFile(io.BytesIO(bytes(raw))) as archive:
+        info = archive.getinfo("stops.txt")
+    start = info.header_offset + 30 + len(info.filename) + len(info.extra)
+    for i in range(start + 20, start + 40):
+        raw[i] ^= 0xFF
+    cache = tmp_path / "cache"
+    feed = crt._feed("f-lzma", "https://feeds.example/l.zip")
+    feed["mdb"] = {"urls": {"latest": "https://hosted.example/latest.zip"}}
+    crt._publish_resolved(cache, [feed])
+    served = {"/l.zip": (bytes(raw), None), "/latest.zip": (crt._zip_bytes(), None)}
+    _, log = crt._crawl(cache, crt._server(served))
+    assert log["f-lzma"]["fetched_from"] == crawl.HOSTED_COPY
+    assert "Corrupt input data" in log["f-lzma"]["producer_failure"]

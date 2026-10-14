@@ -33,6 +33,7 @@ from xml.etree import ElementTree
 
 import pandas
 
+from transitio_index import crawl
 from transitio_index.rank import STALE_DAYS
 
 LARGE_CITY = 1_000_000
@@ -85,9 +86,19 @@ def _label(row):
 
 
 def totals(feeds, places, edges):
-    crawled = feeds["crawl_status"].notna()
+    causes = pandas.Series(
+        [
+            crawl.unread_cause(status, reason)
+            for status, reason in zip(
+                feeds["crawl_status"], feeds["uncrawlable_reason"]
+            )
+        ],
+        index=feeds.index,
+        dtype=object,
+    )
+    crawled = causes.isna()
     stops = feeds["stop_count"].fillna(0)
-    reasons = feeds.loc[~crawled, "uncrawlable_reason"].fillna("no reason recorded")
+    reasons = causes[~crawled]
     cross = edges["cross_border"].astype("boolean").fillna(False)
     return {
         "feeds": len(feeds),

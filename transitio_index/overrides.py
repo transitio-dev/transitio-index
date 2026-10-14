@@ -60,15 +60,25 @@ _STATIC_LINK_METHODS = frozenset({"declared", "same_file", "same_host", "none"})
 # crosswalk and ``set_coverage`` by the coverage stage, not the resolve stage,
 # but both are valid keys here.
 _OPERATIONS = frozenset(
-    {"set_identity", "mark_uncrawlable", "set_coverage", "set_access", "add_feed"}
+    {
+        "set_identity",
+        "mark_uncrawlable",
+        "set_coverage",
+        "set_access",
+        "set_mark",
+        "add_feed",
+    }
 )
 # The operation the crosswalk applies: a curated feed joins the feed set there.
 CROSSWALK_OPERATIONS = frozenset({"add_feed"})
 # The operations whose effect the resolve stage settles, a curated feed's
 # access among them; set_coverage enters at coverage.
 RESOLVE_OPERATIONS = frozenset(
-    {"set_identity", "mark_uncrawlable", "set_access", "add_feed"}
+    {"set_identity", "mark_uncrawlable", "set_access", "set_mark", "add_feed"}
 )
+# The marks ``set_mark`` gives a feed transitio does not take by default: a
+# private or campus service, an unofficial compilation of others' timetables.
+MARKS = frozenset({"private", "compilation"})
 # A curated feed's id: ``f-curated-`` and lower-case words joined by hyphens.
 # The prefix is add_feed's alone; no catalogue mint or other override takes it.
 _CURATED_PREFIX = "f-curated-"
@@ -329,6 +339,11 @@ def _validate_operations(path, ref, entry):
             )
     if "set_access" in entry:
         _validate_access(f"{path}: feed {ref!r} set_access", entry["set_access"])
+    mark = entry.get("set_mark")
+    if "set_mark" in entry and (not isinstance(mark, str) or mark not in MARKS):
+        raise OverrideError(
+            f"{path}: feed {ref!r} set_mark must be one of {sorted(MARKS)}"
+        )
     if "set_coverage" in entry:
         spec = entry["set_coverage"]
         if not isinstance(spec, dict) or set(spec) != {"level", "place_id"}:

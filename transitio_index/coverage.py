@@ -10,7 +10,9 @@ Ancestor edges come free — a stop inside a city is inside its region and
 country polygons too. Metro edges are propagated from member-city edges,
 because minted metros carry no geometry yet (the merged metros stage's own
 convention); when metro polygons exist, PIP takes over with no schema change.
-Crawled evidence supersedes the declared placements feed by feed. Feeds whose
+Crawled evidence supersedes the declared placements feed by feed, unless the
+crawl places none of the feed's stops (none read, or none inside a known
+place): such a feed keeps its declared placements. Feeds whose
 crawls hold the same data by their content identity — an operator's feed listed
 twice, often once in each catalogue — fold into one feed first, the others' ids
 kept as its aliases; feeds sharing their stops and routes but not their
@@ -36,7 +38,7 @@ A GTFS-RT feed linked to a static feed gets no edges here: it inherits the stati
 feed's membership in the edge-override stage, after curation, so a curated change
 to the static feed reaches its companion. An unlinked GTFS-RT feed falls back to
 declared coverage like any uncrawlable feed. Crawled evidence supersedes all of
-this feed by feed once the crawl exists.
+this feed by feed once the crawl places any of the feed's stops.
 
 A feed named by a catalogue note takes its Mobility Database provider's name;
 a feed the catalogues leave nameless takes the name of its crawl's one agency.
@@ -239,8 +241,10 @@ def _identity(state):
     return None
 
 
-def fold_duplicates(feeds, states):
-    """Fold feeds whose crawls hold the same data; ``{folded id: canonical id}``.
+def fold_duplicates(feeds, states, anonymous=None, exempt=frozenset()):
+    """Fold feeds whose crawls hold the same data; ``({folded id: canonical
+    id}, {canonical id: member id})``, the second naming the member whose
+    URL a canonical feed took.
 
     Two crawls hold the same data when their content identities match
     (:func:`transitio.index.fingerprint.identical_groups`: the same stops,
@@ -251,10 +255,16 @@ def fold_duplicates(feeds, states):
     the others' ids and aliases as aliases, and an Atlas-only canonical takes a
     folded MDB feed's record as a feed both catalogues carry, matched by
     ``content``. ``feeds`` and ``states`` lose the folded feeds.
+
+    ``anonymous`` (:func:`anonymous_reads`) maps the feeds read at their own
+    URL without a key to that URL: a canonical feed that was not, and is not
+    in ``exempt``, takes the URL of its group's first member that was and is
+    not exempt, as its ``download_url``, and counts as read at it.
     """
+    anonymous = {} if anonymous is None else anonymous
     by_id = {feed["feed_id"]: feed for feed in feeds}
     identities = {feed_id: _identity(state) for feed_id, (_, state) in states.items()}
-    folded = {}
+    folded, twins = {}, {}
     for members in fingerprint.identical_groups(identities):
         members.sort(
             key=lambda f: (SOURCE_RANK.get(by_id[f].get("source"), len(SOURCE_RANK)), f)
@@ -262,6 +272,14 @@ def fold_duplicates(feeds, states):
         if not _enough_stops(states, members):
             continue
         keep = by_id[members[0]]
+        if keep["feed_id"] not in anonymous and keep["feed_id"] not in exempt:
+            for feed_id in members[1:]:
+                if feed_id in anonymous and feed_id not in exempt:
+                    keep["download_url"] = anonymous[keep["feed_id"]] = anonymous[
+                        feed_id
+                    ]
+                    twins[keep["feed_id"]] = feed_id
+                    break
         for feed_id in members[1:]:
             other = by_id[feed_id]
             if keep.get("source") == "atlas" and other.get("source") == "mdb":
@@ -284,7 +302,83 @@ def fold_duplicates(feeds, states):
             folded[feed_id] = keep["feed_id"]
             del states[feed_id]
     feeds[:] = [feed for feed in feeds if feed["feed_id"] not in folded]
-    return folded
+    return folded, twins
+
+
+# The status a failed producer request answered, as the crawl records it.
+_HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
+
+
+def anonymous_reads(feeds, committed):
+    """``{feed_id: url}`` of the feeds whose committed crawl (``{feed_id:
+    (feed_dir, state)}``) read their own URL without a key."""
+    from transitio_index import crawl
+
+    found = {}
+    for feed in feeds:
+        state = (committed.get(feed["feed_id"]) or (None, {}))[1]
+        url = crawl.feed_url(feed)
+        if (
+            url
+            and state.get("fetched_from") == crawl.PRODUCER
+            and state.get("url") == url
+        ):
+            found[feed["feed_id"]] = url
+    return found
+
+
+def access_exempt(feeds, feed_overrides):
+    """The ids of the feeds whose access a curator set: a curated feed and a
+    feed with a ``set_access`` override, by its id or an alias."""
+    from transitio_index import resolve
+
+    return {
+        feed["feed_id"]
+        for feed in feeds
+        if feed.get("curated") is not None
+        or any(
+            "set_access" in feed_overrides[ref]
+            for ref in resolve._matching_refs(feed_overrides, feed)
+        )
+    }
+
+
+def judge_access(feeds, committed, anonymous, exempt):
+    """Set each kept feed's access from its crawl; ``(opened, keyed,
+    refused)``.
+
+    A feed read at its URL without a key (``anonymous``) is ``open``, its
+    provider and authentication cleared; an ``open`` feed whose producer
+    answered HTTP 401 needs a ``key``, with no provider or method; any other
+    ``open`` feed whose URL the crawl did not read keeps ``open`` and is
+    ``refused``, with the failure. ``opened`` lists the feeds that were
+    ``key``. A feed without a committed crawl, or in ``exempt``, keeps the
+    value it has.
+    """
+    from transitio_index import resolve
+
+    opened, keyed, refused = [], [], {}
+    for feed in feeds:
+        feed_id = feed["feed_id"]
+        if feed_id in exempt or feed_id not in committed:
+            continue
+        if feed_id in anonymous:
+            if feed.get("access") == "key":
+                opened.append(feed_id)
+            registration = feed.get("registration_url")
+            feed.update(resolve._OPEN, registration_url=registration)
+            continue
+        if feed.get("access") != "open":
+            continue
+        failure = committed[feed_id][1].get("producer_failure")
+        failure = failure or "the crawl did not read the feed's URL"
+        status = _HTTP_STATUS.search(failure)
+        if status and status.group(1) == "401":
+            feed.update(resolve._OPEN, access="key")
+            keyed.append(feed_id)
+        else:
+            refused[feed_id] = failure
+    return sorted(opened), sorted(keyed), dict(sorted(refused.items()))
 
 
 def near_duplicates(states):
@@ -642,9 +736,9 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
     :func:`crawled_states`: the crawl's state.json is the commit point,
     exactly as expansion reads them), resolves every stop
     through the boundary lookup, and admits every ``(place, feed)`` pair with
-    a stop inside, the count being the service level's first term. A feed
-    whose stops were read supersedes its declared placements even when no
-    stop lands anywhere — the crawl saw where it stops. Metro edges are
+    a stop inside, the count being the service level's first term. Every
+    feed whose stops were read is reported in ``superseded``; the stage keeps
+    the declared placements of one that gets no edge here. Metro edges are
     propagated from member-city edges; a metro's own aggregated evidence
     outranks them.
 
@@ -683,7 +777,7 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
         read = expand._stop_points(feed_dir, state)
         if read is None:
             mismatches += 1
-            crawl_fields[feed_id] = {"crawl_status": "state_mismatch"}
+            crawl_fields[feed_id] = {"crawl_status": "unreadable"}
             continue
         points, dropped = read
         # The hull leaves out stops at a placeholder position.
@@ -959,7 +1053,10 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "dropped_divisions_hit": [],
                 "crawl_fields": {},
             }
-            folded = {}
+            folded, twins = {}, {}
+            access = [], [], {}
+            # Read without stops.txt, and the failed reads by kind.
+            without_stops, logged = set(), {}
             near = []
             contained = {}
             content = {}
@@ -990,7 +1087,17 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     states, unmatched = crawled_states(cache_dir, feeds)
                     committed = crawled_states(cache_dir, feeds, stops=False)[0]
                     read = set(committed)
-                    folded = fold_duplicates(feeds, states)
+                    without_stops = read - set(states)
+                    canonical = _canonical_ids(feeds)
+                    logged = {
+                        canonical[feed_id]: failure
+                        for feed_id, failure in crawl.failures(cache_dir).items()
+                        if feed_id in canonical
+                    }
+                    exempt = access_exempt(feeds, feed_overrides)
+                    anonymous = anonymous_reads(feeds, committed)
+                    folded, twins = fold_duplicates(feeds, states, anonymous, exempt)
+                    access = judge_access(feeds, committed, anonymous, exempt)
                     # After the fold, so a folded MDB copy names a feed first.
                     for feed in feeds:
                         if not feed.get("name") and feed["feed_id"] in committed:
@@ -1039,10 +1146,17 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 crawl_report["crawl_fields"],
                 own_ids,
             )
+            # A crawl that places none of its stops (none read, or none inside
+            # a known place) leaves a feed its declared placements, when they
+            # give it an edge.
+            crawl_placed = {feed_id for _, feed_id in crawled_by_key}
+            no_edge = crawl_report["superseded"] - crawl_placed
             superseded = crawl_report["superseded"] - curated
             edges, unknown_places, unmatched_feeds, unknown_levels = declared_edges(
-                feeds, places, placements, superseded=superseded
+                feeds, places, placements, superseded=superseded - no_edge
             )
+            unplaced = no_edge & {edge["feed_id"] for edge in edges}
+            superseded -= unplaced
             merged = {
                 key: edge
                 for key, edge in crawled_by_key.items()
@@ -1067,9 +1181,24 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     feed.update(crawl_report["crawl_fields"][feed["feed_id"]])
                 elif feed["feed_id"] in declared_covered:
                     feed["coverage_source"] = "declared"
-                    feed.update(crawl_report["crawl_fields"].get(feed["feed_id"]) or {})
+                    fields = crawl_report["crawl_fields"].get(feed["feed_id"]) or {}
+                    if feed["feed_id"] in unplaced:
+                        # The hull of stops in no known place is not the
+                        # feed's coverage.
+                        fields = {k: v for k, v in fields.items() if k != "coverage"}
+                    feed.update(fields)
                 else:
                     feed["coverage_source"] = None
+                if not feed.get("crawl_status"):
+                    # ok and unreadable come with the crawl's fields, which a
+                    # feed without an edge has not taken.
+                    fields = crawl_report["crawl_fields"].get(feed["feed_id"]) or {}
+                    if fields.get("crawl_status"):
+                        feed["crawl_status"] = fields["crawl_status"]
+                    elif feed["feed_id"] in without_stops:
+                        feed["crawl_status"] = "no_gtfs_files"
+                    elif feed["feed_id"] in logged:
+                        feed["crawl_status"] = logged[feed["feed_id"]]
                 if (
                     feed.get("crawlable")
                     and feed.get("access") == "key"
@@ -1095,6 +1224,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "feeds": len(feeds),
                 "feeds_covered": len(covered),
                 "folded_feeds": dict(sorted(folded.items())),
+                "access_judged": dict(zip(("opened", "keyed", "refused_open"), access)),
+                "access_from_twin": dict(sorted(twins.items())),
                 "feeds_placed_elsewhere": sorted(elsewhere),
                 "named_after_provider": named_after_provider,
                 "near_duplicate_groups": len(near),
@@ -1115,6 +1246,8 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                     if feed.get("dangling_static_feed_id")
                 ),
                 "feeds_crawl_covered": len(superseded),
+                # Crawled, but no stop in a known place: placed as declared.
+                "crawled_unplaced_declared": sorted(unplaced),
                 # Uncrawlable GTFS feeds that need a key, after the crawl.
                 "requires_auth": resolve.count_requires_auth(feeds),
                 "crawl_state_mismatches": crawl_report["state_mismatches"],

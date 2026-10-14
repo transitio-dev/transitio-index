@@ -145,3 +145,42 @@
       municipality: Paris
   reason: The official keyless copy of the Île-de-France Mobilités GTFS.
   date: 2026-10-03
+
+# Private and campus services, and unofficial compilations of other
+# operators' timetables, which transitio does not take by default.
+- feed: f-are~manhattan~shuttle~ny~us
+  set_mark: private
+  reason: A private shuttle serving ARE's Manhattan buildings.
+  date: 2026-10-13
+- feed: f-are~lic~shuttle~ny~us
+  set_mark: private
+  reason: A private shuttle serving ARE's Long Island City buildings.
+  date: 2026-10-13
+- feed: f-aries300erandolph
+  set_mark: private
+  reason: The shuttle of the 300 E Randolph building in Chicago.
+  date: 2026-10-13
+- feed: f-353northclark
+  set_mark: private
+  reason: The shuttle of the 353 North Clark building in Chicago.
+  date: 2026-10-13
+- feed: f-fordham~shuttle
+  set_mark: private
+  reason: Fordham University's campus shuttle.
+  date: 2026-10-13
+- feed: f-mercy~college
+  set_mark: private
+  reason: Mercy College's campus shuttle.
+  date: 2026-10-13
+- feed: f-university~of~chicago
+  set_mark: private
+  reason: The University of Chicago's campus shuttles.
+  date: 2026-10-13
+- feed: f-utel~uiuc~intercity~bus
+  set_mark: compilation
+  reason: A University of Illinois research compilation of US intercity buses, not an operator's feed.
+  date: 2026-10-13
+- feed: f-concord~coach~lines
+  set_mark: compilation
+  reason: A third-party build of Concord Coach Lines' timetables, not the operator's.
+  date: 2026-10-13

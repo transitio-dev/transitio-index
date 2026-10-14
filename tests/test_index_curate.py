@@ -121,7 +121,7 @@ def test_selectors_are_explicit_ids_or_expanded_predicates(tmp_path):
                 "feed": "f-a",
                 "place": "Q-city",
                 "tier": "national",
-                "set_selector": {"route_type": [3]},
+                "set_selector": {"route_type": [202]},
                 **ENTRY,
             },
             # A skipped feed keeps its route evidence: a predicate resolves.
@@ -141,7 +141,7 @@ def test_selectors_are_explicit_ids_or_expanded_predicates(tmp_path):
     national = edges["f-a"][("Q-city", "national")]
     assert national["selector"] == {
         "route_id": ["bus"],
-        "declared_as": {"route_type": [3]},
+        "declared_as": {"route_type": [202]},
     }
     assert edges["f-skip"][("Q-other", "local")]["selector"] == {
         "route_id": ["m1"],
@@ -718,7 +718,7 @@ def test_wildcards_apply_everywhere_and_specific_entries_win(tmp_path):
                 "feed": "f-a",
                 "place": "*",
                 "tier": "*",
-                "set_selector": {"route_type": [0, 3]},
+                "set_selector": {"route_type": [0, 202]},
                 **ENTRY,
             },
         ],
@@ -727,7 +727,7 @@ def test_wildcards_apply_everywhere_and_specific_entries_win(tmp_path):
     assert a[("Q-other", "national")]["selector"] == {"route_id": ["bus"]}
     assert a[("Q-reg", "local")]["selector"] == {
         "route_id": ["bus", "tram"],
-        "declared_as": {"route_type": [0, 3]},
+        "declared_as": {"route_type": [0, 202]},
     }
     assert manifest["overrides_applied"] == 2
 

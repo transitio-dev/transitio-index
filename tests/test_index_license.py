@@ -389,7 +389,13 @@ def _feedless_index(tmp_path, release="2026-08-19.0"):
     )
     places = [
         _place("tp_pe", "country", geometry=GEOM_HEX, country_code="PE"),
-        {**city, "geometry_source": geometry.UCDB, "ucdb_id": 7, "population": 10**7},
+        {
+            **city,
+            "geometry_source": geometry.UCDB,
+            "ucdb_id": 7,
+            "population": 10**7,
+            "population_source": "ghs_ucdb",
+        },
         _place("tp_town", "city", geometry=GEOM_HEX, parent_id="tp_pe"),
     ]
     _publish_gen(
