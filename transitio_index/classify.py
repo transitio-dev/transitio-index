@@ -25,6 +25,12 @@ stop-share-weighted mean of those routes. A feed that skipped
 fixed-tier by construction, so every route serves every candidate place at
 its declared class, else locally.
 
+A demand-responsive (GTFS-Flex) trip that names a zone or a stop group
+instead of a stop is read the same way: a group by its stops, a zone as a
+location of its own that lies in every place it reaches into past the
+boundary simplification, holds a route local only when one city or metro
+holds the whole of it, and spans its hull's vertices.
+
 ``unknown`` is an explicit tier, never a null: a route without a type or of
 no known mode, a feed without route evidence, and every declared-only feed
 yield ``tier = "unknown"`` with ``tier_confidence = 0.0`` and
@@ -133,8 +139,9 @@ SPAN_MAX_STOPS = 2048
 PATTERN_SAMPLE = 8
 # How departures a day are averaged: 1 over every day from the first to the
 # last running a quarter of the busiest day's trips; 2 over the weekdays of
-# the busiest week.
-DEPARTURES_VERSION = 2
+# the busiest week; 3 counts a demand-responsive trip once per zone or stop
+# group it names.
+DEPARTURES_VERSION = 3
 # The decision table's version: bumped whenever a rule, a range or the way a
 # signal feeds a rule changes, so two snapshots' tiers can be told apart from
 # their manifests alone. 1 was the table shipped in schemas 6–9; 2 decides
@@ -145,8 +152,9 @@ DEPARTURES_VERSION = 2
 # declared class, one city or metro, and the top-level regions and the
 # country's reference span, and adds international instead of replacing; 6
 # keeps the departures of routes across a border apart on the international
-# edge, by their own tier.
-RULES_VERSION = 6
+# edge, by their own tier; 7 reads the zones and stop groups of
+# demand-responsive trips.
+RULES_VERSION = 7
 
 # The route-span reference (written by ``scripts/route_span_reference.py``):
 # per home country and basic mode, the 90th percentile of the spans of the
@@ -274,11 +282,22 @@ _MODE_FAMILIES = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14)
 
 def _border(countries):
     """``(majority, minority)`` over ``{code: stop ids}``: the code holding the
-    most stops (ties by code) and the distinct stops absent from it. A stop
-    resolving to the majority country and a neighbour is not a minority stop."""
+    most stops (ties by code) and the distinct stops outside it
+    (:func:`_outside`)."""
     majority = min(countries, key=lambda code: (-len(countries[code]), code))
-    minority = set().union(*countries.values()) - countries[majority]
+    held = countries[majority]
+    minority = set().union(
+        *(_outside(ids, held) for code, ids in countries.items() if code != majority)
+    )
     return majority, minority
+
+
+def _outside(ids, held):
+    """The stops of ``ids`` outside the country holding ``held``: a stop
+    resolving to it and a neighbour is not one, but a zone reaching another
+    country serves it, whatever else it reaches. Zone keys are tuples, stop
+    ids strings."""
+    return {s for s in ids if s not in held or isinstance(s, tuple)}
 
 
 def classify_route(
@@ -309,15 +328,15 @@ def classify_route(
     if not countries:
         return decision
     majority, minority = _border(countries)
-    total = len(minority) + len(countries[majority])
+    total = len(set().union(*countries.values()))
     if len(minority) >= BORDER_STOPS and len(minority) >= BORDER_SHARE * total:
         decision["international"] = decision["tier"] != "international"
         return decision
     held = countries[majority]
     decision["border_stops"] = {
-        code: len(stops - held)
+        code: len(_outside(stops, held))
         for code, stops in sorted(countries.items())
-        if code != majority and stops - held
+        if code != majority and _outside(stops, held)
     }
     return decision
 
@@ -632,7 +651,13 @@ def _date(value):
 
 
 def _read_stop_times(
-    opened, trip_routes, trip_services, weights=None, trips=None, padded=None
+    opened,
+    trip_routes,
+    trip_services,
+    weights=None,
+    trips=None,
+    padded=None,
+    groups=None,
 ):
     """Per route, its distinct stop ids and its longest DISTINCT stop
     patterns, in two streamed passes — the file is never held whole.
@@ -659,6 +684,13 @@ def _read_stop_times(
     country evidence must not shrink with a partial join. The sixth is the
     same weighted stop-events per route, or None without a calendar. Ids
     are trimmed, padded ones counted in ``padded``.
+
+    A GTFS-Flex row names a zone or a stop group (``groups``: its stops)
+    instead of a stop (:func:`_flex_location`): its locations join the
+    feed's scheduled ones and, per route, the seventh result, never the
+    first, which the fingerprint reads. A trip's departure counts once per
+    zone or group, however many rows name it, spread evenly over a group's
+    stops.
     """
     stops = collections.defaultdict(set)
     scheduled = set()
@@ -666,6 +698,8 @@ def _read_stop_times(
     trip_rows = collections.Counter()
     departures = collections.Counter()
     events = collections.Counter()
+    flex = collections.defaultdict(set)
+    windows = set()
     dangling = 0
     for row in crawl.member_rows(opened):
         trip_id = crawl.member_id(row, "trip_id", padded, "stop_times.txt")
@@ -674,14 +708,24 @@ def _read_stop_times(
         traversal = (row.get("pickup_type") or "").strip() == "1" and (
             row.get("drop_off_type") or ""
         ).strip() == "1"
-        if stop_id and not traversal and trip_id in declared:
-            scheduled.add(stop_id)
+        place = None if stop_id else _flex_location(row, groups)
+        if not traversal and trip_id in declared:
+            scheduled.update((stop_id,) if stop_id else place[1] if place else ())
         if route_id is None:
             # A row whose trip the feed does not join: counted, so a feed
             # classified from a partial join says so in its evidence.
             dangling += bool(trip_id)
             continue
         if not stop_id:
+            if place and not traversal:
+                key, locations = place
+                flex[route_id].update(locations)
+                if weights is not None and (trip_id, key) not in windows:
+                    windows.add((trip_id, key))
+                    weight = weights.get(trip_services.get(trip_id, ""), 0.0)
+                    for location in locations:
+                        departures[location] += weight / len(locations)
+                    events[route_id] += weight
             continue
         trip_rows[trip_id] += 1
         if traversal:
@@ -723,11 +767,16 @@ def _read_stop_times(
         if trip_id not in wanted:
             continue
         value = (row.get("stop_sequence") or "").strip()
-        if not stop_id or not value.isdigit():
+        flex_row = not stop_id and bool(
+            crawl.member_id(row, "location_id")
+            or crawl.member_id(row, "location_group_id")
+        )
+        if not (stop_id or flex_row) or not value.isdigit():
             # A row with no stop, or no sequence, leaves a hole in the trip
             # that would be bridged by a fabricated leg: no legs from it.
             unordered.add(trip_id)
             continue
+        # A Flex row breaks the trip's legs: "" never bridges two stops.
         rows[trip_id].append((int(value), stop_id))
     patterns = collections.defaultdict(set)
     for trip_id, pairs in rows.items():
@@ -745,7 +794,22 @@ def _read_stop_times(
         (dict(departures) if weights is not None else None),
         scheduled,
         (dict(events) if weights is not None else None),
+        dict(flex),
     )
+
+
+def _flex_location(row, groups):
+    """``(key, locations)`` for a stop_times row without a stop: its zone,
+    keyed ``("zone", location_id)`` so it never meets a stop id, or its stop
+    group's stops; None for neither, or a group without stops."""
+    zone = crawl.member_id(row, "location_id")
+    if zone:
+        return ("zone", zone), (("zone", zone),)
+    group = crawl.member_id(row, "location_group_id")
+    members = (groups or {}).get(group) if group else None
+    if members:
+        return ("group", group), tuple(sorted(members))
+    return None
 
 
 def _span_km(points):
@@ -768,7 +832,7 @@ def _span_km(points):
     return best
 
 
-def _route_geography(stop_ids, sequences, coords):
+def _route_geography(stop_ids, sequences, coords, extents=None):
     """``(span_km, median_km, stop_count)`` for a route's stops.
 
     ``stop_count`` is every distinct stop the route lists — the service
@@ -776,17 +840,20 @@ def _route_geography(stop_ids, sequences, coords):
     every stop has usable coordinates: a span or median over a subset would
     be presented as complete when it is not. A stop at the placeholder
     position (``crawl.PLACEHOLDER_POSITION``) has none to give and is left
-    out of the span, and its legs out of the median.
+    out of the span, and its legs out of the median. A zone counts as a stop
+    whose points are its hull's vertices (``extents``); it has no legs.
     """
+    extents = extents or {}
     held = {s for s in stop_ids if coords.get(s) == crawl.PLACEHOLDER_POSITION}
-    points = [coords[s] for s in stop_ids if s in coords and s not in held]
-    if not points or len(points) < len(stop_ids) - len(held):
+    located = [s for s in stop_ids if (s in coords or s in extents) and s not in held]
+    if not located or len(located) < len(stop_ids) - len(held):
         return None, None, len(stop_ids)
+    points = [p for s in located for p in ([coords[s]] if s in coords else extents[s])]
     span = _span_km(points)
     if span is None:
         # Unmeasurable geometry: no rule compares the span.
         return None, None, len(stop_ids)
-    if any(s not in coords for sequence in sequences for s in sequence):
+    if any(s not in coords for sequence in sequences for s in sequence if s):
         # A pattern stop without coordinates — a traversal-only stop sits in
         # the patterns but not the scheduled set — would leave the legs a
         # subset presented as complete: no median.
@@ -795,7 +862,9 @@ def _route_geography(stop_ids, sequences, coords):
         haversine_km(coords[a], coords[b])
         for sequence in sequences
         for a, b in zip(sequence, sequence[1:])
-        if coords[a] != crawl.PLACEHOLDER_POSITION
+        if a
+        and b
+        and coords[a] != crawl.PLACEHOLDER_POSITION
         and coords[b] != crawl.PLACEHOLDER_POSITION
     ]
     median = statistics.median(legs) if legs else None
@@ -901,6 +970,14 @@ def _members(feed_dir, state, names, calendar=None):
             # The calendar's weights so each stop-event is weighted as it
             # streams by: one float per stop, never an event table.
             weights = _calendar_weights(calendar, trip_services)
+            parsed["zones"] = _flex_member(
+                feed_dir, state, "locations.geojson", _zone_shapes
+            )
+            groups = _flex_member(
+                feed_dir, state, "location_group_stops.txt", _read_groups
+            )
+            if parsed["zones"] is None or groups is None:
+                return None
             with crawl.verified_member(feed_dir, state, "stop_times.txt") as opened:
                 if opened is None:
                     return None
@@ -911,6 +988,7 @@ def _members(feed_dir, state, names, calendar=None):
                     parsed["stop_departures"],
                     parsed["scheduled"],
                     parsed["route_events"],
+                    parsed["flex"],
                 ) = _read_stop_times(
                     opened,
                     trip_routes,
@@ -918,6 +996,7 @@ def _members(feed_dir, state, names, calendar=None):
                     weights,
                     trips=trip_routes.keys() | orphans,
                     padded=parsed["padded"],
+                    groups=groups,
                 )
             parsed["join_gaps"] = {
                 "orphan_trips": len(orphans),
@@ -926,6 +1005,37 @@ def _members(feed_dir, state, names, calendar=None):
     except crawl.MEMBER_ERRORS:
         return None
     return parsed
+
+
+def _flex_member(feed_dir, state, name, read):
+    """A GTFS-Flex member read by ``read``: empty when the crawl holds none
+    or it does not parse — the rows naming it stay unlocated — and None when
+    it fails verification, as any member."""
+    digests = state.get("member_sha256")
+    if not isinstance(digests, dict) or name not in digests:
+        return {}
+    with crawl.verified_member(feed_dir, state, name) as opened:
+        if opened is None:
+            return None
+        try:
+            return read(opened)
+        except crawl.MEMBER_ERRORS:
+            return {}
+
+
+def _zone_shapes(opened):
+    return crawl.zone_shapes(opened)[0]
+
+
+def _read_groups(opened):
+    """``{location_group_id: stop ids}`` from location_group_stops.txt."""
+    groups = collections.defaultdict(set)
+    for row in crawl.member_rows(opened):
+        group = crawl.member_id(row, "location_group_id")
+        stop_id = crawl.member_id(row, "stop_id")
+        if group and stop_id:
+            groups[group].add(stop_id)
+    return dict(groups)
 
 
 # The members each fingerprint kind reads.
@@ -1181,13 +1291,16 @@ def _stops_inside(route, place_id, place):
     return len(_place_stop_ids(route, place_id, place))
 
 
-def _overlap_rows(routes, place_id, place, coords, route_events, interned):
+def _overlap_rows(
+    routes, place_id, place, coords, route_events, interned, extents=None
+):
     """One row per route for :func:`_overlaps`: the interned ids of its line
     key ``(family, name)`` (-1 without a name, matching nothing) and of its
     basic mode, its departures a day in the place (NaN without a calendar),
-    and the box ``x0, y0, x1, y1`` of its stops in the place (NaN, meeting
-    nothing, when the stops span over 180 degrees of longitude: across the
-    antimeridian)."""
+    and the box ``x0, y0, x1, y1`` of its stops in the place, a zone's by
+    its hull's vertices (``extents``) (NaN, meeting nothing, when the stops
+    span over 180 degrees of longitude: across the antimeridian)."""
+    extents = extents or {}
     rows = np.full((len(routes), 7), np.nan)
     for row, route in zip(rows, routes):
         mode = basic_mode(route["route_type"])
@@ -1199,8 +1312,13 @@ def _overlap_rows(routes, place_id, place, coords, route_events, interned):
         if route_events is not None:
             events = route_events.get(route["route_id"], 0.0)
             row[2] = events / max(route["stop_count"], 1) * len(inside)
-        if inside:
-            xs, ys = zip(*(coords[stop_id] for stop_id in inside))
+        points = [
+            p
+            for stop_id in inside
+            for p in ([coords[stop_id]] if stop_id in coords else extents[stop_id])
+        ]
+        if points:
+            xs, ys = zip(*points)
             if max(xs) - min(xs) <= 180:
                 row[3:] = min(xs), min(ys), max(xs), max(ys)
     return rows
@@ -1370,11 +1488,13 @@ def _top_level(place_id, places):
     return place.get("kind") in ("region", "city") and parent.get("kind") == "country"
 
 
-def _stop_reach(hit, places, metros):
+def _stop_reach(hit, places, metros, holders=None):
     """``(cities, metros, top-level regions)`` holding a stop that lies in the
     places ``hit``; a metro holds it by its own polygon or as a metro of a
-    city holding it."""
-    kinds = {place_id: (places.get(place_id) or {}).get("kind") for place_id in hit}
+    city holding it. A zone reaches the regions it overlaps (``hit``), but
+    only the cities and metros among ``holders`` hold the whole of it."""
+    holders = hit if holders is None else holders
+    kinds = {place_id: (places.get(place_id) or {}).get("kind") for place_id in holders}
     cities = frozenset(p for p, kind in kinds.items() if kind == "city")
     held = {p for p, kind in kinds.items() if kind == "metro"}
     for city in cities:
@@ -1465,7 +1585,19 @@ def _classify_feed(
         )
     coords = parsed["coords"]
     routes = parsed["routes"]
-    lookup.ensure(crawl.cluster_boxes(list(coords.values())))
+    import shapely
+
+    # The zones the feed's trips name, by their key; a zone the zones file
+    # lacks stays unlocated.
+    zones = parsed.get("zones") or {}
+    named = {
+        key: zones[key[1]]
+        for key in parsed.get("scheduled", ())
+        if isinstance(key, tuple) and key[1] in zones
+    }
+    lookup.ensure(
+        crawl.cluster_boxes(list(coords.values())) + crawl.zone_boxes(named.values())
+    )
     stop_places = {}
     stop_countries = {}
     stale = set()
@@ -1476,6 +1608,24 @@ def _classify_feed(
         stop_places[stop_id] = hit
         stop_countries[stop_id] = countries
         stale.update(stale_here)
+    # A zone is a location of its own: the places it reaches into, its
+    # countries, the places holding the whole of it and its hull's vertices.
+    located_places = dict(stop_places)
+    located_countries = dict(stop_countries)
+    holders, extents = {}, {}
+    for key, shape in named.items():
+        hit, countries, stale_here, _ = coverage.zone_places(
+            lookup, shape, by_overture, by_qid, curated
+        )
+        located_places[key] = hit
+        located_countries[key] = countries
+        stale.update(stale_here)
+        holders[key] = coverage.zone_holders(
+            lookup, shape, by_overture, by_qid, curated
+        )
+        extents[key] = [
+            tuple(xy) for xy in shapely.get_coordinates(shapely.convex_hull(shape))
+        ]
     _, stale = coverage.known_misses(stale, conflicts, "classify")
     if stale:
         raise ClassifyError(coverage.stale_expansion(stale))
@@ -1611,17 +1761,24 @@ def _classify_feed(
         for stop_id, position in coords.items()
         if position != crawl.PLACEHOLDER_POSITION
     }
-    home = home_country(_country_stops(parsed["scheduled"], stop_countries), ())
+    reach.update(
+        (key, _stop_reach(located_places[key], places, metros or {}, holders[key]))
+        for key in holders
+    )
+    home = home_country(_country_stops(parsed["scheduled"], located_countries), ())
     references = route_span_reference()
     measured = {}
     minority_stops = set()
     for route_id, info in routes.items():
         route_type = info["route_type"]
-        stop_ids = parsed["stops"].get(route_id, set())
-        span, median, count = _route_geography(
-            stop_ids, parsed["sequences"].get(route_id, []), coords
+        # Its stops and the zones and stop groups its trips name.
+        stop_ids = parsed["stops"].get(route_id, set()) | parsed["flex"].get(
+            route_id, set()
         )
-        countries = _country_sets(stop_ids, stop_countries)
+        span, median, count = _route_geography(
+            stop_ids, parsed["sequences"].get(route_id, []), coords, extents
+        )
+        countries = _country_sets(stop_ids, located_countries)
         majority = None
         if countries:
             majority, minority = _border(countries)
@@ -1631,7 +1788,7 @@ def _classify_feed(
         reference = references.get((home, mode_key), references.get(("*", mode_key)))
         place_stops = collections.defaultdict(set)
         for stop_id in stop_ids:
-            for hit in stop_places.get(stop_id, ()):
+            for hit in located_places.get(stop_id, ()):
                 place_stops[hit].add(stop_id)
         measured[route_id] = {
             "decision": classify_route(
@@ -1703,7 +1860,14 @@ def _classify_feed(
                 by_tier[route["decision"]["tier"]].append(route)
                 if route["decision"]["international"]:
                     across[route["decision"]["tier"]].append(route)
-            shared = (place_id, place, coords, parsed.get("route_events"), interned)
+            shared = (
+                place_id,
+                place,
+                coords,
+                parsed.get("route_events"),
+                interned,
+                extents,
+            )
             for edge in tier_edges:
                 # An international edge holding only routes of other tiers
                 # across the border has no rows of its own; it keeps theirs
@@ -1722,8 +1886,9 @@ def _classify_feed(
         len(routes),
         dropped,
         parsed.get("join_gaps"),
-        *_country_evidence(parsed["scheduled"], stop_countries, "scheduled"),
-        _stop_artefacts(stop_countries, len(minority_stops)),
+        *_country_evidence(parsed["scheduled"], located_countries, "scheduled"),
+        # Boundary artefacts are counted over stops; a zone may cross a border.
+        _stop_artefacts(stop_countries, len(minority_stops & coords.keys())),
     )
 
 

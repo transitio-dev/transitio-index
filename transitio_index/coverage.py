@@ -755,6 +755,20 @@ def zone_places(lookup, shape, by_overture, by_qid, curated=None):
     return hit, countries, stale, slivers
 
 
+def zone_holders(lookup, shape, by_overture, by_qid, curated=None):
+    """The places holding the whole of a zone within the simplification
+    tolerance: a division one of whose polygons, or a curated boundary,
+    covers its :func:`geometry.zone_core`."""
+    from transitio_index import geometry
+
+    core = geometry.zone_core(shape)
+    held, _, _ = _division_places(lookup.divisions_covering(core), by_overture, by_qid)
+    if curated is not None:
+        tree, ids = curated
+        held.update(ids[i] for i in tree.query(core, predicate="covered_by"))
+    return held
+
+
 def _division_places(records, by_overture, by_qid):
     """``(place_ids, countries, stale)`` for the division ``records`` a stop
     or zone reached."""

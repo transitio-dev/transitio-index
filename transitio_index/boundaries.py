@@ -663,6 +663,20 @@ class BoundaryLookup:
             found[record["division_id"]] = record
         return _most_specific(found)
 
+    def divisions_covering(self, shape):
+        """The divisions one of whose polygons covers the whole of
+        ``shape``, most specific first; call :meth:`ensure` for its cells
+        first."""
+        if self._tree is None:
+            self._build_tree()
+        if self._tree_empty:
+            return []
+        found = {}
+        for index in self._tree.query(shape, predicate="covered_by"):
+            record = self._tree_entries[index]
+            found[record["division_id"]] = record
+        return _most_specific(found)
+
 
 def _most_specific(found):
     """The division records ``{division_id: record}``, most specific first."""
