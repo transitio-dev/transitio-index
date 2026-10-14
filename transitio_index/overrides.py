@@ -66,6 +66,7 @@ _OPERATIONS = frozenset(
         "set_coverage",
         "set_access",
         "set_mark",
+        "set_registration",
         "add_feed",
     }
 )
@@ -74,7 +75,14 @@ CROSSWALK_OPERATIONS = frozenset({"add_feed"})
 # The operations whose effect the resolve stage settles, a curated feed's
 # access among them; set_coverage enters at coverage.
 RESOLVE_OPERATIONS = frozenset(
-    {"set_identity", "mark_uncrawlable", "set_access", "set_mark", "add_feed"}
+    {
+        "set_identity",
+        "mark_uncrawlable",
+        "set_access",
+        "set_mark",
+        "set_registration",
+        "add_feed",
+    }
 )
 # The marks ``set_mark`` gives a feed transitio does not take by default: a
 # private or campus service, an unofficial compilation of others' timetables.
@@ -343,6 +351,10 @@ def _validate_operations(path, ref, entry):
     if "set_mark" in entry and (not isinstance(mark, str) or mark not in MARKS):
         raise OverrideError(
             f"{path}: feed {ref!r} set_mark must be one of {sorted(MARKS)}"
+        )
+    if "set_registration" in entry and web_page(entry["set_registration"]) is None:
+        raise OverrideError(
+            f"{path}: feed {ref!r} set_registration must be an http(s) URL"
         )
     if "set_coverage" in entry:
         spec = entry["set_coverage"]

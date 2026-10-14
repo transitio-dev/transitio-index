@@ -184,3 +184,10 @@
   set_mark: compilation
   reason: A third-party build of Concord Coach Lines' timetables, not the operator's.
   date: 2026-10-13
+
+# DELFI's catalogue link is one registered user's sharing link: the data are
+# open, but downloading them needs a free account.
+- feed: f-mdb-3215
+  set_registration: https://www.opendata-oepnv.de/ht/de/standards/registrierung
+  reason: Downloading DELFI's Germany-wide timetable needs a free registration.
+  date: 2026-10-14

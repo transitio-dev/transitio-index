@@ -374,7 +374,8 @@ def judge_access(feeds, committed, anonymous, exempt):
         failure = failure or "the crawl did not read the feed's URL"
         status = _HTTP_STATUS.search(failure)
         if status and status.group(1) == "401":
-            feed.update(resolve._OPEN, access="key")
+            registration = feed.get("registration_url")
+            feed.update(resolve._OPEN, access="key", registration_url=registration)
             keyed.append(feed_id)
         else:
             refused[feed_id] = failure

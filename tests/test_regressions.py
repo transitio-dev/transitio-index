@@ -3134,3 +3134,25 @@ def test_a_corrupt_lzma_member_is_unreadable_and_falls_back(tmp_path):
     _, log = crt._crawl(cache, crt._server(served))
     assert log["f-lzma"]["fetched_from"] == crawl.HOSTED_COPY
     assert "Corrupt input data" in log["f-lzma"]["producer_failure"]
+
+
+def test_an_open_feed_that_needs_a_sign_up_carries_its_registration_page(tmp_path):
+    """DELFI's Germany-wide timetable was published as open with no
+    registration page, though downloading it needs a free account and the
+    catalogue's link is one registered user's sharing link."""
+    import test_index_resolve_stage as rst
+
+    from transitio_index import overrides, resolve
+
+    (tmp_path / "bad").mkdir()
+    bad = [{"feed": "f", "set_registration": "not a page"}]
+    with pytest.raises(overrides.OverrideError, match="set_registration must be"):
+        overrides.load_feed_overrides(rst._overrides_dir(tmp_path / "bad", bad))
+    cache = tmp_path / "cache"
+    rst._crosswalk(cache, [rst._feed("f-delfi")])
+    page = "https://www.opendata-oepnv.de/ht/de/standards/registrierung"
+    entries = [{"feed": "f-delfi", "set_registration": page}]
+    resolve.resolve(cache, overrides_dir=rst._overrides_dir(tmp_path, entries))
+    feeds, _ = rst._resolved(cache)
+    delfi = feeds["f-delfi"]
+    assert (delfi["access"], delfi["registration_url"]) == ("open", page)

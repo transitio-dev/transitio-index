@@ -1,26 +1,26 @@
 """Stage 3, resolve half: settle feed identity, access and crawlability.
 
-Applies the ``set_identity``, ``mark_uncrawlable``, ``set_access`` and
-``set_mark`` operations from ``overrides/feeds.yaml`` to the crosswalk feeds
-and writes
-``feeds_resolved.jsonl``. These are settled before any crawl because identity
-is the crawl cache key and an uncrawlable feed must never be fetched at all; the
-crawl half itself is a later stage, and ``set_coverage`` is left for the coverage
-stage. Each feed records its access details (``access``, ``access_provider``,
-``auth_method``, ``auth_params``, the catalogue's ``auth_param_name`` and
-``registration_url``), from a curated ``set_access`` or else the catalogue
-record supplying its URL; a curated feed (``add_feed``, which the crosswalk
-adds) from its own entry. A feed that needs a key takes its provider from
-``set_access`` or else from the ``overrides/access_providers.yaml`` entry whose
-URL prefix covers its URL; ``access_report.jsonl`` lists the protected feeds
-no provider claims and the curation errors. A GTFS feed that needs a key
+Applies the ``set_identity``, ``mark_uncrawlable``, ``set_access``,
+``set_mark`` and ``set_registration`` operations from ``overrides/feeds.yaml``
+to the crosswalk feeds and writes ``feeds_resolved.jsonl``. These are settled
+before any crawl because identity is the crawl cache key and an uncrawlable
+feed must never be fetched at all; the crawl half itself is a later stage, and
+``set_coverage`` is left for the coverage stage. Each feed records its access
+details (``access``, ``access_provider``, ``auth_method``, ``auth_params``, the
+catalogue's ``auth_param_name`` and ``registration_url``, which
+``set_registration`` sets for any feed), from a curated ``set_access`` or else
+the catalogue record supplying its URL; a curated feed (``add_feed``, which the
+crosswalk adds) from its own entry. A feed that needs a key takes its provider
+from ``set_access`` or else from the ``overrides/access_providers.yaml`` entry
+whose URL prefix covers its URL; ``access_report.jsonl`` lists the protected
+feeds no provider claims and the curation errors. A GTFS feed that needs a key
 stays crawlable while it has a URL: the crawl requests it once without a key,
 else reads the feed's MDB-hosted copy, and the coverage stage marks a feed it
 read no copy of uncrawlable. Only one without a URL is uncrawlable from the
 start. This stage fetches nothing. An override references a feed by its
 ``feed_id`` or any of its aliases — the crosswalk keeps superseded ids in
-``aliases`` for exactly this — so a correction filed against a pre-crosswalk
-id still lands.
+``aliases`` for exactly this — so a correction filed against a pre-crosswalk id
+still lands.
 """
 
 import collections
@@ -200,6 +200,10 @@ def _apply(feed, entry):
         # A private or campus service, or an unofficial compilation: the rank
         # stage puts the mark in every edge's evidence.
         feed["mark"] = entry["set_mark"]
+    if "set_registration" in entry:
+        # The page where a feed's download needs a sign-up, an open feed's
+        # too; the access stays as it is.
+        feed["registration_url"] = entry["set_registration"]
 
 
 _BASIC_FIELDS = ["password", "username"]
