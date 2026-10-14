@@ -15,14 +15,20 @@ once and each of its edges gets that score. For city, metro and region places
 ``share_of_place`` is the pair's departures per day (or stops, when any pair
 of the place lacks a crawled calendar — one basis per place, recorded as
 ``share_basis``) over the place total; ``share_of_feed`` is the pair's stops
-over the feed's stops in its home country (all its countries when it has no
-home). For country places ``share_of_feed`` is replaced by breadth: the
-cities the feed serves in the country over all served cities there. A feed
-stale when indexed — its ``service_end`` more than ``STALE_DAYS`` before its
-``last_crawled`` — scores 0 on every edge, so it sorts last in its category
-with its tier and category unchanged; the edge's evidence records that
-``service_end`` as ``stale_when_indexed``, and its pairs stay out of the
-place totals with a ``share_of_place`` of 0. The weights live here and nothing
+over the feed's stops in its home country when the feed is domestic (in all
+its countries otherwise). For country places ``share_of_feed`` is replaced by
+breadth: the cities the feed serves in the country over all served cities
+there. A feed stale when indexed — its ``service_end`` more than
+``STALE_DAYS`` before its ``last_crawled`` — has that ``service_end``
+recorded as ``stale_when_indexed`` in its edges' evidence, and one whose
+window holds placeholder dates (see :func:`_nominal_window`) has
+``nominal_window``. A stale pair is
+set aside — it scores 0, so it sorts last in its category with its tier and
+category unchanged, and stays out of the place totals with a
+``share_of_place`` of 0 — unless it runs a mode no fresh pair of its place
+runs (its overlap evidence names the modes), or, without mode evidence, its
+place has no fresh pair: the place's only feed of a mode keeps its share.
+The weights live here and nothing
 else in the pipeline reads them; the merge rescores merged edges through
 :func:`score_edges`, the half of the scoring that depends on the place.
 """
@@ -41,6 +47,11 @@ FEEDS_ARTIFACT = classify.RANKED_FEEDS_ARTIFACT
 W_PLACE = 0.7
 W_FEED = 0.3
 STALE_DAYS = 30
+# A service window is nominal — its dates placeholders, such as 1970 or 2099 —
+# when it starts before this date or ends more than this many years after
+# the feed's last crawl.
+NOMINAL_BEFORE = datetime.date(2000, 1, 1)
+NOMINAL_YEARS = 5
 CATEGORY_BY_TIER = {
     "local": "primary",
     "regional": "secondary",
@@ -81,6 +92,30 @@ def _stale_when_indexed(feed):
     return span[1].isoformat() if (day - span[1]).days > STALE_DAYS else None
 
 
+def _nominal_window(feed):
+    """Whether the feed's service window holds placeholder dates: it starts
+    before ``NOMINAL_BEFORE`` or ends more than ``NOMINAL_YEARS`` after the
+    feed's ``last_crawled``."""
+    span = publish.service_span(feed)
+    if span is None:
+        return False
+    if span[0] < NOMINAL_BEFORE:
+        return True
+    crawled = feed.get("last_crawled")
+    if not isinstance(crawled, str):
+        return False
+    try:
+        day = datetime.datetime.fromisoformat(crawled).date()
+    except ValueError:
+        return False
+    end = span[1]
+    return (end.year, end.month, end.day) > (
+        day.year + NOMINAL_YEARS,
+        day.month,
+        day.day,
+    )
+
+
 def rank_edges(edges, feeds, places):
     """The edges with their relevance fields, and the stage report.
 
@@ -95,6 +130,7 @@ def rank_edges(edges, feeds, places):
             raise RankError(f"duplicate feed {feed['feed_id']!r}")
         feed_by_id[feed["feed_id"]] = feed
     stale = {feed_id: _stale_when_indexed(f) for feed_id, f in feed_by_id.items()}
+    nominal = {feed_id: _nominal_window(f) for feed_id, f in feed_by_id.items()}
     pairs = {}
     for edge in edges:
         key = (edge["feed_id"], edge["place_id"])
@@ -119,7 +155,9 @@ def rank_edges(edges, feeds, places):
         if places[edge["place_id"]].get("kind") in FEED_SHARE_KINDS:
             country_stops = feed.get("country_stops") or {}
             denominator = (
-                country_stops.get(home, 0) if home else sum(country_stops.values())
+                country_stops.get(home, 0)
+                if feed.get("scope") == "domestic"
+                else sum(country_stops.values())
             )
             if denominator:
                 stops = pairs[(edge["feed_id"], edge["place_id"])].get("stops")
@@ -130,6 +168,8 @@ def rank_edges(edges, feeds, places):
         ended = stale[edge["feed_id"]]
         if ended is not None:
             evidence["stale_when_indexed"] = ended
+        if nominal[edge["feed_id"]]:
+            evidence["nominal_window"] = True
         prepared.append({**edge, "evidence": evidence})
     scored, basis, _ = score_edges(prepared, places)
 
@@ -165,19 +205,22 @@ def score_edges(edges, places):
     ``relevance_category``, ``relevance`` and ``needs_review``. A city, metro
     or region edge without ``share_of_feed`` scores 0 for it and carries the
     ``no_share_of_feed`` note unless it has a note; ``unscored`` counts them.
-    A stale pair (:func:`is_stale`) has a ``share_of_place`` of 0 and counts
-    toward neither its place's total nor, while the place has a pair that is
-    not stale, its basis.
+    A stale pair (:func:`is_stale`) set aside by :func:`_set_aside` has a
+    ``share_of_place`` of 0 and counts toward neither its place's total nor,
+    while the place has a pair that is not set aside, its basis.
     """
-    pairs, stale = {}, set()
+    pairs, stale, modes = {}, set(), collections.defaultdict(set)
     for edge in edges:
         key = (edge["feed_id"], edge["place_id"])
         pairs.setdefault(key, edge.get("service") or {})
+        overlap = (edge.get("evidence") or {}).get("overlap") or {}
+        modes[key].update(overlap.get("departures") or ())
         if is_stale(edge):
             stale.add(key)
     by_place = collections.defaultdict(list)
     for key in pairs:
         by_place[key[1]].append(key)
+    stale = _set_aside(by_place, stale, modes)
     basis, totals = {}, {}
     for place_id, keys in by_place.items():
         fresh = [k for k in keys if k not in stale]
@@ -240,6 +283,23 @@ def score_edges(edges, places):
             }
         )
     return scored, basis, unscored
+
+
+def _set_aside(by_place, stale, modes):
+    """The stale pairs that score 0: all but those running a mode in
+    ``modes`` that no fresh pair of their place runs, or, without modes, at a
+    place with no fresh pair."""
+    aside = set()
+    for keys in by_place.values():
+        fresh = [key for key in keys if key not in stale]
+        fresh_modes = set().union(*(modes[key] for key in fresh))
+        for key in keys:
+            if key not in stale:
+                continue
+            alone = modes[key] - fresh_modes if modes[key] else not fresh
+            if not alone:
+                aside.add(key)
+    return aside
 
 
 def _quantiles(values):

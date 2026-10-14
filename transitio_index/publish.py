@@ -107,6 +107,7 @@ SUMMARY_KEYS = (
     "share_of_place",
     "share_basis",
     "stale_when_indexed",
+    "nominal_window",
     "carried_by",
     "overlap",
 )

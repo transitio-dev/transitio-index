@@ -194,8 +194,8 @@ def member_rows(opened):
 
     Header names lose surrounding whitespace (``str.strip``, as transitio's
     fingerprint reads them); a name repeated after that keeps its first
-    column, and later ones read under ``""``. Values stay as written: ids
-    feed the classification fingerprint. Decoding is strict UTF-8 with an
+    column, and later ones read under ``""``. Values stay as written; ids are
+    read through :func:`member_id`. Decoding is strict UTF-8 with an
     optional BOM: replacing malformed bytes would let distinct invalid ids
     collapse into one. A ``TextIOWrapper`` closes its file when collected;
     detaching keeps ``opened`` usable for a second pass.
@@ -215,14 +215,30 @@ def member_rows(opened):
         text.detach()
 
 
-def stop_rows(source):
+# A stop at exactly (0, 0) stands in for a position the feed lacks: it stays
+# in the stops the fingerprint reads, and is left out of every measure.
+PLACEHOLDER_POSITION = (0.0, 0.0)
+
+
+def member_id(row, field, padded=None, member=None):
+    """``row``'s ``field`` trimmed of surrounding whitespace, as transitio's
+    version-2 fingerprints read ids, ``""`` when absent; trimming that changes
+    the value counts under ``member`` in the ``padded`` counter."""
+    value = row.get(field) or ""
+    trimmed = value.strip()
+    if padded is not None and trimmed != value:
+        padded[member] += 1
+    return trimmed
+
+
+def stop_rows(source, padded=None):
     """``(rows, dropped)`` parsed from ``stops.txt`` bytes or a binary file.
 
     ``rows`` are ``(stop_id, lon, lat)`` for the parseable rows; ``dropped``
     counts rows refused for a malformed or out-of-range coordinate —
     range-checked, not just finite, because a huge value would overflow the
     grid-cell arithmetic. Evidence consumers use the rows; the skip predicate
-    refuses any drop.
+    refuses any drop. Ids are trimmed, padded ones counted in ``padded``.
     """
     rows = []
     dropped = 0
@@ -235,9 +251,7 @@ def stop_rows(source):
             dropped += 1
             continue
         if -180.0 <= x <= 180.0 and -90.0 <= y <= 90.0:
-            # Ids verbatim: two legal ids differing only by padding must
-            # never collapse into one.
-            rows.append((row.get("stop_id") or "", x, y))
+            rows.append((member_id(row, "stop_id", padded, "stops.txt"), x, y))
         else:
             dropped += 1
     return rows, dropped

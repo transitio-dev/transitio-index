@@ -27,9 +27,10 @@ the edge keeps its membership and the coverage stage's service level — not
 knowing a route's tier says nothing about whether the feed serves the place.
 Every tier edge of a ``(place, feed)`` pair carries the same ``service``
 struct: the pair's scheduled stops and serving routes in the place, and its
-stop-events per day when the calendar was crawled, averaged over the period
-the timetable covers: from the first to the last date running at least
-``COVERED_SHARE`` of the busiest day's trips, quieter days inside it included.
+stop-events a day when the calendar was crawled: the Monday-to-Friday
+average of the timetable's busiest week (the Monday-to-Sunday week running
+the most trips), or the average of all its seven days when that week runs no
+weekday trip.
 Selectors and fingerprints are decided here, from the same evidence. A
 route-level feed gives each tier edge a ``complete`` selector — exactly the
 route ids that serve the place at that tier — and a ``route_stops``
@@ -53,11 +54,12 @@ others.
 
 The stage also decides each feed's home country from its stops: the distinct
 scheduled stops per country (``country_stops``), their shares, the country
-holding at least ``HOME_SHARE`` of them (``home_country``, else null) and the
-resulting ``scope`` — ``domestic``, ``international`` (stops, no home),
-``declared`` (no stop evidence, a catalogue country) or ``unknown``. The
-catalogues' ``declared_countries`` never set the home; they only tell
-``declared`` from ``unknown`` and feed the statistics. ``country_basis`` says
+holding the most of them (``home_country``; a tie goes to the lower code) and
+the resulting ``scope`` — ``domestic`` when the home holds at least
+``HOME_SHARE`` of them, ``international`` when it holds less, ``declared`` (no
+stop evidence, a catalogue country) or ``unknown``. A feed without stop
+evidence takes its home from the catalogues' ``declared_countries`` when they
+name one country only, and has none otherwise. ``country_basis`` says
 which stops the counts came from: every located stop of a whole-feed (skipped)
 feed or of a crawl with stops but no schedule, the scheduled stops of declared
 trips of a route-level feed, or null whenever the counts are empty.
@@ -94,7 +96,8 @@ REVIEW_CUTOFF = coverage.REVIEW_CUTOFF
 # every one of them; a neighbourhood route's single stop serves the people
 # around it.
 ROUTE_MIN_STOPS = 1
-# A feed's home country holds at least this share of its scheduled stops.
+# A feed is domestic when its home country holds at least this share of its
+# scheduled stops.
 HOME_SHARE = 0.80
 # A route decided within this fraction of a threshold has its confidence
 # multiplied by the penalty.
@@ -121,16 +124,18 @@ SPAN_MAX_STOPS = 2048
 # deterministic sample of trips (PATTERN_SAMPLE per distinct length, for
 # the PATTERN_SAMPLE longest lengths).
 PATTERN_SAMPLE = 8
-# A timetable covers the dates from the first to the last running at least
-# this share of its busiest day's trips; departures per day average over them.
-COVERED_SHARE = 0.25
+# How departures a day are averaged: 1 over every day from the first to the
+# last running a quarter of the busiest day's trips; 2 over the weekdays of
+# the busiest week.
+DEPARTURES_VERSION = 2
 # The decision table's version: bumped whenever a rule, a range or the way a
 # signal feeds a rule changes, so two snapshots' tiers can be told apart from
 # their manifests alone. 1 was the table shipped in schemas 6–9; 2 decides
 # extended types by family, covers basic types 5–7, 11 and 12, and marks air,
 # taxi and miscellaneous services unclassifiable (rule 10); 3 gates rule 1 on
-# the border share and records every route's scale.
-RULES_VERSION = 3
+# the border share and records every route's scale; 4 leaves stops at the
+# placeholder position out of a route's span and spacing.
+RULES_VERSION = 4
 
 # Basic modes over GTFS route types, the reader's table: railway 100s and
 # suburban railway 300s are rail; urban railway 400s, metro 500s,
@@ -150,10 +155,9 @@ RAIL_BOUND = frozenset({"tram", "subway", "rail"})
 # Another feed runs a route when its route of the same family and line name
 # has stops in the place within this many degrees of the route's stop box.
 OVERLAP_NEAR_DEG = 0.003
-# An edge lists the other feeds running at least this share of its
-# departures, at most this many, largest first.
+# An edge lists every other feed running at least this share of its
+# departures, largest first.
 OVERLAP_MIN_SHARE = 0.01
-OVERLAP_MAX_FEEDS = 10
 # Rows per box test in the place pass.
 _OVERLAP_BLOCK = 2048
 
@@ -181,7 +185,7 @@ def classifier_settings(route_min_stops=ROUTE_MIN_STOPS):
         "bus_regional_span_km": BUS_REGIONAL_SPAN_KM,
         "span_max_stops": SPAN_MAX_STOPS,
         "pattern_sample": PATTERN_SAMPLE,
-        "covered_share": COVERED_SHARE,
+        "departures_version": DEPARTURES_VERSION,
     }
 
 
@@ -379,46 +383,48 @@ class _LaterFirst:
         return self.value == other.value
 
 
-def _read_routes(opened):
+def _read_routes(opened, padded=None):
     """``({route_id: {"route_type", "agency_id", "name"}}, route_types)`` —
     an unparsable type is a missing signal (None), never a guessed one; ids
-    stay verbatim; ``name`` is the :func:`_line_name`. ``route_types`` lists
-    every row's type, id or not, as the crawl's skip predicate saw them."""
+    trimmed (see :func:`crawl.member_id`); ``name`` is the
+    :func:`_line_name`. ``route_types`` lists every row's type, id or not, as
+    the crawl's skip predicate saw them."""
     routes = {}
     route_types = []
     for row in crawl.member_rows(opened):
         value = (row.get("route_type") or "").strip()
         route_type = int(value) if value.isdigit() else None
         route_types.append(route_type)
-        route_id = row.get("route_id") or ""
+        route_id = crawl.member_id(row, "route_id", padded, "routes.txt")
         if not route_id:
             continue
         routes[route_id] = {
             "route_type": route_type,
-            "agency_id": row.get("agency_id") or "",
+            "agency_id": crawl.member_id(row, "agency_id", padded, "routes.txt"),
             "name": _line_name(row),
         }
     return routes, route_types
 
 
-def _read_trips(opened, routes):
+def _read_trips(opened, routes, padded=None):
     """``({trip_id: route_id}, {trip_id: service_id}, orphans)`` for trips of
-    known routes, ids verbatim; ``orphans`` is the set of trip ids naming a
-    route the feed lacks."""
+    known routes, ids trimmed, the last row of an id naming a known route
+    winning as in the reader's fingerprint; ``orphans`` is the set of trip
+    ids naming only routes the feed lacks."""
     trips = {}
     services = {}
     orphans = set()
     for row in crawl.member_rows(opened):
-        trip_id = row.get("trip_id") or ""
-        route_id = row.get("route_id") or ""
+        trip_id = crawl.member_id(row, "trip_id", padded, "trips.txt")
+        route_id = crawl.member_id(row, "route_id", padded, "trips.txt")
         if not trip_id:
             continue
         if route_id in routes:
             trips[trip_id] = route_id
-            services[trip_id] = row.get("service_id") or ""
+            services[trip_id] = crawl.member_id(row, "service_id")
         else:
             orphans.add(trip_id)
-    return trips, services, orphans
+    return trips, services, orphans - trips.keys()
 
 
 # A read calendar: per service id its window ``(start, end, weekday flags)``
@@ -427,10 +433,10 @@ def _read_trips(opened, routes):
 Calendar = collections.namedtuple("Calendar", ["windows", "added", "removed", "span"])
 # A calendar over day numbers counted from its first date: per service its
 # window bounds (0 and -1 without one) and weekday flags indexed by day number
-# modulo 7, and every exception that changes whether it runs as
-# ``(service, day, delta)`` arrays.
+# modulo 7, every exception that changes whether it runs as
+# ``(service, day, delta)`` arrays, and the weekday of day 0 (Monday 0).
 _Days = collections.namedtuple(
-    "_Days", ["services", "start", "end", "flags", "exceptions", "length"]
+    "_Days", ["services", "start", "end", "flags", "exceptions", "length", "weekday"]
 )
 
 
@@ -446,7 +452,7 @@ def _read_calendar(calendar, calendar_dates):
     windows = {}
     if calendar is not None:
         for row in crawl.member_rows(calendar):
-            service_id = row.get("service_id") or ""
+            service_id = crawl.member_id(row, "service_id")
             start = _date(row.get("start_date"))
             end = _date(row.get("end_date"))
             if not service_id or start is None or end is None or end < start:
@@ -468,7 +474,7 @@ def _read_calendar(calendar, calendar_dates):
     removed = collections.defaultdict(set)
     if calendar_dates is not None:
         for row in crawl.member_rows(calendar_dates):
-            service_id = row.get("service_id") or ""
+            service_id = crawl.member_id(row, "service_id")
             date = _date(row.get("date"))
             kind = (row.get("exception_type") or "").strip()
             if not service_id or date is None:
@@ -545,7 +551,15 @@ def _calendar_days(calendar):
         np.concatenate([a_day[plus], r_day[minus]]),
         np.repeat([1.0, -1.0], [plus.sum(), minus.sum()]),
     )
-    return _Days(services, start, end, flags, exceptions, int(bounds.max()) - first + 1)
+    return _Days(
+        services,
+        start,
+        end,
+        flags,
+        exceptions,
+        int(bounds.max()) - first + 1,
+        datetime.date.fromordinal(first).weekday(),
+    )
 
 
 def _weeks(low, high, offset):
@@ -554,14 +568,10 @@ def _weeks(low, high, offset):
     return -((offset - low) // 7), (high - offset) // 7
 
 
-def _covered_period(days, trips):
-    """``(first, last)``: the first and last day number running at least
-    ``COVERED_SHARE`` of the busiest day's trips, ``trips`` holding the trip
-    count of each of ``days.services``; every day when none runs a trip.
-
-    The trips per day are one dense array: each weekday's days are a stride
-    of it, filled by a cumulative sum over the windows' bounds.
-    """
+def _daily_trips(days, trips):
+    """The trips each day number runs, ``trips`` holding the trip count of
+    each of ``days.services``: one dense array, each weekday's days a stride
+    of it, filled by a cumulative sum over the windows' bounds."""
     daily = np.zeros(days.length)
     for offset in range(7):
         on = days.flags[:, offset]
@@ -574,11 +584,7 @@ def _covered_period(days, trips):
         stride += np.cumsum(steps)[:-1]
     service, day, delta = days.exceptions
     daily += np.bincount(day, delta * trips[service], days.length)
-    peak = daily.max()
-    if peak <= 0:
-        return 0, days.length - 1
-    covered = np.flatnonzero(daily >= COVERED_SHARE * peak)
-    return int(covered[0]), int(covered[-1])
+    return daily
 
 
 def _running(window, removed, step):
@@ -608,7 +614,9 @@ def _date(value):
         return None
 
 
-def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=None):
+def _read_stop_times(
+    opened, trip_routes, trip_services, weights=None, trips=None, padded=None
+):
     """Per route, its distinct stop ids and its longest DISTINCT stop
     patterns, in two streamed passes — the file is never held whole.
 
@@ -624,14 +632,16 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     different patterns of the very same length can still compete for that
     length's slots — a bounded approximation, never unbounded memory.
 
-    ``weights`` maps a service id to its share of the covered days; with it,
+    ``weights`` maps a service id to its share of the averaged days (see
+    :func:`_calendar_weights`); with it,
     every scheduled stop-event adds that share to its stop's departures per
     day as the row streams by, one float per stop — the fourth result, or
     None without a calendar. The fifth result is every served stop id the
     file schedules for a trip the feed declares (``trips``, default the
     joined ones), whether or not that trip joins a route: the feed's
     country evidence must not shrink with a partial join. The sixth is the
-    same weighted stop-events per route, or None without a calendar.
+    same weighted stop-events per route, or None without a calendar. Ids
+    are trimmed, padded ones counted in ``padded``.
     """
     stops = collections.defaultdict(set)
     scheduled = set()
@@ -641,9 +651,9 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     events = collections.Counter()
     dangling = 0
     for row in crawl.member_rows(opened):
-        trip_id = row.get("trip_id") or ""
+        trip_id = crawl.member_id(row, "trip_id", padded, "stop_times.txt")
         route_id = trip_routes.get(trip_id)
-        stop_id = row.get("stop_id") or ""
+        stop_id = crawl.member_id(row, "stop_id", padded, "stop_times.txt")
         traversal = (row.get("pickup_type") or "").strip() == "1" and (
             row.get("drop_off_type") or ""
         ).strip() == "1"
@@ -691,8 +701,8 @@ def _read_stop_times(opened, trip_routes, trip_services, weights=None, trips=Non
     rows = collections.defaultdict(list)
     unordered = set()
     for row in crawl.member_rows(opened):
-        trip_id = row.get("trip_id") or ""
-        stop_id = row.get("stop_id") or ""
+        trip_id = crawl.member_id(row, "trip_id")
+        stop_id = crawl.member_id(row, "stop_id")
         if trip_id not in wanted:
             continue
         value = (row.get("stop_sequence") or "").strip()
@@ -746,28 +756,33 @@ def _route_geography(stop_ids, sequences, coords):
 
     ``stop_count`` is every distinct stop the route lists — the service
     denominator — while the geometry is a missing signal (``None``) unless
-    EVERY stop has usable coordinates: a span or median over a subset would
-    be presented as complete when it is not.
+    every stop has usable coordinates: a span or median over a subset would
+    be presented as complete when it is not. A stop at the placeholder
+    position (``crawl.PLACEHOLDER_POSITION``) has none to give and is left
+    out of the span, and its legs out of the median.
     """
-    points = [coords[s] for s in stop_ids if s in coords]
-    if not points or len(points) < len(stop_ids):
+    held = {s for s in stop_ids if coords.get(s) == crawl.PLACEHOLDER_POSITION}
+    points = [coords[s] for s in stop_ids if s in coords and s not in held]
+    if not points or len(points) < len(stop_ids) - len(held):
         return None, None, len(stop_ids)
     span = _span_km(points)
     if span is None:
         # Unmeasurable geometry: every geography-dependent rule must skip.
-        return None, None, len(points)
+        return None, None, len(stop_ids)
     if any(s not in coords for sequence in sequences for s in sequence):
         # A pattern stop without coordinates — a traversal-only stop sits in
         # the patterns but not the scheduled set — would leave the legs a
         # subset presented as complete: no median.
-        return span, None, len(points)
+        return span, None, len(stop_ids)
     legs = [
         haversine_km(coords[a], coords[b])
         for sequence in sequences
         for a, b in zip(sequence, sequence[1:])
+        if coords[a] != crawl.PLACEHOLDER_POSITION
+        and coords[b] != crawl.PLACEHOLDER_POSITION
     ]
     median = statistics.median(legs) if legs else None
-    return span, median, len(points)
+    return span, median, len(stop_ids)
 
 
 def _calendar(feed_dir, state):
@@ -794,26 +809,33 @@ def _calendar(feed_dir, state):
 
 
 def _calendar_weights(calendar, trip_services):
-    """``{service_id: share of the covered days it runs}`` from a read
-    calendar, the period found by :func:`_covered_period` from the trips per
-    service in ``trip_services``; None without a calendar or a date, so no
-    departure count can be measured."""
+    """``{service_id: share of the averaged days it runs}`` from a read
+    calendar, the trips per service in ``trip_services``; None without a
+    calendar or a date, so no departure count can be measured.
+
+    The averaged days are the weekdays of the busiest week — the
+    Monday-to-Sunday week running the most trips, the earliest of equals —
+    so a stop's departures a day are a working day's; a week without a
+    weekday trip averages all its seven days."""
     days = None if calendar is None else _calendar_days(calendar)
     if days is None:
         return None
     per_service = collections.Counter(trip_services.values())
     trips = np.array([per_service[s] for s in days.services], float)
-    first, last = _covered_period(days, trips)
-    low, high = np.maximum(days.start, first), np.minimum(days.end, last)
+    daily = _daily_trips(days, trips)
+    numbers = np.arange(days.length)
+    week = (days.weekday + numbers) // 7
+    busiest = int(np.argmax(np.bincount(week, daily)))
+    chosen = numbers[week == busiest]
+    weekdays = chosen[(days.weekday + chosen) % 7 < 5]
+    averaged, width = (weekdays, 5) if daily[weekdays].sum() > 0 else (chosen, 7)
     count = np.zeros(len(days.services))
-    for offset in range(7):
-        first_week, last_week = _weeks(low, high, offset)
-        weeks = np.maximum(last_week - first_week + 1, 0)
-        count += days.flags[:, offset] * weeks
+    for day in averaged:
+        count += (days.start <= day) & (day <= days.end) & days.flags[:, day % 7]
     service, day, delta = days.exceptions
-    inside = (first <= day) & (day <= last)
+    inside = np.isin(day, averaged)
     count += np.bincount(service[inside], delta[inside], len(days.services))
-    return dict(zip(days.services, (count / (last - first + 1)).tolist()))
+    return dict(zip(days.services, (count / width).tolist()))
 
 
 def _service_span(calendar):
@@ -837,23 +859,27 @@ def _members(feed_dir, state, names, calendar=None):
             f"{state.get('feed_id')}: the crawl state predates the current "
             "member set; re-run the crawl stage"
         )
-    parsed = {}
+    # The ids trimming changed, per member: a feed with any reads under the
+    # version-2 fingerprint kinds.
+    parsed = {"padded": collections.Counter()}
     try:
         with crawl.verified_member(feed_dir, state, "stops.txt") as opened:
             if opened is None:
                 return None
-            rows, parsed["stops_dropped"] = crawl.stop_rows(opened)
+            rows, parsed["stops_dropped"] = crawl.stop_rows(opened, parsed["padded"])
         parsed["coords"] = {stop_id: (x, y) for stop_id, x, y in rows if stop_id}
         with crawl.verified_member(feed_dir, state, "routes.txt") as opened:
             if opened is None:
                 return None
-            parsed["routes"], parsed["route_types"] = _read_routes(opened)
+            parsed["routes"], parsed["route_types"] = _read_routes(
+                opened, parsed["padded"]
+            )
         if "trips.txt" in names:
             with crawl.verified_member(feed_dir, state, "trips.txt") as opened:
                 if opened is None:
                     return None
                 trip_routes, trip_services, orphans = _read_trips(
-                    opened, parsed["routes"]
+                    opened, parsed["routes"], parsed["padded"]
                 )
             # The calendar's weights so each stop-event is weighted as it
             # streams by: one float per stop, never an event table.
@@ -874,6 +900,7 @@ def _members(feed_dir, state, names, calendar=None):
                     trip_services,
                     weights,
                     trips=trip_routes.keys() | orphans,
+                    padded=parsed["padded"],
                 )
             parsed["join_gaps"] = {
                 "orphan_trips": len(orphans),
@@ -882,6 +909,22 @@ def _members(feed_dir, state, names, calendar=None):
     except crawl.MEMBER_ERRORS:
         return None
     return parsed
+
+
+# The members each fingerprint kind reads.
+FINGERPRINT_MEMBERS = {
+    "feed_stops": ("routes.txt", "stops.txt"),
+    "route_stops": ("routes.txt", "stops.txt", "trips.txt", "stop_times.txt"),
+}
+
+
+def _fingerprint_kind(kind, padded):
+    """``kind``, or its version 2 when trimming changed an id of a member it
+    reads, so the reader recomputes the digest from trimmed ids; a feed
+    without padded ids keeps version 1, which older readers verify."""
+    if any(padded.get(member) for member in FINGERPRINT_MEMBERS[kind]):
+        return f"{kind}@2"
+    return kind
 
 
 def _edge(candidate, tier, tier_confidence, evidence, needs_review):
@@ -932,24 +975,34 @@ def _stop_artefacts(stop_countries, border=0):
     }
 
 
+def home_country(country_stops, declared):
+    """The country holding the most of ``country_stops`` (stop counts or
+    shares by code; a tie goes to the lower code), else the one country
+    ``declared`` names, else None."""
+    if country_stops:
+        return min(country_stops, key=lambda code: (-country_stops[code], code))
+    return declared[0] if len(declared) == 1 else None
+
+
 def feed_scope(country_stops, declared):
     """``(country_shares, home_country, scope)`` from the decision table:
-    ``domestic`` when one country holds at least ``HOME_SHARE`` of the stops,
-    ``international`` when stops exist but none does, ``declared`` when there
-    is no stop evidence but a catalogue country, else ``unknown``."""
+    ``domestic`` when the home holds at least ``HOME_SHARE`` of the stops,
+    ``international`` when it holds less, ``declared`` when there is no stop
+    evidence but a catalogue country, else ``unknown``."""
+    home = home_country(country_stops, declared)
     total = sum(country_stops.values())
     if not total:
-        return {}, None, "declared" if declared else "unknown"
+        return {}, home, "declared" if declared else "unknown"
     shares = {code: count / total for code, count in country_stops.items()}
-    home = max(shares, key=shares.get)
     if shares[home] < HOME_SHARE:
-        return shares, None, "international"
+        return shares, home, "international"
     return shares, home, "domestic"
 
 
-def _agreement(home, declared):
-    """How the observed home country compares with the catalogues' claim."""
-    if home is None:
+def _agreement(shares, home, declared):
+    """How the home country observed from the stops compares with the
+    catalogues' claim."""
+    if not shares:
         return "unobserved"
     if not declared:
         return "undeclared"
@@ -1021,6 +1074,10 @@ def _tier_edges(
         evidence = dict(candidate.get("evidence") or {})
         if border:
             evidence["border_stops"] = dict(sorted(border.items()))
+        # Stops at the placeholder position, left out of the routes' spans.
+        held = sum(item.get("placeholder_stops", 0) for item in items)
+        if held:
+            evidence["placeholder_stops"] = held
         evidence.update(
             {
                 "matched_route_types": sorted(t for t in types if t < 100),
@@ -1166,7 +1223,7 @@ def _overlap_block(rows, matched, other, names, modes):
     listed = sorted(
         np.flatnonzero(overall >= OVERLAP_MIN_SHARE),
         key=lambda i: (-overall[i], names[i]),
-    )[:OVERLAP_MAX_FEEDS]
+    )
     return {
         "departures": {
             modes[int(m)]: round(float(t), 1) for m, t in zip(mode_ids, totals)
@@ -1180,30 +1237,75 @@ def _overlap_block(rows, matched, other, names, modes):
     }
 
 
+def place_overlaps(feed_ids, row_sets, interned):
+    """The overlap block of each of a place's edges, given as its feed id
+    and its route rows (:func:`_overlap_rows`), measured against every other
+    feed's rows there; None for an edge whose feed has no calendar."""
+    modes = {i: name for name, i in interned.items() if isinstance(name, str)}
+    names = sorted(set(feed_ids))
+    index = {feed_id: i for i, feed_id in enumerate(names)}
+    sizes = [len(rows) for rows in row_sets]
+    stacked = np.concatenate(row_sets)
+    feeds = np.repeat([index[feed_id] for feed_id in feed_ids], sizes)
+    matched, other = _overlap_matches(stacked, feeds, len(names))
+    bounds = np.cumsum([0] + sizes)
+    cuts = np.searchsorted(matched, bounds)
+    blocks = []
+    for rows, low, lo, hi in zip(row_sets, bounds, cuts, cuts[1:]):
+        if np.isnan(rows[:, 2]).any():
+            blocks.append(None)
+            continue
+        blocks.append(
+            _overlap_block(rows, matched[lo:hi] - low, other[lo:hi], names, modes)
+        )
+    return blocks
+
+
+def overlap_routes(rows, interned):
+    """An edge's route ``rows`` as ``evidence["overlap_routes"]`` keeps them,
+    so a merge of builds can measure overlap across them: per route its line
+    name (None without one), mode, departures a day in the place and stop
+    box, None where a value is missing."""
+    names = {i: key for key, i in interned.items()}
+    kept = []
+    for row in rows:
+        line = None if row[0] < 0 else names[int(row[0])][1]
+        values = [None if np.isnan(v) else float(v) for v in row[2:]]
+        kept.append([line, names[int(row[1])], *values])
+    return kept
+
+
+def route_rows(routes, interned):
+    """The route rows :func:`overlap_routes` kept, interned in ``interned``
+    as :func:`_overlap_rows` interns them."""
+    rows = np.full((len(routes), 7), np.nan)
+    for row, (line, mode, *values) in zip(rows, routes):
+        family = "rail-bound" if mode in RAIL_BOUND else mode
+        row[0] = interned.setdefault((family, line), len(interned)) if line else -1
+        row[1] = interned.setdefault(mode, len(interned))
+        row[2:] = [np.nan if v is None else v for v in values]
+    return rows
+
+
 def _overlaps(by_place, interned):
     """Write ``evidence["overlap"]`` on the edges :func:`_overlap_rows` gave
     rows, one place at a time, emptying ``by_place`` (``{place_id: [(edge,
-    rows)]}``) as it goes; how many edges got a block. An edge whose feed
-    has no calendar gets none."""
-    modes = {i: name for name, i in interned.items() if isinstance(name, str)}
+    rows)]}``) as it goes, and keep every such edge's rows under
+    ``evidence["overlap_routes"]``; how many edges got a block. An edge whose
+    feed has no calendar gets none."""
     written = 0
     for place_id in sorted(by_place):
         pairs = by_place.pop(place_id)
-        names = sorted({edge["feed_id"] for edge, _ in pairs})
-        index = {feed_id: i for i, feed_id in enumerate(names)}
-        sizes = [len(rows) for _, rows in pairs]
-        stacked = np.concatenate([rows for _, rows in pairs])
-        feeds = np.repeat([index[edge["feed_id"]] for edge, _ in pairs], sizes)
-        matched, other = _overlap_matches(stacked, feeds, len(names))
-        bounds = np.cumsum([0] + sizes)
-        cuts = np.searchsorted(matched, bounds)
-        for (edge, rows), low, lo, hi in zip(pairs, bounds, cuts, cuts[1:]):
-            if np.isnan(rows[:, 2]).any():
-                continue
-            edge["evidence"]["overlap"] = _overlap_block(
-                rows, matched[lo:hi] - low, other[lo:hi], names, modes
-            )
-            written += 1
+        blocks = place_overlaps(
+            [edge["feed_id"] for edge, _ in pairs],
+            [rows for _, rows in pairs],
+            interned,
+        )
+        for (edge, rows), block in zip(pairs, blocks):
+            edge["evidence"]["overlap_routes"] = overlap_routes(rows, interned)
+            if block is not None:
+                edge["evidence"]["overlap"] = block
+                written += 1
     return written
 
 
@@ -1339,11 +1441,10 @@ def _classify_feed(
             "routes": len(routes),
             "departures_per_day": None,
         }
+        kind = _fingerprint_kind("feed_stops", parsed["padded"])
         stamp = {
-            "classification_fingerprint": fingerprint.compute(
-                "feed_stops", routes, coords
-            ),
-            "fingerprint_kind": "feed_stops",
+            "classification_fingerprint": fingerprint.compute(kind, routes, coords),
+            "fingerprint_kind": kind,
         }
         for candidate in candidates.values():
             edges.extend(
@@ -1427,15 +1528,19 @@ def _classify_feed(
             "span_km": span,
             "median_km": median,
             "stop_count": count,
+            "placeholder_stops": sum(
+                coords.get(s) == crawl.PLACEHOLDER_POSITION for s in stop_ids
+            ),
             "place_stops": place_stops,
         }
     # The fingerprint describes the feed, not the place: one digest over
     # every route's served stops and every stop's coordinates, on all edges.
+    kind = _fingerprint_kind("route_stops", parsed["padded"])
     stamp = {
         "classification_fingerprint": fingerprint.compute(
-            "route_stops", routes, coords, parsed["stops"]
+            kind, routes, coords, parsed["stops"]
         ),
-        "fingerprint_kind": "route_stops",
+        "fingerprint_kind": kind,
     }
 
     edges = []
@@ -1971,7 +2076,7 @@ def classify(
                 )
                 scopes[scope] += 1
                 bases[basis or "none"] += 1
-                agreement[_agreement(home, declared)] += 1
+                agreement[_agreement(shares, home, declared)] += 1
             # Under the crawl lock still held: appenders and the crawl's own
             # rewrite of this file must never interleave.
             recrawl_requested = _request_recrawl(cache_dir, stale_skips)
@@ -2020,7 +2125,6 @@ def classify(
                 "overlap_settings": {
                     "near_deg": OVERLAP_NEAR_DEG,
                     "min_share": OVERLAP_MIN_SHARE,
-                    "max_feeds": OVERLAP_MAX_FEEDS,
                 },
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc

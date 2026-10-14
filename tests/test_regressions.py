@@ -1553,7 +1553,7 @@ def test_a_padded_member_reads_as_the_clean_one(read, members):
     assert read(*(io.BytesIO(_padded(m)) for m in members)) == clean
     if members[0] == _CALENDAR:
         weights = classify._calendar_weights(clean, {"t1": "s1"})
-        assert weights == {"s1": pytest.approx(12 / 13)}
+        assert weights == {"s1": pytest.approx(1.0)}
         assert [d.isoformat() for d in clean.span] == ["2026-09-29", "2026-10-11"]
 
 
@@ -2381,3 +2381,277 @@ def test_feeds_running_the_same_lines_name_each_other(tmp_path):
         others = edge["evidence"]["overlap"]["with"]
         assert set(others) == {"f-mvv", "f-delfi", "f-urban"} - {edge["feed_id"]}
         assert {s for shares in others.values() for s in shares.values()} == {1.0}
+
+
+def test_a_feed_split_across_countries_gets_a_home_in_the_merge():
+    """Barcelona's ATM feed (70 % of its stops in Spain) had no home country,
+    so every one of its edges counted as cross-border, even in Spain."""
+    from transitio_index import merge
+
+    feeds = pa.table(
+        {
+            "feed_id": ["kept", "split", "blank", "declared", "several"],
+            "home_country": ["FI", None, "", None, None],
+            "country_shares": [
+                '{"FI": 1.0}',
+                '{"EE": 0.5, "FI": 0.5}',
+                '{"FI": 0.9, "SE": 0.1}',
+                "{}",
+                None,
+            ],
+            "declared_countries": [["FI"], [], [], ["SE"], ["EE", "FI"]],
+        }
+    )
+    places = pa.table({"place_id": ["hel", "tll"], "country_code": ["FI", "EE"]})
+    edges = pa.table(
+        {
+            "place_id": ["hel", "hel", "tll", "hel", "hel", "hel"],
+            "feed_id": ["kept", "split", "split", "blank", "declared", "several"],
+            "cross_border": [False, True, True, True, True, True],
+        }
+    )
+    feeds, edges = merge._homes(feeds, edges, places)
+    # A tie goes to the lower code, an empty home is none; a stopless feed
+    # takes its one declared country, and none of several.
+    assert feeds["home_country"].to_pylist() == ["FI", "EE", "FI", "SE", None]
+    assert edges["cross_border"].to_pylist() == [False, True, False, False, True, True]
+
+
+def test_a_geohash_alone_does_not_pair_two_feeds_of_one_host():
+    """Dublin's Express Bus feed carried the LUAS tram's MDB record: one
+    download host and one geohash cell, but no name or file name alike."""
+    import test_index_crosswalk as cwt
+
+    geohash = crosswalk._geohash_encode(53.35, -6.26, 4)
+    feed_id = f"f-{geohash}-expressbus"
+    records, summary = crosswalk.build_records(
+        [
+            cwt.atlas_feed(
+                feed_id,
+                url="https://t.example/GTFS_Express_Bus.zip",
+                name="Express Bus",
+            )
+        ],
+        [
+            cwt.mdb_feed(
+                "mdb-2638",
+                url="https://t.example/GTFS_LUAS.zip",
+                provider="LUAS",
+                bounding_box=cwt.point_box(53.35, -6.26),
+            )
+        ],
+    )
+    assert summary["geohash_pairs"] == 0
+    assert {record["feed_id"] for record in records} == {feed_id, "f-mdb-2638"}
+
+
+def test_a_places_only_stale_feed_of_a_mode_keeps_its_share():
+    """A feed stale when indexed scored 0 and left its place's totals even
+    where it was the only feed of its mode, so a city whose only rail or only
+    feed was stale showed none of that service."""
+    from transitio_index import rank
+
+    def edge(feed_id, place_id, departures, modes, stale):
+        evidence = {"share_of_feed": 0.5}
+        if modes:
+            evidence["overlap"] = {"departures": dict.fromkeys(modes, departures)}
+        if stale:
+            evidence["stale_when_indexed"] = "2025-01-01"
+        return {
+            "feed_id": feed_id,
+            "place_id": place_id,
+            "tier": "local",
+            "service": {"stops": 5, "routes": 1, "departures_per_day": departures},
+            "evidence": evidence,
+        }
+
+    places = {p: {"place_id": p, "kind": "city", "country_code": "FI"} for p in "pq"}
+    scored, _, _ = rank.score_edges(
+        [
+            edge("bus", "p", 60.0, ["bus"], False),
+            edge("old-bus", "p", 40.0, ["bus"], True),
+            edge("rail", "p", 40.0, ["rail"], True),
+            # No mode evidence: kept only where no fresh feed serves the place.
+            edge("old", "q", 10.0, [], True),
+        ],
+        places,
+    )
+    share = {e["feed_id"]: e["evidence"]["share_of_place"] for e in scored}
+    assert share == {"bus": 0.6, "old-bus": 0.0, "rail": 0.4, "old": 1.0}
+    relevance = {e["feed_id"]: e["relevance"] for e in scored}
+    assert relevance["old-bus"] == 0.0 and relevance["rail"] > 0.0
+
+
+def test_a_stop_at_sea_lies_in_the_division_whose_waters_hold_it(tmp_path):
+    """The boundary lookup read Overture's land areas only, so Stavanger's
+    ferry stops off its coast lay in no city and its ferries were cropped
+    away; a division's territorial area holds its sea."""
+    with bt._lookup(tmp_path, tmp_path / "cache") as lookup:
+        lookup.ensure([(24.0, 59.0, 25.5, 60.35)])
+        at_sea = lookup.divisions_at(24.5, 59.5)
+        assert [r["division_id"] for r in at_sea] == ["fi-hel", "fi"]
+
+
+def test_the_merge_measures_overlap_across_builds():
+    """Overlap was measured within each build only, so at Munich the MVV feed
+    of one build and DELFI of another were never compared, and recommend()
+    left MVV out as "not compared"."""
+    import json
+
+    from transitio_index import merge
+
+    box = [11.5, 48.1, 11.6, 48.2]
+    old = {"with": {}, "departures": {"tram": 5.0}, "compared": []}
+    evidence = [
+        {"overlap": {"with": {}, "departures": {"rail": 100.0}}},
+        {"overlap": {"with": {}, "departures": {"rail": 80.0, "bus": 20.0}}},
+        {"overlap": old},
+    ]
+    evidence[0]["overlap_routes"] = [["s1", "rail", 100.0, *box]]
+    evidence[1]["overlap_routes"] = [
+        ["s1", "rail", 80.0, *box],
+        ["x1", "bus", 20.0, *box],
+    ]
+    edges = pa.table(
+        {
+            "place_id": ["muc", "muc", "muc"],
+            "feed_id": ["f-mvv", "f-delfi", "f-old"],
+            "evidence": [json.dumps(e) for e in evidence],
+        }
+    )
+    merged = merge._cross_build_overlaps(edges)
+    found = [json.loads(e) for e in merged["evidence"].to_pylist()]
+    assert found[0]["overlap"]["with"] == {"f-delfi": {"rail": 1.0}}
+    assert found[1]["overlap"]["with"] == {"f-mvv": {"rail": 1.0}}
+    assert found[0]["overlap"]["compared"] == ["f-delfi"]
+    # The route rows do not ship; an edge without them keeps its block.
+    assert not any("overlap_routes" in e for e in found)
+    assert found[2]["overlap"] == old
+
+
+def test_a_stop_at_zero_zero_is_left_out_of_the_measures(tmp_path):
+    """57 feeds place stops at exactly (0, 0), a stand-in for a missing
+    position, which stretched routes past 5,000 km (BreizhGo's TER routes
+    rated national) and coverage hulls to the Gulf of Guinea."""
+    near, far, zero = (10.0, 1.0), (10.1, 1.0), (0.0, 0.0)
+    coords = {"a": near, "b": far, "z": zero}
+    span, median, count = classify._route_geography(
+        {"a", "b", "z"}, [("a", "b", "z")], coords
+    )
+    leg = classify.haversine_km(near, far)
+    assert (span, median, count) == (pytest.approx(leg), pytest.approx(leg), 3)
+    rows = ["s1,1.0,10.0\n", "s2,1.0,10.1\n", "s0,0.0,0.0\n"]
+    _, covered, _ = ct._cover(tmp_path, crawls={"f-city": rows}, lookup=ct.LOOKUP)
+    hull = shapely.from_wkb(bytes.fromhex(covered["f-city"]["coverage"]))
+    assert hull.bounds[0] == 10.0 and covered["f-city"]["stop_count"] == 3
+
+
+def test_departures_a_day_are_a_working_days(tmp_path):
+    """Departures a day averaged every day of a period set by the whole feed,
+    weekends and holidays included, so Barcelona's ATM feed counted 49 % and
+    TMB 86 % of a real Wednesday's stop events."""
+    import io
+
+    calendar = classify._read_calendar(
+        io.BytesIO(
+            b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            b"sunday,start_date,end_date\n"
+            b"wk,1,1,1,1,1,0,0,20260901,20260930\n"
+            b"wkend,0,0,0,0,0,1,1,20260901,20260930\n"
+            b"long,1,1,1,1,1,1,1,20260101,20261231\n"
+        ),
+        None,
+    )
+    trips = {f"w{i}": "wk" for i in range(10)} | {"s1": "wkend", "s2": "wkend"}
+    weights = classify._calendar_weights(calendar, trips | {"l1": "long"})
+    assert weights == {"long": 1.0, "wk": 1.0, "wkend": 0.0}
+
+
+def test_a_window_of_placeholder_dates_is_flagged_nominal():
+    """222 feeds carry placeholder dates (CORE Calabria from 1970, shuttles
+    to 2099), so they looked as if they covered almost any study day."""
+    import json
+
+    from transitio_index import rank
+
+    crawled = "2026-10-03T08:00:00+00:00"
+    feeds = [
+        {"feed_id": f, "service_start": a, "service_end": b, "last_crawled": crawled}
+        for f, a, b in (
+            ("from-1970", "1970-01-01", "2026-12-31"),
+            ("to-2099", "2025-12-12", "2099-12-31"),
+            ("five-years", "2026-01-01", "2031-10-03"),
+        )
+    ]
+    places = {"c": {"place_id": "c", "kind": "city", "country_code": "FI"}}
+    edges = [
+        {
+            "feed_id": feed["feed_id"],
+            "place_id": "c",
+            "tier": "local",
+            "service": {"stops": 2, "routes": 1, "departures_per_day": 10.0},
+            "evidence": {},
+        }
+        for feed in feeds
+    ]
+    ranked, _ = rank.rank_edges(edges, feeds, places)
+    summaries = {
+        e["feed_id"]: json.loads(publish._summary(json.dumps(e["evidence"])))
+        for e in ranked
+    }
+    flagged = {f for f, summary in summaries.items() if summary.get("nominal_window")}
+    assert flagged == {"from-1970", "to-2099"}
+
+
+@pytest.mark.parametrize("padded", [False, True], ids=["clean", "padded"])
+def test_padded_ids_join_and_match_the_readers_fingerprint(tmp_path, padded):
+    """Renfe pads the route ids of routes.txt but not those of trips.txt, so
+    no trip of its Cercanías, Rodalies or Feve feeds joined a route and they
+    served no place; Metra writes a space after each comma."""
+    import collections
+    import io
+    import zipfile
+
+    from transitio.index import fingerprint
+
+    def pad(value):
+        return f"{value}  " if padded else value
+
+    members = {
+        "routes.txt": f"route_id,agency_id,route_type\n{pad('r1')},a,2\n",
+        "stops.txt": f"stop_id,stop_lat,stop_lon\n{pad('s1')},40.4,-3.7\ns2,40.5,-3.6\n",
+        # A later row of the same trimmed id naming an unknown route leaves
+        # the trip on its route, as the reader reads it.
+        "trips.txt": "route_id,service_id,trip_id\n"
+        + ("r1,c, t1\nzz,c,t1\n" if padded else "r1,c,t1\n"),
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "t1,08:00:00,08:00:00,s1,1\nt1,08:10:00,08:10:00,s2,2\n"
+        ),
+    }
+
+    def member(name):
+        return io.BytesIO(members[name].encode())
+
+    counted = collections.Counter()
+    routes, _ = classify._read_routes(member("routes.txt"), counted)
+    rows, _ = crawl.stop_rows(member("stops.txt"), counted)
+    coords = {stop_id: (x, y) for stop_id, x, y in rows}
+    trip_routes, services, _ = classify._read_trips(
+        member("trips.txt"), routes, counted
+    )
+    served = classify._read_stop_times(
+        member("stop_times.txt"), trip_routes, services, padded=counted
+    )[0]
+    assert served == {"r1": {"s1", "s2"}}
+    # A clean feed keeps version 1, which older readers verify.
+    kind = classify._fingerprint_kind("route_stops", counted)
+    assert kind == ("route_stops@2" if padded else "route_stops")
+    archive = tmp_path / "feed.zip"
+    with zipfile.ZipFile(archive, "w") as written:
+        for name, text in members.items():
+            written.writestr(name, text)
+    assert fingerprint.from_feed(archive, kind) == (
+        fingerprint.compute(kind, routes, coords, served),
+        {"r1"},
+    )

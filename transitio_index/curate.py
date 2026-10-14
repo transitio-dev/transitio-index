@@ -107,12 +107,16 @@ def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+# Evidence about the other feeds at the place, or kept only to measure it.
+_OVERLAP_KEYS = ("overlap", "overlap_routes")
+
+
 def _own_evidence(evidence):
     """The evidence without its overlap block, which moves with the other
-    feeds at the place."""
-    if not isinstance(evidence, dict) or "overlap" not in evidence:
+    feeds at the place, and the route rows it was measured from."""
+    if not isinstance(evidence, dict) or not set(_OVERLAP_KEYS) & evidence.keys():
         return evidence
-    return {key: value for key, value in evidence.items() if key != "overlap"}
+    return {k: v for k, v in evidence.items() if k not in _OVERLAP_KEYS}
 
 
 def _needs_review(edge):
@@ -201,7 +205,9 @@ def _sole_agency(feed_dir, state):
         with crawl.verified_member(feed_dir, state, "agency.txt") as opened:
             if opened is None:
                 return None
-            ids = {row.get("agency_id") or "" for row in crawl.member_rows(opened)}
+            ids = {
+                crawl.member_id(row, "agency_id") for row in crawl.member_rows(opened)
+            }
     except crawl.MEMBER_ERRORS:
         return None
     return next(iter(ids)) if len(ids) == 1 else None
@@ -215,11 +221,11 @@ def _read_feed(feed_dir, state):
         return None
     sole = _sole_agency(feed_dir, state)
     if mode == "complete":
-        return _Feed(
-            parsed["routes"], parsed["coords"], parsed["stops"], "route_stops", sole
-        )
+        kind = classify._fingerprint_kind("route_stops", parsed["padded"])
+        return _Feed(parsed["routes"], parsed["coords"], parsed["stops"], kind, sole)
     if mode == "skipped":
-        return _Feed(parsed["routes"], parsed["coords"], None, "feed_stops", sole)
+        kind = classify._fingerprint_kind("feed_stops", parsed["padded"])
+        return _Feed(parsed["routes"], parsed["coords"], None, kind, sole)
     return None
 
 
@@ -416,8 +422,14 @@ class _Curator:
                     if k in (template.get("evidence") or {})
                 }
             )
+            # The route rows serve the merge's overlap only; they never ship.
             evidence["classified"] = {
-                t: dict(e.get("evidence") or {}) for t, e in sorted(classified.items())
+                t: {
+                    k: v
+                    for k, v in (e.get("evidence") or {}).items()
+                    if k != "overlap_routes"
+                }
+                for t, e in sorted(classified.items())
             }
         route_evidence = self.route_evidence(feed_id)
         return {
@@ -503,7 +515,8 @@ class _Curator:
             feed_id, entry["set_selector"], entry
         )
         # The overlap block described the routes the machine selected.
-        (edge.get("evidence") or {}).pop("overlap", None)
+        for key in _OVERLAP_KEYS:
+            (edge.get("evidence") or {}).pop(key, None)
         if edge["selector_state"] != "unavailable":
             # A trusted selector is validated at fetch time against the
             # fingerprint of the very evidence it was built from — an edge

@@ -289,16 +289,15 @@ def test_the_cli_refuses_to_lose_the_golden_gate(tmp_path):
     )
 
 
-def test_ids_are_joined_verbatim():
+def test_route_ids_are_read_trimmed():
     import io
 
     routes, route_types = classify._read_routes(
         io.BytesIO(b"route_id,agency_id,route_type\na ,x,3\na,,0\n,,7\n")
     )
-    assert routes == {
-        "a ": {"route_type": 3, "agency_id": "x", "name": ""},
-        "a": {"route_type": 0, "agency_id": "", "name": ""},
-    }
+    # Ids alike once trimmed are one route, the later row's, as the reader's
+    # version-2 fingerprint reads them.
+    assert routes == {"a": {"route_type": 0, "agency_id": "", "name": ""}}
     # The id-less row still counts for the skip predicate's tier check.
     assert route_types == [3, 0, 7]
 
@@ -622,11 +621,12 @@ def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
     "country_stops, declared, home, scope",
     [
         ({"AA": 4, "BB": 1}, [], "AA", "domestic"),  # exactly HOME_SHARE
-        ({"AA": 3, "BB": 1}, ["AA"], None, "international"),
-        ({}, ["AA"], None, "declared"),
+        ({"AA": 3, "BB": 1}, ["BB"], "AA", "international"),
+        ({}, ["AA"], "AA", "declared"),
+        ({}, ["AA", "BB"], None, "declared"),
         ({}, [], None, "unknown"),
     ],
-    ids=["domestic", "international", "declared", "unknown"],
+    ids=["domestic", "international", "declared", "declared-several", "unknown"],
 )
 def test_feed_scope_follows_the_decision_table(country_stops, declared, home, scope):
     shares, found_home, found_scope = classify.feed_scope(country_stops, declared)
@@ -662,7 +662,7 @@ def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
     assert by_id["f-none"]["country_stops"] == {}
     assert by_id["f-declared"]["scope"] == "declared"
     assert by_id["f-declared"]["declared_countries"] == ["AA"]
-    assert by_id["f-declared"]["home_country"] is None
+    assert by_id["f-declared"]["home_country"] == "AA"
     # No calendar in these crawls, and no crawl for the declared feed: undated.
     assert {f["service_start"] for f in feeds} == {None}
     assert manifest["feeds_dated"] == 0
@@ -683,7 +683,7 @@ def test_feeds_carry_country_stops_home_country_and_scope(tmp_path):
     assert manifest["home_country_agreement"] == {"undeclared": 2, "unobserved": 2}
 
 
-def test_a_two_country_feed_without_a_home_is_international(tmp_path):
+def test_a_feed_split_evenly_is_international_at_home_in_the_lower_code(tmp_path):
     cache = tmp_path / "cache"
     feeds = [
         {
@@ -729,9 +729,9 @@ def test_a_two_country_feed_without_a_home_is_international(tmp_path):
     )
     assert feed["country_stops"] == {"AA": 1, "BB": 1}
     assert feed["country_shares"] == {"AA": 0.5, "BB": 0.5}
-    assert feed["home_country"] is None and feed["scope"] == "international"
+    assert feed["home_country"] == "AA" and feed["scope"] == "international"
     assert feed["declared_countries"] == ["AA"]
-    assert manifest["home_country_agreement"] == {"unobserved": 1}
+    assert manifest["home_country_agreement"] == {"agree": 1}
     assert manifest["join_gaps"] == {"orphan_trips": 1, "dangling_stop_times": 1}
 
 
@@ -1107,12 +1107,16 @@ def test_calendar_days_are_counted_not_walked():
     )
     calendar = classify._read_calendar(calendar, dates)
     assert calendar.span == (datetime.date(1, 1, 1), datetime.date(9999, 12, 31))
-    # Every day runs a trip, so the period covered is the whole calendar, as
-    # it is when no day runs one.
-    days = 3652059
-    expected = {"all": 1.0, "wk": 10 / days, "lone": 1 / days}
-    for trips in ({"t1": "all", "t2": "wk", "t3": "lone"}, {}):
-        assert classify._calendar_weights(calendar, trips) == pytest.approx(expected)
+    # The busiest week starts on Monday 31 August: each service weighs the
+    # share of its five weekdays it runs. Without a trip no weekday runs
+    # one, and the first week's seven days are averaged.
+    trips = {"t1": "all", "t2": "wk", "t3": "lone"}
+    assert classify._calendar_weights(calendar, trips) == pytest.approx(
+        {"all": 1.0, "wk": 4 / 5, "lone": 1 / 5}
+    )
+    assert classify._calendar_weights(calendar, {}) == pytest.approx(
+        {"all": 1.0, "wk": 0.0, "lone": 0.0}
+    )
 
 
 def test_the_service_span_is_the_effective_first_and_last_date():
@@ -1295,9 +1299,10 @@ def test_a_curated_boundary_places_the_stops_inside_it(tmp_path):
 
 
 def test_departures_per_day_are_weighted_by_the_calendar(tmp_path):
-    # Two weeks: a weekday service minus one removed day (9 dates) and a
-    # Sunday service plus one added date (3 dates); each trip visits both
-    # stops once, so the place sees 2 * (9 + 3) / 14 stop-events a day.
+    # A weekday service minus one removed Monday and a Sunday service plus
+    # one added Tuesday: the busiest week, from Monday 31 August, runs the
+    # weekday trip on four weekdays and the Sunday trip on the added one;
+    # each trip visits both stops once: 2 * 5 / 5 stop-events a weekday.
     cache = tmp_path / "cache"
     feeds = [
         {"feed_id": "f-cal", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
@@ -1331,7 +1336,7 @@ def test_departures_per_day_are_weighted_by_the_calendar(tmp_path):
     assert edge["service"] == {
         "stops": 2,
         "routes": 1,
-        "departures_per_day": pytest.approx(24 / 14),
+        "departures_per_day": pytest.approx(2.0),
     }
     # The feed carries the span the same calendar gives: the added Sunday
     # opens it, the last weekday closes it.
@@ -1380,7 +1385,7 @@ def _lines(cache, feed_id, lines, xs=(10.0, 10.01), calendar=True):
         ("other name", {"rail": 1.0}),
         ("far", {}),
         ("no calendar", {"rail": 1.0, "bus": 1.0}),
-        ("trimmed", {"rail": 1.0, "bus": 1.0}),
+        ("a third feed", {"rail": 1.0, "bus": 1.0}),
         ("blocks of one", {"rail": 1.0, "bus": 1.0}),
         ("across 180", {}),
     ],
@@ -1402,8 +1407,7 @@ def test_an_edge_records_how_much_of_it_other_feeds_run(
             ),
         ),
     ]
-    if case == "trimmed":
-        monkeypatch.setattr(classify, "OVERLAP_MAX_FEEDS", 1)
+    if case == "a third feed":
         built.append(_lines(cache, "f-third", [("S1", 2), ("10", 3)]))
     if case == "blocks of one":
         monkeypatch.setattr(classify, "_OVERLAP_BLOCK", 1)
@@ -1425,9 +1429,14 @@ def test_an_edge_records_how_much_of_it_other_feeds_run(
     found = {}
     for tier in ("regional", "local"):
         others = blocks[("f-copy", tier)]["with"]
-        assert set(others) <= {"f-big"}
+        # Every feed running the lines is listed, however many.
+        third = {"f-third"} if case == "a third feed" else set()
+        assert set(others) - {"f-big"} == third
         found.update(others.get("f-big", {}))
     assert found == named
+    # The route rows each edge was measured from stay with it.
+    routes = {(e["feed_id"], e["tier"]): e["evidence"]["overlap_routes"] for e in edges}
+    assert routes[("f-copy", "regional")][0][:2] == ["s1", "rail"]
     if case == "no calendar":
         assert ("f-big", "local") not in blocks
     else:

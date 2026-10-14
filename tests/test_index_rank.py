@@ -13,11 +13,14 @@ PLACES = {
     "ee": {"place_id": "ee", "kind": "city", "country_code": "EE"},
 }
 FEEDS = [
-    {"feed_id": "bus", "home_country": "FI", "country_stops": {"FI": 100}},
-    {"feed_id": "rail", "home_country": "FI", "country_stops": {"FI": 40, "EE": 2}},
-    {"feed_id": "ferry", "home_country": None, "country_stops": {"FI": 5, "EE": 5}},
-    {"feed_id": "declared", "home_country": None, "country_stops": {}},
-    {"feed_id": "nobody", "home_country": None, "country_stops": {}},
+    {"feed_id": feed_id, "home_country": home, "scope": scope, "country_stops": stops}
+    for feed_id, home, scope, stops in (
+        ("bus", "FI", "domestic", {"FI": 100}),
+        ("rail", "FI", "domestic", {"FI": 40, "EE": 2}),
+        ("ferry", "EE", "international", {"FI": 5, "EE": 5}),
+        ("declared", "FI", "declared", {}),
+        ("nobody", None, "unknown", {}),
+    )
 ]
 
 
@@ -46,7 +49,7 @@ def test_relevance_is_scored_per_pair_and_category_follows_the_tier():
         # the country: bus serves 1 of 2 served cities, rail both.
         _edge("bus", "fi", "national", 50, 80.0),
         _edge("rail", "fi", "national", 40, 30.0),
-        # the ferry has no home country; its Estonian city edge crosses.
+        # the ferry's stops split evenly: home EE, the lower code.
         _edge("ferry", "ee", "international", 5, 4.0),
         _edge("ferry", "c1", "international", 5, 4.0),
         _edge("ferry", "r1", "international", 5, 4.0),
@@ -77,11 +80,11 @@ def test_relevance_is_scored_per_pair_and_category_follows_the_tier():
     rail_c2 = by_key[("rail", "c2", "national")]
     assert rail_c2["evidence"]["share_basis"] == "stops"
     assert rail_c2["relevance"] == pytest.approx(0.7 * 20 / 25 + 0.3 * 20 / 40)
-    # An international feed's city edges score in [0, 1] over all its stops
-    # and cross the border everywhere.
+    # An international feed's edges score in [0, 1] over all its stops and
+    # cross the border outside its home.
     ferry_ee = by_key[("ferry", "ee", "international")]
     assert ferry_ee["relevance_category"] == "international"
-    assert ferry_ee["cross_border"] is True
+    assert ferry_ee["cross_border"] is False
     assert ferry_ee["relevance"] == pytest.approx(0.7 * 1.0 + 0.3 * 5 / 10)
     assert by_key[("ferry", "c1", "international")]["cross_border"] is True
     ferry_r1 = by_key[("ferry", "r1", "international")]
@@ -95,6 +98,9 @@ def test_relevance_is_scored_per_pair_and_category_follows_the_tier():
         assert edge["relevance"] == 0.0 and edge["needs_review"] is True
         assert edge["evidence"]["relevance_note"] == "no_country_stops"
         assert edge["evidence"]["share_of_feed"] == 0.0
+    # The declared country is the stopless feed's home; no home crosses.
+    assert by_key[("declared", "c2", "unknown")]["cross_border"] is False
+    assert by_key[("nobody", "c2", "unknown")]["cross_border"] is True
     assert report["edges_by_category"] == {
         "primary": 1,
         "secondary": 1,
@@ -102,7 +108,7 @@ def test_relevance_is_scored_per_pair_and_category_follows_the_tier():
         "international": 3,
         "unknown": 2,
     }
-    assert report["cross_border_edges"] == 5
+    assert report["cross_border_edges"] == 3
     assert report["share_basis_by_place"] == {"departures": 4, "stops": 1}
     # Two-value kinds keep their quartiles inside [min, max].
     region = report["relevance_by_kind"]["region"]

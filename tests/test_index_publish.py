@@ -1610,11 +1610,11 @@ def test_the_index_ships_the_country_relevance_and_access_columns_in_schema_12(
             ),
         },
     )
-    # Classify decides the country fields: a declared-only feed with an MDB
-    # country keeps that claim and no home.
+    # Classify decides the country fields: a declared-only feed takes its one
+    # MDB country as its home.
     feed = {
         **_covered_feed("f-a"),
-        "mdb": {"location": {"country_code": "fi"}},
+        "mdb": {"location": {"country_code": "ee"}},
         "atlas": {"urls": {"static_current": "https://a.example/gtfs.zip"}},
         "access": "open",
     }
@@ -1666,16 +1666,18 @@ def test_the_index_ships_the_country_relevance_and_access_columns_in_schema_12(
     assert manifest["min_reader_version"] == transitio_index.MIN_READER_VERSIONS.get(
         12, publish.MIN_READER_VERSION
     )
-    # Without a home country the feeds sit in the international partition and
-    # their edges in the links, naming that partition.
-    assert set(manifest["partitions"]) == {"EE", "FI", "international", "links"}
-    path = cache / "index" / "international" / "feeds.parquet"
-    feeds = pq.read_table(path)
-    rows = {r["feed_id"]: r for r in feeds.to_pylist()}
+    # The feeds sit in their home countries' partitions and their edges to a
+    # Finnish place in the links, naming those partitions.
+    assert set(manifest["partitions"]) == {"EE", "FI", "US", "links"}
+    rows = {
+        r["feed_id"]: r
+        for part in ("EE", "US")
+        for r in pq.read_table(cache / "index" / part / "feeds.parquet").to_pylist()
+    }
     row = rows["f-a"]
-    assert row["home_country"] is None and row["scope"] == "declared"
+    assert row["home_country"] == "EE" and row["scope"] == "declared"
     assert json.loads(row["country_shares"]) == {}
-    assert row["declared_countries"] == ["FI"]
+    assert row["declared_countries"] == ["EE"]
     assert row["download_url"] == "https://a.example/gtfs.zip"
     assert row["access"] == "open" and row["auth_params"] is None
     # A curated feed ships its own URL, access details and, as an Atlas
@@ -1690,7 +1692,7 @@ def test_the_index_ships_the_country_relevance_and_access_columns_in_schema_12(
     edge_row = links.to_pylist()[0]
     assert edge_row["relevance_category"] == "primary"
     assert edge_row["relevance"] == 0.75 and edge_row["cross_border"] is True
-    assert edge_row["feed_partition"] == "international"
+    assert links["feed_partition"].to_pylist() == ["EE", "US"]
     assert manifest["partitions"]["links"]["edges"]["rows"] == 2
     assert manifest["partitions"]["FI"]["places"]["rows"] == len(PLACES)
     assert "edges" not in manifest["partitions"]["FI"]

@@ -6,7 +6,8 @@ a stable ``feed_id`` and the crosswalk method that produced it. Identity is
 resolved in a cascade of narrowing confidence: url-exact (one GTFS download URL
 in both catalogues, http and https alike), then a gated same-host match (feeds
 sharing a download host whose names agree), then geohash-confirm (a same-host
-candidate whose Onestop-ID geohash meets the MDB centroid geohash). Feeds still
+candidate whose Onestop-ID geohash meets the MDB centroid geohash and that
+shares a name token or its download file name). Feeds still
 unpaired then pair by url-historic: an MDB download URL that is one of an Atlas
 feed's past URLs. GBFS
 ``systems.csv`` systems are linked to their Atlas feed by auto-discovery URL,
@@ -399,8 +400,9 @@ def _best_name_overlap(atlas_token_sets, mdb_token_sets):
 # Geohash-confirm corroborates a same-host candidate geographically: an Atlas
 # Onestop ID embeds a geohash (``f-<geohash>-<name>``), compared with the
 # geohash of an MDB feed's bounding-box centroid. It resolves identity only at
-# >= 4 characters (~20 km), only within a shared host, and at a lower confidence
-# than a name match.
+# >= 4 characters (~20 km), only within a shared host, only when a name or
+# operator shares a token or the download file names match, and at a lower
+# confidence than a name match.
 GEOHASH_PRECISION = 4
 GEOHASH_CONFIDENCE = 0.6
 
@@ -563,22 +565,53 @@ def _match_within_host_by_name(atlas_feeds, mdb_feeds, operator_names, host):
     return pairs, provisional
 
 
-def _match_within_host_by_geohash(atlas_feeds, mdb_feeds, host):
+def _file_name(url):
+    """The casefolded last path segment of a download URL, or None."""
+    url = _clean_url(url)
+    if url is None:
+        return None
+    try:
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:
+        return None
+    return path.rsplit("/", 1)[-1].casefold() or None
+
+
+def _match_within_host_by_geohash(atlas_feeds, mdb_feeds, operator_names, host):
     """Geohash-confirm matches on one host, returning ``(pairs, provisional)``.
 
     An Atlas Onestop geohash equal to an MDB centroid geohash at
-    ``GEOHASH_PRECISION`` is a match, one-to-one; a geohash agreeing with more
-    than one feed is ambiguous and recorded for review, not merged. Weaker
-    evidence than a name, so it runs only on feeds a name did not resolve.
+    ``GEOHASH_PRECISION`` is a match, one-to-one, when one Atlas name or
+    operator and one MDB name or provider share a token, or an Atlas download
+    file name (current or past) is the MDB one: two feeds of one host in one
+    cell are not one feed by place alone. A geohash agreeing with more than
+    one feed is ambiguous and recorded for review, not merged. Weaker evidence
+    than a name, so it runs only on feeds a name did not resolve.
     """
     atlas_geohash = {
         feed["onestop_id"]: _onestop_geohash(feed["onestop_id"]) for feed in atlas_feeds
     }
     mdb_geohash = {feed["mdb_id"]: _mdb_centroid_geohash(feed) for feed in mdb_feeds}
+    atlas_tokens = {
+        feed["onestop_id"]: _atlas_name_token_sets(feed, operator_names)
+        for feed in atlas_feeds
+    }
+    mdb_tokens = {feed["mdb_id"]: _mdb_name_token_sets(feed) for feed in mdb_feeds}
+    atlas_files = {}
+    for feed in atlas_feeds:
+        urls = feed.get("urls") or {}
+        found = [urls.get(ATLAS_STATIC_URL), *(urls.get(ATLAS_HISTORIC_URLS) or ())]
+        atlas_files[feed["onestop_id"]] = {_file_name(url) for url in found} - {None}
 
     def agree(atlas_feed, mdb_feed):
-        atlas_gh = atlas_geohash[atlas_feed["onestop_id"]]
-        return atlas_gh is not None and atlas_gh == mdb_geohash[mdb_feed["mdb_id"]]
+        onestop_id, mdb_id = atlas_feed["onestop_id"], mdb_feed["mdb_id"]
+        atlas_gh = atlas_geohash[onestop_id]
+        if atlas_gh is None or atlas_gh != mdb_geohash[mdb_id]:
+            return False
+        if _best_name_overlap(atlas_tokens[onestop_id], mdb_tokens[mdb_id]) > 0:
+            return True
+        mdb_file = _file_name((mdb_feed.get("urls") or {}).get(MDB_DOWNLOAD_URL))
+        return mdb_file in atlas_files[onestop_id]
 
     pairs, contested = _clean_matches(atlas_feeds, mdb_feeds, agree)
     provisional = [
@@ -635,6 +668,7 @@ def _same_host_matches(atlas_feeds, mdb_feeds, operator_names):
         host_geohash_pairs, host_geohash_provisional = _match_within_host_by_geohash(
             [f for f in atlas_on_host if f["onestop_id"] not in named_atlas],
             [f for f in mdb_on_host if f["mdb_id"] not in named_mdb],
+            operator_names,
             host,
         )
         geohash_pairs.extend(host_geohash_pairs)

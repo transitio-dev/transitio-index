@@ -17,7 +17,7 @@ version = "0.1.0"
 dependencies = [
     # The reader the build writes for: its release contract, schema floors,
     # fingerprint and country languages. Released to PyPI; schema 12 ships from 0.24.
-    "transitio>=0.24",
+    "transitio>=0.26",
     # The build's own libraries, owned here rather than through transitio's
     # extra: GeoParquet and geometry, the crawl's HTTP and key tally, the
     # Eurostat workbook and the override YAML. Floors match transitio's.

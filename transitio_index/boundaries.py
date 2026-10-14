@@ -9,7 +9,7 @@ only the row groups whose boxes intersect the query — the COG access pattern �
 and the divisions theme supplies the matching subtype/hierarchy metadata.
 
 What a query touches is memoized under
-``cache/boundary_lookup/<release>-t<tolerance>/`` as
+``cache/boundary_lookup/<release>-t<tolerance>-l<layout>/`` as
 GeoParquet parts of the division polygons (simplified to the shipping
 tolerance) plus their metadata, keyed by the release, so repeated queries
 within and across builds read locally and both consumers see the same
@@ -58,7 +58,10 @@ _SCALAR_FIELDS = (
 _JSON_FIELDS = ("names", "ancestors", "osm_relation_ids", "sources")
 _MEMO_COLUMNS = ["division_id", *_SCALAR_FIELDS, *_JSON_FIELDS]
 
-AREA_COLUMNS = ["division_id", "geometry", "country", "is_land"]
+AREA_COLUMNS = ["division_id", "geometry", "country"]
+# The memo's layout, part of its name: 2 holds a division's territorial area
+# (land and sea) beside its land one.
+MEMO_LAYOUT = 2
 # The ``bbox`` struct's fields, in the order the footprint and row-box readers
 # take them: the footer statistics of these columns bound each row group.
 _BBOX_FIELDS = ("xmin", "xmax", "ymin", "ymax")
@@ -132,10 +135,11 @@ def _read_memo(directory, name):
 
 def memo_name(release, tolerance=None):
     """The memo directory for ``release`` at the simplification ``tolerance``
-    (the shipping tolerance by default): a memo holds polygons simplified at
-    one tolerance, so another tolerance is another memo, never a stale read."""
+    (the shipping tolerance by default) in layout ``MEMO_LAYOUT``: a memo
+    holds polygons simplified at one tolerance and read one way, so another
+    tolerance or layout is another memo, never a stale read."""
     tolerance = geometry.SIMPLIFY_TOLERANCE_DEG if tolerance is None else tolerance
-    return f"{release}-t{tolerance!r}"
+    return f"{release}-t{tolerance!r}-l{MEMO_LAYOUT}"
 
 
 def _part_name(part):
@@ -423,7 +427,7 @@ class BoundaryLookup:
 
         Boxes already inside a covered box cost nothing. The rest select, from
         the files' footer statistics, the row groups whose footprint they
-        touch; each is read once, its land polygons whose own bbox touches a
+        touch; each is read once, its polygons whose own bbox touches a
         box parsed (malformed WKB skipped) and their divisions' metadata
         resolved, then memoized, and every box is recorded as covered.
         """
@@ -542,8 +546,10 @@ class BoundaryLookup:
 
     @staticmethod
     def _group_polygons(open_dataset, group, cells):
-        """``(dataset, {division_id: {wkb: simplified polygon}})`` for the land
-        areas of one row group whose own bbox touches a cell — the dataset the
+        """``(dataset, {division_id: {wkb: simplified polygon}})`` for the
+        areas of one row group whose own bbox touches a cell, land and
+        territorial (land and sea) alike, so a stop at sea lies in the division
+        whose waters hold it — the dataset the
         attempt opened and read, both under the stall deadline — so the caller
         can adopt that dataset once the whole attempt has succeeded."""
         path, index = group
@@ -554,7 +560,6 @@ class BoundaryLookup:
             fragment = next(f for f in opened[0].get_fragments() if f.path == path)
             return fragment.subset(row_group_ids=[index]).to_batches(
                 columns=AREA_COLUMNS + ["bbox"],
-                filter=ds.field("is_land"),
                 **geometry.scan_options(),
             )
 

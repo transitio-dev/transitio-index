@@ -52,9 +52,9 @@ AREAS = [
     fx.area("fi", _wkb(19.0, 59.0, 32.0, 71.0), CC0, country="FI"),
     fx.area("fi-uusimaa", _wkb(23.0, 59.8, 26.5, 60.9), CC0, country="FI"),
     fx.area("fi-hel", _wkb(24.8, 60.1, 25.3, 60.35), CC0, country="FI"),
-    # A maritime polygon COVERING the query point and a malformed row: both
-    # must be ignored despite matching the bbox pushdown.
-    fx.area("fi-sea", _wkb(24.0, 59.0, 25.5, 60.3), CC0, is_land=False, country="FI"),
+    # Helsinki's territorial area, its land and sea, beside its land one.
+    fx.area("fi-hel", _wkb(24.0, 59.0, 25.5, 60.35), CC0, is_land=False, country="FI"),
+    # A malformed row must be ignored despite matching the bbox pushdown.
     fx.area("fi-bad", b"not wkb", CC0, country="FI"),
     # A usable polygon naming no division is not evidence for anything.
     fx.area("", _wkb(24.8, 60.1, 25.3, 60.35), CC0, country="FI"),
@@ -95,7 +95,7 @@ def test_a_point_resolves_most_specific_first(tmp_path):
     cache = tmp_path / "cache"
     with _lookup(tmp_path, cache) as lookup:
         added = lookup.ensure([HEL_BOX])
-        assert added == 3  # locality, region, country; sea and junk ignored
+        assert added == 3  # locality, region, country; junk ignored
         found = lookup.divisions_at(24.94, 60.17)
         assert [r["division_id"] for r in found] == ["fi-hel", "fi-uusimaa", "fi"]
         assert found[0]["kind"] == "city"
@@ -322,7 +322,7 @@ def test_the_memo_is_keyed_by_the_simplification_tolerance(tmp_path, monkeypatch
     # a changed constant opens a fresh memo and leaves the old one alone.
     monkeypatch.setattr(geometry, "SIMPLIFY_TOLERANCE_DEG", 0.002)
     other = cache / "boundary_lookup" / boundaries.memo_name("test-release")
-    assert other != current and other.name == "test-release-t0.002"
+    assert other != current and other.name == "test-release-t0.002-l2"
     with _lookup(tmp_path, cache) as lookup:
         assert lookup.divisions_at(24.95, 60.17) == []  # nothing memoized here yet
         lookup.ensure([HEL_BOX])

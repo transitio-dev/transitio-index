@@ -562,27 +562,48 @@ def test_geohash_encode_matches_the_reference_value(tmp_path):
     assert crosswalk._geohash_encode(57.64911, 10.40744, 5) == "u4pru"
 
 
-def test_geohash_confirms_a_same_host_candidate(tmp_path):
-    # Same host, names disagree, but the Onestop geohash meets the MDB centroid.
+@pytest.mark.parametrize(
+    "atlas_name, atlas_url, provider, mdb_url",
+    [
+        # A shared token, too weak for a name match.
+        (
+            "Alpha Express",
+            "https://v.example/a.zip",
+            "Alpha",
+            "https://v.example/b.zip",
+        ),
+        # The same download file name in another folder.
+        (
+            "Alpha",
+            "https://v.example/2023/City.zip",
+            "Beta",
+            "https://v.example/city.zip",
+        ),
+    ],
+    ids=["name-token", "file-name"],
+)
+def test_geohash_confirms_a_same_host_candidate_that_shares_a_name_or_file(
+    atlas_name, atlas_url, provider, mdb_url
+):
     geohash = crosswalk._geohash_encode(37.5, -122.3, 4)
     feed_id = f"f-{geohash}z-alpha"
     records, summary = crosswalk.build_records(
-        [atlas_feed(feed_id, url="https://v.example/a", name="Alpha")],
+        [atlas_feed(feed_id, url=atlas_url, name=atlas_name)],
         [
             mdb_feed(
                 "mdb-1",
-                url="https://v.example/b",
-                provider="Beta",
+                url=mdb_url,
+                provider=provider,
                 bounding_box=point_box(37.5, -122.3),
             )
         ],
     )
+    assert summary["geohash_pairs"] == 1
     both = by_feed_id(records)[feed_id]
     assert both["source"] == "both"
     assert both["mdb_id"] == "mdb-1"
     assert both["crosswalk_method"] == "geohash"
     assert both["crosswalk_confidence"] == crosswalk.GEOHASH_CONFIDENCE
-    assert summary["geohash_pairs"] == 1
 
 
 def test_a_geohash_below_four_chars_does_not_confirm(tmp_path):
@@ -624,14 +645,21 @@ def test_an_ambiguous_geohash_is_not_confirmed(tmp_path):
         [atlas_feed(feed_id, url="https://v.example/a", name="Alpha")],
         [
             mdb_feed(
-                "mdb-1", url="https://v.example/b", provider="Beta", bounding_box=box
+                "mdb-1",
+                url="https://v.example/b",
+                provider="Alpha North",
+                bounding_box=box,
             ),
             mdb_feed(
-                "mdb-2", url="https://v.example/c", provider="Gamma", bounding_box=box
+                "mdb-2",
+                url="https://v.example/c",
+                provider="Alpha South",
+                bounding_box=box,
             ),
         ],
     )
-    # Two MDB feeds in the same cell: ambiguous, so not confirmed but recorded.
+    # Two MDB feeds in the same cell sharing a token: ambiguous, so not
+    # confirmed but recorded.
     assert {record["feed_id"] for record in records} == {feed_id, "f-mdb-1", "f-mdb-2"}
     assert summary["geohash_pairs"] == 0
     assert {(p["onestop_id"], p["mdb_id"]) for p in summary["provisional_links"]} == {
@@ -955,7 +983,9 @@ def test_the_full_cascade_over_one_fixture(tmp_path):
     atlas_feeds = [
         atlas_feed("f-url", url="https://exact.example/f.zip"),
         atlas_feed("f-name", url="https://host.example/a", name="Namematch"),
-        atlas_feed(f"f-{geohash}z-geo", url="https://geo.example/a", name="AlphaGeo"),
+        atlas_feed(
+            f"f-{geohash}z-geo", url="https://geo.example/a/gtfs.zip", name="AlphaGeo"
+        ),
         atlas_feed("f-amb", url="https://amb.example/a", name="Ambiguous"),
         atlas_feed("f-solo"),
         atlas_feed("f-gbfs", spec="gbfs", urls={"gbfs_auto_discovery": "https://g/x"}),
@@ -963,9 +993,10 @@ def test_the_full_cascade_over_one_fixture(tmp_path):
     mdb_feeds = [
         mdb_feed("mdb-url", url="https://exact.example/f.zip"),
         mdb_feed("mdb-name", url="https://host.example/b", provider="Namematch"),
+        # Names apart, one download file name: a geohash pair.
         mdb_feed(
             "mdb-geo",
-            url="https://geo.example/b",
+            url="https://geo.example/b/gtfs.zip",
             provider="Different",
             bounding_box=point_box(37.5, -122.3),
         ),
