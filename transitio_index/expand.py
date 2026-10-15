@@ -540,8 +540,11 @@ def _attach_fao_metros(
             names,
         )
         for key in changed:
-            # Redrawn from the members it now has, never kept around a core
-            # that left.
+            # Redrawn: as its city-region when the FAO inputs give one, else
+            # from the members it now has, never kept around a core that left;
+            # a boundary a curator drew stays.
+            if places_by_id[key].get("geometry_source") == geometry.CURATED:
+                continue
             places_by_id[key]["geometry"] = places_by_id[key]["geometry_source"] = None
         touched |= changed
     return added, touched
@@ -947,6 +950,7 @@ def _discover(
         reopen=reopen,
         inventory=inventory,
         shipped_sources=shipped,
+        fao=fao_inputs[:2] if fao_inputs is not None else None,
     )
     if centres is not None:
         metros.fao_centres(
@@ -988,6 +992,8 @@ def _discover(
             names_stage._merge(places_by_id[key], entry)
     names_stage.fill_centres(places_by_id, enrich, wikidata)
 
+    from transitio_index.fao import DOI as FAO_DOI
+
     return {
         "feeds_scanned": len(crawled),
         "stops_read": stops_read,
@@ -1003,7 +1009,9 @@ def _discover(
         "licence_sources": sorted("|".join(pair) for pair in shipped),
         "licence_inventory": [
             row
-            for row in geometry._inventory_rows(inventory, 0)
+            for row in geometry._inventory_rows(
+                inventory, 0, releases={geometry.FAO_DERIVED: FAO_DOI}
+            )
             if row["role"] == "component"
         ],
     }

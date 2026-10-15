@@ -840,8 +840,14 @@ def test_a_fao_region_the_seed_left_unpublished_is_minted_over_every_city(
     assert manifest["metros_added"] == 1
 
 
-@pytest.mark.parametrize("seeded_core", [False, True], ids=["joins", "leaves"])
-def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core):
+@pytest.mark.parametrize(
+    ("seeded_core", "curated"),
+    [(False, False), (True, False), (True, True)],
+    ids=["joins", "leaves", "curated"],
+)
+def test_a_sliver_fao_metros_core_is_settled_on_discovery(
+    tmp_path, seeded_core, curated
+):
     from test_index_metros import _fao_inputs, _ucdb_inputs
     from transitio_index import fao, ucdb
 
@@ -850,9 +856,8 @@ def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core)
     # whose centre lies in Pirkanmaa. A stop off every city discovers
     # Pirkanmaa, which joins as the core; or the seed gave the metro a core
     # and a stop discovers Badgeo, a city shipping no polygon, so it leaves.
-    files, pins = _fao_inputs(
-        tmp_path, patch=shapely.box(21.0, 60.5, 29.0, 62.5), iso3="FIN"
-    )
+    patch = shapely.box(21.0, 60.5, 29.0, 62.5)
+    files, pins = _fao_inputs(tmp_path, patch=patch, iso3="FIN")
     fao.prepare_inputs(cache, files=files, expected=pins)
     centres, centre_pins = _ucdb_inputs(
         tmp_path, centre=shapely.box(23, 61.2, 24, 61.8)
@@ -882,6 +887,7 @@ def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core)
         "country_code": "FI",
         "statistical_area_id": "50",
         "geometry": shapely.to_wkb(drawn).hex(),
+        "geometry_source": geometry.CURATED if curated else "member_union",
         "metro_ids": [],
         "member_ids": ["Q1", "Q2"] if seeded_core else ["Q1"],
     }
@@ -904,15 +910,27 @@ def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core)
     boundary = shapely.from_wkb(bytes.fromhex(metro["geometry"]))
     assert manifest["places_added"] == 1
     if seeded_core:
-        # Redrawn over the members it keeps, without the core.
+        # The core leaves the members.
         assert metro["member_ids"] == ["Q1", "Q999"]
         assert places["Q2"]["metro_ids"] == []
-        assert not boundary.covers(shapely.Point(23.5, 61.5))
     else:
-        # Redrawn over its members, the metro now takes Pirkanmaa's shape.
+        # Pirkanmaa joins as the core.
         assert metro["member_ids"] == ["Q1", "Q5697"]
         assert places["Q5697"]["metro_ids"] == [key]
-        assert boundary.covers(shapely.Point(24.4, 61.1))
+    if curated:
+        # A boundary a curator drew stays, whatever its members.
+        assert metro["geometry_source"] == geometry.CURATED
+        assert boundary.equals(drawn)
+        return
+    # Either way the metro is redrawn as its city-region, whatever its members,
+    # inventoried at the FAO record's version.
+    assert metro["geometry_source"] == geometry.OFFICIAL_AREA
+    assert boundary.equals(patch)
+    assert {
+        row["version"]
+        for row in manifest["licence_inventory"]
+        if row["dataset"] == geometry.FAO_DERIVED[0]
+    } == {fao.DOI}
 
 
 def test_an_unauditable_boundary_ships_without_geometry(tmp_path):
