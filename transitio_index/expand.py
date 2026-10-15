@@ -1,8 +1,10 @@
 """Stage 2b: gazetteer expansion from crawled stops.
 
 The declared seed only knows places feeds *declare*; the crawl shows where
-they actually stop. This stage reads each crawled feed's ``stops.txt``,
-resolves the stop clusters through the boundary lookup, and adds every
+they actually stop. This stage reads each crawled feed's ``stops.txt`` and
+its demand-responsive zones (``locations.geojson``), resolves the stop
+clusters and the places each zone reaches into through the boundary lookup,
+and adds every
 QID-bearing admin unit the seed missed — running the same ancestor-and-metro
 expansion the seed uses, so a crawl-discovered city arrives with its region,
 country and any metro — US, Eurostat or FAO — that contains it, its boundary
@@ -25,6 +27,7 @@ import shapely
 from transitio_index import registry as _registry
 from transitio_index import (
     boundaries,
+    cbsa,
     crawl,
     geometry,
     metros,
@@ -132,6 +135,45 @@ def _stop_points(feed_dir, state):
             return crawl.stop_coordinates(opened)
     except crawl.MEMBER_ERRORS:
         return None
+
+
+def _zone_shapes(feed_dir, state):
+    """``(zones, dropped)`` for one crawled feed's demand-responsive zones
+    (:func:`crawl.zone_shapes`), ``({}, 0)`` when its crawl holds none, or
+    None when the member fails verification or parsing, as
+    :func:`_stop_points`."""
+    digests = state.get("member_sha256")
+    if not isinstance(digests, dict) or "locations.geojson" not in digests:
+        return {}, 0
+    try:
+        with crawl.verified_member(feed_dir, state, "locations.geojson") as opened:
+            if opened is None:
+                return None
+            return crawl.zone_shapes(opened)
+    except crawl.MEMBER_ERRORS:
+        return None
+
+
+def _onestop_cells(cache_dir, seed_generation):
+    """The ``onestop_cell`` boxes (:func:`crosswalk._id_locations`) of the
+    feeds of the crosswalk generation the seed ``seed_generation`` read —
+    never a later one; none without a seed naming one. A generation gone
+    since is an error: the stages ran out of order."""
+    if not seed_generation:
+        return []
+    seed_run, seed_manifest = store.resolve_generation(
+        cache_dir / "gazetteer", seed_generation
+    )
+    with seed_run:
+        crosswalk_generation = seed_manifest.get("crosswalk_generation")
+    if not crosswalk_generation:
+        return []
+    generation, _ = store.resolve_generation(
+        cache_dir / "crosswalk", crosswalk_generation
+    )
+    with generation:
+        feeds = store.parse_jsonl(generation.read_bytes("feeds.jsonl"))
+    return [shapely.box(*f["onestop_cell"]) for f in feeds if f.get("onestop_cell")]
 
 
 def _attach_boundary(place, rows, inventory, shipped):
@@ -244,9 +286,10 @@ def _shipped_footprint(place):
 
 
 def _derived_inputs(cache_dir, recorded):
-    """The Eurostat, Urban Audit and FAO inputs, the UCDB names and the FAO
-    centres the metros stage published metros from: ``(eurostat, urau, fao,
-    names, centres)``, loaded under the digests the run's ``derived_inputs``
+    """The Eurostat, Urban Audit and FAO inputs, the UCDB names, the FAO
+    centres and the CBSA delineation the metros stage published metros from:
+    ``(eurostat, urau, fao, names, centres, delineation)``, loaded under the
+    digests the run's ``derived_inputs``
     recorded — so expansion derives metros from the run's snapshot, never
     from the modules' current pins — each None (the names empty) where the
     run records none, that definition or branch having published none. A
@@ -300,7 +343,10 @@ def _derived_inputs(cache_dir, recorded):
             lambda pins: ucdb.centre_points(cache_dir, expected=pins),
         )
     names = names[0] if names is not None else {}
-    return euro, urau_inputs, fao_inputs, names, centres
+    delineation = load(
+        "cbsa", (cbsa.DERIVED,), lambda pins: cbsa.load_inputs(cache_dir, expected=pins)
+    )
+    return euro, urau_inputs, fao_inputs, names, centres, delineation
 
 
 class _SeededPlacement:
@@ -494,8 +540,11 @@ def _attach_fao_metros(
             names,
         )
         for key in changed:
-            # Redrawn from the members it now has, never kept around a core
-            # that left.
+            # Redrawn: as its city-region when the FAO inputs give one, else
+            # from the members it now has, never kept around a core that left;
+            # a boundary a curator drew stays.
+            if places_by_id[key].get("geometry_source") == geometry.CURATED:
+                continue
             places_by_id[key]["geometry"] = places_by_id[key]["geometry_source"] = None
         touched |= changed
     return added, touched
@@ -514,18 +563,25 @@ def _discover(
     derived,
     reopen=None,
     curated=(),
+    seed_generation=None,
 ):
     """Resolve crawled stops and fold the missing places in; returns counts.
     With ``registry``, every discovered place is identified through it;
     ``derived`` is the run's ``derived_inputs`` — the digests the metros stage
     derived metros from — ``reopen`` reopens ``area_dataset`` when its S3
-    scan stalls, and ``curated`` holds the ``set_boundary`` entries a
-    discovered place takes."""
-    # Two passes, one feed's stops in memory at a time — never every crawled
-    # feed's stops at once: first the lookup boxes, then, with the boxes
-    # ensured, the per-point division resolution.
+    scan stalls, ``curated`` holds the ``set_boundary`` entries a
+    discovered place takes, and ``seed_generation`` names the seed whose
+    crosswalk the Onestop ID cells are read from."""
+    # Two passes, one feed's stops and zones in memory at a time — never every
+    # crawled feed's at once: first the lookup boxes, then, with the boxes
+    # ensured, the per-point and per-zone division resolution. A feed whose
+    # zones fail to read keeps its stops. The cells Onestop IDs name for
+    # Atlas-only feeds without twins discover the places holding them.
+    cells = _onestop_cells(cache_dir, seed_generation)
     crawled = crawl.crawled_feeds(cache_dir)
     stops_read = 0
+    zones_read = 0
+    zone_failures = set()
     state_mismatches = 0
     boxes = []
     usable = []
@@ -535,22 +591,39 @@ def _discover(
             state_mismatches += 1
             continue
         points, _ = read
+        zones = _zone_shapes(feed_dir, state)
+        if zones is None:
+            zone_failures.add(state.get("feed_id"))
+            zones = {}, 0
         stops_read += len(points)
+        zones_read += len(zones[0])
         boxes.extend(crawl.cluster_boxes(points))
-        usable.append((feed_dir, state))
-    lookup.ensure(boxes)
+        boxes.extend(crawl.zone_boxes(zones[0].values()))
+        # Only zones whose cells were ensured are resolved.
+        usable.append((feed_dir, state, bool(zones[0])))
+    lookup.ensure(boxes + crawl.zone_boxes(cells))
 
     divisions = {}
-    for feed_dir, state in progress(usable, "expand resolve"):
+    for feed_dir, state, zoned in progress(usable, "expand resolve"):
         read = _stop_points(feed_dir, state)
+        zones = _zone_shapes(feed_dir, state) if zoned else ({}, 0)
         if read is None:
             # Changed between the passes: no longer trustworthy evidence.
             state_mismatches += 1
             continue
+        if zones is None:
+            zone_failures.add(state.get("feed_id"))
+            zones = {}, 0
         points, _ = read
         for x, y in points:
             for record in lookup.divisions_at(x, y):
                 divisions[record["division_id"]] = record
+        for shape in zones[0].values():
+            for record in lookup.divisions_reached(geometry.zone_core(shape)):
+                divisions[record["division_id"]] = record
+    for cell in cells:
+        for record in lookup.divisions_covering(geometry.zone_core(cell)):
+            divisions[record["division_id"]] = record
 
     candidates = [dict(record) for record in divisions.values() if record.get("kind")]
     seed._resolve_candidates(candidates, wikidata)
@@ -743,14 +816,15 @@ def _discover(
     new_metros, metro_pairs = _attach_metros(
         places_by_id, codes, new_cities, wikidata, report, registry
     )
-    euro = urau_inputs = fao_inputs = centres = None
+    euro = urau_inputs = fao_inputs = centres = delineation = None
     names = {}
     # A discovered region may hold a FAO metro's centre.
     if city_rows or any(places_by_id[q].get("kind") == "region" for q in new_ids):
-        euro, urau_inputs, fao_inputs, names, centres = _derived_inputs(
+        euro, urau_inputs, fao_inputs, names, centres, delineation = _derived_inputs(
             cache_dir, derived
         )
-    # One join per Eurostat definition the run derived, over the same cities.
+    # One join per Eurostat definition the run derived, over the same cities;
+    # a metro minted here takes its official area, as the metros stage's.
     eurostat_metros, eurostat_touched, assignments = [], set(), []
     for definition, inputs in (
         (metros.METROPOLITAN_REGION, euro),
@@ -759,6 +833,16 @@ def _discover(
         added, touched, rows = _attach_eurostat_metros(
             places_by_id, codes, city_rows, areas, inputs, definition, land=euro
         )
+        if added:
+            metros.eurostat_parts(
+                [places_by_id[key] for key in added],
+                definition,
+                inputs,
+                lookup,
+                cache_dir,
+                area_dataset,
+                euro[1] if euro is not None else None,
+            )
         eurostat_metros += added
         eurostat_touched |= touched
         assignments += rows
@@ -790,6 +874,37 @@ def _discover(
         report,
         fao=None if fao_inputs is None else (names, fao_inputs[0]),
     )
+    # A US metro minted here takes its official area, as the metros stage's.
+    us_minted = [
+        places_by_id[key]
+        for key in new_metros
+        if key not in dropped
+        and places_by_id[key].get("source_subtype") == "metropolitan statistical area"
+    ]
+    if delineation is not None and us_minted:
+        # The skeleton of the gazetteer run the names belong to: its run
+        # manifest names the generation, whatever the pointer says since.
+        gazetteer = cache_dir / "gazetteer"
+        run = store.run_generations(gazetteer)
+        if not run or "overture.json" not in run:
+            raise overture.GazetteerError(
+                "no gazetteer run names the skeleton; rerun the gazetteer"
+            )
+        skeleton, _ = store.read_jsonl(
+            gazetteer, "overture.json", "overture_divisions.jsonl", generations=run
+        )
+        _, missing = metros.official_parts(
+            us_minted, delineation[0], wikidata, skeleton, places_by_id
+        )
+        report.extend(
+            {
+                "kind": "metro",
+                "metro_id": metro_id,
+                "fips": code,
+                "reason": "county without a division",
+            }
+            for metro_id, code in missing
+        )
     minted = [key for key in eurostat_metros + fao_metros if key not in dropped]
     new_metros = [key for key in new_metros if key not in dropped] + minted
     metro_pairs = [key for key in metro_pairs if key not in dropped]
@@ -833,6 +948,9 @@ def _discover(
         chunk=geometry.AREA_CHUNK,
         release=release,
         reopen=reopen,
+        inventory=inventory,
+        shipped_sources=shipped,
+        fao=fao_inputs[:2] if fao_inputs is not None else None,
     )
     if centres is not None:
         metros.fao_centres(
@@ -874,9 +992,13 @@ def _discover(
             names_stage._merge(places_by_id[key], entry)
     names_stage.fill_centres(places_by_id, enrich, wikidata)
 
+    from transitio_index.fao import DOI as FAO_DOI
+
     return {
         "feeds_scanned": len(crawled),
         "stops_read": stops_read,
+        "zones_read": zones_read,
+        "zone_failures": sorted(str(feed_id) for feed_id in zone_failures),
         "state_mismatches": state_mismatches,
         "divisions_hit": len(divisions),
         "places_added": len(new_ids) + len(new_metros),
@@ -887,7 +1009,9 @@ def _discover(
         "licence_sources": sorted("|".join(pair) for pair in shipped),
         "licence_inventory": [
             row
-            for row in geometry._inventory_rows(inventory, 0)
+            for row in geometry._inventory_rows(
+                inventory, 0, releases={geometry.FAO_DERIVED: FAO_DOI}
+            )
             if row["role"] == "component"
         ],
     }
@@ -906,6 +1030,7 @@ def _expanded(
     digest,
     derived,
     curated,
+    seed_generation=None,
 ):
     """Discovery under the crawl lock; ``(crawl_digest, counts, mode)``.
 
@@ -949,6 +1074,7 @@ def _expanded(
                 derived,
                 reopen,
                 curated,
+                seed_generation,
             )
     finally:
         if opened_lookup is not None:
@@ -1036,6 +1162,8 @@ def expand(
             counts = {
                 "feeds_scanned": 0,
                 "stops_read": 0,
+                "zones_read": 0,
+                "zone_failures": [],
                 "divisions_hit": 0,
                 "places_added": 0,
                 "metros_added": 0,
@@ -1057,6 +1185,7 @@ def expand(
                     digest,
                     derived,
                     overrides.by_operation(place_overrides, "set_boundary"),
+                    names_manifest.get("seed_generation"),
                 )
             # Saved before the generation is visible, as the gazetteer run
             # does: a crash between the two leaves rows a rerun reproduces.

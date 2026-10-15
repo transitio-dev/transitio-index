@@ -229,16 +229,49 @@ def _enough_stops(states, members):
 SOURCE_RANK = {"both": 0, "atlas": 1, "mdb": 2, "curated": 3}
 
 
+# The identity key of a crawl's zones: the zones file's digest.
+ZONES_IDENTITY = "locations.geojson"
+
+
 def _identity(state):
     """The crawl's content identity, or None when it has none, a malformed
-    one, or one computed under another identity version."""
+    one, or one computed under another identity version; with the digest of
+    its demand-responsive zones under ``ZONES_IDENTITY`` when it has some."""
     found = state.get("identity")
     version = state.get("identity_version")
     if type(version) is not int or version != fingerprint.IDENTITY_VERSION:
         return None
     if isinstance(found, dict) and all(isinstance(v, str) for v in found.values()):
-        return found
+        digests = state.get("member_sha256")
+        zones = digests.get(ZONES_IDENTITY) if isinstance(digests, dict) else None
+        return {**found, ZONES_IDENTITY: zones} if isinstance(zones, str) else found
     return None
+
+
+def content_groups(identities, files=None):
+    """The groups of feeds with identical content, from ``{id: identity}``:
+    :func:`transitio.index.fingerprint.identical_groups`, split by their
+    zones, so feeds whose zones differ, or one without zones, never fold.
+    ``files`` maps a feed to its archive's file names: an identity without a
+    zones digest whose archive lists a zones file takes no part, its zones
+    never read."""
+    unread = {
+        feed_id
+        for feed_id, names in (files or {}).items()
+        if (identities.get(feed_id) or {}).get(ZONES_IDENTITY) is None
+        and any(
+            str(name).replace("\\", "/").rsplit("/", 1)[-1].lower() == ZONES_IDENTITY
+            for name in names or ()
+        )
+    }
+    identities = {k: v for k, v in identities.items() if k not in unread}
+    groups = []
+    for members in fingerprint.identical_groups(identities):
+        by_zones = collections.defaultdict(list)
+        for feed_id in members:
+            by_zones[identities[feed_id].get(ZONES_IDENTITY)].append(feed_id)
+        groups.extend(ids for ids in by_zones.values() if len(ids) > 1)
+    return sorted(groups)
 
 
 def fold_duplicates(feeds, states, anonymous=None, exempt=frozenset()):
@@ -247,9 +280,9 @@ def fold_duplicates(feeds, states, anonymous=None, exempt=frozenset()):
     URL a canonical feed took.
 
     Two crawls hold the same data when their content identities match
-    (:func:`transitio.index.fingerprint.identical_groups`: the same stops,
-    routes, trips and calendars, and stop_times where both crawls read it,
-    however the files were packaged); a group whose stops give fewer than two
+    (:func:`content_groups`: the same stops, routes, trips and calendars,
+    stop_times where both crawls read it and the same zones, however the
+    files were packaged); a group whose stops give fewer than two
     readable coordinates (a header-only archive) never folds.
     The canonical feed is the first by :data:`SOURCE_RANK`, then id: it keeps
     the others' ids and aliases as aliases, and an Atlas-only canonical takes a
@@ -261,11 +294,17 @@ def fold_duplicates(feeds, states, anonymous=None, exempt=frozenset()):
     in ``exempt``, takes the URL of its group's first member that was and is
     not exempt, as its ``download_url``, and counts as read at it.
     """
+    from transitio_index import crawl
+
     anonymous = {} if anonymous is None else anonymous
     by_id = {feed["feed_id"]: feed for feed in feeds}
     identities = {feed_id: _identity(state) for feed_id, (_, state) in states.items()}
+    files = {
+        feed_id: crawl._manifest_list(state.get("files"))
+        for feed_id, (_, state) in states.items()
+    }
     folded, twins = {}, {}
-    for members in fingerprint.identical_groups(identities):
+    for members in content_groups(identities, files):
         members.sort(
             key=lambda f: (SOURCE_RANK.get(by_id[f].get("source"), len(SOURCE_RANK)), f)
         )
@@ -374,7 +413,8 @@ def judge_access(feeds, committed, anonymous, exempt):
         failure = failure or "the crawl did not read the feed's URL"
         status = _HTTP_STATUS.search(failure)
         if status and status.group(1) == "401":
-            feed.update(resolve._OPEN, access="key")
+            registration = feed.get("registration_url")
+            feed.update(resolve._OPEN, access="key", registration_url=registration)
             keyed.append(feed_id)
         else:
             refused[feed_id] = failure
@@ -649,9 +689,10 @@ def place_qids(places):
 
 
 def curated_boundaries(places):
-    """``(tree, place_ids)`` over the boundaries curators drew and the
-    seeded cities' urban centres, or None: no Overture division stands for
-    such a boundary, so a stop reaches its place by lying inside it."""
+    """``(tree, place_ids)`` over the boundaries curators drew, the seeded
+    cities' urban centres and the metros' official areas, or None: no
+    Overture division stands for such a boundary, so a stop reaches its
+    place by lying inside it."""
     import shapely
 
     from transitio_index import geometry
@@ -659,7 +700,8 @@ def curated_boundaries(places):
     ids = [
         place_id
         for place_id, place in places.items()
-        if place.get("geometry_source") in (geometry.CURATED, geometry.UCDB)
+        if place.get("geometry_source")
+        in (geometry.CURATED, geometry.UCDB, geometry.OFFICIAL_AREA)
         and place.get("geometry")
     ]
     if not ids:
@@ -680,16 +722,64 @@ def stop_places(lookup, x, y, by_overture, by_qid, curated=None):
     """
     import shapely
 
-    from transitio_index import overture
-
-    hit = set()
+    hit, countries, stale = _division_places(
+        lookup.divisions_at(x, y), by_overture, by_qid
+    )
     if curated is not None:
         tree, ids = curated
         point = shapely.Point(x, y)
         hit.update(ids[i] for i in tree.query(point, predicate="intersects"))
+    return hit, countries, stale
+
+
+def zone_places(lookup, shape, by_overture, by_qid, curated=None):
+    """``(place_ids, countries, stale, slivers)`` for one demand-responsive
+    zone, as :func:`stop_places` for a stop: the places it reaches into past
+    the simplification tolerance (:func:`geometry.zone_core`), and
+    ``slivers`` counting the divisions and curated boundaries its full
+    outline touches no deeper, known places or not."""
+    from transitio_index import geometry
+
+    core = geometry.zone_core(shape)
+    reached = lookup.divisions_reached(core)
+    hit, countries, stale = _division_places(reached, by_overture, by_qid)
+    kept = {record["division_id"] for record in reached}
+    slivers = sum(
+        1
+        for record in lookup.divisions_reached(shape)
+        if record.get("kind") and record["division_id"] not in kept
+    )
+    if curated is not None:
+        tree, ids = curated
+        inside = set(geometry.interior_hits(tree, core).tolist())
+        hit.update(ids[i] for i in inside)
+        slivers += len(set(geometry.interior_hits(tree, shape).tolist()) - inside)
+    return hit, countries, stale, slivers
+
+
+def zone_holders(lookup, shape, by_overture, by_qid, curated=None):
+    """The places holding the whole of a zone within the simplification
+    tolerance: a division one of whose polygons, or a curated boundary,
+    covers its :func:`geometry.zone_core`."""
+    from transitio_index import geometry
+
+    core = geometry.zone_core(shape)
+    held, _, _ = _division_places(lookup.divisions_covering(core), by_overture, by_qid)
+    if curated is not None:
+        tree, ids = curated
+        held.update(ids[i] for i in tree.query(core, predicate="covered_by"))
+    return held
+
+
+def _division_places(records, by_overture, by_qid):
+    """``(place_ids, countries, stale)`` for the division ``records`` a stop
+    or zone reached."""
+    from transitio_index import overture
+
+    hit = set()
     countries = set()
     stale = set()
-    for record in lookup.divisions_at(x, y):
+    for record in records:
         if record.get("country"):
             countries.add(record["country"])
         place_ids = by_overture.get(record.get("overture_id"))
@@ -712,7 +802,8 @@ def known_misses(stale, conflicts, stage):
     dropped_hit = sorted(stale & set(conflicts))
     for qid in dropped_hit:
         log.warning(
-            "%s: stops fall in %s, which the expand stage dropped as a conflict; "
+            "%s: stops or zones fall in %s, which the expand stage dropped as a "
+            "conflict; "
             "they count for its enclosing places only",
             stage,
             qid,
@@ -721,9 +812,10 @@ def known_misses(stale, conflicts, stage):
 
 
 def stale_expansion(stale):
-    """The message for stops in QID-bearing divisions no place knows."""
+    """The message for stops or zones in QID-bearing divisions no place
+    knows."""
     return (
-        "crawled stops hit QID-bearing divisions the gazetteer does not "
+        "crawled stops or zones hit QID-bearing divisions the gazetteer does not "
         f"know ({', '.join(sorted(stale)[:5])}); places_expanded predates "
         "the crawl — re-run the expand stage"
     )
@@ -736,7 +828,11 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
     :func:`crawled_states`: the crawl's state.json is the commit point,
     exactly as expansion reads them), resolves every stop
     through the boundary lookup, and admits every ``(place, feed)`` pair with
-    a stop inside, the count being the service level's first term. Every
+    a stop inside, the count being the service level's first term. A
+    demand-responsive zone counts as one stop in every place it reaches into
+    (:func:`zone_places`), its evidence naming how many of them are zones;
+    the report lists the feeds whose zones failed to read and counts the
+    sliver overlaps left out. Every
     feed whose stops were read is reported in ``superseded``; the stage keeps
     the declared placements of one that gets no edge here. Metro edges are
     propagated from member-city edges; a metro's own aggregated evidence
@@ -756,23 +852,33 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
     # crawl artifacts exist; the declared path stays importable without them.
     import shapely
 
-    from transitio_index import crawl, expand
+    from transitio_index import crawl, expand, geometry
 
     by_overture = place_index(places)
     curated = curated_boundaries(places)
     by_qid = place_qids(places)
     # Minted metros have no geometry: a stop is inside a metro when it is
-    # inside ANY member city — counted once however many members it hits.
+    # inside ANY member city — counted once however many members it hits. A
+    # metro drawn over its official area counts by that polygon alone.
+    official = {
+        place_id
+        for place_id, place in places.items()
+        if place.get("geometry_source") == geometry.OFFICIAL_AREA
+    }
     metro_members = {
         place_id: set(place.get("member_ids") or [])
         for place_id, place in places.items()
-        if place.get("kind") == "metro" and place.get("member_ids")
+        if place.get("kind") == "metro"
+        and place.get("member_ids")
+        and place_id not in official
     }
     by_key = {}
     superseded = set()
     crawl_fields = {}
     stale = set()
     mismatches = 0
+    zone_failures = []
+    slivers = 0
     for feed_id, (feed_dir, state) in progress(sorted(states.items()), "coverage"):
         read = expand._stop_points(feed_dir, state)
         if read is None:
@@ -780,8 +886,19 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
             crawl_fields[feed_id] = {"crawl_status": "unreadable"}
             continue
         points, dropped = read
-        # The hull leaves out stops at a placeholder position.
-        placed = [p for p in points if p != crawl.PLACEHOLDER_POSITION]
+        zoned = expand._zone_shapes(feed_dir, state)
+        if zoned is None:
+            # The stops still place the feed.
+            zone_failures.append(feed_id)
+            zoned = {}, 0
+        zones, zones_dropped = zoned
+        # The hull leaves out stops at a placeholder position, and covers
+        # each zone's own hull.
+        placed = [p for p in points if p != crawl.PLACEHOLDER_POSITION] + [
+            tuple(xy)
+            for shape in zones.values()
+            for xy in shapely.get_coordinates(shapely.convex_hull(shape))
+        ]
         superseded.add(feed_id)
         # The schema's crawl bookkeeping, from the state that verified the
         # evidence: measured hull, stop count, validators, retrieval time.
@@ -806,30 +923,36 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
             "crawled_url": state.get("url"),
             "key_provider": state.get("key_provider"),
         }
-        if not points:
+        if not points and not zones:
             continue
-        lookup.ensure(crawl.cluster_boxes(points))
+        lookup.ensure(crawl.cluster_boxes(points) + crawl.zone_boxes(zones.values()))
         counts = collections.Counter()
-        for x, y in points:
-            hit, _, stale_here = stop_places(lookup, x, y, by_overture, by_qid, curated)
+        zone_counts = collections.Counter()
+        reached = [
+            stop_places(lookup, x, y, by_overture, by_qid, curated) for x, y in points
+        ]
+        for shape in zones.values():
+            *found, thin = zone_places(lookup, shape, by_overture, by_qid, curated)
+            slivers += thin
+            reached.append(found)
+            zone_counts.update(_with_metros(found[0], metro_members))
+        for hit, _, stale_here in reached:
             stale.update(stale_here)
-            # A metro counts a stop once, whether its own polygon, a member
-            # city, or both placed it there.
-            counts.update(
-                hit | {m for m, members in metro_members.items() if hit & members}
-            )
+            counts.update(_with_metros(hit, metro_members))
         # Dropped rows stay in the denominator: a stop whose coordinates do
         # not parse is still one of the feed's stops, and excluding it would
         # let a mostly-corrupt file inflate a share to false confidence.
         # Membership is a fact: any stop inside a place admits the feed to
         # it. The classify stage keeps the pair only when a route has a
         # SCHEDULED stop there, which stops.txt alone cannot tell.
-        total = len(points) + dropped
+        total = len(points) + dropped + len(zones) + zones_dropped
         for place_id, stops_in_place in counts.items():
             evidence = {
                 "stops_in_place": stops_in_place,
                 "stop_share": stops_in_place / total,
             }
+            if zones or zones_dropped:
+                evidence["zones_in_place"] = zone_counts[place_id]
             service = {
                 "stops": stops_in_place,
                 "routes": None,
@@ -842,7 +965,7 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
                 targets.extend(
                     metro_id
                     for metro_id in places[place_id].get("metro_ids") or []
-                    if metro_id in places
+                    if metro_id in places and metro_id not in official
                 )
             for target in targets:
                 key = (target, feed_id)
@@ -863,8 +986,17 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
         "state_mismatches": mismatches,
         "dropped_divisions_hit": dropped_hit,
         "crawl_fields": crawl_fields,
+        "zone_failures": zone_failures,
+        "zone_slivers": slivers,
     }
     return by_key, report
+
+
+def _with_metros(hit, metro_members):
+    """The places ``hit`` and the metros holding one of them as a member: a
+    metro counts a stop once, whether its own polygon, a member city, or both
+    placed it there."""
+    return hit | {m for m, members in metro_members.items() if hit & members}
 
 
 def _placed_elsewhere(feeds, places, feed_overrides, own_ids):
@@ -882,6 +1014,68 @@ def _placed_elsewhere(feeds, places, feed_overrides, own_ids):
         and entry["set_coverage"]["place_id"] not in places
         and overrides.elsewhere(entry["set_coverage"]["place_id"], own_ids=own_ids)
     }
+
+
+# The declared level of a place holding an Onestop ID's cell, by its kind.
+CELL_LEVELS = {"city": "municipality", "region": "subdivision", "country": "country"}
+
+
+def _cell_placements(feeds, placements, places, lookup):
+    """Place each feed with an ``onestop_cell`` (an Atlas-only feed without
+    twins, by its Onestop ID's geohash) at the most specific place holding
+    the whole cell (:func:`zone_holders`) — the one with the most ancestors,
+    a city before a region before a country, never a metro — instead of its
+    seed placements, the ID's country or none; a feed whose cell no place
+    holds keeps them. Returns how many were placed."""
+    import shapely
+
+    from transitio_index import crawl
+
+    cells = {
+        feed["feed_id"]: shapely.box(*feed["onestop_cell"])
+        for feed in feeds
+        if feed.get("onestop_cell")
+    }
+    if not cells:
+        return 0
+    lookup.ensure(crawl.zone_boxes(cells.values()))
+    refs = _canonical_ids(feeds)
+    by_overture, by_qid = place_index(places), place_qids(places)
+    curated = curated_boundaries(places)
+
+    def depth(place_id):
+        seen = set()
+        while place_id in places and place_id not in seen:
+            seen.add(place_id)
+            place_id = places[place_id].get("parent_id")
+        return len(seen)
+
+    kinds = list(CELL_LEVELS)
+    placed = 0
+    for feed_id, cell in sorted(cells.items()):
+        held = [
+            place_id
+            for place_id in zone_holders(lookup, cell, by_overture, by_qid, curated)
+            if places[place_id].get("kind") in CELL_LEVELS
+        ]
+        if not held:
+            continue
+        best = min(
+            held,
+            key=lambda p: (-depth(p), kinds.index(places[p]["kind"]), p),
+        )
+        placements[:] = [
+            p for p in placements if refs.get(p["feed_id"], p["feed_id"]) != feed_id
+        ]
+        placements.append(
+            {
+                "feed_id": feed_id,
+                "place_id": best,
+                "level": CELL_LEVELS[places[best]["kind"]],
+            }
+        )
+        placed += 1
+    return placed
 
 
 def _set_coverage(
@@ -1046,12 +1240,15 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
             named_after_provider = _name_after_provider(feeds)
 
             crawled_by_key = {}
+            cell_placements = 0
             crawl_report = {
                 "superseded": set(),
                 "state_mismatches": 0,
                 "unmatched_crawl_ids": [],
                 "dropped_divisions_hit": [],
                 "crawl_fields": {},
+                "zone_failures": [],
+                "zone_slivers": 0,
             }
             folded, twins = {}, {}
             access = [], [], {}
@@ -1129,6 +1326,9 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                             "stops; run the expand stage first"
                         ) from error
                     crawl_report["unmatched_crawl_ids"] = sorted(unmatched - elsewhere)
+                    cell_placements = _cell_placements(
+                        feeds, placements, places, lookup
+                    )
             finally:
                 crawl_lock.__exit__(None, None, None)
                 if opened_lookup is not None:
@@ -1253,6 +1453,13 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "crawl_state_mismatches": crawl_report["state_mismatches"],
                 "unmatched_crawl_ids": crawl_report["unmatched_crawl_ids"],
                 "dropped_divisions_hit": crawl_report["dropped_divisions_hit"],
+                # Feeds placed by their stops alone because their zones did
+                # not read, and the zone overlaps no deeper than the boundary
+                # simplification, left out.
+                "zone_failures": crawl_report["zone_failures"],
+                "zone_slivers": crawl_report["zone_slivers"],
+                # Atlas-only feeds placed by the cell their Onestop ID names.
+                "onestop_cell_placements": cell_placements,
                 "edges": len(edges),
                 "edges_by_place_kind": dict(
                     collections.Counter(places[e["place_id"]]["kind"] for e in edges)

@@ -8,7 +8,10 @@ its attribution goes into ``NOTICE``; geometry with any unaudited or unlicensed
 source is omitted and recorded in the licence inventory. A division Overture
 splits into a land area and a territorial one (land and sea) ships both, so
 its boundary holds its sea; metro memberships are measured over land areas
-only (``eurostat.place_footprint``). A metro's geometry is the union of its
+only (``eurostat.place_footprint``). A metro with an official area (a US
+metro's delineated counties, a Eurostat metro's municipalities) is the union
+of those divisions' audited areas, holes kept; a FAO metro is its
+city-region's polygon. Any other metro's geometry is the union of its
 members' areas, read at full resolution, and is drawn only from members that
 ship their own, so it never carries what a member may not; its holes are
 filled unless a non-member city stands in one, and the union is simplified
@@ -148,6 +151,19 @@ DERIVED_SOURCES = {
         ),
         "share_alike": False,
     },
+    # A US government work: no terms, credited all the same.
+    ("OMB CBSA delineation July 2023", "US-PD"): {
+        "credit": (
+            "U.S. Census Bureau, core based statistical areas: OMB "
+            "delineation of July 2023 (list 1)"
+        ),
+        "licence": "Public domain (a work of the U.S. federal government)",
+        "url": (
+            "https://www.census.gov/geographies/reference-files/time-series/"
+            "demo/metro-micro/delineation-files.html"
+        ),
+        "share_alike": False,
+    },
     ("GHS-UCDB R2024A", "CC-BY-4.0"): {
         "credit": (
             "GHS Urban Centre Database 2025 (GHS-UCDB R2024A), European "
@@ -174,12 +190,15 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
         ("GISCO Urban Audit 2024", "EuroGeographics-NC"),
         ("GHS-UCDB R2024A", "CC-BY-4.0"),
         ("FAO city-regions 2024", "CC-BY-4.0"),
+        ("OMB CBSA delineation July 2023", "US-PD"),
     }
 )
 
 # The FAO city-regions as a derived input: a curated FAO metro publishes
 # only with this row and Overture's allowlisted.
 FAO_DERIVED = ("FAO city-regions 2024", "CC-BY-4.0")
+# A FAO metro ships its city-region's polygon, credited as its terms require.
+SOURCE_ALLOWLIST[FAO_DERIVED] = DERIVED_SOURCES[FAO_DERIVED]
 # The GHS-UCDB urban centres: a derived input, and the boundary a seeded city
 # with no other ships.
 UCDB_DERIVED = ("GHS-UCDB R2024A", "CC-BY-4.0")
@@ -196,8 +215,30 @@ URAU_DERIVED = ("GISCO Urban Audit 2024", "EuroGeographics-NC")
 # both countries or in neither; classify counts those artefacts.
 SIMPLIFY_TOLERANCE_DEG = 0.0005
 
+
+def zone_core(shape):
+    """A demand-responsive zone shrunk by ``SIMPLIFY_TOLERANCE_DEG``: a
+    simplified boundary may cross a zone drawn along it by that much, so only
+    the core tells which places the zone reaches into. Each polygon is shrunk
+    on its own; one thinner than twice the tolerance keeps its own outline."""
+    parts = shapely.get_parts(shape)
+    cores = shapely.buffer(parts, -SIMPLIFY_TOLERANCE_DEG)
+    return shapely.union_all(np.where(shapely.is_empty(cores), parts, cores))
+
+
+def interior_hits(tree, shape):
+    """The indices of the ``tree`` geometries sharing interior with
+    ``shape``: intersecting it, not only touching its boundary."""
+    return np.setdiff1d(
+        tree.query(shape, predicate="intersects"),
+        tree.query(shape, predicate="touches"),
+    )
+
+
 # The geometry source of a city that ships its council area's boundary.
 COUNCIL_AREA = "council_area"
+# The geometry source of a metro drawn over its official area's divisions.
+OFFICIAL_AREA = "official_area"
 # The geometry source of a boundary a curator drew.
 CURATED = "curated"
 # The geometry source of a place that ships the area of another division its
@@ -371,13 +412,7 @@ def ship_area(place, rows, inventory=None, shipped=None, source="overture"):
     every polygon valid; ``"shipped"``, ``"omitted"`` (a source not
     allowlisted) or ``"invalid"``. ``inventory`` counts every row's sources
     and ``shipped`` gathers those of an area that ships."""
-    if inventory is not None:
-        for row in rows:
-            # An area with no sources still records one row, keyed to the
-            # null source, so its omission is auditable, not silent.
-            for row_source in row["sources"] or [None]:
-                key = _source_key(row_source)
-                inventory[(*key, key in SOURCE_ALLOWLIST)] += 1
+    _count_sources(rows, inventory)
     outcome, simplified = shipped_geometry(rows)
     if simplified is None:
         return outcome
@@ -387,6 +422,18 @@ def ship_area(place, rows, inventory=None, shipped=None, source="overture"):
         for row in rows:
             shipped.update(_source_key(row_source) for row_source in row["sources"])
     return "shipped"
+
+
+def _count_sources(rows, inventory):
+    """Count every area row's sources in ``inventory``, as allowed or not."""
+    if inventory is None:
+        return
+    for row in rows:
+        # An area with no sources still records one row, keyed to the
+        # null source, so its omission is auditable, not silent.
+        for row_source in row["sources"] or [None]:
+            key = _source_key(row_source)
+            inventory[(*key, key in SOURCE_ALLOWLIST)] += 1
 
 
 def shipped_geometry(rows):
@@ -456,17 +503,52 @@ def _raw_area(place, by_id):
 
 
 def draw_member_unions(
-    cache_dir, dataset, by_id, keys, *, chunk=0, release=None, reopen=None
+    cache_dir,
+    dataset,
+    by_id,
+    keys,
+    *,
+    chunk=0,
+    release=None,
+    reopen=None,
+    inventory=None,
+    shipped_sources=None,
+    fao=None,
 ):
     """Draw each metro ``by_id[key]`` of ``keys`` with :func:`member_union`
     from its members that ship a boundary: a member's raw areas, read
     with :func:`place_areas` about ``chunk`` members' areas at a time (all
     at once when not positive) from ``release`` as :func:`place_areas` reads
-    it, else its shipped polygon. A metro whose
-    union is not a valid polygon keeps the boundary it has; returns how many
-    were drawn."""
+    it, else its shipped polygon. A metro with ``official_parts`` (a US
+    metro's counties) is drawn over those divisions' areas alone instead
+    (:func:`_official_union`), labelled ``OFFICIAL_AREA``, its parts'
+    sources counted in ``inventory`` and ``shipped_sources``; one whose
+    parts all failed to resolve is drawn from its members. With ``fao`` —
+    the ``(regions, patches)`` of ``fao.load_inputs`` — a FAO metro whose
+    region they hold is drawn as the union of the patches its region lists
+    instead, simplified once, labelled ``OFFICIAL_AREA`` and counted under
+    ``FAO_DERIVED``. A metro a curator
+    gave a boundary is never redrawn, and one whose union is not a valid
+    polygon keeps the boundary it has; returns how many were drawn."""
+    # A boundary a curator drew is the metro's, whatever else holds.
+    keys = [key for key in keys if by_id[key].get("geometry_source") != CURATED]
+    # A FAO metro whose region gives no valid polygon is drawn from its
+    # members, as one whose official parts all failed.
+    drawn = 0
+    for key, polygons in _fao_regions(by_id, keys, fao).items():
+        boundary = _simplify(shapely.union_all(polygons))
+        if inventory is not None:
+            inventory[(*FAO_DERIVED, True)] += 1
+        if not _valid_polygon(boundary):
+            continue
+        by_id[key]["geometry"] = shapely.to_wkb(boundary).hex()
+        by_id[key]["geometry_source"] = OFFICIAL_AREA
+        if shipped_sources is not None:
+            shipped_sources.add(FAO_DERIVED)
+        keys.remove(key)
+        drawn += 1
     if not keys:
-        return 0
+        return drawn
     members = {
         key: [
             by_id[m]
@@ -479,45 +561,119 @@ def draw_member_unions(
         key: {_raw_area(m, by_id) for m in rows} - {None}
         for key, rows in members.items()
     }
-    # The members and the parents whose council areas they may borrow: the
-    # read is scoped to their countries, not to every place's.
+    official = {key: set(by_id[key].get("official_parts") or ()) for key in keys}
+    # The members, the parents whose council areas they may borrow and the
+    # metros themselves: the read is scoped to their countries, not to every
+    # place's.
     places = {
         id(place): place
-        for rows in members.values()
-        for member in rows
+        for key, rows in members.items()
+        for member in [by_id[key], *rows]
         for place in (member, by_id.get(member.get("parent_id")))
         if place is not None
     }.values()
     groups, size = [[]], 0
     for key in keys:
-        if chunk > 0 and groups[-1] and size + len(raw[key]) > chunk:
+        wanted = len(official[key] or raw[key])
+        if chunk > 0 and groups[-1] and size + wanted > chunk:
             groups.append([])
             size = 0
         groups[-1].append(key)
-        size += len(raw[key])
+        size += wanted
     cities = city_points(by_id)
-    drawn = 0
     for group in groups:
-        wanted = set().union(*(raw[key] for key in group))
+        wanted = set().union(*(official[key] or raw[key] for key in group))
         areas = place_areas(
             cache_dir, dataset, places, wanted, release=release, reopen=reopen
         )
         for key in group:
-            parts, shipped = [], []
-            for member in members[key]:
-                rows = areas.get(_raw_area(member, by_id))
-                if rows:
-                    parts += [row["geom"] for row in rows]
-                else:
-                    shipped.append(member["geometry"])
-            parts += list(shapely.from_wkb(shipped, on_invalid="ignore"))
-            member_ids = by_id[key].get("member_ids") or []
-            boundary = member_union(parts, member_ids, cities)
+            if official[key]:
+                boundary = _official_union(
+                    [areas.get(i) or [] for i in sorted(official[key])],
+                    inventory,
+                    shipped_sources,
+                )
+                source = OFFICIAL_AREA
+            else:
+                parts, shipped = [], []
+                for member in members[key]:
+                    rows = areas.get(_raw_area(member, by_id))
+                    if rows:
+                        parts += [row["geom"] for row in rows]
+                    else:
+                        shipped.append(member["geometry"])
+                parts += list(shapely.from_wkb(shipped, on_invalid="ignore"))
+                member_ids = by_id[key].get("member_ids") or []
+                boundary = member_union(parts, member_ids, cities)
+                source = "member_union"
             if boundary is not None:
                 by_id[key]["geometry"] = shapely.to_wkb(boundary).hex()
-                by_id[key]["geometry_source"] = "member_union"
+                by_id[key]["geometry_source"] = source
                 drawn += 1
     return drawn
+
+
+def _fao_inputs(cache_dir, metros_manifest):
+    """The FAO inputs the metros stage derived its FAO metros from — under
+    the digests its manifest records — or None when it derived none. An
+    input recorded but no longer readable refuses the stage: the metros were
+    derived from it."""
+    pins = (metros_manifest.get("derived_inputs") or {}).get("fao")
+    if pins is None:
+        return None
+    from transitio_index import fao
+
+    return fao.load_inputs(cache_dir, expected=pins)
+
+
+def _fao_regions(by_id, keys, fao):
+    """``{key: patch polygons}`` for the FAO metros among ``keys`` whose
+    region ``fao`` (``(regions, patches)``, or None) holds, each region's
+    listed patches that are there."""
+    if fao is None:
+        return {}
+    from transitio_index import metros
+
+    regions, patches = fao
+    found = {}
+    for key in keys:
+        place = by_id[key]
+        region = regions.get(place.get("statistical_area_id"))
+        if place.get("source_subtype") != metros.FAO_SUBTYPE or region is None:
+            continue
+        polygons = [
+            patches[p]["geom"]
+            for p in region["patches"]
+            if p in patches and _valid_polygon(patches[p]["geom"])
+        ]
+        if polygons:
+            found[key] = polygons
+    return found
+
+
+def _official_union(divisions, inventory, shipped_sources):
+    """The union of the divisions' area rows — each division's rows in
+    ``divisions`` — that pass the audit a place's area passes (every source
+    allowlisted, every polygon valid), never a hole filled, simplified once;
+    None when none passes or the union is not a valid polygon. Every row's
+    sources are counted in ``inventory``, a shipped one's in
+    ``shipped_sources``."""
+    parts = []
+    for rows in divisions:
+        _count_sources(rows, inventory)
+        if not rows or not all(_is_shippable(row["sources"]) for row in rows):
+            continue
+        geoms = [row["geom"] for row in rows]
+        if not all(_valid_polygon(geom) for geom in geoms):
+            continue
+        parts += geoms
+        if shipped_sources is not None:
+            for row in rows:
+                shipped_sources.update(_source_key(s) for s in row["sources"])
+    if not parts:
+        return None
+    simplified = _simplify(shapely.union_all(parts))
+    return simplified if _valid_polygon(simplified) else None
 
 
 def _area_predicate(ids):
@@ -1080,7 +1236,8 @@ def attach_geometry(
     simplified (unioned) geometry only where every area's sources are
     allowlisted, recording the audit in the licence inventory and NOTICE; a place
     with a disallowed source, no source, or invalid geometry keeps a null
-    geometry; a metro gets the union of its members' areas, or none.
+    geometry; a metro gets the union of its official area's divisions, else
+    of its members' areas, or none.
     One writer lock spans the read, the geometry read and the publish.
     Returns the generation manifest.
     """
@@ -1221,27 +1378,56 @@ def attach_geometry(
             # Drawn once curated boundaries are in, so a curated member or city
             # counts with its own boundary; a metro set_boundary gave a geometry
             # keeps it. Every member must have shipped its own polygon: a metro
-            # is drawn only from what its members already redistribute.
+            # is drawn only from what its members already redistribute — or
+            # over its official area, whose divisions are audited as drawn.
+            # The FAO city-regions a FAO metro ships, under the digests the
+            # metros stage derived its FAO metros from.
+            from transitio_index import metros
+
+            fao_inputs = _fao_inputs(cache_dir, metros_manifest)
+            fao_regions = fao_inputs[0] if fao_inputs is not None else {}
             unions = [
                 place["place_id"]
                 for place in places
                 if place.get("kind") == "metro"
                 and not place.get("geometry")
-                and place.get("member_ids")
-                and all(
-                    (by_id.get(m) or {}).get("geometry") for m in place["member_ids"]
+                and (
+                    place.get("official_parts")
+                    or (
+                        place.get("source_subtype") == metros.FAO_SUBTYPE
+                        and place.get("statistical_area_id") in fao_regions
+                    )
+                    or (
+                        place.get("member_ids")
+                        and all(
+                            (by_id.get(m) or {}).get("geometry")
+                            for m in place["member_ids"]
+                        )
+                    )
                 )
             ]
             member_union = draw_member_unions(
-                cache_dir, dataset, by_id, unions, chunk=chunk
+                cache_dir,
+                dataset,
+                by_id,
+                unions,
+                chunk=chunk,
+                inventory=inventory,
+                shipped_sources=shipped,
+                fao=fao_inputs[:2] if fao_inputs is not None else None,
             )
             invalid += len(unions) - member_union
             centres = settle_centres(places, shipped)
             derived = metros_manifest.get("derived_inventory") or []
             from transitio_index import ucdb  # ucdb -> fao -> geometry
 
+            from transitio_index import fao
+
             inventory_rows = _inventory_rows(
-                inventory, with_geometry, derived, {UCDB_DERIVED: ucdb.RELEASE}
+                inventory,
+                with_geometry,
+                derived,
+                {UCDB_DERIVED: ucdb.RELEASE, FAO_DERIVED: fao.DOI},
             )
             notice = _notice(shipped, overture.OVERTURE_RELEASE, derived)
             manifest = {

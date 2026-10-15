@@ -499,6 +499,10 @@ def _snapshot_id(sources, overture_release=None, digests=()):
         sources["mdb"].get("csv_sha256") or "",
         sources["gbfs"].get("csv_sha256") or "",
     ]
+    # The whole MDB catalogue an Atlas-only feed's twins were found in.
+    catalogue = (sources.get("mdb_catalogue") or {}).get("csv_sha256")
+    if catalogue:
+        parts.append(catalogue)
     if overture_release:
         parts.append(overture_release)
     parts.extend(digests)

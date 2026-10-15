@@ -452,6 +452,7 @@ def _feed_rows(records):
 CATALOGUES = (
     ("Transitland Atlas", "atlas", "commit"),
     ("Mobility Database catalog", "mdb", "csv_sha256"),
+    ("Mobility Database catalog", "mdb_catalogue", "csv_sha256"),
     ("GBFS systems.csv", "gbfs", "csv_sha256"),
 )
 
@@ -554,9 +555,10 @@ def _notice(geometry_notice, sources, feed_rows, provider_lines=()):
     atlas = (sources or {}).get("atlas") or {}
     if atlas.get("commit"):
         lines.append(f"  - Transitland Atlas, commit {atlas['commit']}")
-    mdb = (sources or {}).get("mdb") or {}
-    if mdb.get("csv_sha256"):
-        lines.append(f"  - Mobility Database catalog, sha256 {mdb['csv_sha256']}")
+    for key in ("mdb", "mdb_catalogue"):
+        mdb = (sources or {}).get(key) or {}
+        if mdb.get("csv_sha256"):
+            lines.append(f"  - Mobility Database catalog, sha256 {mdb['csv_sha256']}")
     gbfs = (sources or {}).get("gbfs") or {}
     if gbfs.get("csv_sha256"):
         lines.append(f"  - GBFS systems.csv, sha256 {gbfs['csv_sha256']}")

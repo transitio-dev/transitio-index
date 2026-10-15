@@ -33,12 +33,18 @@ FAO_REGIONS = {
 
 @functools.cache
 def _lookups():
-    """``(by UCDB name, by ISO3)`` from the table."""
+    """``(by UCDB name, by ISO3, every code)`` from the table."""
     rows = csv_source.read_rows(TABLE.read_text(encoding="utf-8"), COLUMNS)
     return (
         {row["ucdb"]: row["code"] for row in rows if row["ucdb"]},
         {row["iso3"]: row["code"] for row in rows if row["iso3"]},
+        frozenset(row["code"] for row in rows),
     )
+
+
+def codes():
+    """Every country code the index partitions by."""
+    return _lookups()[2]
 
 
 def by_ucdb(name):

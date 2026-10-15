@@ -3134,3 +3134,57 @@ def test_a_corrupt_lzma_member_is_unreadable_and_falls_back(tmp_path):
     _, log = crt._crawl(cache, crt._server(served))
     assert log["f-lzma"]["fetched_from"] == crawl.HOSTED_COPY
     assert "Corrupt input data" in log["f-lzma"]["producer_failure"]
+
+
+def test_an_open_feed_that_needs_a_sign_up_carries_its_registration_page(tmp_path):
+    """DELFI's Germany-wide timetable was published as open with no
+    registration page, though downloading it needs a free account and the
+    catalogue's link is one registered user's sharing link."""
+    import test_index_resolve_stage as rst
+
+    from transitio_index import overrides, resolve
+
+    (tmp_path / "bad").mkdir()
+    bad = [{"feed": "f", "set_registration": "not a page"}]
+    with pytest.raises(overrides.OverrideError, match="set_registration must be"):
+        overrides.load_feed_overrides(rst._overrides_dir(tmp_path / "bad", bad))
+    cache = tmp_path / "cache"
+    rst._crosswalk(cache, [rst._feed("f-delfi")])
+    page = "https://www.opendata-oepnv.de/ht/de/standards/registrierung"
+    entries = [{"feed": "f-delfi", "set_registration": page}]
+    resolve.resolve(cache, overrides_dir=rst._overrides_dir(tmp_path, entries))
+    feeds, _ = rst._resolved(cache)
+    delfi = feeds["f-delfi"]
+    assert (delfi["access"], delfi["registration_url"]) == ("open", page)
+
+
+@pytest.mark.parametrize("range_threshold", [10**9, 1])
+def test_the_crawl_reads_the_files_that_place_a_flex_trip(tmp_path, range_threshold):
+    """68 demand-responsive feeds point their timetables at service zones
+    (``locations.geojson``) or stop groups (``location_group_stops.txt``),
+    which the crawl never read, so they ended with the tier "unknown"."""
+    cache = tmp_path / "cache"
+    crt._publish_resolved(cache, [crt._feed("f-flex", "https://feeds.example/f.zip")])
+    zones = {
+        "locations.geojson": b'{"type": "FeatureCollection", "features": []}',
+        "location_group_stops.txt": b"location_group_id,stop_id\ng1,s1\n",
+    }
+    members = {**crt._members(), **zones}
+    archive = crt._zip_bytes({f"gtfs/{name}": data for name, data in members.items()})
+    server = crt._server({"/f.zip": (archive, '"v1"')})
+    lookup = crt.StubLookup({24.9: crt.CITY_RECORDS})
+    _, log = crt._crawl(cache, server, range_threshold=range_threshold, lookup=lookup)
+    record = log["f-flex"]
+    assert set(zones) <= set(record["members"])
+    # One fixed-tier city feed, but a zone may leave the city: no skip.
+    assert record["stop_times"] == "complete"
+    # A state written before the crawl read these files is fetched again.
+    state_path = crt._feed_dir(cache, "f-flex") / "state.json"
+    state = json.loads(state_path.read_text())
+    for name in zones:
+        state["members"].remove(name)
+        del state["member_sha256"][name]
+    state_path.write_text(json.dumps(state))
+    _, log = crt._crawl(cache, server, range_threshold=range_threshold, lookup=lookup)
+    assert log["f-flex"]["method"] != "not_modified"
+    assert set(zones) <= set(log["f-flex"]["members"])

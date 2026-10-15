@@ -286,20 +286,23 @@ def _publish_names(cache, places, **manifest):
         directory.close()
 
 
-def _write_crawl(cache, feed_id, stops_rows):
+def _write_crawl(cache, feed_id, stops_rows, members=None):
     feed_dir = cache / "crawl" / crawl._dir_name(feed_id)
     feed_dir.mkdir(parents=True, exist_ok=True)
     stops_text = "stop_id,stop_lat,stop_lon\n" + "".join(stops_rows)
     # Bytes, not text: the state digest is over exact bytes, and Windows
     # text mode would rewrite the newlines.
-    (feed_dir / "stops.txt").write_bytes(stops_text.encode())
+    files = {"stops.txt": stops_text.encode(), **(members or {})}
+    for name, data in files.items():
+        (feed_dir / name).write_bytes(data)
     (feed_dir / "state.json").write_text(
         json.dumps(
             {
                 "feed_id": feed_id,
-                "members": ["stops.txt"],
+                "members": sorted(files),
                 "member_sha256": {
-                    "stops.txt": hashlib.sha256(stops_text.encode()).hexdigest()
+                    name: hashlib.sha256(data).hexdigest()
+                    for name, data in files.items()
                 },
             }
         )
@@ -307,7 +310,7 @@ def _write_crawl(cache, feed_id, stops_rows):
     log = {
         "feed_id": feed_id,
         "directory": crawl._dir_name(feed_id),
-        "members": ["stops.txt"],
+        "members": sorted(files),
         "method": "download",
     }
     log_path = cache / "crawl" / "crawl_log.jsonl"
@@ -365,6 +368,7 @@ def test_no_crawl_artifacts_pass_the_seed_through(tmp_path):
     assert manifest["mode"] == "declared"
     assert manifest["simplify_tolerance_deg"] == geometry.SIMPLIFY_TOLERANCE_DEG
     assert manifest["places_added"] == 0
+    assert (manifest["zones_read"], manifest["zone_failures"]) == (0, [])
     assert manifest["licence_sources"] == manifest["licence_inventory"] == []
     assert set(places) == {"Q33"}
     assert report == []
@@ -403,6 +407,76 @@ def test_a_crawled_stop_discovers_an_unseeded_city(tmp_path):
     # The country was already seeded and is not duplicated or replaced.
     assert places["Q33"] is not tampere
     assert manifest["places_added"] == 2  # the city and its region
+
+
+def test_a_zone_discovers_the_places_it_reaches_into(tmp_path):
+    # The feed's one stop lies in no city; one zone reaches 0.1° into
+    # Tampere, the other 0.0003° into Nowhere, less than the boundary
+    # simplification: only Tampere and its region are discovered.
+    cache = tmp_path / "cache"
+    _publish_names(cache, SEED_PLACES)
+    zones = [
+        ("deep", shapely.box(23.9, 61.45, 24.2, 61.55)),
+        ("sliver", shapely.box(25.6, 62.05, 26.0003, 62.15)),
+    ]
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "id": zone_id, "geometry": shapely.geometry.mapping(z)}
+            for zone_id, z in zones
+        ],
+    }
+    _write_crawl(
+        cache,
+        "f-flex",
+        ["s1,63.0,25.0\n"],
+        {"locations.geojson": json.dumps(geojson).encode()},
+    )
+    manifest, places, _ = _expand(tmp_path, cache)
+    assert {"Q40840", "Q5697"} <= set(places)
+    assert "Nowhere" not in {place.get("name") for place in places.values()}
+    assert manifest["zones_read"] == 2
+    assert manifest["zone_failures"] == []
+
+
+def test_an_onestop_cell_discovers_the_place_holding_it(tmp_path):
+    # The crawl's one stop lies in no city; an Atlas-only feed's Onestop ID
+    # names a cell inside Tampere, in the crosswalk the seed read. A later
+    # crosswalk naming a cell in Nowhere is not read.
+    cache = tmp_path / "cache"
+
+    def publish(subdir, pointer, artifact, records, manifest):
+        directory = store.open_subdir(cache, subdir)
+        try:
+            with store.exclusive_writer(directory):
+                return store.publish(
+                    cache / subdir,
+                    pointer,
+                    {artifact: store.jsonl_chunks(records)},
+                    manifest,
+                    held=directory,
+                )
+        finally:
+            directory.close()
+
+    def crosswalk(cell):
+        feeds = [{"feed_id": "f-tre", "onestop_cell": cell}]
+        return publish("crosswalk", "feeds.json", "feeds.jsonl", feeds, {})
+
+    read = crosswalk([23.7, 61.45, 23.8, 61.5])
+    seed = publish(
+        "gazetteer",
+        "seed.json",
+        "feed_places.jsonl",
+        [],
+        {"crosswalk_generation": read["generation"]},
+    )
+    crosswalk([26.1, 62.05, 26.2, 62.1])
+    _publish_names(cache, SEED_PLACES, seed_generation=seed["generation"])
+    _write_crawl(cache, "f-other", ["s1,63.0,25.0\n"])
+    _, places, _ = _expand(tmp_path, cache)
+    assert {"Q40840", "Q5697"} <= set(places)
+    assert "Nowhere" not in {place.get("name") for place in places.values()}
 
 
 @pytest.mark.parametrize("kind", ["region", "city"], ids=["seeded", "conflicting"])
@@ -543,8 +617,10 @@ def test_a_discovered_city_gains_the_eurostat_metro_the_run_derived(tmp_path):
     )
     assert metro["member_ids"] == ["Q40840"]
     assert places["Q40840"]["metro_ids"] == ["eurostat_metro:FI002M"]
-    # Drawn from its member's shipped boundary, so the licence stage keeps it.
-    assert metro["geometry_source"] == "member_union"
+    # Drawn over the municipalities mostly inside its official area — here
+    # Tampere's two parts — so the licence stage keeps it.
+    assert metro["official_parts"] == ["fi-tre"]
+    assert metro["geometry_source"] == geometry.OFFICIAL_AREA
     boundary = shapely.from_wkb(bytes.fromhex(metro["geometry"]))
     assert boundary.covers(shapely.Point(23.8, 61.5))
     assert manifest["metros_added"] == 1
@@ -598,7 +674,11 @@ def test_a_discovered_city_gains_the_functional_urban_area_the_run_derived(
     assert metro["country_code"] == "FI"
     assert metro["member_ids"] == (["Q1", "Q40840"] if seeded else ["Q40840"])
     assert places["Q40840"]["metro_ids"] == ["eurostat_fua:FI002F"]
-    assert metro["geometry_source"] == "member_union"
+    # A metro minted here takes its official area; one the seed published
+    # and this expansion joined keeps the boundary its run gave it.
+    assert metro["geometry_source"] == (
+        "member_union" if seeded else geometry.OFFICIAL_AREA
+    )
     assert manifest["metros_added"] == (0 if seeded else 1)
 
 
@@ -760,8 +840,14 @@ def test_a_fao_region_the_seed_left_unpublished_is_minted_over_every_city(
     assert manifest["metros_added"] == 1
 
 
-@pytest.mark.parametrize("seeded_core", [False, True], ids=["joins", "leaves"])
-def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core):
+@pytest.mark.parametrize(
+    ("seeded_core", "curated"),
+    [(False, False), (True, False), (True, True)],
+    ids=["joins", "leaves", "curated"],
+)
+def test_a_sliver_fao_metros_core_is_settled_on_discovery(
+    tmp_path, seeded_core, curated
+):
     from test_index_metros import _fao_inputs, _ucdb_inputs
     from transitio_index import fao, ucdb
 
@@ -770,9 +856,8 @@ def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core)
     # whose centre lies in Pirkanmaa. A stop off every city discovers
     # Pirkanmaa, which joins as the core; or the seed gave the metro a core
     # and a stop discovers Badgeo, a city shipping no polygon, so it leaves.
-    files, pins = _fao_inputs(
-        tmp_path, patch=shapely.box(21.0, 60.5, 29.0, 62.5), iso3="FIN"
-    )
+    patch = shapely.box(21.0, 60.5, 29.0, 62.5)
+    files, pins = _fao_inputs(tmp_path, patch=patch, iso3="FIN")
     fao.prepare_inputs(cache, files=files, expected=pins)
     centres, centre_pins = _ucdb_inputs(
         tmp_path, centre=shapely.box(23, 61.2, 24, 61.8)
@@ -802,6 +887,7 @@ def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core)
         "country_code": "FI",
         "statistical_area_id": "50",
         "geometry": shapely.to_wkb(drawn).hex(),
+        "geometry_source": geometry.CURATED if curated else "member_union",
         "metro_ids": [],
         "member_ids": ["Q1", "Q2"] if seeded_core else ["Q1"],
     }
@@ -824,15 +910,27 @@ def test_a_sliver_fao_metros_core_is_settled_on_discovery(tmp_path, seeded_core)
     boundary = shapely.from_wkb(bytes.fromhex(metro["geometry"]))
     assert manifest["places_added"] == 1
     if seeded_core:
-        # Redrawn over the members it keeps, without the core.
+        # The core leaves the members.
         assert metro["member_ids"] == ["Q1", "Q999"]
         assert places["Q2"]["metro_ids"] == []
-        assert not boundary.covers(shapely.Point(23.5, 61.5))
     else:
-        # Redrawn over its members, the metro now takes Pirkanmaa's shape.
+        # Pirkanmaa joins as the core.
         assert metro["member_ids"] == ["Q1", "Q5697"]
         assert places["Q5697"]["metro_ids"] == [key]
-        assert boundary.covers(shapely.Point(24.4, 61.1))
+    if curated:
+        # A boundary a curator drew stays, whatever its members.
+        assert metro["geometry_source"] == geometry.CURATED
+        assert boundary.equals(drawn)
+        return
+    # Either way the metro is redrawn as its city-region, whatever its members,
+    # inventoried at the FAO record's version.
+    assert metro["geometry_source"] == geometry.OFFICIAL_AREA
+    assert boundary.equals(patch)
+    assert {
+        row["version"]
+        for row in manifest["licence_inventory"]
+        if row["dataset"] == geometry.FAO_DERIVED[0]
+    } == {fao.DOI}
 
 
 def test_an_unauditable_boundary_ships_without_geometry(tmp_path):

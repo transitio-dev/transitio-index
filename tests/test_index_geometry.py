@@ -98,7 +98,7 @@ AREAS = [
 ]
 
 
-def _publish(cache, records, overrides_dir=None, derived=()):
+def _publish(cache, records, overrides_dir=None, derived=(), derived_inputs=None):
     from transitio_index import overrides
 
     directory = store.open_subdir(cache, "gazetteer")
@@ -111,6 +111,7 @@ def _publish(cache, records, overrides_dir=None, derived=()):
                 {
                     "source": "metros",
                     "derived_inventory": list(derived),
+                    "derived_inputs": derived_inputs,
                     "places_overrides_sha256": overrides.places_digest(overrides_dir),
                 },
                 held=directory,
@@ -486,6 +487,97 @@ def test_a_metro_is_its_members_union_holed_only_around_other_cities(tmp_path):
     assert places["Q_PARTIAL"]["geometry"] is None
     assert places["Q_METRO"]["geometry"] is None
     assert manifest["member_union_geometry"] == 1
+
+
+def test_an_official_area_metro_is_drawn_over_its_audited_parts_alone(tmp_path):
+    # Two counties no place holds, one from a source not allowlisted and
+    # holding a hole, and a member city outside both: the metro is the
+    # allowed county alone, its hole kept.
+    allowed = shapely.box(0, 0, 2, 2).difference(shapely.box(0.5, 0.5, 1, 1))
+    records = [
+        _place("Q_city", "city", overture_id="city"),
+        {
+            **_place("Q_MSA", "metro", members=("Q_city",)),
+            "official_parts": ["county-a", "county-b"],
+        },
+    ]
+    cache = tmp_path / "cache"
+    _publish(cache, records)
+    denied = {"dataset": "Mystery Maps", "license": "proprietary", "record_id": "x"}
+    rows = [
+        fx.area("county-a", shapely.to_wkb(allowed), [_osm()]),
+        fx.area("county-b", shapely.to_wkb(shapely.box(2, 0, 4, 2)), [denied]),
+        fx.area("city", shapely.to_wkb(shapely.box(10, 10, 11, 11)), [_osm()]),
+    ]
+    dataset = fx.write_area_dataset(tmp_path / "areas.parquet", rows)
+    manifest = geometry.attach_geometry(cache, dataset=dataset)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    metro = {p["place_id"]: p for p in places}["Q_MSA"]
+    assert metro["geometry_source"] == geometry.OFFICIAL_AREA
+    assert shapely.from_wkb(metro["geometry"]).equals(allowed)
+    assert manifest["member_union_geometry"] == 1
+    inventory, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    assert any(row["dataset"] == "Mystery Maps" for row in inventory)
+    # A metro a curator drew is never redrawn.
+    curated = {**metro, "geometry": "ff", "geometry_source": geometry.CURATED}
+    by_id = {"Q_MSA": curated}
+    assert geometry.draw_member_unions(cache, dataset, by_id, ["Q_MSA"]) == 0
+    assert by_id["Q_MSA"]["geometry"] == "ff"
+
+
+def test_a_fao_metro_ships_its_city_region(tmp_path):
+    # Region 50 is one patch; region 51 is not in the inputs, so its metro
+    # keeps its members' union, as does a metro of another definition whose
+    # code happens to be 50.
+    from test_index_metros import _fao_inputs
+    from transitio_index import fao, metros
+
+    patch = shapely.box(21.0, 60.5, 29.0, 62.5)
+    files, pins = _fao_inputs(tmp_path, patch=patch, iso3="FIN")
+    cache = tmp_path / "cache"
+    fao.prepare_inputs(cache, files=files, expected=pins)
+    records = [_place("Q_city", "city", overture_id="city")]
+    for region in ("50", "51"):
+        records.append(
+            {
+                **_place(f"Q_{region}", "metro", members=("Q_city",)),
+                "source_subtype": metros.FAO_SUBTYPE,
+                "statistical_area_id": region,
+            }
+        )
+    records.append(
+        {
+            **_place("Q_EU", "metro", members=("Q_city",)),
+            "source_subtype": "functional urban area",
+            "statistical_area_id": "50",
+        }
+    )
+    _publish(cache, records, derived_inputs={"fao": pins})
+    city = shapely.box(22.0, 61.0, 23.0, 62.0)
+    dataset = fx.write_area_dataset(
+        tmp_path / "areas.parquet", [fx.area("city", shapely.to_wkb(city), [_osm()])]
+    )
+    geometry.attach_geometry(cache, dataset=dataset)
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    places = {p["place_id"]: p for p in places}
+    assert places["Q_50"]["geometry_source"] == geometry.OFFICIAL_AREA
+    assert shapely.from_wkb(places["Q_50"]["geometry"]).equals(patch)
+    assert places["Q_51"]["geometry_source"] == "member_union"
+    assert places["Q_EU"]["geometry_source"] == "member_union"
+    assert geometry.SOURCE_ALLOWLIST[geometry.FAO_DERIVED]["licence"] == "CC-BY-4.0"
+    credit = geometry.DERIVED_SOURCES[geometry.FAO_DERIVED]["credit"]
+    assert credit in _read_text(cache, "NOTICE")
+    inventory, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    fao_rows = [row for row in inventory if row["dataset"] == geometry.FAO_DERIVED[0]]
+    assert fao_rows and fao_rows[0]["version"] == fao.DOI
 
 
 def test_a_city_without_an_area_ships_its_twins_or_council_areas_boundary(tmp_path):
@@ -877,3 +969,18 @@ def test_the_area_scan_is_narrowed_to_the_places_countries(tmp_path):
     )
     assert seen["filter"].equals(expected)
     assert set(areas) == {"A", "B"}  # B has no country and is still read
+
+
+def test_a_zone_core_keeps_thin_parts_and_reaches_interiors_only():
+    tol = geometry.SIMPLIFY_TOLERANCE_DEG
+    thick = shapely.box(0.0, 0.0, 1.0, 1.0)
+    thin = shapely.box(2.0, 0.0, 2.0 + tol, 1.0)
+    core = geometry.zone_core(shapely.MultiPolygon([thick, thin]))
+    # Each part shrinks on its own; the thin one keeps its outline.
+    assert core.covers(thin)
+    assert core.intersection(thick).equals(shapely.box(tol, tol, 1 - tol, 1 - tol))
+    # Touching a boundary is not reaching into it.
+    tree = shapely.STRtree(
+        [shapely.box(1.0 - tol, 0.0, 2.0, 1.0), shapely.box(0.5, 0.5, 3.0, 3.0)]
+    )
+    assert geometry.interior_hits(tree, core).tolist() == [1]

@@ -304,6 +304,8 @@ def _run(
         derive_fao=bool(fao),
         urau_pins=urau_pins,
         derive_urau=urau is not None,
+        derive_cbsa=False,
+        division_dataset=dataset,
     )
     places, _ = store.read_jsonl(
         cache / "gazetteer", "metros.json", "places_seed.jsonl"
@@ -569,6 +571,7 @@ def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
             pins=_inputs(tmp_path, tmp_path / "cache"),
             derive_fao=False,
             derive_urau=False,
+            derive_cbsa=False,
         )
 
 
@@ -720,6 +723,7 @@ def test_an_unavailable_eurostat_input_degrades_to_no_eu_metros(tmp_path, monkey
         "metros_published": 0,
     }
     assert manifest["derived_inputs"] == {
+        "cbsa": None,
         "eurostat": None,
         "urau": None,
         "fao": None,
@@ -1514,3 +1518,133 @@ def test_a_sliver_fao_metro_takes_its_region_as_a_core(tmp_path, curated):
         assert metro["member_ids"] == ["Q1204", "Q1297"]
         assert places["Q1204"]["metro_ids"] == ["fao_city_region:50"]
         assert manifest["fao"] == {"published": 1, "memberships": 2, "cores": 1}
+
+
+def test_a_us_metro_takes_its_delineated_counties_as_official_parts():
+    # 06037 is a county of the skeleton; 08031 only the place of a
+    # consolidated city-county; 11001 nothing below a country; the second
+    # metro is not a delineated MSA.
+    class Wikidata:
+        def fips_items(self, codes):
+            found = {"06037": ["Q104994"], "08031": ["Q16554"], "11001": ["Q30"]}
+            return {code: found[code] for code in codes if code in found}
+
+    # Los Angeles County resolved through its OSM relation: no direct tag.
+    skeleton = [
+        {"overture_id": "us-lac", "qid": "Q104994", "wikidata": None, "kind": "region"},
+        {"overture_id": "us", "qid": "Q30", "wikidata": "Q30", "kind": "country"},
+    ]
+    msa = {
+        "place_id": "Q1",
+        "source_subtype": "metropolitan statistical area",
+        "statistical_area_id": "31080",
+    }
+    other = {**msa, "place_id": "Q2", "statistical_area_id": "99999"}
+    # A country place never stands in for a county.
+    places = {
+        "Q16554": {"overture_id": "us-den", "kind": "city"},
+        "Q30": {"overture_id": "us", "kind": "country"},
+    }
+    delineation = {"31080": ["06037", "08031", "11001"]}
+    took, missing = metros.official_parts(
+        [msa, other], delineation, Wikidata(), skeleton, places
+    )
+    assert (took, missing) == (1, [("Q1", "11001")])
+    assert msa["official_parts"] == ["us-den", "us-lac"]
+    assert "official_parts" not in other
+
+
+def test_the_delineation_keeps_the_metropolitan_counties():
+    import io
+
+    import openpyxl
+
+    from transitio_index import cbsa
+
+    def workbook(header, *rows):
+        book = openpyxl.Workbook()
+        sheet = book.active
+        sheet.append(["Table title"])
+        sheet.append(["List 1"])
+        sheet.append(header)
+        for row in rows:
+            sheet.append(row)
+        sheet.append([None])
+        sheet.append(["Note: the standards are at …"])
+        data = io.BytesIO()
+        book.save(data)
+        return data.getvalue()
+
+    header = list(cbsa.COLUMNS)
+    data = workbook(
+        header,
+        ["31080", cbsa.METROPOLITAN, "6", "37"],
+        ["31080", cbsa.METROPOLITAN, "06", "059"],
+        ["10100", "Micropolitan Statistical Area", "46", "013"],
+    )
+    assert cbsa.read_delineation(data) == {"31080": ["06037", "06059"]}
+    for broken in (
+        workbook(header[:2]),
+        workbook(header, ["31080", cbsa.METROPOLITAN, None, "37"]),
+    ):
+        with pytest.raises(cbsa.CbsaError):
+            cbsa.read_delineation(broken)
+
+
+def test_a_eurostat_metro_takes_the_municipalities_mostly_inside_its_area(tmp_path):
+    # AA001F is one area; AA002M is two NUTS-3 regions, R1 and R2; R0 is land
+    # in no metro. m-in lies inside AA001F, m-split half in R1 and half in R2
+    # (all in AA002M), m-out 40 % inside AA001F and the rest in R0, and
+    # m-coast 40 % in R2 and the rest at sea, outside every land region.
+    regions = {
+        "AA001F": shapely.box(0, 0, 2, 2),
+        "R1": shapely.box(4, 0, 6, 2),
+        "R2": shapely.box(6, 0, 7.6, 2),
+    }
+    towns = {
+        "m-in": shapely.box(0.5, 0.5, 1.5, 1.5),
+        "m-split": shapely.box(5.5, 0.5, 6.5, 1.5),
+        "m-out": shapely.box(1.6, 0.5, 2.6, 1.5),
+        "m-coast": shapely.box(7.2, 0.5, 8.2, 1.5),
+    }
+
+    class Lookup:
+        def ensure(self, boxes):
+            return 0
+
+        def divisions_reached(self, shape):
+            return [
+                {"overture_id": key, "kind": "city", "country": "AA"}
+                for key, town in towns.items()
+                if town.intersects(shape) and not town.touches(shape)
+            ]
+
+    composition = {
+        "AA001F": {"nuts3": ["AA001F"]},
+        "AA002M": {"nuts3": ["R1", "R2"]},
+    }
+    dataset = fx.write_area_dataset(
+        tmp_path / "areas.parquet",
+        [
+            fx.area(key, shapely.to_wkb(town), [], country="AA")
+            for key, town in towns.items()
+        ],
+    )
+    definition = metros.Definition("b", "area", "ns", (), (), 0.5)
+    rows = [
+        {"source_subtype": "area", "statistical_area_id": code}
+        for code in ("AA001F", "AA002M", "ZZ999F")
+    ]
+    took, empty = metros.eurostat_parts(
+        rows,
+        definition,
+        (composition, regions, {}),
+        Lookup(),
+        tmp_path / "cache",
+        dataset,
+        land={**regions, "R0": shapely.box(2, 0, 4, 2)},
+    )
+    assert (took, empty) == (2, 0)
+    assert rows[0]["official_parts"] == ["m-in"]
+    assert rows[1]["official_parts"] == ["m-coast", "m-split"]
+    assert "official_parts" not in rows[2]

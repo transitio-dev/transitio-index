@@ -233,13 +233,31 @@ def test_shorter_patterns_survive_many_longer_duplicates():
     assert sequences["r"] == [("a", "b", "c"), ("a", "d")]
 
 
-def test_a_blank_stop_id_row_leaves_no_legs():
+@pytest.mark.parametrize(
+    ("hole", "sequences"),
+    [
+        ("t,,,,3", {}),
+        ("t,,z,,3", {"r": [("a", "b", "", "c")]}),
+        ("t,,,G,3", {"r": [("a", "b", "", "c")]}),
+    ],
+    ids=["blank", "flex-zone", "unresolved-group"],
+)
+def test_a_row_without_a_stop_never_bridges_a_leg(hole, sequences):
+    # A blank row leaves the trip no legs; a Flex row breaks them, and the
+    # leg beside it stays.
     import io
 
-    rows = b"trip_id,stop_id,stop_sequence\nt,a,1\nt,,2\nt,c,3\n"
-    stops, sequences, *_ = classify._read_stop_times(io.BytesIO(rows), {"t": "r"}, {})
-    assert stops["r"] == {"a", "c"}
-    assert sequences == {}
+    rows = (
+        "trip_id,stop_id,location_id,location_group_id,stop_sequence\n"
+        f"t,a,,,1\nt,b,,,2\n{hole}\nt,c,,,4\n"
+    ).encode()
+    stops, found, *_ = classify._read_stop_times(io.BytesIO(rows), {"t": "r"}, {})
+    assert stops["r"] == {"a", "b", "c"}
+    assert found == sequences
+    coords = {"a": (1.0, 1.0), "b": (1.0, 1.1), "c": (5.0, 5.0)}
+    _, median, _ = classify._route_geography(stops["r"], found.get("r", []), coords)
+    leg = classify.haversine_km(coords["a"], coords["b"])
+    assert median == (leg if sequences else None)
 
 
 def test_pattern_sampling_keeps_distinct_patterns():
@@ -565,6 +583,108 @@ def _build(tmp_path):
     for edge in edges:
         grouped.setdefault(edge["feed_id"], {})[(edge["place_id"], edge["tier"])] = edge
     return cache, manifest, grouped
+
+
+class ZoneLookup(StubLookup):
+    """The stub's points, and zones answered from division polygons."""
+
+    def __init__(self, by_x, polygons):
+        super().__init__(by_x)
+        self.polygons = polygons
+
+    def divisions_reached(self, shape):
+        return [
+            record
+            for polygon, record in self.polygons
+            if polygon.intersects(shape) and not polygon.touches(shape)
+        ]
+
+    def divisions_covering(self, shape):
+        return [record for polygon, record in self.polygons if polygon.covers(shape)]
+
+
+def test_flex_trips_classify_by_their_zones_and_stop_groups(tmp_path):
+    # inner: a zone inside Q-city whose trip names it twice (a pickup and a
+    # drop-off window); wide: a zone reaching Q-city and Q-other; group: a
+    # trip at a stop group of two Q-city stops. The calendar runs every day.
+    import io
+    import zipfile
+
+    import shapely
+    from transitio.index import fingerprint
+
+    inner = shapely.box(9.8, 0.5, 10.2, 1.5)
+    wide = shapely.box(10.2, 0.5, 19.8, 1.5)
+    region = [{"kind": "region", "wikidata": "Q-reg", "country": "AA"}]
+    lookup = ZoneLookup(
+        LOOKUP.by_x,
+        [
+            (shapely.box(9.5, 0.0, 10.5, 2.0), {**_records("Q-city")[0]}),
+            (shapely.box(19.5, 0.0, 20.5, 2.0), {**_records("Q-other")[0]}),
+            (shapely.box(0.0, -10.0, 70.0, 10.0), region[0]),
+            (shapely.box(0.0, -10.0, 70.0, 10.0), _records("Q-city")[2]),
+        ],
+    )
+    for index, (_, record) in enumerate(lookup.polygons):
+        record["division_id"] = f"d{index}"
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "id": key, "geometry": shapely.geometry.mapping(z)}
+            for key, z in (("inner", inner), ("wide", wide))
+        ],
+    }
+    members = {
+        "stops.txt": b"stop_id,stop_lat,stop_lon\nhq,1.0,10.0\ng1,1.0,10.01\ng2,1.0,10.02\n",
+        "routes.txt": b"route_id,route_type\ninner,715\nwide,715\ngroup,3\n",
+        "trips.txt": b"trip_id,route_id,service_id\nt1,inner,all\nt2,wide,all\nt3,group,all\n",
+        "calendar.txt": (
+            b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+            b"start_date,end_date\nall,1,1,1,1,1,1,1,20260105,20260111\n"
+        ),
+        "stop_times.txt": (
+            b"trip_id,stop_id,location_id,location_group_id,stop_sequence\n"
+            b"t1,,inner,,1\nt1,,inner,,2\nt2,,wide,,1\nt3,,,G,1\n"
+        ),
+        "location_group_stops.txt": b"location_group_id,stop_id\nG,g1\nG,g2\n",
+        "locations.geojson": json.dumps(geojson).encode(),
+    }
+    cache = tmp_path / "cache"
+    _write_crawl(cache, "f-flex", members, "complete")
+    feeds = [
+        {"feed_id": "f-flex", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    places = ("Q-city", "Q-other", "Q-reg", "Q-c", "Q-metro")
+    _coverage(cache, feeds, [_candidate(p, "f-flex") for p in places])
+    classify.classify(cache, lookup=lookup)
+    rows, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    edges = {(e["place_id"], e["tier"]): e for e in rows}
+    assert {tier for _, tier in edges} == {"local", "regional"}
+    # One city holds the inner zone and the group's stops; the wide zone
+    # reaches two cities and spans its hull.
+    local = edges[("Q-city", "local")]
+    assert local["evidence"]["rules"] == ["one_city"]
+    # The pair's service over every route serving Q-city: one departure for
+    # t1 however many rows name its zone, t3's spread over the group's two
+    # stops, and t2's.
+    assert local["service"] == {"stops": 4, "routes": 3, "departures_per_day": 3.0}
+    assert ("Q-metro", "local") in edges and ("Q-other", "local") not in edges
+    other = edges[("Q-other", "regional")]
+    assert other["service"] == {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+    diagonals = [((10.2, 0.5), (19.8, 1.5)), ((10.2, 1.5), (19.8, 0.5))]
+    assert other["evidence"]["spread_km"] == pytest.approx(
+        max(classify.haversine_km(a, b) for a, b in diagonals)
+    )
+    # The reader's fingerprint reads stop ids only, as before.
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as written:
+        for name, data in members.items():
+            written.writestr(name, data)
+    archive.seek(0)
+    assert (
+        local["classification_fingerprint"]
+        == fingerprint.from_feed(archive, local["fingerprint_kind"])[0]
+    )
 
 
 def test_routes_are_measured_and_edges_split_by_tier(tmp_path):
@@ -1709,6 +1829,11 @@ def test_the_border_gate_needs_two_minority_stops_and_a_tenth():
     sliver = {"AA": frozenset({"a0", "a1", "x"}), "BB": frozenset({"x"})}
     decision = route(sliver)
     assert decision["international"] is False and decision["border_stops"] == {}
+    # A zone reaching the other country serves it there, whatever else it
+    # reaches; it counts once among the route's locations.
+    zones = {("zone", "z1"), ("zone", "z2")}
+    decision = route({"AA": frozenset({"a0", *zones}), "BB": frozenset(zones)})
+    assert decision["international"] is True
     # A route declared international is not added a second time.
     declared = route(_stops(AA=17, BB=3), route_type=201)
     assert (declared["tier"], declared["international"]) == ("international", False)
@@ -1740,3 +1865,21 @@ def test_a_foreign_stop_that_breaks_a_skip_is_counted_as_a_border_stop(tmp_path)
     )
     (feed,) = records
     assert feed["border_stops"] == 1 and feed["stops_in_several_countries"] == 0
+
+
+def test_an_official_area_metro_holds_its_own_polygons_stops_only():
+    from transitio_index import geometry
+
+    places = {
+        "city": {"kind": "city", "metro_ids": ["drawn", "union"]},
+        "drawn": {
+            "kind": "metro",
+            "member_ids": ["city"],
+            "geometry_source": geometry.OFFICIAL_AREA,
+        },
+        "union": {"kind": "metro", "member_ids": ["city"]},
+    }
+    assert classify.metros_of(places)["city"] == {"union"}
+    route = {"place_stops": {"city": {"s1"}, "drawn": {"s2"}, "union": set()}}
+    assert classify._place_stop_ids(route, "drawn", places["drawn"]) == {"s2"}
+    assert classify._place_stop_ids(route, "union", places["union"]) == {"s1"}

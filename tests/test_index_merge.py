@@ -305,11 +305,19 @@ IDENTITY = {"stops.txt": "s", "routes.txt": "r", "trips.txt": "t", "calendar.txt
     [
         (IDENTITY, 5, None, True),
         ({**IDENTITY, "trips.txt": "t2"}, 5, None, False),
+        ({**IDENTITY, "locations.geojson": "z"}, 5, None, False),
         (IDENTITY, 1, None, False),
         (IDENTITY, 5, 0, False),
         (IDENTITY, 5, True, False),
     ],
-    ids=["same-content", "other-trips", "one-stop", "stale-version", "bool-version"],
+    ids=[
+        "same-content",
+        "other-trips",
+        "other-zones",
+        "one-stop",
+        "stale-version",
+        "bool-version",
+    ],
 )
 def test_feeds_another_build_kept_with_the_same_content_fold(
     tmp_path, other, stops, version, folded
@@ -985,7 +993,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
     read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
     assert set(read["snapshot"].to_pylist()) == {snapshot_id}
-    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 22
+    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 24
     assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
     assert manifest["min_reader_version"] == MIN_READER_VERSIONS[12]
     assert manifest["built_with"] == transitio.__version__
