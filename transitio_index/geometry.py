@@ -1,13 +1,13 @@
 """Attach simplified place geometry and audit its source licences.
 
 Reads the Overture ``division_area`` polygons for the seeded admin places,
-simplifies them to a shipping tolerance, and audits each area's sources against
-an allowlist of audited ``(dataset, licence)`` pairs: geometry ships (as
-hex-encoded WKB) only when every source that built it is on the allowlist, and
-its attribution goes into ``NOTICE``; geometry with any unaudited or unlicensed
-source is omitted and recorded in the licence inventory. A division Overture
-splits into a land area and a territorial one (land and sea) ships both, so
-its boundary holds its sea; metro memberships are measured over land areas
+simplifies them to a shipping tolerance, and audits each area's sources by
+licence: geometry ships (as hex-encoded WKB) only when every source that built
+it names its dataset and a licence of ``SHIPPABLE_LICENCES``, and its
+attribution goes into ``NOTICE``; geometry with any unlicensed source, or one
+under another licence, is omitted and recorded in the licence inventory. A
+division Overture splits into a land area and a territorial one (land and sea)
+ships both, so its boundary holds its sea; metro memberships are measured over land areas
 only (``eurostat.place_footprint``). A metro with an official area (a US
 metro's delineated counties, a Eurostat metro's municipalities) is the union
 of those divisions' audited areas, holes kept; a FAO metro is its
@@ -58,45 +58,61 @@ AREA_READ_ATTEMPTS = 3
 # keeps the ones it is blocked on (PROXY_SCAN_OPTIONS lets it hold about two).
 RETRY_IO_THREADS = 2
 
-# Explicit allowlist of AUDITED geometry sources, keyed by ``(dataset, licence)``
-# so a new upstream dataset is not shipped on a familiar licence until it is
-# audited. Each records the NOTICE credit, the licence's canonical URL, and
-# whether the licence is share-alike (ODbL), which the plan flags as a recorded
-# policy decision. The pairs are those Overture 2026-08-19.0 carried.
-SOURCE_ALLOWLIST = {
-    ("OpenStreetMap", "ODbL-1.0"): {
-        "credit": "OpenStreetMap, © OpenStreetMap contributors",
+# The licences a boundary source may ship under, by the SPDX id Overture gives,
+# with the name and canonical URL NOTICE cites: every permissive licence,
+# whatever the dataset, and ODbL, whose share-alike terms NOTICE states. A
+# source with no licence or any other (a non-commercial or no-derivatives one
+# among them) keeps its area out of the index.
+SHIPPABLE_LICENCES = {
+    "CC0-1.0": {
+        "licence": "CC0 1.0",
+        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "share_alike": False,
+    },
+    **{
+        f"CC-BY-{version}": {
+            "licence": f"CC BY {version}",
+            "url": f"https://creativecommons.org/licenses/by/{version}/",
+            "share_alike": False,
+        }
+        for version in ("1.0", "2.0", "2.5", "3.0", "4.0")
+    },
+    "PDDL-1.0": {
+        "licence": "PDDL 1.0",
+        "url": "https://opendatacommons.org/licenses/pddl/1-0/",
+        "share_alike": False,
+    },
+    "ODC-By-1.0": {
+        "licence": "ODC-By 1.0",
+        "url": "https://opendatacommons.org/licenses/by/1-0/",
+        "share_alike": False,
+    },
+    "CDLA-Permissive-1.0": {
+        "licence": "CDLA-Permissive 1.0",
+        "url": "https://cdla.dev/permissive-1-0/",
+        "share_alike": False,
+    },
+    "CDLA-Permissive-2.0": {
+        "licence": "CDLA-Permissive 2.0",
+        "url": "https://cdla.dev/permissive-2-0/",
+        "share_alike": False,
+    },
+    "ODbL-1.0": {
         "licence": "ODbL 1.0",
         "url": "https://opendatacommons.org/licenses/odbl/1-0/",
         "share_alike": True,
     },
-    ("Esri Community Maps", "CC0-1.0"): {
-        "credit": "Esri Community Maps",
-        "licence": "CC0 1.0",
-        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
-        "share_alike": False,
-    },
-    ("geoBoundaries", "CC-BY-4.0"): {
-        "credit": "geoBoundaries",
-        "licence": "CC BY 4.0",
-        "url": "https://creativecommons.org/licenses/by/4.0/",
-        "share_alike": False,
-    },
-    ("Linz", "CC-BY-4.0"): {
-        "credit": "Land Information New Zealand (LINZ)",
-        "licence": "CC BY 4.0",
-        "url": "https://creativecommons.org/licenses/by/4.0/",
-        "share_alike": False,
-    },
-    ("Maps Entity Variant Names", "CC0-1.0"): {
-        "credit": "Maps Entity Variant Names",
-        "licence": "CC0 1.0",
-        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
-        "share_alike": False,
-    },
 }
 
-# Overture aggregates the sources above under its own permissive licence; the
+# The NOTICE credit of a boundary source whose terms ask for more than its
+# dataset's name; any other is credited by that name.
+SOURCE_CREDITS = {
+    "OpenStreetMap": "OpenStreetMap, © OpenStreetMap contributors",
+    "Esri Community Maps": "Esri Community Maps contributors",
+    "Linz": "Land Information New Zealand (LINZ)",
+}
+
+# Overture aggregates its boundary sources under its own permissive licence; the
 # inventory records it as the aggregator, versioned by the build's release. The URL
 # is the licence's canonical URL, as the inventory records licence URLs.
 OVERTURE_AGGREGATOR = {
@@ -108,7 +124,7 @@ OVERTURE_AGGREGATOR = {
 # The audited DERIVED-data sources — memberships and codes computed from them
 # at build time, as opposed to shipped geometry — with the credit and licence
 # URL their terms require, kept apart from the permission to use them so that
-# a closed source still names its terms. Keyed like the geometry allowlist.
+# a closed source still names its terms. Keyed ``(dataset, licence)``.
 DERIVED_SOURCES = {
     ("Overture Maps divisions", "CDLA-Permissive-2.0"): {
         "credit": "Overture Maps Foundation, divisions theme",
@@ -195,14 +211,14 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
 )
 
 # The FAO city-regions as a derived input: a curated FAO metro publishes
-# only with this row and Overture's allowlisted.
+# only while this row and Overture's are in ``DERIVED_SOURCE_ALLOWLIST``.
 FAO_DERIVED = ("FAO city-regions 2024", "CC-BY-4.0")
-# A FAO metro ships its city-region's polygon, credited as its terms require.
-SOURCE_ALLOWLIST[FAO_DERIVED] = DERIVED_SOURCES[FAO_DERIVED]
 # The GHS-UCDB urban centres: a derived input, and the boundary a seeded city
 # with no other ships.
 UCDB_DERIVED = ("GHS-UCDB R2024A", "CC-BY-4.0")
-SOURCE_ALLOWLIST[UCDB_DERIVED] = DERIVED_SOURCES[UCDB_DERIVED]
+# The derived inputs whose polygons ship (a FAO metro's city-region, a city's
+# urban centre), credited as their terms require.
+SHIPPED_DERIVED = (FAO_DERIVED, UCDB_DERIVED)
 # The Urban Audit functional urban areas as a derived input, like the NUTS
 # boundaries: point-in-polygon at build time, never shipped.
 URAU_DERIVED = ("GISCO Urban Audit 2024", "EuroGeographics-NC")
@@ -408,9 +424,9 @@ def lend_areas(areas, lent):
 
 def ship_area(place, rows, inventory=None, shipped=None, source="overture"):
     """Ship a division's area ``rows`` as ``place``'s simplified geometry,
-    labelled ``source``, when every area's every source is allowlisted and
-    every polygon valid; ``"shipped"``, ``"omitted"`` (a source not
-    allowlisted) or ``"invalid"``. ``inventory`` counts every row's sources
+    labelled ``source``, when every area's every source may ship and every
+    polygon is valid; ``"shipped"``, ``"omitted"`` (a source that may not
+    ship) or ``"invalid"``. ``inventory`` counts every row's sources
     and ``shipped`` gathers those of an area that ships."""
     _count_sources(rows, inventory)
     outcome, simplified = shipped_geometry(rows)
@@ -433,14 +449,14 @@ def _count_sources(rows, inventory):
         # null source, so its omission is auditable, not silent.
         for row_source in row["sources"] or [None]:
             key = _source_key(row_source)
-            inventory[(*key, key in SOURCE_ALLOWLIST)] += 1
+            inventory[(*key, source_terms(key) is not None)] += 1
 
 
 def shipped_geometry(rows):
     """``(outcome, geometry)`` for a division's area ``rows``:
     ``"shipped"`` and the simplified union it ships when every area's every
-    source is allowlisted and every polygon valid, else ``"omitted"`` (a
-    source not allowlisted) or ``"invalid"``, and None."""
+    source may ship and every polygon is valid, else ``"omitted"`` (a source
+    that may not ship) or ``"invalid"``, and None."""
     if not all(_is_shippable(row["sources"]) for row in rows):
         return "omitted", None
     geoms = [row["geom"] for row in rows]
@@ -654,7 +670,7 @@ def _fao_regions(by_id, keys, fao):
 def _official_union(divisions, inventory, shipped_sources):
     """The union of the divisions' area rows — each division's rows in
     ``divisions`` — that pass the audit a place's area passes (every source
-    allowlisted, every polygon valid), never a hole filled, simplified once;
+    shippable, every polygon valid), never a hole filled, simplified once;
     None when none passes or the union is not a valid polygon. Every row's
     sources are counted in ``inventory``, a shipped one's in
     ``shipped_sources``."""
@@ -982,14 +998,37 @@ def _source_key(source):
     return (source.get("dataset"), source.get("license"))
 
 
-def _is_shippable(sources):
-    """True only when every source is an audited, allowlisted ``(dataset, licence)``.
+def source_terms(key):
+    """The NOTICE terms (credit, licence, URL, share-alike) of a boundary
+    source ``(dataset, licence)``, or None when it may not ship: a licence
+    outside ``SHIPPABLE_LICENCES``, or a dataset name NOTICE cannot credit on
+    one line as it is — blank, padded, holding a control character, or holding
+    the ``|`` the stage manifests record a pair with."""
+    if key in SHIPPED_DERIVED:
+        return DERIVED_SOURCES[key]
+    dataset, licence = key
+    terms = SHIPPABLE_LICENCES.get(licence)
+    named = (
+        isinstance(dataset, str)
+        and dataset.strip() == dataset != ""
+        and dataset.isprintable()
+        and "|" not in dataset
+    )
+    if terms is None or not named:
+        return None
+    return {"credit": SOURCE_CREDITS.get(dataset, dataset), **terms}
 
-    A source with a missing licence, or a dataset not yet audited, is not on the
-    allowlist and makes the area unshippable rather than being ignored — a
-    boundary is redistributed only when every source that built it permits it.
+
+def _is_shippable(sources):
+    """True only when every source may ship (``source_terms``).
+
+    A source with a missing licence, or one outside ``SHIPPABLE_LICENCES``,
+    makes the area unshippable rather than being ignored — a boundary is
+    redistributed only when every source that built it permits it.
     """
-    return bool(sources) and all(_source_key(s) in SOURCE_ALLOWLIST for s in sources)
+    return bool(sources) and all(
+        source_terms(_source_key(source)) is not None for source in sources
+    )
 
 
 def _valid_polygons(geoms):
@@ -1023,7 +1062,7 @@ def settle_centres(places, shipped=None):
     """Keep each place's ``centre`` (WKB hex) only when it is a point its
     geometry covers — unchecked without one — and, for an Overture label
     point (``centre_sources``, popped from every place), only when every
-    source is allowlisted; ``shipped`` gathers those sources. Returns how
+    source may ship; ``shipped`` gathers those sources. Returns how
     many places keep a centre."""
     places = list(places)
     sources = [place.pop("centre_sources", None) for place in places]
@@ -1095,9 +1134,9 @@ def _notice(shipped, release, derived=()):
         "",
     ]
     for pair in sorted(shipped):
-        meta = SOURCE_ALLOWLIST[pair]
+        meta = source_terms(pair)
         lines.append(f"  - {meta['credit']} — {meta['licence']} ({meta['url']})")
-    if any(SOURCE_ALLOWLIST[pair]["share_alike"] for pair in shipped):
+    if any(source_terms(pair)["share_alike"] for pair in shipped):
         lines += [
             "",
             "Geometry derived from OpenStreetMap is a Derived Database under the",
@@ -1140,7 +1179,7 @@ def _inventory_rows(inventory, shipped_count, derived=(), releases=None):
     for (dataset_name, licence, allowed), count in sorted(
         inventory.items(), key=lambda item: tuple(str(part) for part in item[0])
     ):
-        meta = SOURCE_ALLOWLIST.get((dataset_name, licence))
+        meta = source_terms((dataset_name, licence))
         rows.append(
             {
                 "role": "component",
@@ -1233,8 +1272,8 @@ def attach_geometry(
     """Attach simplified geometry to the seeded places and write the NOTICE.
 
     Resolves each seeded place's ``division_area`` polygon(s) and ships the
-    simplified (unioned) geometry only where every area's sources are
-    allowlisted, recording the audit in the licence inventory and NOTICE; a place
+    simplified (unioned) geometry only where every area's sources may ship,
+    recording the audit in the licence inventory and NOTICE; a place
     with a disallowed source, no source, or invalid geometry keeps a null
     geometry; a metro gets the union of its official area's divisions, else
     of its members' areas, or none.

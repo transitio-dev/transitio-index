@@ -17,8 +17,8 @@ nulled where redistribution is explicitly disallowed; a feed whose licence
 is unknown keeps its hull, a recorded judgement the ``redistribution_allowed``
 column lets a stricter user overrule.
 
-A place without a boundary of its own — its sources outside the geometry
-allowlist, or a metro — is given the buffered union of the redistributable
+A place without a boundary of its own — a source of it under a licence that
+may not ship, or a metro — is given the buffered union of the redistributable
 coverage hulls of the feeds with an edge to it, labelled
 ``geometry_source = "derived_from_feeds"``, so every place that can have an
 AOI has one materialised. A place still without one is not published: its
@@ -385,10 +385,14 @@ def _geometry_notice(
         )
     staged = _pairs(audit.get("licence_sources"))
     shipped = staged | _pairs(places_manifest.get("licence_sources"))
-    stale = sorted("|".join(pair) for pair in shipped - set(geometry.SOURCE_ALLOWLIST))
+    stale = sorted(
+        "|".join(pair)
+        for pair in shipped
+        if len(pair) != 2 or geometry.source_terms(pair) is None
+    )
     if stale:
         raise LicenseError(
-            f"{', '.join(stale)} is no longer allowlisted; rerun the gazetteer"
+            f"{', '.join(stale)} may no longer ship; rerun the gazetteer"
         )
     derived = [row for row in audit_rows if row.get("role") == "derived_input"]
     credited = shipped | {

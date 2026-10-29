@@ -1619,26 +1619,49 @@ LINZ_CREDIT = (
 )
 
 
-def test_a_linz_area_ships_and_is_credited(tmp_path):
-    """Overture's New Zealand localities carry the LINZ source under CC BY
-    4.0, which was not allowlisted: their boundaries were omitted and the
-    licence stage drew each from its feeds' hulls."""
+@pytest.mark.parametrize(
+    ("dataset_name", "licence", "credit"),
+    [
+        ("Linz", "CC-BY-4.0", LINZ_CREDIT),
+        (
+            "Esri Community Maps",
+            "CC-BY-4.0",
+            "  - Esri Community Maps contributors — CC BY 4.0 "
+            "(https://creativecommons.org/licenses/by/4.0/)",
+        ),
+        (
+            "DadosAbertos",
+            "CC0-1.0",
+            "  - DadosAbertos — CC0 1.0 "
+            "(https://creativecommons.org/publicdomain/zero/1.0/)",
+        ),
+    ],
+    ids=["linz", "esri-relabelled", "unlisted-dataset"],
+)
+def test_a_permissively_licensed_area_ships_and_is_credited(
+    tmp_path, dataset_name, licence, credit
+):
+    """Boundaries shipped only for exact ``(dataset, licence)`` pairs: the LINZ
+    source of Overture's New Zealand localities (CC BY 4.0) was omitted, and
+    Overture 2026-10-21.0 relabelling Esri Community Maps from CC0 to CC BY
+    4.0 dropped US states and cities from the index, each under a licence
+    that permits redistribution."""
     import test_index_geometry as gt
 
     cache = tmp_path / "cache"
     gt._publish(
         cache, [gt._place("Q37100", "city", overture_id="nz-akl", country="NZ")]
     )
-    linz = [{"dataset": "Linz", "license": "CC-BY-4.0", "record_id": "L"}]
+    sources = [{"dataset": dataset_name, "license": licence, "record_id": "L"}]
     dataset = fx.write_area_dataset(
-        tmp_path / "areas.parquet", [fx.area("nz-akl", gt.BOX, linz)]
+        tmp_path / "areas.parquet", [fx.area("nz-akl", gt.BOX, sources)]
     )
     geometry.attach_geometry(cache, dataset=dataset)
     (place,), _ = store.read_jsonl(
         cache / "gazetteer", "geometry.json", "places_seed.jsonl"
     )
     assert place["geometry_source"] == "overture"
-    assert LINZ_CREDIT + "\n" in gt._read_text(cache, "NOTICE")
+    assert credit + "\n" in gt._read_text(cache, "NOTICE")
     inventory, _ = store.read_jsonl(
         cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
     )
@@ -1646,7 +1669,7 @@ def test_a_linz_area_ships_and_is_credited(tmp_path):
         (row["dataset"], row["license"], row["allowed"])
         for row in inventory
         if row["role"] == "component"
-    ] == [("Linz", "CC-BY-4.0", True)]
+    ] == [(dataset_name, licence, True)]
 
 
 def test_a_source_only_expand_shipped_is_credited(tmp_path):
@@ -1690,14 +1713,14 @@ def test_a_source_only_expand_shipped_is_credited(tmp_path):
     [
         # Expanded before the stage recorded what its boundaries shipped.
         ({"mode": "expanded"}, "rerun the expand stage"),
-        # A shipped source the allowlist has since dropped.
+        # A shipped source under a licence that may no longer ship.
         (
             {
                 "mode": "expanded",
                 "licence_sources": ["Retired|X-1.0"],
                 "licence_inventory": [],
             },
-            "no longer allowlisted",
+            "may no longer ship",
         ),
     ],
     ids=["unaudited", "dropped"],

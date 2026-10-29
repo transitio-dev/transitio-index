@@ -183,7 +183,7 @@ def _attach_boundary(place, rows, inventory, shipped):
     :func:`geometry.read_areas` read — never the lookup's box-clipped subset,
     which would ship a multi-part city truncated to wherever its stops were.
     The contract mirrors the geometry stage's exactly: every area's every
-    source allowlisted and every polygon valid, else the place ships without
+    source shippable and every polygon valid, else the place ships without
     geometry rather than with unaudited or partial geometry. The audit is
     recorded in ``inventory`` and ``shipped`` as the geometry stage records it.
     """
