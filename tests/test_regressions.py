@@ -606,7 +606,7 @@ def test_the_metros_read_warms_the_area_cache_for_every_seeded_division(tmp_path
     later = geometry.read_areas(
         Counting(),
         {"region"},
-        cache=(cache_dir, overture.OVERTURE_RELEASE),
+        cache=(cache_dir, overture.current_release()),
         countries={"FI"},
     )
     assert set(later) == {"region"} and scans["n"] == 1  # served from the warmed cache

@@ -118,7 +118,7 @@ def test_resolve_publishes_resolved_and_report(tmp_path):
         "overture_id": 1,
     }
     assert manifest["countries"] == ["FI", "US"]
-    assert manifest["overture_release"] == overture.OVERTURE_RELEASE
+    assert manifest["overture_release"] == overture.current_release()
 
 
 def test_subtype_maps_to_kind_and_keeps_source_subtype(tmp_path):
@@ -258,3 +258,53 @@ def test_a_nameless_division_is_reported_not_published(tmp_path):
         ("ov-nameless", overture.UNRESOLVED)
     ]
     assert manifest["reported"] == 1
+
+
+def _bucket(root, releases):
+    """A local stand-in for the Overture bucket: a directory per release,
+    holding the division table when ``releases`` maps it to True; with no
+    releases, not even ``release/`` exists."""
+    from pyarrow import fs
+
+    root.mkdir()
+    for name, has_table in releases.items():
+        path = root / overture.OVERTURE_BUCKET / "release" / name
+        (path / "theme=divisions" / "type=division" if has_table else path).mkdir(
+            parents=True
+        )
+    return fs.SubTreeFileSystem(str(root), fs.LocalFileSystem())
+
+
+def test_the_newest_release_with_a_division_table_is_read(tmp_path, monkeypatch):
+    bucket = _bucket(
+        tmp_path / "bucket",
+        {"2026-09-23.2": True, "2026-09-23.10": True, "2026-10-21.0": False, "a": True},
+    )
+    monkeypatch.setattr(overture, "s3_filesystem", lambda: bucket)
+    monkeypatch.setattr(overture, "_release", None)
+    # A day's numbered releases sort by number, not as text.
+    assert overture.releases() == ["2026-09-23.2", "2026-09-23.10"]
+    assert overture.current_release() == "2026-09-23.10"
+    with pytest.raises(overture.GazetteerError, match="2026-08-19.0 is not in"):
+        overture.overture_dataset("2026-08-19.0")
+    empty = _bucket(tmp_path / "empty", {})
+    monkeypatch.setattr(overture, "s3_filesystem", lambda: empty)
+    with pytest.raises(overture.GazetteerError, match="no Overture release"):
+        overture.latest_release()
+
+
+def test_the_build_reads_the_release_its_option_names(tmp_path, monkeypatch):
+    from transitio_index import build
+
+    seen = []
+    monkeypatch.setitem(
+        build.STAGES,
+        "ingest",
+        lambda arguments: seen.append(overture.current_release()) or [],
+    )
+    options = ["--stage", "ingest", "--cache-dir", str(tmp_path), "--overture-release"]
+    assert build.main(options + ["2026-10-21.0"]) == 0
+    assert seen == ["2026-10-21.0"]
+    for value in ("latest", "2026-10-21", "2026-10-21.0/x"):
+        with pytest.raises(SystemExit):
+            build.parse_args(options + [value])

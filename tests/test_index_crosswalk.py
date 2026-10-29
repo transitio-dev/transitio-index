@@ -1438,7 +1438,7 @@ def test_an_atlas_only_feed_takes_its_mdb_twins_location(tmp_path, whole):
     if whole != "catalogue":
         assert manifest["atlas_twin_locations"] == 0
         assert "mdb_catalogue" not in manifest["sources"]
-        assert located == dict.fromkeys(located, {})
+        assert located == {key: {} for key in located}
         return
     assert manifest["atlas_twin_locations"] == 2
     digest = hashlib.sha256(whole_csv.read_bytes()).hexdigest()

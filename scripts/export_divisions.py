@@ -2,7 +2,7 @@
 
 """Export the Overture division hierarchy, with geometry, for inspection.
 
-A maintainer tool, not part of the package: it reads the pinned Overture
+A maintainer tool, not part of the package: it reads the newest Overture
 release the build resolves places against and writes the administrative
 hierarchy — countries, regions, counties, localadmins and localities (down to
 city level) — for the requested countries as GeoParquet and GeoJSON, so the
@@ -35,7 +35,7 @@ SUBTYPES = ("country", "dependency", "region", "county", "localadmin", "locality
 
 
 def _read_divisions(countries):
-    """Normalised Overture divisions for ``countries``, from the pinned release."""
+    """Normalised Overture divisions for ``countries``, from the newest release."""
     import pyarrow.dataset as ds
 
     from transitio_index import overture

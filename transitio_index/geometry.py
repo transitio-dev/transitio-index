@@ -62,7 +62,7 @@ RETRY_IO_THREADS = 2
 # so a new upstream dataset is not shipped on a familiar licence until it is
 # audited. Each records the NOTICE credit, the licence's canonical URL, and
 # whether the licence is share-alike (ODbL), which the plan flags as a recorded
-# policy decision. The pairs are those the pinned release carries.
+# policy decision. The pairs are those Overture 2026-08-19.0 carried.
 SOURCE_ALLOWLIST = {
     ("OpenStreetMap", "ODbL-1.0"): {
         "credit": "OpenStreetMap, © OpenStreetMap contributors",
@@ -97,7 +97,7 @@ SOURCE_ALLOWLIST = {
 }
 
 # Overture aggregates the sources above under its own permissive licence; the
-# inventory records it as the aggregator, versioned by the pinned release. The URL
+# inventory records it as the aggregator, versioned by the build's release. The URL
 # is the licence's canonical URL, as the inventory records licence URLs.
 OVERTURE_AGGREGATOR = {
     "dataset": "Overture Maps divisions",
@@ -248,10 +248,10 @@ QID_TWIN = "qid_twin"
 UCDB = "ghs_ucdb"
 
 
-def division_area_dataset(release=overture.OVERTURE_RELEASE):
-    """The pinned Overture ``division_area`` theme as a dataset over S3."""
-    path = f"{overture.OVERTURE_BUCKET}/{DIVISION_AREA_PATH.format(release=release)}"
-    return ds.dataset(path, filesystem=overture.s3_filesystem(), format="parquet")
+def division_area_dataset(release=None):
+    """The Overture ``division_area`` theme of ``release``, by default
+    ``overture.current_release()``, as a dataset over S3."""
+    return overture.theme_dataset(DIVISION_AREA_PATH, release)
 
 
 def read_areas(
@@ -323,7 +323,7 @@ def place_areas(
     """The areas of the ``wanted`` division ids among ``places`` — the
     metros and fao stages' read, raw unless ``simplify`` is given (as in
     :func:`read_areas`): served from the cache of ``release`` (default: the
-    pinned one), the scan narrowed to the places' countries, and the S3
+    build's), the scan narrowed to the places' countries, and the S3
     dataset of that release opened (under the read's deadline) only when
     ``dataset`` is None and an id is missing; ``reopen`` reopens ``dataset``
     when its scan stalls. ``{}`` when nothing is wanted.
@@ -334,7 +334,7 @@ def place_areas(
     """
     if not wanted:
         return {}
-    release = release or overture.OVERTURE_RELEASE
+    release = release or overture.current_release()
     cache = (cache_dir, release)
     if reopen is None and dataset is None:
         reopen = functools.partial(division_area_dataset, release)
@@ -1120,7 +1120,7 @@ def _inventory_rows(inventory, shipped_count, derived=(), releases=None):
     """The licence inventory: the Overture aggregator, each component source,
     then the derived-data rows an earlier stage recorded.
 
-    Every row carries the licence URL and the pinned release as its version
+    Every row carries the licence URL and the build's release as its version
     (a component's own from ``releases``, keyed by its pair, when it is not
     Overture's), so the record answers "what shipped, under what licence, from
     where, at which version" without reading back the source data.
@@ -1132,7 +1132,7 @@ def _inventory_rows(inventory, shipped_count, derived=(), releases=None):
             "dataset": OVERTURE_AGGREGATOR["dataset"],
             "license": OVERTURE_AGGREGATOR["license"],
             "url": OVERTURE_AGGREGATOR["url"],
-            "version": overture.OVERTURE_RELEASE,
+            "version": overture.current_release(),
             "allowed": True,
             "geometries": shipped_count,
         }
@@ -1149,7 +1149,7 @@ def _inventory_rows(inventory, shipped_count, derived=(), releases=None):
                 "license": licence,
                 "url": meta["url"] if meta else None,
                 "version": (releases or {}).get(
-                    (dataset_name, licence), overture.OVERTURE_RELEASE
+                    (dataset_name, licence), overture.current_release()
                 ),
                 "allowed": allowed,
                 "geometries": count,
@@ -1281,7 +1281,7 @@ def attach_geometry(
                     dataset,
                     set(batch_ids),
                     simplify=SIMPLIFY_TOLERANCE_DEG,
-                    cache=(cache_dir, overture.OVERTURE_RELEASE),
+                    cache=(cache_dir, overture.current_release()),
                     reopen=reopen,
                     countries=countries,
                 )
@@ -1307,7 +1307,7 @@ def attach_geometry(
                     dataset,
                     {area for candidates in twins.values() for area, _ in candidates},
                     simplify=SIMPLIFY_TOLERANCE_DEG,
-                    cache=(cache_dir, overture.OVERTURE_RELEASE),
+                    cache=(cache_dir, overture.current_release()),
                     reopen=reopen,
                     countries=countries,
                 )
@@ -1429,7 +1429,7 @@ def attach_geometry(
                 derived,
                 {UCDB_DERIVED: ucdb.RELEASE, FAO_DERIVED: fao.DOI},
             )
-            notice = _notice(shipped, overture.OVERTURE_RELEASE, derived)
+            notice = _notice(shipped, overture.current_release(), derived)
             manifest = {
                 "source": "geometry",
                 "sources": metros_manifest.get("sources"),
@@ -1437,7 +1437,7 @@ def attach_geometry(
                 # Carried forward so the expand stage derives metros from the
                 # same pinned inputs as the metros stage, not the module pins.
                 "derived_inputs": metros_manifest.get("derived_inputs"),
-                "overture_release": overture.OVERTURE_RELEASE,
+                "overture_release": overture.current_release(),
                 "simplify_tolerance_deg": SIMPLIFY_TOLERANCE_DEG,
                 "with_geometry": with_geometry,
                 "omitted_by_licence": outcomes["omitted"],

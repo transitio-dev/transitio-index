@@ -2,7 +2,7 @@
 
 The gazetteer's expansion pass and the coverage stage both ask "which admin
 unit contains this stop?", and neither stop coordinates nor the seeded rows can
-answer that. This module answers it against the full pinned Overture release
+answer that. This module answers it against the build's full Overture release
 without mirroring it: ``division_area`` is cloud-native GeoParquet whose row
 groups carry ``bbox`` statistics, so a spatial query reads the file footers and
 only the row groups whose boxes intersect the query — the COG access pattern —
@@ -210,7 +210,7 @@ def _footprint(row_group, columns):
 
 
 class BoundaryLookup:
-    """Point-in-division queries over the pinned release, locally memoized.
+    """Point-in-division queries over one Overture release, locally memoized.
 
     ``ensure`` makes a set of bounding boxes queryable (fetching what the memo
     lacks); ``divisions_at`` then answers exactly, most specific first. The
@@ -222,13 +222,13 @@ class BoundaryLookup:
         self,
         cache_dir,
         *,
-        release=overture.OVERTURE_RELEASE,
+        release=None,
         area_dataset=None,
         division_dataset=None,
         reopen_area=None,
         reopen_division=None,
     ):
-        self.release = release
+        self.release = release or overture.current_release()
         self._area_dataset = area_dataset
         self._division_dataset = division_dataset
         # Fresh-connection openers for a scan that stalls (see geometry.retrying);
@@ -237,7 +237,7 @@ class BoundaryLookup:
         self._reopen_division = reopen_division
         root = store.open_subdir(cache_dir, "boundary_lookup")
         try:
-            self._dir = store.open_subdir(root.path, memo_name(release))
+            self._dir = store.open_subdir(root.path, memo_name(self.release))
         finally:
             root.close()
         self._records = {}

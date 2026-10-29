@@ -237,7 +237,7 @@ def test_the_notice_credits_sources_and_records_share_alike(tmp_path):
     assert "ODbL 1.0" in notice
     assert "geoBoundaries" in notice
     assert "CC BY 4.0" in notice
-    assert overture.OVERTURE_RELEASE in notice  # the pinned release
+    assert overture.current_release() in notice  # the build's release
     # ODbL's share-alike obligation is stated, not just the attribution.
     assert "share-alike" in notice
     assert "Derived Database" in notice
@@ -254,7 +254,7 @@ def test_the_licence_inventory_records_sources_and_the_aggregator(tmp_path):
     # Overture itself is recorded as the aggregator, with a URL and version.
     aggregator = by_dataset["Overture Maps divisions"]
     assert aggregator["role"] == "aggregator"
-    assert aggregator["version"] == overture.OVERTURE_RELEASE
+    assert aggregator["version"] == overture.current_release()
     assert aggregator["url"]
     # Component sources carry allow status, a URL for allowed ones, and a version.
     osm = by_dataset["OpenStreetMap"]

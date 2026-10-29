@@ -169,7 +169,7 @@ def merge_names(
                 "geometry_generation": geometry_manifest.get("generation"),
                 "derived_inputs": geometry_manifest.get("derived_inputs"),
                 "wikidata_api": overture.WIKIDATA_API,
-                # Carried forward so the publish stage reads the pinned release
+                # Carried forward so the publish stage reads the build's release
                 # from the same generation as the places, not a separate pointer.
                 "overture_release": geometry_manifest.get("overture_release"),
                 "simplify_tolerance_deg": geometry_manifest.get(
