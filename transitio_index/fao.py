@@ -414,7 +414,7 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
     """Publish ``gazetteer/fao.json``: the report of the FAO city-regions
     holding cities, each named after its centre's GHS-UCDB match. ``dataset``
     is the Overture ``division_area``
-    dataset (the pinned release by default), ``pins`` the FAO inputs' digests
+    dataset (the build's release by default), ``pins`` the FAO inputs' digests
     and ``ucdb_pins`` the UCDB inputs'. Returns the generation manifest."""
     # Both build on this module, so imported here.
     from transitio_index import metros, ucdb

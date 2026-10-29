@@ -1,6 +1,6 @@
 """Overture divisions ingest and Wikidata QID resolution for the gazetteer.
 
-Reads the pinned Overture ``divisions`` release as projected GeoParquet, keeps
+Reads one Overture ``divisions`` release as projected GeoParquet, keeps
 the whole administrative skeleton (country, region, county, localadmin — each
 with its label point, never its area), and resolves each division to a
 canonical Wikidata QID: the division's own ``wikidata`` property, else a reverse
@@ -52,10 +52,13 @@ _TRANSIENT_ERRORS = (
 # The longest ``Retry-After`` a 429 is waited for; a longer one waits this long.
 RETRY_AFTER_MAX = 120
 
-OVERTURE_RELEASE = "2026-08-19.0"
 OVERTURE_BUCKET = "overturemaps-us-west-2"
 OVERTURE_REGION = "us-west-2"
 DIVISION_PATH = "release/{release}/theme=divisions/type=division"
+# An Overture release name: the release date and that day's release number.
+RELEASE_NAME = re.compile(r"(\d{4}-\d{2}-\d{2})\.(\d+)")
+# The release this process reads, once chosen (``current_release``).
+_release = None
 
 # Overture ``subtype`` to the gazetteer's ``kind``. Finer subtypes (borough,
 # neighborhood, macrohood, microhood) are below the resolution feeds are worth
@@ -170,10 +173,71 @@ def _cap_io_threads():
     _io_threads_capped = True
 
 
-def overture_dataset(release=OVERTURE_RELEASE):
-    """The pinned Overture ``division`` theme as a pyarrow dataset over S3."""
-    path = f"{OVERTURE_BUCKET}/{DIVISION_PATH.format(release=release)}"
-    return ds.dataset(path, filesystem=s3_filesystem(), format="parquet")
+def releases(filesystem=None):
+    """The Overture releases the bucket holds a ``division`` table for,
+    oldest first. Overture keeps only its recent releases there."""
+    from pyarrow.fs import FileSelector, FileType
+
+    filesystem = filesystem or s3_filesystem()
+    found = []
+    listing = FileSelector(f"{OVERTURE_BUCKET}/release", allow_not_found=True)
+    for entry in filesystem.get_file_info(listing):
+        match = RELEASE_NAME.fullmatch(entry.base_name)
+        if entry.type != FileType.Directory or match is None:
+            continue
+        table = f"{OVERTURE_BUCKET}/{DIVISION_PATH.format(release=entry.base_name)}"
+        if filesystem.get_file_info(table).type == FileType.Directory:
+            found.append((match.group(1), int(match.group(2)), entry.base_name))
+    return [name for _, _, name in sorted(found)]
+
+
+def latest_release(filesystem=None):
+    """The newest Overture release with a ``division`` table."""
+    found = releases(filesystem)
+    if not found:
+        raise GazetteerError(
+            f"no Overture release with a division table in {OVERTURE_BUCKET}"
+        )
+    return found[-1]
+
+
+def use_release(name):
+    """Read Overture release ``name`` for the rest of the process."""
+    global _release
+    if not isinstance(name, str) or RELEASE_NAME.fullmatch(name) is None:
+        raise ValueError(f"not an Overture release name: {name!r}")
+    _release = name
+
+
+def current_release():
+    """The Overture release this process reads: the one ``use_release``
+    named, else the newest the bucket holds, looked up once, so every stage
+    of a build reads the same release."""
+    global _release
+    if _release is None:
+        _release = latest_release()
+        log.info("overture: reading release %s, the newest", _release)
+    return _release
+
+
+def theme_dataset(path, release=None):
+    """The Overture table at ``path`` (a template naming ``{release}``) of
+    ``release``, by default ``current_release()``, as a dataset over S3."""
+    release = release or current_release()
+    location = f"{OVERTURE_BUCKET}/{path.format(release=release)}"
+    try:
+        return ds.dataset(location, filesystem=s3_filesystem(), format="parquet")
+    except FileNotFoundError as error:
+        raise GazetteerError(
+            f"Overture release {release} is not in {OVERTURE_BUCKET}, which "
+            f"keeps only recent releases: no {location}"
+        ) from error
+
+
+def overture_dataset(release=None):
+    """The Overture ``division`` theme of ``release``, by default
+    ``current_release()``, as a pyarrow dataset over S3."""
+    return theme_dataset(DIVISION_PATH, release)
 
 
 def read_divisions(dataset, *, subtypes=SKELETON_SUBTYPES):
@@ -375,7 +439,7 @@ class WikidataClient:
     (``fips_items``), its metro-like candidates (``metro_candidates``),
     an entity's area (``areas``) and coordinates (``coordinates``) and a
     place's labels and aliases (``labels_and_aliases``), each in id-keyed
-    batches. Only the Overture release is pinned; these endpoints are live, so
+    batches. The Overture release is fixed for a build; these endpoints are live, so
     results track Wikidata at build time.
     Tests substitute a stub exposing the same methods rather than reaching the
     network.
@@ -740,7 +804,7 @@ def qidless_place(record):
 def resolve(cache_dir, *, dataset=None, wikidata=None, run=None):
     """Ingest the Overture admin skeleton and resolve each division to a QID.
 
-    Reads the whole skeleton from the pinned Overture release and resolves each
+    Reads the whole skeleton from the build's Overture release and resolves each
     division to a QID. Divisions with a QID, and named divisions without one
     (identified by their Overture id), are published to
     ``overture_divisions.jsonl`` (with the OSM relation ids kept as a
@@ -798,7 +862,7 @@ def resolve(cache_dir, *, dataset=None, wikidata=None, run=None):
 
     manifest = {
         "source": "overture",
-        "overture_release": OVERTURE_RELEASE,
+        "overture_release": current_release(),
         "wikidata_endpoint": wikidata.endpoint,
         "countries": sorted({r["country"] for r in resolved if r["country"]}),
         "divisions_read": len(records),

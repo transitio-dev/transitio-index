@@ -418,6 +418,11 @@ def parse_args(argv=None):
         help="ingest this local systems.csv instead of downloading it",
     )
     parser.add_argument(
+        "--overture-release",
+        help="the Overture release every stage reads, such as 2026-10-21.0 "
+        "(default: the newest release the Overture bucket holds)",
+    )
+    parser.add_argument(
         "--commit",
         type=commit_sha,
         default=atlas.ATLAS_COMMIT,
@@ -512,6 +517,9 @@ def parse_args(argv=None):
     arguments = parser.parse_args(argv)
     if arguments.workers < 1:
         parser.error("--workers must be at least 1")
+    release = arguments.overture_release
+    if release is not None and not overture.RELEASE_NAME.fullmatch(release):
+        parser.error(f"--overture-release: not an Overture release name: {release!r}")
     if not arguments.sources:
         arguments.sources = list(SOURCES)
     return arguments
@@ -538,6 +546,8 @@ def _highlights(summaries):
 
 def main(argv=None):
     arguments = parse_args(argv)
+    if arguments.overture_release is not None:
+        overture.use_release(arguments.overture_release)
     stage = arguments.stage
     try:
         progress.configure(

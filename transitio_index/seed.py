@@ -819,7 +819,7 @@ def prepare_centres(cache_dir, dataset, *, expected=None):
     inputs = ucdb.prepare_inputs(cache_dir, expected=expected)
     sources = {
         **inputs["digests"],
-        "overture": overture.OVERTURE_RELEASE,
+        "overture": overture.current_release(),
         "rules": CENTRES_VERSION,
         "min_population": ucdb.MIN_POPULATION,
         "near_deg": NEAR_DEG,
@@ -969,7 +969,7 @@ def _identify_places(places, registry, places_digest, report=None):
         if row.get("overture_id"):
             concordances["overture"] = [row["overture_id"]]
             minted_from = f"overture:{row['overture_id']}"
-            minted_in = f"overture {overture.OVERTURE_RELEASE}"
+            minted_in = f"overture {overture.current_release()}"
         elif row.get("resolution_method") == "ghs_ucdb":
             minted_from = place_id
             minted_in = f"GHS-UCDB {ucdb.RELEASE}"
@@ -1332,7 +1332,7 @@ def resolve_seed(
         "overrides_applied": resolved_by_hand + len(added),
         "stale_overrides": len(override_report),
         "stale_place_overrides": len(override_report),
-        "overture_release": overture.OVERTURE_RELEASE,
+        "overture_release": overture.current_release(),
         # The catalogue versions the placements were derived from, carried
         # forward so coverage can refuse a mixed-lineage input set.
         "sources": crosswalk_manifest.get("sources"),

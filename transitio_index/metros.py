@@ -585,8 +585,7 @@ def _eurostat_official_areas(rows, branches, cache_dir, dataset, divisions, land
 
     with boundaries.BoundaryLookup(
         cache_dir,
-        area_dataset=dataset
-        or geometry.division_area_dataset(overture.OVERTURE_RELEASE),
+        area_dataset=dataset or geometry.division_area_dataset(),
         division_dataset=divisions or overture.overture_dataset(),
     ) as lookup:
         for definition, inputs in wanted:
@@ -745,7 +744,7 @@ def _consumed(definition, inputs_manifest, memberships, land=None):
     boundaries when ``land`` (the Eurostat inputs) measured its shares."""
     digests = inputs_manifest["digests"]
     versions = (
-        overture.OVERTURE_RELEASE,
+        overture.current_release(),
         *(digests[name] for name in definition.files),
     )
     consumed = {
@@ -1077,7 +1076,7 @@ def _apply_fao(
                 cores.add(key)
         fao_centres([metros[key] for key in touched], centres)
     versions = {
-        OVERTURE_DERIVED: overture.OVERTURE_RELEASE,
+        OVERTURE_DERIVED: overture.current_release(),
         geometry.FAO_DERIVED: _fao_version(
             inputs_manifest, centre_pin if centres is not None else None
         ),
@@ -1297,7 +1296,7 @@ def attach_metros(
     report (``metro_report.jsonl``) and the Eurostat assignments of both
     definitions (``metro_assignments.jsonl``, each row naming its subtype).
     ``dataset`` is the Overture ``division_area`` dataset the branches read
-    city land areas from (the pinned release by default), ``pins`` the
+    city land areas from (the build's release by default), ``pins`` the
     Eurostat inputs' digests and ``urau_pins`` the Urban Audit input's (the
     modules' pins by default); ``derive_urau`` runs the functional urban
     areas (on by default). A US metro whose CBSA code the OMB delineation
