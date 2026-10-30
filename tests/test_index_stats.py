@@ -8,7 +8,7 @@ import pytest
 pytest.importorskip("pyarrow")
 import pyarrow.parquet as pq  # noqa: E402
 
-from transitio_index import crawl, stats, store  # noqa: E402
+from transitio_index import crawl, geometry, stats, store  # noqa: E402
 
 
 def _mdb(mdb_id, status="active", **kw):
@@ -217,7 +217,9 @@ def test_summary_sections_count_the_catalogue_defects():
     assert identity["rows_into_feeds"] == 5 and identity["gbfs_systems_kept"] == 1
     # Aggregating archives has no systems artifact: the count is unknown.
     assert stats.identity(rows, FEEDS)["gbfs_systems_kept"] is None
-    assert stats._cell("a|b\nc") == "a\\|b c"  # a value never breaks a table
+    # A value, listed or not, never breaks a table.
+    assert stats._cell("a|b\nc") == "a\\|b c"
+    assert stats._cell(["a\\|b", "c|d"]) == "a\\\\\\|b, c\\|d"
     assert identity["rows_dropped_by_reason"] == {"not_transit": 2, "ambiguous_id": 1}
     assert identity["feeds_by_crosswalk_method"] == {"url_exact": 1, "none": 3}
 
@@ -235,6 +237,41 @@ def _publish(cache, subdir, pointer, artifacts, manifest):
             )
     finally:
         directory.close()
+
+
+@pytest.mark.parametrize(
+    ("pointer", "artifacts", "manifest", "error"),
+    [
+        # Written before the stage named the places: zero only without refusals.
+        ("geometry.json", {"NOTICE": []}, {"omitted_by_licence": 0}, None),
+        ("geometry.json", {"NOTICE": []}, {"omitted_by_licence": 2}, "without naming"),
+        (
+            "expanded.json",
+            {"places_expanded.jsonl": []},
+            {"licence_inventory": [{"dataset": "M", "allowed": False}]},
+            "without naming",
+        ),
+        # Named places that disagree with the stage's own count.
+        (
+            "geometry.json",
+            {geometry.OMISSIONS_ARTIFACT: [{"overture_id": "o"}]},
+            {"omitted_by_licence": 2},
+            "names 1 places",
+        ),
+    ],
+    ids=["unrecorded-clean", "unrecorded-geometry", "unrecorded-expand", "miscounted"],
+)
+def test_omissions_a_stage_did_not_name_are_never_read_as_none(
+    tmp_path, pointer, artifacts, manifest, error
+):
+    cache = tmp_path / "cache"
+    published = _publish(cache, "gazetteer", pointer, artifacts, manifest)
+    snapshot = {"generations": {f"gazetteer/{pointer}": published["generation"]}}
+    if error is None:
+        assert stats._licence_omissions(cache, snapshot) == []
+    else:
+        with pytest.raises(stats.StatsError, match=error):
+            stats._licence_omissions(cache, snapshot)
 
 
 def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
@@ -259,6 +296,30 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
         {"source": "crosswalk", "sources": {"mdb": {"csv_label": "x"}}},
     )
     generations["crosswalk/feeds.json"] = crosswalk["generation"]
+    # A boundary each stage that ships them kept out over a licence.
+    florida = {
+        "overture_id": "o-fl",
+        "name": "Florida",
+        "kind": "region",
+        "country_code": "US",
+        "refused_sources": ["Esri Community Maps|CC-BY-NC-4.0"],
+        "geometry_source": None,
+    }
+    miami = {**florida, "overture_id": "o-mia", "name": "Miami", "kind": "city"}
+    for pointer, artifacts, manifest in (
+        (
+            "geometry.json",
+            {geometry.OMISSIONS_ARTIFACT: [florida]},
+            {"omitted_by_licence": 1},
+        ),
+        (
+            "expanded.json",
+            {"places_expanded.jsonl": []},
+            {"licence_omissions": [{**miami, "geometry_source": "ucdb"}]},
+        ),
+    ):
+        published = _publish(cache, "gazetteer", pointer, artifacts, manifest)
+        generations[f"gazetteer/{pointer}"] = published["generation"]
     (cache / "index").mkdir(exist_ok=True)
     snapshot = cache / "index" / "snapshot.json"
     with pytest.raises(stats.StatsError, match="no published index"):
@@ -312,6 +373,18 @@ def test_the_stage_publishes_the_catalogue_table_and_summary(tmp_path):
     assert summary["identity"]["gbfs_systems_kept"] == 0  # no artifact: none
     assert summary["realtime"]["feeds"] == 0 and manifest["realtime"] == 0
     assert summary["validity"]["build_date"] == "2026-09-12"
+    boundaries = summary["boundaries"]
+    assert (boundaries["omitted_by_licence"], boundaries["without_a_boundary"]) == (
+        2,
+        1,
+    )
+    assert boundaries["published"] == 0
+    assert boundaries["refused_sources"] == {"Esri Community Maps|CC-BY-NC-4.0": 2}
+    assert [(row["name"], row["stage"]) for row in boundaries["places"]] == [
+        ("Miami", "expand"),
+        ("Florida", "geometry"),
+    ]
+    assert "## Boundaries" in report and "| Florida | region | US |" in report
 
 
 def test_the_stage_reads_the_ingest_fixtures_through_the_crosswalk(tmp_path):

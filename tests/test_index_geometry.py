@@ -33,7 +33,7 @@ PLACES = [
     _place("Q1508", "region", overture_id="fi-uusimaa"),
     _place("Q_METRO", "metro"),  # no overture_id, no geometry here
     _place("Q_NOGEO", "city", overture_id="no-area"),  # no division_area row
-    _place("Q_DENIED", "city", overture_id="denied"),  # non-allowlisted licence
+    _place("Q_DENIED", "city", overture_id="denied"),  # a licence that may not ship
     _place("Q_MIXED", "city", overture_id="mixed"),  # one allowed + one unlicensed
     _place("Q_TWOLAND", "city", overture_id="twoland"),  # two allowed land areas
     _place("Q_MULTI", "city", overture_id="multi"),  # one allowed + one unlicensed area
@@ -81,15 +81,15 @@ AREAS = [
         BOX,
         [_osm(), {"dataset": "Unknown", "license": None, "record_id": "U"}],
     ),
-    # Two allowlisted land areas of one division are unioned.
+    # Two shippable land areas of one division are unioned.
     fx.area("twoland", BOX, [_osm()]),
     fx.area("twoland", OTHER, [_osm()]),
-    # Two land areas, one allowlisted and one unlicensed: the whole is omitted.
+    # Two land areas, one shippable and one unlicensed: the whole is omitted.
     fx.area("multi", BOX, [_osm()]),
     fx.area(
         "multi", OTHER, [{"dataset": "Unknown", "license": None, "record_id": "U2"}]
     ),
-    # An allowlisted source but an empty polygon: rejected as invalid geometry.
+    # A shippable source but an empty polygon: rejected as invalid geometry.
     fx.area("empty", shapely.to_wkb(shapely.Polygon()), [_osm()]),
     # Malformed WKB must be skipped, not abort the stage.
     fx.area("badwkb", b"\x00 not real wkb", [_osm()]),
@@ -160,7 +160,7 @@ def test_geometry_from_a_disallowed_licence_is_omitted(tmp_path):
 
 
 def test_geometry_with_any_unlicensed_source_is_omitted(tmp_path):
-    # One allowlisted source is not enough: a same-geometry source with no
+    # One shippable source is not enough: a same-geometry source with no
     # licence leaves the boundary unshippable.
     _, places, _ = _run(tmp_path)
     assert places["Q_MIXED"]["geometry"] is None
@@ -168,12 +168,12 @@ def test_geometry_with_any_unlicensed_source_is_omitted(tmp_path):
 
 def test_an_unlicensed_land_area_omits_the_whole_division(tmp_path):
     # Sources are audited per land-area row, not flattened: one unlicensed area
-    # makes the division unshippable even though another area is allowlisted.
+    # makes the division unshippable even though another area is shippable.
     _, places, _ = _run(tmp_path)
     assert places["Q_MULTI"]["geometry"] is None
 
 
-def test_allowlisted_land_areas_are_unioned(tmp_path):
+def test_shippable_land_areas_are_unioned(tmp_path):
     _, places, _ = _run(tmp_path)
     shipped = shapely.from_wkb(bytes.fromhex(places["Q_TWOLAND"]["geometry"]))
     # The two disjoint 0.04 and 1.0 boxes union to 1.04.
@@ -189,11 +189,56 @@ def test_an_empty_or_invalid_geometry_is_rejected(tmp_path):
     assert manifest["invalid_geometry"] == 2
 
 
-def test_a_null_source_is_denied_not_crashing():
-    assert geometry._source_key(None) == (None, None)
-    assert geometry._is_shippable([None]) is False
-    osm = {"dataset": "OpenStreetMap", "license": "ODbL-1.0"}
-    assert geometry._is_shippable([osm, None]) is False
+@pytest.mark.parametrize(
+    ("sources", "shippable"),
+    [
+        ([None], False),
+        ([_osm(), None], False),
+        ([{"dataset": "Mystery Maps", "license": "CC-BY-3.0"}], True),
+        ([{"dataset": "Mystery Maps", "license": "CC-BY-NC-4.0"}], False),
+        ([{"dataset": "Mystery Maps", "license": "CC-BY-SA-4.0"}], False),
+        ([{"dataset": None, "license": "CC0-1.0"}], False),
+        ([{"dataset": "  ", "license": "CC0-1.0"}], False),
+        ([{"dataset": "Esri Community Maps ", "license": "CC-BY-4.0"}], False),
+        ([{"dataset": "Maps\n  - Forged", "license": "CC0-1.0"}], False),
+        ([{"dataset": "A|B", "license": "CC0-1.0"}], False),
+    ],
+    ids=[
+        "null",
+        "null-beside-osm",
+        "any-dataset",
+        "non-commercial",
+        "sa",
+        "no-dataset",
+        "blank-dataset",
+        "padded-dataset",
+        "control-character",
+        "pair-separator",
+    ],
+)
+def test_a_source_ships_by_its_licence(sources, shippable):
+    assert geometry._is_shippable(sources) is shippable
+
+
+def test_refused_sources_read_apart_on_one_line():
+    # "A|B" under "X" and "A" under "B|X" would join alike, a dataset named
+    # "(none)" like a missing one; a newline would start a forged log line. A
+    # shippable source is not named.
+    sources = [
+        {"dataset": "A|B", "license": "X"},
+        {"dataset": "A", "license": "B|X"},
+        {"dataset": "(none)", "license": "X"},
+        {"dataset": "Maps\nForged", "license": None},
+        _osm(),
+    ]
+    rows = [{"sources": sources}, {"sources": []}]
+    assert geometry.refused_sources(rows) == [
+        "(none)|(none)",
+        "A\\|B|X",
+        "A|B\\|X",
+        "Maps\\nForged|(none)",
+        "\\(none)|X",
+    ]
 
 
 INSIDE = shapely.to_wkb(shapely.Point(25.0, 60.2)).hex()
@@ -490,7 +535,7 @@ def test_a_metro_is_its_members_union_holed_only_around_other_cities(tmp_path):
 
 
 def test_an_official_area_metro_is_drawn_over_its_audited_parts_alone(tmp_path):
-    # Two counties no place holds, one from a source not allowlisted and
+    # Two counties no place holds, one from a source that may not ship and
     # holding a hole, and a member city outside both: the metro is the
     # allowed county alone, its hole kept.
     allowed = shapely.box(0, 0, 2, 2).difference(shapely.box(0.5, 0.5, 1, 1))
@@ -570,7 +615,7 @@ def test_a_fao_metro_ships_its_city_region(tmp_path):
     assert shapely.from_wkb(places["Q_50"]["geometry"]).equals(patch)
     assert places["Q_51"]["geometry_source"] == "member_union"
     assert places["Q_EU"]["geometry_source"] == "member_union"
-    assert geometry.SOURCE_ALLOWLIST[geometry.FAO_DERIVED]["licence"] == "CC-BY-4.0"
+    assert geometry.source_terms(geometry.FAO_DERIVED)["licence"] == "CC-BY-4.0"
     credit = geometry.DERIVED_SOURCES[geometry.FAO_DERIVED]["credit"]
     assert credit in _read_text(cache, "NOTICE")
     inventory, _ = store.read_jsonl(

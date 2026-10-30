@@ -304,7 +304,7 @@ def _source_licences(sources):
     """The distinct ``(dataset, license)`` pairs backing a division.
 
     Kept for the later boundary licence audit; a division's geometry may not
-    ship until every source that built it is on the allowlist.
+    ship until every source that built it carries a shippable licence.
     """
     seen = []
     for source in sources or []:
