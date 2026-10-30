@@ -23,6 +23,7 @@ memoizes geometry at that same tolerance.
 import collections
 import datetime
 import functools
+import json
 import logging
 import os
 import queue
@@ -42,6 +43,8 @@ log = logging.getLogger(__name__)
 
 DIVISION_AREA_PATH = "release/{release}/theme=divisions/type=division_area"
 AREA_PROJECT = ["division_id", "geometry", "sources", "is_land"]
+# The places whose Overture boundary a licence kept out (``omission_rows``).
+OMISSIONS_ARTIFACT = "licence_omissions.jsonl"
 
 # How many divisions' areas to resolve at once in ``attach_geometry``. Holding
 # every seeded division's polygons in memory at once peaks high enough to OOM a
@@ -422,14 +425,19 @@ def lend_areas(areas, lent):
     return given
 
 
-def ship_area(place, rows, inventory=None, shipped=None, source="overture"):
+def ship_area(
+    place, rows, inventory=None, shipped=None, source="overture", omitted=None
+):
     """Ship a division's area ``rows`` as ``place``'s simplified geometry,
     labelled ``source``, when every area's every source may ship and every
     polygon is valid; ``"shipped"``, ``"omitted"`` (a source that may not
-    ship) or ``"invalid"``. ``inventory`` counts every row's sources
-    and ``shipped`` gathers those of an area that ships."""
+    ship) or ``"invalid"``. ``inventory`` counts every row's sources,
+    ``shipped`` gathers those of an area that ships, and ``omitted`` gets
+    ``(place, refused sources)`` for an area a licence keeps out."""
     _count_sources(rows, inventory)
     outcome, simplified = shipped_geometry(rows)
+    if outcome == "omitted" and omitted is not None:
+        omitted.append((place, refused_sources(rows)))
     if simplified is None:
         return outcome
     place["geometry"] = shapely.to_wkb(simplified).hex()
@@ -450,6 +458,71 @@ def _count_sources(rows, inventory):
         for row_source in row["sources"] or [None]:
             key = _source_key(row_source)
             inventory[(*key, source_terms(key) is not None)] += 1
+
+
+def refused_sources(rows):
+    """The ``dataset|licence`` of every source of ``rows`` that may not ship,
+    sorted, each part escaped (``_escaped``) so two pairs never read alike; a
+    missing part reads ``(none)``."""
+    refused = set()
+    for row in rows:
+        for row_source in row["sources"] or [None]:
+            key = _source_key(row_source)
+            if source_terms(key) is None:
+                refused.add(
+                    "|".join(
+                        "(none)" if part is None else _escaped(part) for part in key
+                    )
+                )
+    return sorted(refused)
+
+
+def _escaped(part):
+    """``part`` as one printable line: a backslash and the pair separator
+    ``|`` backslash-escaped, any other unprintable character as its Python
+    escape (``\\n``, ``\\x07``), and a part named ``(none)`` as ``\\(none)``
+    so it reads apart from a missing one."""
+    text = "".join(
+        (
+            "\\" + char
+            if char in "\\|"
+            else char if char.isprintable() else char.encode("unicode_escape").decode()
+        )
+        for char in str(part)
+    )
+    return "\\" + text if text == "(none)" else text
+
+
+def omission_rows(omitted):
+    """One record per place ``ship_area`` kept a boundary from (``omitted``):
+    the place, the refused sources and the boundary it ships instead, if any
+    (read when called, so after every fallback)."""
+    return [
+        {
+            "overture_id": place.get("overture_id"),
+            "name": place.get("name"),
+            "kind": place.get("kind"),
+            "country_code": place.get("country_code"),
+            "refused_sources": refused,
+            "geometry_source": place.get("geometry_source"),
+        }
+        for place, refused in omitted
+    ]
+
+
+def warn_omissions(stage, rows):
+    """Log one warning naming how many boundaries a licence kept out in
+    ``stage`` and the places per refused source, as a JSON object so no name
+    reads as another entry; silent when none was."""
+    if not rows:
+        return
+    counts = collections.Counter(s for row in rows for s in row["refused_sources"])
+    log.warning(
+        "%s: boundaries omitted by licence: %d %s",
+        stage,
+        len(rows),
+        json.dumps(dict(sorted(counts.items())), ensure_ascii=False),
+    )
 
 
 def shipped_geometry(rows):
@@ -1306,6 +1379,7 @@ def attach_geometry(
             inventory = collections.Counter()
             absent = set()
             outcomes = collections.Counter()
+            omitted = []
             # Resolve the seeded places' areas in bounded chunks so the whole
             # set's polygons are never held at once (that peak OOMs a feed-dense
             # country's build on a memory-tight host). The accumulators below are
@@ -1330,7 +1404,10 @@ def attach_geometry(
                         absent.add(overture_id)
                         continue
                     for place in by_overture[overture_id]:
-                        outcomes[ship_area(place, rows, inventory, shipped)] += 1
+                        outcome = ship_area(
+                            place, rows, inventory, shipped, omitted=omitted
+                        )
+                        outcomes[outcome] += 1
                 del areas
             # A place whose own division has no area ships the area of another
             # division its QID names.
@@ -1356,9 +1433,10 @@ def attach_geometry(
                     absent.discard(own)
                     for place in by_overture[own]:
                         rows = areas[own]
-                        outcomes[
-                            ship_area(place, rows, inventory, shipped, source)
-                        ] += 1
+                        outcome = ship_area(
+                            place, rows, inventory, shipped, source, omitted
+                        )
+                        outcomes[outcome] += 1
             with_geometry = outcomes["shipped"]
             invalid = outcomes["invalid"]
 
@@ -1469,6 +1547,8 @@ def attach_geometry(
                 {UCDB_DERIVED: ucdb.RELEASE, FAO_DERIVED: fao.DOI},
             )
             notice = _notice(shipped, overture.current_release(), derived)
+            omissions = omission_rows(omitted)
+            warn_omissions("geometry", omissions)
             manifest = {
                 "source": "geometry",
                 "sources": metros_manifest.get("sources"),
@@ -1505,6 +1585,7 @@ def attach_geometry(
                 {
                     "places_seed.jsonl": store.jsonl_chunks(places),
                     "licence_inventory.jsonl": store.jsonl_chunks(inventory_rows),
+                    OMISSIONS_ARTIFACT: store.jsonl_chunks(omissions),
                     "override_report.jsonl": store.jsonl_chunks(override_report),
                     "NOTICE": lambda: [notice],
                 },

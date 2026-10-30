@@ -1672,6 +1672,41 @@ def test_a_permissively_licensed_area_ships_and_is_credited(
     ] == [(dataset_name, licence, True)]
 
 
+def test_a_boundary_a_licence_keeps_out_is_warned_and_recorded(tmp_path, caplog):
+    """A boundary a licence kept out was only counted in the stage manifest:
+    a us2 build on Overture 2026-10-21.0 lost 24 US states and 24 cities with
+    no line in its log or its report."""
+    import test_index_geometry as gt
+
+    cache = tmp_path / "cache"
+    gt._publish(cache, [gt._place("Q812", "region", overture_id="us-fl", country="US")])
+    # A name holding the warning's own punctuation stays one entry.
+    name = "Atlas (A: 1, B)"
+    sources = [{"dataset": name, "license": "CC-BY-NC-4.0", "record_id": "M"}]
+    dataset = fx.write_area_dataset(
+        tmp_path / "areas.parquet", [fx.area("us-fl", gt.BOX, sources)]
+    )
+    with caplog.at_level(logging.WARNING):
+        geometry.attach_geometry(cache, dataset=dataset)
+    rows, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", geometry.OMISSIONS_ARTIFACT
+    )
+    assert rows == [
+        {
+            "overture_id": "us-fl",
+            "name": "Q812",
+            "kind": "region",
+            "country_code": "US",
+            "refused_sources": [f"{name}|CC-BY-NC-4.0"],
+            "geometry_source": None,
+        }
+    ]
+    assert (
+        'geometry: boundaries omitted by licence: 1 {"Atlas (A: 1, B)|CC-BY-NC-4.0": 1}'
+        in caplog.messages
+    )
+
+
 def test_a_source_only_expand_shipped_is_credited(tmp_path):
     """The expand stage shipped boundaries without recording their sources,
     and the NOTICE was the geometry stage's, written over the seeded places

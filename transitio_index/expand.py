@@ -176,7 +176,7 @@ def _onestop_cells(cache_dir, seed_generation):
     return [shapely.box(*f["onestop_cell"]) for f in feeds if f.get("onestop_cell")]
 
 
-def _attach_boundary(place, rows, inventory, shipped):
+def _attach_boundary(place, rows, inventory, shipped, omitted):
     """The division's licence-audited, simplified boundary onto the place.
 
     ``rows`` are the division's COMPLETE land areas from an id-filtered
@@ -185,12 +185,13 @@ def _attach_boundary(place, rows, inventory, shipped):
     The contract mirrors the geometry stage's exactly: every area's every
     source shippable and every polygon valid, else the place ships without
     geometry rather than with unaudited or partial geometry. The audit is
-    recorded in ``inventory`` and ``shipped`` as the geometry stage records it.
+    recorded in ``inventory``, ``shipped`` and ``omitted`` as the geometry
+    stage records it.
     """
     place.setdefault("geometry", None)
     place.setdefault("geometry_source", None)
     if rows:
-        geometry.ship_area(place, rows, inventory, shipped)
+        geometry.ship_area(place, rows, inventory, shipped, omitted=omitted)
 
 
 def _attach_metros(places_by_id, codes, new_cities, wikidata, report, registry=None):
@@ -767,12 +768,14 @@ def _discover(
     pending = [entry for entry in curated if entry["place"] not in places_by_id]
     inventory = collections.Counter()
     shipped = set()
+    omitted = []
     for qid in new_ids:
         place = discovered[qid]
         place.setdefault("aliases", [])
         place.setdefault("statistical_area_id", None)
         place.setdefault("metro_ids", [])
-        _attach_boundary(place, areas.get(place["overture_id"]), inventory, shipped)
+        rows = areas.get(place["overture_id"])
+        _attach_boundary(place, rows, inventory, shipped, omitted)
         if place["geometry"] and place["overture_id"] in given:
             place["geometry_source"] = given[place["overture_id"]]
         places_by_id[qid] = place
@@ -994,6 +997,8 @@ def _discover(
 
     from transitio_index.fao import DOI as FAO_DOI
 
+    omissions = geometry.omission_rows(omitted)
+    geometry.warn_omissions("expand", omissions)
     return {
         "feeds_scanned": len(crawled),
         "stops_read": stops_read,
@@ -1014,6 +1019,7 @@ def _discover(
             )
             if row["role"] == "component"
         ],
+        "licence_omissions": omissions,
     }
 
 
@@ -1170,6 +1176,7 @@ def expand(
                 "identified": 0,
                 "licence_sources": [],
                 "licence_inventory": [],
+                "licence_omissions": [],
             }
             with crawl.reading(cache_dir):
                 crawl_digest, counts, mode = _expanded(

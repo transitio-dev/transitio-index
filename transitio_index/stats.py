@@ -8,8 +8,9 @@ per catalogue row, whether or not it became a feed — ``feeds.parquet`` — one
 row per published feed, joined with the crawl log, the seed placements and
 the published edges — and ``summary.json``, the totals the report renders,
 keyed by section: the build's provenance, the declared places, identity and
-duplication, availability, licensing, scale, the declared-versus-observed
-country agreement and the declared-municipality outcomes. Nothing is re-run and
+duplication, availability, licensing, the boundaries a licence kept out,
+scale, the declared-versus-observed country agreement and the
+declared-municipality outcomes. Nothing is re-run and
 no network is touched; for a sample build the rows are the sample's, and the
 summary records the build's snapshot id and source versions.
 """
@@ -31,8 +32,9 @@ from transitio_index.crosswalk import GBFS_ARTIFACT, _clean_url, _host, _mint_md
 
 STATS_POINTER = "stats.json"
 # The shape of the stats artifacts; the aggregation script refuses a mismatch.
-# 2: the realtime section; 3: validity; 4: hosted copies; 5: keyed crawls
-STATS_SCHEMA_VERSION = 5
+# 2: the realtime section; 3: validity; 4: hosted copies; 5: keyed crawls;
+# 6: the boundaries section
+STATS_SCHEMA_VERSION = 6
 CATALOGUE_ARTIFACT = "catalogue.parquet"
 FEEDS_ARTIFACT = "feeds.parquet"
 PLACES_ARTIFACT = "places.parquet"
@@ -486,6 +488,9 @@ def stats(cache_dir):
         )
         summary["duplicate_coverage"] = duplicate_coverage(edges, rows)
         summary["distributions"] = distributions(edges, places)
+        summary["boundaries"] = boundary_section(
+            _licence_omissions(cache_dir, snapshot), places
+        )
         manifest = {
             "source": "stats",
             "stats_schema_version": STATS_SCHEMA_VERSION,
@@ -1032,6 +1037,100 @@ def _placements(cache_dir, snapshot):
     return placements
 
 
+def _licence_omissions(cache_dir, snapshot):
+    """The places the geometry and expand stages kept an Overture boundary
+    from by licence, each with its stage, read from the generations the
+    snapshot descends from; none for a stage it records no generation of.
+
+    A generation written before the stages recorded the places is read as
+    none only when it shows no refusal (the geometry stage's
+    ``omitted_by_licence``, the expand stage's licence inventory); otherwise
+    the statistics are refused, never published as a clean zero.
+    """
+    from transitio_index import geometry
+
+    recorded = snapshot.get("generations") or {}
+    rows = []
+    for pointer, stage in (("geometry.json", "geometry"), ("expanded.json", "expand")):
+        wanted = recorded.get(f"gazetteer/{pointer}")
+        if wanted is None:
+            continue
+        generation, manifest = store.resolve(cache_dir / "gazetteer", pointer)
+        with generation:
+            if manifest.get("generation") != wanted:
+                raise StatsError(
+                    f"the published index was not built from the current "
+                    f"{pointer}; re-run the pipeline in stage order"
+                )
+            if stage == "expand":
+                found = manifest.get("licence_omissions")
+                counted = None
+                refused = any(
+                    not row.get("allowed")
+                    for row in manifest.get("licence_inventory") or ()
+                )
+            else:
+                found = (
+                    store.parse_jsonl(
+                        generation.read_bytes(geometry.OMISSIONS_ARTIFACT)
+                    )
+                    if generation.has(geometry.OMISSIONS_ARTIFACT)
+                    else None
+                )
+                counted = manifest.get("omitted_by_licence") or 0
+                refused = counted > 0
+        if found is None:
+            if refused:
+                raise StatsError(
+                    f"{pointer} omitted boundaries by licence without naming "
+                    "the places; re-run the gazetteer stages"
+                )
+            found = []
+        elif counted is not None and len(found) != counted:
+            raise StatsError(
+                f"{pointer} names {len(found)} places omitted by licence, "
+                f"its manifest counts {counted}"
+            )
+        rows += [{**row, "stage": stage} for row in found]
+    return rows
+
+
+def boundary_section(omissions, places):
+    """The places whose Overture boundary a licence kept out: how many, how
+    many ship no boundary at all and how many are published (by Overture id),
+    the places per refused source, and each place with the boundary it ships
+    instead."""
+    published = {place.get("overture_id") for place in places} - {None}
+    refused = collections.Counter(
+        source for row in omissions for source in row.get("refused_sources") or ()
+    )
+    listed = [
+        {
+            "name": row.get("name"),
+            "kind": row.get("kind"),
+            "country_code": row.get("country_code"),
+            "overture_id": row.get("overture_id"),
+            "stage": row.get("stage"),
+            "refused_sources": row.get("refused_sources"),
+            "geometry_source": row.get("geometry_source"),
+            "published": row.get("overture_id") in published,
+        }
+        for row in sorted(
+            omissions,
+            key=lambda row: tuple(
+                str(row.get(key)) for key in ("country_code", "kind", "name")
+            ),
+        )
+    ]
+    return {
+        "omitted_by_licence": len(listed),
+        "without_a_boundary": sum(not row["geometry_source"] for row in listed),
+        "published": sum(row["published"] for row in listed),
+        "refused_sources": dict(sorted(refused.items())),
+        "places": listed,
+    }
+
+
 # ---- place level, duplicate coverage, distributions and the report ----
 
 PLACE_SCHEMA = pa.schema(
@@ -1072,6 +1171,12 @@ DEFINITIONS = {
         "catalogue status."
     ),
     "licensing": "Licence declarations and the redistribution judgement per feed.",
+    "boundaries": (
+        "Places whose Overture boundary a source's licence kept out of the "
+        "index: the places per refused source, and each place with the "
+        "boundary it ships instead (none when blank) and whether it is "
+        "published."
+    ),
     "validity": (
         "Feed validity against the build date: dated feeds, the ones valid "
         "on it, expired or not started, the valid ones ending within 30 and "
@@ -1116,6 +1221,7 @@ REPORT_SECTIONS = (
     "identity",
     "availability",
     "licensing",
+    "boundaries",
     "realtime",
     "scale",
     "validity",
@@ -1263,14 +1369,18 @@ def distributions(edges, places):
 
 
 def _cell(value):
+    """One Markdown table cell: a float to three decimals, a list joined with
+    commas, anything else as text, on one line and never splitting the row."""
     if isinstance(value, float):
         return f"{value:.3f}".rstrip("0").rstrip(".")
     if isinstance(value, (list, tuple)):
-        return ", ".join(str(v) for v in value)
-    # A pipe or a line break in a value (an archive label, a URL) would
-    # break the table: escaped and folded to one line.
-    text = "" if value is None else str(value)
-    return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+        text = ", ".join(str(v) for v in value)
+    else:
+        text = "" if value is None else str(value)
+    # A backslash, a pipe or a line break in a value (an archive label, a URL,
+    # a refused source) would break the table: escaped and folded to one line.
+    text = text.replace("\\", "\\\\").replace("|", "\\|")
+    return text.replace("\r", " ").replace("\n", " ")
 
 
 def _table(rows, columns):

@@ -220,6 +220,27 @@ def test_a_source_ships_by_its_licence(sources, shippable):
     assert geometry._is_shippable(sources) is shippable
 
 
+def test_refused_sources_read_apart_on_one_line():
+    # "A|B" under "X" and "A" under "B|X" would join alike, a dataset named
+    # "(none)" like a missing one; a newline would start a forged log line. A
+    # shippable source is not named.
+    sources = [
+        {"dataset": "A|B", "license": "X"},
+        {"dataset": "A", "license": "B|X"},
+        {"dataset": "(none)", "license": "X"},
+        {"dataset": "Maps\nForged", "license": None},
+        _osm(),
+    ]
+    rows = [{"sources": sources}, {"sources": []}]
+    assert geometry.refused_sources(rows) == [
+        "(none)|(none)",
+        "A\\|B|X",
+        "A|B\\|X",
+        "Maps\\nForged|(none)",
+        "\\(none)|X",
+    ]
+
+
 INSIDE = shapely.to_wkb(shapely.Point(25.0, 60.2)).hex()
 OUTSIDE = shapely.to_wkb(shapely.Point(26.0, 60.2)).hex()
 

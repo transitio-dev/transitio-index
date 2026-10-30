@@ -945,6 +945,11 @@ def test_an_unauditable_boundary_ships_without_geometry(tmp_path):
     assert [
         (row["dataset"], row["allowed"]) for row in manifest["licence_inventory"]
     ] == [("Mystery Maps", False)]
+    # The place a licence kept the boundary from is recorded, not just counted.
+    assert [
+        (row["overture_id"], row["refused_sources"], row["geometry_source"])
+        for row in manifest["licence_omissions"]
+    ] == [(badgeo["overture_id"], ["Mystery Maps|proprietary"], None)]
 
 
 def test_a_discovered_place_keeps_its_label_point_inside_its_boundary(tmp_path):
