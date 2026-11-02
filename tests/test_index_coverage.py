@@ -366,6 +366,13 @@ def _geojson(zones):
     ).encode()
 
 
+# A trip picking riders up in the zones "deep" and "sliver".
+BOARDING_TRIP = (
+    b"trip_id,location_id,stop_sequence,pickup_type,drop_off_type\n"
+    b"t,deep,1,2,2\nt,sliver,2,2,2\n"
+)
+
+
 def test_a_zone_places_its_feed_like_a_stop(tmp_path):
     # f-city: one stop in Q-city, a zone deep in Q-other and one reaching
     # 0.0003° into Q-city and into a hamlet no place names, less than the
@@ -397,7 +404,10 @@ def test_a_zone_places_its_feed_like_a_stop(tmp_path):
         tmp_path,
         crawls={feed_id: _rows(1, 10.0) for feed_id in ("f-city", "f-reg", "f-none")},
         members={
-            "f-city": {"locations.geojson": _geojson(zones)},
+            "f-city": {
+                "locations.geojson": _geojson(zones),
+                "stop_times.txt": BOARDING_TRIP,
+            },
             "f-reg": {"locations.geojson": b"{not json"},
             "f-none": {"locations.geojson": b'{"features": [{"id": "x"}]}'},
         },

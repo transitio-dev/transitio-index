@@ -137,21 +137,31 @@ def _stop_points(feed_dir, state):
         return None
 
 
-def _zone_shapes(feed_dir, state):
-    """``(zones, dropped)`` for one crawled feed's demand-responsive zones
-    (:func:`crawl.zone_shapes`), ``({}, 0)`` when its crawl holds none, or
-    None when the member fails verification or parsing, as
-    :func:`_stop_points`."""
+def _boarding_zone_shapes(feed_dir, state):
+    """``(zones, dropped, unboarded)`` for one crawled feed's demand-responsive
+    zones (:func:`crawl.zone_shapes`): only those riders can board in
+    (:func:`crawl.boarding_zones`), ``unboarded`` counting the parsed zones
+    left out — none boards in a crawl without ``stop_times.txt``.
+    ``({}, 0, 0)`` when its crawl holds no zones, or None when a member fails
+    verification or parsing, as :func:`_stop_points`."""
     digests = state.get("member_sha256")
     if not isinstance(digests, dict) or "locations.geojson" not in digests:
-        return {}, 0
+        return {}, 0, 0
     try:
         with crawl.verified_member(feed_dir, state, "locations.geojson") as opened:
             if opened is None:
                 return None
-            return crawl.zone_shapes(opened)
+            zones, dropped = crawl.zone_shapes(opened)
+        boarded = set()
+        if zones and crawl.STOP_TIMES in digests:
+            with crawl.verified_member(feed_dir, state, crawl.STOP_TIMES) as opened:
+                if opened is None:
+                    return None
+                boarded = crawl.boarding_zones(opened, zones)
     except crawl.MEMBER_ERRORS:
         return None
+    kept = {zone_id: shape for zone_id, shape in zones.items() if zone_id in boarded}
+    return kept, dropped, len(zones) - len(kept)
 
 
 def _onestop_cells(cache_dir, seed_generation):
@@ -582,6 +592,7 @@ def _discover(
     crawled = crawl.crawled_feeds(cache_dir)
     stops_read = 0
     zones_read = 0
+    zones_without_pickup = 0
     zone_failures = set()
     state_mismatches = 0
     boxes = []
@@ -592,12 +603,13 @@ def _discover(
             state_mismatches += 1
             continue
         points, _ = read
-        zones = _zone_shapes(feed_dir, state)
+        zones = _boarding_zone_shapes(feed_dir, state)
         if zones is None:
             zone_failures.add(state.get("feed_id"))
-            zones = {}, 0
+            zones = {}, 0, 0
         stops_read += len(points)
         zones_read += len(zones[0])
+        zones_without_pickup += zones[2]
         boxes.extend(crawl.cluster_boxes(points))
         boxes.extend(crawl.zone_boxes(zones[0].values()))
         # Only zones whose cells were ensured are resolved.
@@ -607,14 +619,14 @@ def _discover(
     divisions = {}
     for feed_dir, state, zoned in progress(usable, "expand resolve"):
         read = _stop_points(feed_dir, state)
-        zones = _zone_shapes(feed_dir, state) if zoned else ({}, 0)
+        zones = _boarding_zone_shapes(feed_dir, state) if zoned else ({}, 0, 0)
         if read is None:
             # Changed between the passes: no longer trustworthy evidence.
             state_mismatches += 1
             continue
         if zones is None:
             zone_failures.add(state.get("feed_id"))
-            zones = {}, 0
+            zones = {}, 0, 0
         points, _ = read
         for x, y in points:
             for record in lookup.divisions_at(x, y):
@@ -1003,6 +1015,8 @@ def _discover(
         "feeds_scanned": len(crawled),
         "stops_read": stops_read,
         "zones_read": zones_read,
+        # Zones riders are only set down in: they discover no place.
+        "zones_without_pickup": zones_without_pickup,
         "zone_failures": sorted(str(feed_id) for feed_id in zone_failures),
         "state_mismatches": state_mismatches,
         "divisions_hit": len(divisions),
@@ -1169,6 +1183,7 @@ def expand(
                 "feeds_scanned": 0,
                 "stops_read": 0,
                 "zones_read": 0,
+                "zones_without_pickup": 0,
                 "zone_failures": [],
                 "divisions_hit": 0,
                 "places_added": 0,

@@ -3246,3 +3246,101 @@ def test_the_crawl_reads_the_files_that_place_a_flex_trip(tmp_path, range_thresh
     _, log = crt._crawl(cache, server, range_threshold=range_threshold, lookup=lookup)
     assert log["f-flex"]["method"] != "not_modified"
     assert set(zones) <= set(log["f-flex"]["members"])
+
+
+def test_a_flex_zone_riders_are_only_set_down_in_places_nothing(tmp_path, caplog):
+    """A Flex feed was placed at every place any of its zones reached: a
+    Grand County, Colorado service setting riders down across 181,155 km² was
+    listed at 301 places, Wyoming and Nebraska among them, as national."""
+    other = {"division_id": "d-other", "kind": "city", "wikidata": "Q-other"}
+    lookup = ct.ZoneLookup(
+        ct.LOOKUP.by_x, [(shapely.box(19.0, -1.0, 21.0, 1.0), other)]
+    )
+    zones = {"away": shapely.box(19.5, 0.0, 20.5, 0.5)}
+    set_down = (
+        b"trip_id,location_id,stop_sequence,pickup_type,drop_off_type\n"
+        b"t,away,1,1,2\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        manifest, _, edges = ct._cover(
+            tmp_path,
+            crawls={"f-city": ct._rows(1, 10.0)},
+            members={
+                "f-city": {
+                    "locations.geojson": ct._geojson(zones),
+                    "stop_times.txt": set_down,
+                }
+            },
+            lookup=lookup,
+        )
+    assert "Q-other" not in edges["f-city"]
+    # The stop alone places the feed, at its full share.
+    assert edges["f-city"]["Q-city"]["evidence"] == {
+        "stops_in_place": 1,
+        "stop_share": 1.0,
+    }
+    assert manifest["zones_without_pickup"] == {"f-city": 1}
+    assert "coverage: zones without a pickup left out: 1 in 1 feeds" in caplog.messages
+
+
+def test_a_flex_zone_named_in_stop_id_places_its_route(tmp_path):
+    """Older GTFS-Flex drafts name a zone in stop_times' stop_id. Classify
+    read it as a stop without coordinates and dropped every edge: Humboldt
+    Transit Authority's dial-a-ride lost all 7 of its places, Eureka and
+    Humboldt County among them."""
+    import test_index_classify as clt
+    from transitio.index import fingerprint
+
+    city = {**clt._records("Q-city")[0], "division_id": "d-city"}
+    country = {**clt._records("Q-city")[2], "division_id": "d-c"}
+    lookup = clt.ZoneLookup(
+        clt.LOOKUP.by_x,
+        [
+            (shapely.box(9.5, 0.0, 10.5, 2.0), city),
+            (shapely.box(0.0, -10.0, 70.0, 10.0), country),
+        ],
+    )
+    area = shapely.geometry.mapping(shapely.box(9.8, 0.5, 10.2, 1.5))
+    geojson = {"features": [{"type": "Feature", "id": "area", "geometry": area}]}
+    members = {
+        "stops.txt": b"stop_id,stop_lat,stop_lon\n",
+        "routes.txt": b"route_id,route_type\nr,715\n",
+        "trips.txt": b"trip_id,route_id,service_id\nt,r,all\n",
+        "calendar.txt": (
+            b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+            b"start_date,end_date\nall,1,1,1,1,1,1,1,20260105,20260111\n"
+        ),
+        # A pickup window, then a set-down window, in the one zone.
+        "stop_times.txt": (
+            b"trip_id,stop_id,stop_sequence,pickup_type,drop_off_type\n"
+            b"t,area,1,2,1\nt,area,2,1,2\n"
+        ),
+        "locations.geojson": json.dumps(geojson).encode(),
+    }
+    cache = tmp_path / "cache"
+    clt._write_crawl(cache, "f-flex", members, "complete")
+    feeds = [
+        {"feed_id": "f-flex", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    clt._coverage(
+        cache, feeds, [clt._candidate(p, "f-flex") for p in ("Q-city", "Q-c")]
+    )
+    classify.classify(cache, lookup=lookup)
+    rows, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    local = {(e["place_id"], e["tier"]): e for e in rows}[("Q-city", "local")]
+    assert local["service"] == {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+    # The route is measured by the zone's hull, as any zone's.
+    diagonals = [((9.8, 0.5), (10.2, 1.5)), ((9.8, 1.5), (10.2, 0.5))]
+    assert local["evidence"]["spread_km"] == pytest.approx(
+        max(classify.haversine_km(a, b) for a, b in diagonals)
+    )
+    # The fingerprint still reads the zone's id as a stop id, as transitio does.
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as written:
+        for name, data in members.items():
+            written.writestr(name, data)
+    archive.seek(0)
+    assert (
+        local["classification_fingerprint"]
+        == fingerprint.from_feed(archive, local["fingerprint_kind"])[0]
+    )

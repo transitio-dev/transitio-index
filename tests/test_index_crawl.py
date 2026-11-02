@@ -1761,6 +1761,20 @@ def test_zone_shapes_keep_the_polygons_and_count_the_rest():
             crawl.zone_shapes(document)
 
 
+def test_boarding_zones_are_the_zones_a_row_picks_up_in():
+    stop_times = (
+        b"trip_id,stop_id,location_id,stop_sequence,pickup_type,drop_off_type\n"
+        # Pickup by phone, then set down only.
+        b"t,,home,1,2,1\nt,,away,2,1,2\n"
+        # A blank pickup type is a regular pickup; ids are trimmed.
+        b"u,, plain ,1,,\n"
+        # An older Flex draft names the zone in stop_id; s1 is a stop.
+        b"v,draft,,1,0,1\nv,s1,,2,0,0\n"
+    )
+    zones = {"home", "away", "plain", "draft", "unused"}
+    assert crawl.boarding_zones(stop_times, zones) == {"home", "plain", "draft"}
+
+
 def test_zone_boxes_cover_the_cells_each_part_touches():
     import shapely
 

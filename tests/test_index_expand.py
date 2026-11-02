@@ -409,10 +409,14 @@ def test_a_crawled_stop_discovers_an_unseeded_city(tmp_path):
     assert manifest["places_added"] == 2  # the city and its region
 
 
-def test_a_zone_discovers_the_places_it_reaches_into(tmp_path):
+@pytest.mark.parametrize(
+    "pickup_type, discovered", [("2", True), ("1", False)], ids=["pickup", "set-down"]
+)
+def test_a_zone_discovers_the_places_it_reaches_into(tmp_path, pickup_type, discovered):
     # The feed's one stop lies in no city; one zone reaches 0.1° into
     # Tampere, the other 0.0003° into Nowhere, less than the boundary
-    # simplification: only Tampere and its region are discovered.
+    # simplification: only Tampere and its region are discovered, and only
+    # when riders can board in its zone.
     cache = tmp_path / "cache"
     _publish_names(cache, SEED_PLACES)
     zones = [
@@ -426,16 +430,25 @@ def test_a_zone_discovers_the_places_it_reaches_into(tmp_path):
             for zone_id, z in zones
         ],
     }
+    stop_times = (
+        "trip_id,location_id,stop_sequence,pickup_type,drop_off_type\n"
+        f"t,deep,1,{pickup_type},2\nt,sliver,2,2,2\n"
+    )
     _write_crawl(
         cache,
         "f-flex",
         ["s1,63.0,25.0\n"],
-        {"locations.geojson": json.dumps(geojson).encode()},
+        {
+            "locations.geojson": json.dumps(geojson).encode(),
+            "stop_times.txt": stop_times.encode(),
+        },
     )
     manifest, places, _ = _expand(tmp_path, cache)
-    assert {"Q40840", "Q5697"} <= set(places)
+    assert ({"Q40840", "Q5697"} <= set(places)) is discovered
     assert "Nowhere" not in {place.get("name") for place in places.values()}
-    assert manifest["zones_read"] == 2
+    assert (manifest["zones_read"], manifest["zones_without_pickup"]) == (
+        (2, 0) if discovered else (1, 1)
+    )
     assert manifest["zone_failures"] == []
 
 
