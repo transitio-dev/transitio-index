@@ -605,8 +605,9 @@ class ZoneLookup(StubLookup):
 
 def test_flex_trips_classify_by_their_zones_and_stop_groups(tmp_path):
     # inner: a zone inside Q-city whose trip names it twice (a pickup and a
-    # drop-off window); wide: a zone reaching Q-city and Q-other; group: a
-    # trip at a stop group of two Q-city stops. The calendar runs every day.
+    # drop-off window); wide: a zone reaching Q-city and Q-other, whose trip
+    # also sets riders down in the far zone, where none board; group: a trip
+    # at a stop group of two Q-city stops. The calendar runs every day.
     import io
     import zipfile
 
@@ -615,6 +616,7 @@ def test_flex_trips_classify_by_their_zones_and_stop_groups(tmp_path):
 
     inner = shapely.box(9.8, 0.5, 10.2, 1.5)
     wide = shapely.box(10.2, 0.5, 19.8, 1.5)
+    far = shapely.box(40.0, 0.5, 60.0, 1.5)
     region = [{"kind": "region", "wikidata": "Q-reg", "country": "AA"}]
     lookup = ZoneLookup(
         LOOKUP.by_x,
@@ -631,7 +633,7 @@ def test_flex_trips_classify_by_their_zones_and_stop_groups(tmp_path):
         "type": "FeatureCollection",
         "features": [
             {"type": "Feature", "id": key, "geometry": shapely.geometry.mapping(z)}
-            for key, z in (("inner", inner), ("wide", wide))
+            for key, z in (("inner", inner), ("wide", wide), ("far", far))
         ],
     }
     members = {
@@ -643,8 +645,10 @@ def test_flex_trips_classify_by_their_zones_and_stop_groups(tmp_path):
             b"start_date,end_date\nall,1,1,1,1,1,1,1,20260105,20260111\n"
         ),
         "stop_times.txt": (
-            b"trip_id,stop_id,location_id,location_group_id,stop_sequence\n"
-            b"t1,,inner,,1\nt1,,inner,,2\nt2,,wide,,1\nt3,,,G,1\n"
+            b"trip_id,stop_id,location_id,location_group_id,stop_sequence,"
+            b"pickup_type\n"
+            b"t1,,inner,,1,\nt1,,inner,,2,\nt2,,wide,,1,\nt2,,far,,2,1\n"
+            b"t3,,,G,1,\n"
         ),
         "location_group_stops.txt": b"location_group_id,stop_id\nG,g1\nG,g2\n",
         "locations.geojson": json.dumps(geojson).encode(),
@@ -661,7 +665,7 @@ def test_flex_trips_classify_by_their_zones_and_stop_groups(tmp_path):
     edges = {(e["place_id"], e["tier"]): e for e in rows}
     assert {tier for _, tier in edges} == {"local", "regional"}
     # One city holds the inner zone and the group's stops; the wide zone
-    # reaches two cities and spans its hull.
+    # reaches two cities and spans its hull, the far zone neither.
     local = edges[("Q-city", "local")]
     assert local["evidence"]["rules"] == ["one_city"]
     # The pair's service over every route serving Q-city: one departure for

@@ -140,8 +140,8 @@ PATTERN_SAMPLE = 8
 # How departures a day are averaged: 1 over every day from the first to the
 # last running a quarter of the busiest day's trips; 2 over the weekdays of
 # the busiest week; 3 counts a demand-responsive trip once per zone or stop
-# group it names.
-DEPARTURES_VERSION = 3
+# group it names; 4 leaves out the zones it only sets riders down in.
+DEPARTURES_VERSION = 4
 # The decision table's version: bumped whenever a rule, a range or the way a
 # signal feeds a rule changes, so two snapshots' tiers can be told apart from
 # their manifests alone. 1 was the table shipped in schemas 6–9; 2 decides
@@ -153,8 +153,9 @@ DEPARTURES_VERSION = 3
 # country's reference span, and adds international instead of replacing; 6
 # keeps the departures of routes across a border apart on the international
 # edge, by their own tier; 7 reads the zones and stop groups of
-# demand-responsive trips.
-RULES_VERSION = 7
+# demand-responsive trips; 8 leaves the zones a trip only sets riders down in
+# out of its route's places and span.
+RULES_VERSION = 8
 
 # The route-span reference (written by ``scripts/route_span_reference.py``):
 # per home country and basic mode, the 90th percentile of the spans of the
@@ -690,7 +691,9 @@ def _read_stop_times(
     feed's scheduled ones and, per route, the seventh result, never the
     first, which the fingerprint reads. A trip's departure counts once per
     zone or group, however many rows name it, spread evenly over a group's
-    stops.
+    stops. A zone row without a pickup (``pickup_type`` 1) only sets riders
+    down: it locates nothing, so the zone neither places nor measures the
+    route.
     """
     stops = collections.defaultdict(set)
     scheduled = set()
@@ -705,10 +708,11 @@ def _read_stop_times(
         trip_id = crawl.member_id(row, "trip_id", padded, "stop_times.txt")
         route_id = trip_routes.get(trip_id)
         stop_id = crawl.member_id(row, "stop_id", padded, "stop_times.txt")
-        traversal = (row.get("pickup_type") or "").strip() == "1" and (
-            row.get("drop_off_type") or ""
-        ).strip() == "1"
+        no_pickup = (row.get("pickup_type") or "").strip() == "1"
+        traversal = no_pickup and (row.get("drop_off_type") or "").strip() == "1"
         place = None if stop_id else _flex_location(row, groups)
+        if no_pickup and place and place[0][0] == "zone":
+            place = None
         if not traversal and trip_id in declared:
             scheduled.update((stop_id,) if stop_id else place[1] if place else ())
         if route_id is None:

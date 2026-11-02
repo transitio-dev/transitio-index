@@ -3246,3 +3246,38 @@ def test_the_crawl_reads_the_files_that_place_a_flex_trip(tmp_path, range_thresh
     _, log = crt._crawl(cache, server, range_threshold=range_threshold, lookup=lookup)
     assert log["f-flex"]["method"] != "not_modified"
     assert set(zones) <= set(log["f-flex"]["members"])
+
+
+def test_a_flex_zone_riders_are_only_set_down_in_places_nothing(tmp_path, caplog):
+    """A Flex feed was placed at every place any of its zones reached: a
+    Grand County, Colorado service setting riders down across 181,155 km² was
+    listed at 301 places, Wyoming and Nebraska among them, as national."""
+    other = {"division_id": "d-other", "kind": "city", "wikidata": "Q-other"}
+    lookup = ct.ZoneLookup(
+        ct.LOOKUP.by_x, [(shapely.box(19.0, -1.0, 21.0, 1.0), other)]
+    )
+    zones = {"away": shapely.box(19.5, 0.0, 20.5, 0.5)}
+    set_down = (
+        b"trip_id,location_id,stop_sequence,pickup_type,drop_off_type\n"
+        b"t,away,1,1,2\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        manifest, _, edges = ct._cover(
+            tmp_path,
+            crawls={"f-city": ct._rows(1, 10.0)},
+            members={
+                "f-city": {
+                    "locations.geojson": ct._geojson(zones),
+                    "stop_times.txt": set_down,
+                }
+            },
+            lookup=lookup,
+        )
+    assert "Q-other" not in edges["f-city"]
+    # The stop alone places the feed, at its full share.
+    assert edges["f-city"]["Q-city"]["evidence"] == {
+        "stops_in_place": 1,
+        "stop_share": 1.0,
+    }
+    assert manifest["zones_without_pickup"] == {"f-city": 1}
+    assert "coverage: zones without a pickup left out: 1 in 1 feeds" in caplog.messages

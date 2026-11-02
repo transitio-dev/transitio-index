@@ -324,6 +324,25 @@ def zone_shapes(source):
     return zones, dropped
 
 
+def boarding_zones(source, zone_ids):
+    """The ids in ``zone_ids`` that a ``stop_times.txt`` row (bytes or a
+    binary file) lets riders board in: the row names the zone in
+    ``location_id``, or in ``stop_id`` as older GTFS-Flex drafts do, and its
+    ``pickup_type`` is not 1. A zone riders are only set down in is a
+    destination, not a place the feed serves."""
+    stream = io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source
+    wanted = set(zone_ids)
+    found = set()
+    for row in member_rows(stream):
+        if (row.get("pickup_type") or "").strip() == "1":
+            continue
+        for field in ("location_id", "stop_id"):
+            zone = member_id(row, field)
+            if zone in wanted:
+                found.add(zone)
+    return found
+
+
 def _zone_polygon(geometry):
     """The polygonal shape of a GeoJSON Polygon or MultiPolygon whose every
     coordinate is finite and in range, repaired when invalid; None for

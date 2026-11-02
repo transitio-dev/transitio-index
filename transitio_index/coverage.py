@@ -829,10 +829,11 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
     exactly as expansion reads them), resolves every stop
     through the boundary lookup, and admits every ``(place, feed)`` pair with
     a stop inside, the count being the service level's first term. A
-    demand-responsive zone counts as one stop in every place it reaches into
-    (:func:`zone_places`), its evidence naming how many of them are zones;
-    the report lists the feeds whose zones failed to read and counts the
-    sliver overlaps left out. Every
+    demand-responsive zone riders can board in counts as one stop in every
+    place it reaches into (:func:`zone_places`), its evidence naming how many
+    of them are zones; the report lists the feeds whose zones failed to read,
+    the zones per feed riders are only set down in, and counts the sliver
+    overlaps left out. Every
     feed whose stops were read is reported in ``superseded``; the stage keeps
     the declared placements of one that gets no edge here. Metro edges are
     propagated from member-city edges; a metro's own aggregated evidence
@@ -878,6 +879,7 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
     stale = set()
     mismatches = 0
     zone_failures = []
+    without_pickup = {}
     slivers = 0
     for feed_id, (feed_dir, state) in progress(sorted(states.items()), "coverage"):
         read = expand._stop_points(feed_dir, state)
@@ -886,12 +888,16 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
             crawl_fields[feed_id] = {"crawl_status": "unreadable"}
             continue
         points, dropped = read
-        zoned = expand._zone_shapes(feed_dir, state)
+        zoned = expand._boarding_zone_shapes(feed_dir, state)
         if zoned is None:
             # The stops still place the feed.
             zone_failures.append(feed_id)
-            zoned = {}, 0
-        zones, zones_dropped = zoned
+            zoned = {}, 0, 0
+        # A zone riders are only set down in places nothing and is no
+        # location of the feed's service, so no share counts it.
+        zones, zones_dropped, unboarded = zoned
+        if unboarded:
+            without_pickup[feed_id] = unboarded
         # The hull leaves out stops at a placeholder position, and covers
         # each zone's own hull.
         placed = [p for p in points if p != crawl.PLACEHOLDER_POSITION] + [
@@ -981,12 +987,19 @@ def crawled_edges(states, places, lookup, conflicts=frozenset(), *, urls):
         raise CoverageError(stale_expansion(stale))
     for edge in by_key.values():
         edge.pop("_own", None)
+    if without_pickup:
+        log.warning(
+            "coverage: zones without a pickup left out: %d in %d feeds",
+            sum(without_pickup.values()),
+            len(without_pickup),
+        )
     report = {
         "superseded": superseded,
         "state_mismatches": mismatches,
         "dropped_divisions_hit": dropped_hit,
         "crawl_fields": crawl_fields,
         "zone_failures": zone_failures,
+        "zones_without_pickup": without_pickup,
         "zone_slivers": slivers,
     }
     return by_key, report
@@ -1248,6 +1261,7 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "dropped_divisions_hit": [],
                 "crawl_fields": {},
                 "zone_failures": [],
+                "zones_without_pickup": {},
                 "zone_slivers": 0,
             }
             folded, twins = {}, {}
@@ -1454,9 +1468,11 @@ def cover(cache_dir, *, lookup=None, overrides_dir=None, strict=False, registry=
                 "unmatched_crawl_ids": crawl_report["unmatched_crawl_ids"],
                 "dropped_divisions_hit": crawl_report["dropped_divisions_hit"],
                 # Feeds placed by their stops alone because their zones did
-                # not read, and the zone overlaps no deeper than the boundary
+                # not read, the zones riders are only set down in per feed,
+                # and the zone overlaps no deeper than the boundary
                 # simplification, left out.
                 "zone_failures": crawl_report["zone_failures"],
+                "zones_without_pickup": crawl_report["zones_without_pickup"],
                 "zone_slivers": crawl_report["zone_slivers"],
                 # Atlas-only feeds placed by the cell their Onestop ID names.
                 "onestop_cell_placements": cell_placements,
