@@ -137,6 +137,10 @@ SPAN_MAX_STOPS = 2048
 # deterministic sample of trips (PATTERN_SAMPLE per distinct length, for
 # the PATTERN_SAMPLE longest lengths).
 PATTERN_SAMPLE = 8
+# A feed's service ends on the last day it runs at least this share of its
+# busiest day's trips: a few trips dated far beyond the rest do not keep an
+# ended timetable current.
+SERVICE_END_SHARE = 0.01
 # How departures a day are averaged: 1 over every day from the first to the
 # last running a quarter of the busiest day's trips; 2 over the weekdays of
 # the busiest week; 3 counts a demand-responsive trip once per zone or stop
@@ -224,6 +228,7 @@ def classifier_settings(route_min_stops=ROUTE_MIN_STOPS):
         "span_max_stops": SPAN_MAX_STOPS,
         "pattern_sample": PATTERN_SAMPLE,
         "departures_version": DEPARTURES_VERSION,
+        "service_end_share": SERVICE_END_SHARE,
     }
 
 
@@ -473,9 +478,11 @@ Calendar = collections.namedtuple("Calendar", ["windows", "added", "removed", "s
 # A calendar over day numbers counted from its first date: per service its
 # window bounds (0 and -1 without one) and weekday flags indexed by day number
 # modulo 7, every exception that changes whether it runs as
-# ``(service, day, delta)`` arrays, and the weekday of day 0 (Monday 0).
+# ``(service, day, delta)`` arrays, the weekday of day 0 (Monday 0) and its
+# date's ordinal.
 _Days = collections.namedtuple(
-    "_Days", ["services", "start", "end", "flags", "exceptions", "length", "weekday"]
+    "_Days",
+    ["services", "start", "end", "flags", "exceptions", "length", "weekday", "first"],
 )
 
 
@@ -598,6 +605,7 @@ def _calendar_days(calendar):
         exceptions,
         int(bounds.max()) - first + 1,
         datetime.date.fromordinal(first).weekday(),
+        first,
     )
 
 
@@ -917,6 +925,17 @@ def _calendar(feed_dir, state):
         )
 
 
+def _calendar_trips(calendar, service_trips):
+    """``(days, daily)``: the calendar's :data:`_Days` and the trips each of
+    its day numbers runs (:func:`_daily_trips`), ``service_trips`` holding
+    the trips per service id; None without a calendar or a date."""
+    days = None if calendar is None else _calendar_days(calendar)
+    if days is None:
+        return None
+    trips = np.array([service_trips.get(s, 0) for s in days.services], float)
+    return days, _daily_trips(days, trips)
+
+
 def _calendar_weights(calendar, trip_services):
     """``{service_id: share of the averaged days it runs}`` from a read
     calendar, the trips per service in ``trip_services``; None without a
@@ -926,12 +945,10 @@ def _calendar_weights(calendar, trip_services):
     Monday-to-Sunday week running the most trips, the earliest of equals —
     so a stop's departures a day are a working day's; a week without a
     weekday trip averages all its seven days."""
-    days = None if calendar is None else _calendar_days(calendar)
-    if days is None:
+    counted = _calendar_trips(calendar, collections.Counter(trip_services.values()))
+    if counted is None:
         return None
-    per_service = collections.Counter(trip_services.values())
-    trips = np.array([per_service[s] for s in days.services], float)
-    daily = _daily_trips(days, trips)
+    days, daily = counted
     numbers = np.arange(days.length)
     week = (days.weekday + numbers) // 7
     busiest = int(np.argmax(np.bincount(week, daily)))
@@ -947,13 +964,44 @@ def _calendar_weights(calendar, trip_services):
     return dict(zip(days.services, (count / width).tolist()))
 
 
-def _service_span(calendar):
+def _service_span(calendar, service_trips=None):
     """``(service_start, service_end)`` as ISO dates from a read calendar;
-    two Nones without one or without an effective service date."""
+    two Nones without one or without an effective service date.
+
+    The start is the first date any service runs. With ``service_trips``
+    (trips per service id) the end is the last day running at least
+    ``SERVICE_END_SHARE`` of the busiest day's trips; without it, or when no
+    day runs a trip, the last date any service runs."""
     if calendar is None or calendar.span is None:
         return None, None
     first, last = calendar.span
+    counted = (
+        None if service_trips is None else _calendar_trips(calendar, service_trips)
+    )
+    if counted is not None and counted[1].max() > 0:
+        days, daily = counted
+        kept = np.flatnonzero(daily >= SERVICE_END_SHARE * daily.max())
+        last = datetime.date.fromordinal(days.first + int(kept[-1]))
     return first.isoformat(), last.isoformat()
+
+
+def _service_trips(feed_dir, state):
+    """The trips per service id of the crawled trips member, ids trimmed;
+    None when the state records none, or the member fails verification or
+    does not parse — one feed's problem, which the member reader reports."""
+    if "trips.txt" not in (state.get("member_sha256") or {}):
+        return None
+    try:
+        with crawl.verified_member(feed_dir, state, "trips.txt") as opened:
+            if opened is None:
+                return None
+            return collections.Counter(
+                crawl.member_id(row, "service_id")
+                for row in crawl.member_rows(opened)
+                if crawl.member_id(row, "trip_id")
+            )
+    except crawl.MEMBER_ERRORS:
+        return None
 
 
 def _members(feed_dir, state, names, calendar=None):
@@ -2325,7 +2373,9 @@ def classify(
                     # Read once: the weights for the stop-events, and the
                     # span the feed record carries.
                     calendar = _calendar(feed_dir, state)
-                    spans[feed_id] = _service_span(calendar)
+                    spans[feed_id] = _service_span(
+                        calendar, _service_trips(feed_dir, state)
+                    )
                     classified, status, routes, dropped, gaps, stops, basis, marks = (
                         _classify_feed(
                             feed_candidates,
@@ -2370,7 +2420,9 @@ def classify(
             # A crawled feed with no candidate place still carries its span.
             for feed_id, (feed_dir, state) in crawled.items():
                 if feed_id not in spans and sources.get(feed_id) == "crawl":
-                    spans[feed_id] = _service_span(_calendar(feed_dir, state))
+                    spans[feed_id] = _service_span(
+                        _calendar(feed_dir, state), _service_trips(feed_dir, state)
+                    )
             edges_with_overlap = _overlaps(by_place, interned)
             edges.sort(key=lambda e: (e["place_id"], e["feed_id"], e["tier"]))
             scopes = collections.Counter()
@@ -2400,8 +2452,9 @@ def classify(
                         "home_country": home,
                         "declared_countries": declared,
                         "scope": scope,
-                        # The first and last date any of its services runs,
-                        # from the crawled calendar; null without one.
+                        # The first date any of its services runs and the
+                        # last running SERVICE_END_SHARE of its busiest day's
+                        # trips, from the crawled calendar; null without one.
                         "service_start": start,
                         "service_end": end,
                     }

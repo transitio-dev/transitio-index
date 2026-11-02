@@ -146,6 +146,29 @@
   reason: The official keyless copy of the Île-de-France Mobilités GTFS.
   date: 2026-10-03
 
+# No catalogue lists a current National Rail timetable for Great Britain;
+# Travelwhiz builds one daily from National Rail's data.
+- feed: f-curated-travelwhiz-gb-rail
+  add_feed:
+    name: National Rail, Great Britain (Travelwhiz)
+    url: https://storage.travelwhiz.app/generated-gtfs/gb-nationalrail.gtfs.zip
+    spec: gtfs
+    license:
+      spdx_identifier: CC-BY-4.0
+      url: https://github.com/travelwhiz-ltd/GB-Bus-Train-Metro-GTFS/blob/main/NOTICE.md
+      use_without_attribution: "no"
+      attribution_text: >-
+        Contains a curated GTFS dataset assembled and normalised by
+        Travelwhiz Ltd.
+      attribution_instructions: >-
+        Includes data derived from multiple upstream public transport data
+        sources; see the repository's NOTICE.md and DATA_SOURCES.md for
+        source attributions and terms.
+    location:
+      country_code: GB
+  reason: The current National Rail timetable for Great Britain, which no catalogue lists.
+  date: 2026-11-02
+
 # Private and campus services, and unofficial compilations of other
 # operators' timetables, which transitio does not take by default.
 - feed: f-are~manhattan~shuttle~ny~us

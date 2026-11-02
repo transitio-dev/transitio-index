@@ -3344,3 +3344,52 @@ def test_a_flex_zone_named_in_stop_id_places_its_route(tmp_path):
         local["classification_fingerprint"]
         == fingerprint.from_feed(archive, local["fingerprint_kind"])[0]
     )
+
+
+@pytest.mark.parametrize(
+    ("remnant", "end"),
+    [
+        (b"x0,tram,tail", "2026-09-30"),
+        (b"x0,tram,tail\nx1,tram,tail", "2099-12-31"),
+        (b"x0,tram,tail\xff", "2099-12-31"),
+    ],
+    ids=["below", "at", "unparsable"],
+)
+def test_a_few_trips_dated_far_ahead_do_not_keep_a_timetable_current(
+    tmp_path, remnant, end
+):
+    """The 2021 National Rail timetable (f-mdb-1311) kept two bus routes dated
+    to 2099, so its service_end was 2099-12-31 and it never read as stale.
+    The main service runs 198 trips a weekday in September; the remnant's
+    trips run daily to 2099, below and at 1% of the busiest day. A trips
+    member that does not parse leaves the calendar's last running date."""
+    import test_index_classify as clt
+
+    trips = b"\n".join(b"m%d,tram,main" % i for i in range(198))
+    members = {
+        "stops.txt": b"stop_id,stop_lat,stop_lon\ns1,1.0,10.0\ns2,1.0,10.01\n",
+        "routes.txt": b"route_id,route_type\ntram,0\n",
+        "trips.txt": b"trip_id,route_id,service_id\n" + trips + b"\n" + remnant,
+        "calendar.txt": (
+            b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+            b"start_date,end_date\n"
+            b"main,1,1,1,1,1,0,0,20260901,20260930\n"
+            b"tail,1,1,1,1,1,1,1,20260901,20991231\n"
+        ),
+        "stop_times.txt": b"trip_id,stop_id,stop_sequence\nm0,s1,1\nm0,s2,2\n",
+    }
+    cache = tmp_path / "cache"
+    clt._write_crawl(cache, "f-rail", members, "complete")
+    feeds = [
+        {"feed_id": "f-rail", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
+    ]
+    clt._coverage(cache, feeds, [clt._candidate("Q-city", "f-rail", 2)])
+    classify.classify(cache, lookup=clt.LOOKUP)
+    rows, _ = store.read_jsonl(
+        cache / "classify", "edges.json", "feeds_classified.jsonl"
+    )
+    (feed,) = rows
+    assert (feed["service_start"], feed["service_end"]) == ("2026-09-01", end)
+    # Without trips per service the calendar's last running date stands.
+    calendar = classify._read_calendar(io.BytesIO(members["calendar.txt"]), None)
+    assert classify._service_span(calendar) == ("2026-09-01", "2099-12-31")
