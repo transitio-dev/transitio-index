@@ -254,6 +254,65 @@ def test_wikidata_get_json_retries_transport_failures_not_bad_requests(
         assert sleeps == []
 
 
+SERVER_ERROR = {"error": {"code": "internal_api_error_DBConnectionError"}}
+
+
+@pytest.mark.parametrize(
+    "replies, labelled, sleeps_made",
+    [
+        # A server-side error reply is retried, then answered.
+        ([SERVER_ERROR], {"Q1", "Q2", "Q3", "Q4"}, [1]),
+        # One that outlasts the retries is bisected down to single ids, skipped.
+        ([SERVER_ERROR] * 99, set(), None),
+        # A request error (an id beyond any item) is not retried: bisection
+        # isolates its id, which is skipped, and the rest are labelled.
+        ("no-such-entity", {"Q1", "Q2", "Q4"}, []),
+    ],
+    ids=["retried", "persistent", "bad-id"],
+)
+def test_a_wikidata_error_reply_is_retried_or_skipped_not_fatal(
+    monkeypatch, replies, labelled, sleeps_made
+):
+    """Labels atlas4 and atlas5 of rebuild 2026-10c failed when wbgetentities
+    answered HTTP 200 with an error object (internal_api_error_DBConnectionError):
+    the reply raised an error nothing retried or bisected."""
+    calls, sleeps = [], []
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return self.body
+
+    def fake_urlopen(request, timeout=None):
+        query = overture.urllib.parse.urlsplit(request.full_url).query
+        ids = overture.urllib.parse.parse_qs(query)["ids"][0].split("|")
+        calls.append(ids)
+        if replies == "no-such-entity":
+            reply = {"error": {"code": replies}} if "Q3" in ids else None
+        else:
+            reply = replies[len(calls) - 1] if len(calls) <= len(replies) else None
+        if reply is None:
+            reply = {"entities": {q: {"labels": {"en": {"value": q}}} for q in ids}}
+        return FakeResponse(json.dumps(reply).encode())
+
+    monkeypatch.setattr(overture.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(overture.time, "sleep", sleeps.append)
+    found = overture.WikidataClient().labels_and_aliases(["Q1", "Q2", "Q3", "Q4"])
+    assert set(found) == labelled
+    if sleeps_made is not None:
+        assert sleeps == sleeps_made
+    if replies == "no-such-entity":
+        assert calls.count(["Q3"]) == 1
+
+
 def test_a_stop_on_another_division_of_a_known_qid_is_not_stale():
     """A QID names several Overture divisions but a place records only one
     overture_id; a stop on another of its divisions is matched by QID, not
