@@ -82,6 +82,17 @@ class KindConflict(RegistryError):
         return self.args[0]
 
 
+class SeveralPlaces(RegistryError):
+    """Concordances name more than one registered place: ``place_ids``."""
+
+    def __init__(self, message, place_ids):
+        super().__init__(message, place_ids)
+        self.place_ids = place_ids
+
+    def __str__(self):
+        return self.args[0]
+
+
 def _number(place_id):
     return int(place_id[3:])
 
@@ -471,7 +482,9 @@ class Registry:
         wanted, pairs = self._candidate(concordances, kind, where)
         hits = sorted({self._index[pair] for pair in pairs if pair in self._index})
         if len(hits) > 1:
-            raise RegistryError(f"{where}: concordances name several places {hits}")
+            raise SeveralPlaces(
+                f"{where}: concordances name several places {hits}", hits
+            )
         if hits:
             (place_id,) = hits
             row = self.rows[place_id]
@@ -546,13 +559,15 @@ class Registry:
         self.merge(place_id, new_id, at=minted_in, reason=reason)
         return new_id
 
-    def merge(self, place_id, into, *, at, reason):
+    def merge(self, place_id, into, *, at, reason, joining=None):
         """Merge the live place ``place_id`` into the live place ``into``: its
         row keeps its concordances and detachments, which now resolve to
         ``into``, and the rows already merged into it are retargeted there
         (flattening, so no chain forms). A value either place resolves that
         the other, or an alias of it, detached refuses the merge: it would
-        resolve again to the place a curator took it from."""
+        resolve again to the place a curator took it from. So does a value of
+        ``joining`` — the concordances of the candidate the merge is for —
+        detached from either, before anything changes."""
         where = f"merging {place_id} into {into}"
         if place_id == into:
             raise RegistryError(f"{where}: a place cannot merge into itself")
@@ -563,6 +578,10 @@ class Registry:
         for keeps, joins in ((into, place_id), (place_id, into)):
             resolved = [pair for pair, owner in self._index.items() if owner == joins]
             self._refuse_detached(keeps, resolved, where)
+        if joining is not None:
+            _, pairs = self._candidate(joining, self.rows[into]["kind"], where)
+            for keeps in (into, place_id):
+                self._refuse_detached(keeps, pairs, where)
         _text(at, where, "at")
         _text(reason, where, "reason")
         self._refuse_change(where)

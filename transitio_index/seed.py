@@ -970,13 +970,16 @@ def _identify_places(
     ``city_dataset``, a zero-argument opener of the release's divisions, a
     city or region registered as the other kind is first judged by the
     release (``_supersede_retyped``); ``release`` names the Overture release
-    the rows were read from, the process's own by default. A mint, an
-    enrichment or a supersede a read-only registry refuses still stops it.
-    Returns the number identified."""
+    the rows were read from, the process's own by default. Two places one of
+    which carries no QID are merged when the row's division joins them
+    (``_merge_qidless_place``). A mint, an enrichment, a supersede or a merge
+    a read-only registry refuses still stops it. Returns the number
+    identified."""
     if registry is None:
         return 0
     skipped = []
     retyped = []
+    merges = registry.merged
     for place_id in sorted(places):
         row = places[place_id]
         try:
@@ -992,6 +995,16 @@ def _identify_places(
             else:
                 _skip_place(place_id, row, exc, skipped, report)
             continue
+        except _registry.SeveralPlaces as exc:
+            try:
+                row["tp_id"] = _merge_qidless_place(
+                    place_id, row, exc, registry, places_digest, release, report
+                )
+            except _registry.ReadOnlyError:
+                raise
+            except _registry.RegistryError as error:
+                _skip_place(place_id, row, error, skipped, report)
+                continue
         except _registry.RegistryError as exc:
             # An identity conflict is a per-item miss in a read-only session
             # too, so a build against a read-only registry drops the places a
@@ -1003,8 +1016,10 @@ def _identify_places(
         skipped += _supersede_retyped(
             places, registry, places_digest, retyped, city_dataset(), report, release
         )
-        # A row identified before another superseded its place names an id
-        # that is now an alias: it is identified again, against the successor.
+    if registry.merged > merges:
+        # A row identified before a merge (a supersede is one) of its place
+        # names an id that is now an alias: it is identified again, against
+        # the successor.
         for place_id in sorted(places):
             row = places[place_id]
             if place_id in skipped or "tp_id" not in row:
@@ -1024,6 +1039,61 @@ def _identify_places(
     if skipped:
         _drop_places(places, skipped)
     return len(places)
+
+
+def _merge_qidless_place(
+    place_id, row, conflict, registry, places_digest, release, report
+):
+    """The row's id once the QID-less place of a two-place ``conflict`` is
+    merged into the place the row's QID names. The September registry
+    minted Brockton, Montana twice — from a locality carrying its QID, since
+    removed from Overture, and from a QID-less one that now carries it — so
+    the row found both. Only that shape merges: two places of the row's
+    kind, one the row's QID resolves to and one no QID resolves to; any
+    other several-places conflict is raised again."""
+    hits = conflict.place_ids
+    if len(hits) != 2 or not overture.QID_PATTERN.match(place_id):
+        raise conflict
+    named = [h for h in hits if place_id in _resolved_qids(registry, h)]
+    qidless = [h for h in hits if not _resolved_qids(registry, h)]
+    if len(named) != 1 or len(qidless) != 1:
+        raise conflict
+    if any(registry.rows[h]["kind"] != row["kind"] for h in hits):
+        raise conflict
+    (survivor,), (merged,) = named, qidless
+    concordances, _, minted_in = _registry_candidate(
+        place_id, row, registry, places_digest, release
+    )
+    registry.merge(
+        merged,
+        survivor,
+        at=minted_in,
+        reason=f"no QID of its own; its division now carries {place_id}, "
+        f"which {survivor} holds",
+        joining=concordances,
+    )
+    tp_id = _identify_row(place_id, row, registry, places_digest, release)
+    log.warning("seed: %s merged %s into %s", place_id, merged, survivor)
+    if report is not None:
+        report.append(
+            {
+                "kind": "merged",
+                "place_id": place_id,
+                "from": merged,
+                "into": survivor,
+                "name": row.get("name"),
+            }
+        )
+    return tp_id
+
+
+def _resolved_qids(registry, place_id):
+    """The QIDs that resolve to the live place ``place_id``: its own and
+    those of the rows merged into it."""
+    qids = set()
+    for row_id in (place_id, *registry.former_ids(place_id)):
+        qids.update(registry.effective(row_id).get("wikidata", []))
+    return qids
 
 
 def _identify_row(place_id, row, registry, places_digest, release=None):

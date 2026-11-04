@@ -558,6 +558,59 @@ def test_a_place_whose_kind_overture_changed_is_superseded_not_dropped(
         reg.merge("tp_2", "tp_1", at="t", reason="one town")
 
 
+@pytest.mark.parametrize("district", ["qid-less", "own-qid", "detached"])
+def test_a_qidless_place_whose_division_gained_a_qid_is_merged(tmp_path, district):
+    """Rebuild 2026-10c dropped Brockton, Montana and Lanchkhuti: September
+    minted each twice, from a locality carrying its QID (since removed from
+    Overture) and from a QID-less one, which now carries the QID — so the row
+    named both places and was refused. The QID-less place is now merged into
+    the QID's, the row lands on the survivor, and the registry's contract
+    holds. A second place with a QID of its own stays a conflict, and so does
+    a row carrying a value a curator detached, the registry left as it was."""
+    from transitio_index import registry_history
+
+    def row(place_id, **concordances):
+        return {
+            "place_id": place_id,
+            "kind": "city",
+            "concordances": concordances,
+            "minted_from": "t",
+            "minted_in": "t",
+        }
+
+    second = row("tp_2", overture=["district"])
+    if district == "own-qid":
+        second["concordances"]["wikidata"] = ["Q5"]
+    if district == "detached":
+        second["concordances"]["osm_relation"] = ["9"]
+        entry = {"value": "9", "at": "t", "reason": "not this town"}
+        second["detached"] = {"osm_relation": [entry]}
+    rows = [
+        {"next_id": 3, "registry": 1},
+        row("tp_1", wikidata=["Q966053"], overture=["gone"]),
+        second,
+    ]
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    base = path.read_bytes()
+    places = {
+        "Q966053": {"kind": "city", "overture_id": "district", "osm_relation_id": 9}
+    }
+    report = []
+    with registry.session(path) as reg:
+        identified = seed._identify_places(places, reg, "d", report=report)
+        reg.save()
+    if district != "qid-less":
+        assert identified == 0 and places == {} and path.read_bytes() == base
+        assert [r["kind"] for r in report] == ["conflict"]
+        return
+    head = registry.parse(path.read_bytes(), "head")
+    assert identified == 1 and places["Q966053"]["tp_id"] == "tp_1"
+    assert head[1]["tp_2"]["status"] == "merged" and head[1]["tp_2"]["into"] == "tp_1"
+    assert [(r["kind"], r["from"]) for r in report] == [("merged", "tp_2")]
+    assert registry_history.violations(registry.parse(base, "base"), head) == []
+
+
 def test_the_boundary_memo_grows_by_appended_parts(tmp_path, monkeypatch):
     """The memo used to be one file rewritten whole on every ensure(), so a
     memo accumulated over enough countries crossed the store's artifact
