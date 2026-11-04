@@ -69,6 +69,19 @@ class ReadOnlyError(RegistryError):
     """A change a read-only session refuses."""
 
 
+class KindConflict(RegistryError):
+    """Concordances name a registered place of another kind: ``place_id``,
+    registered as ``kind``."""
+
+    def __init__(self, message, place_id, kind):
+        super().__init__(message, place_id, kind)
+        self.place_id = place_id
+        self.kind = kind
+
+    def __str__(self):
+        return self.args[0]
+
+
 def _number(place_id):
     return int(place_id[3:])
 
@@ -355,8 +368,9 @@ class Registry:
         self.digest = base
         self.minted = 0
         self.enriched = 0
+        self.merged = 0
         self._index = _index(rows, str(path))
-        # Merges arrive only with the file, so the index is built once.
+        # ``merge`` keeps both indexes current.
         self._former = _former_index(rows)
 
     @property
@@ -454,14 +468,7 @@ class Registry:
         id. A candidate without any concordance is refused, and in a
         read-only session so is every change, at the point of discovery."""
         where = f"{minted_from}"
-        if kind not in KINDS:
-            raise RegistryError(f"{where}: kind {kind!r}")
-        wanted = _concordances(concordances, where)
-        pairs = [(ns, v) for ns, values in wanted.items() for v in values]
-        if not pairs:
-            raise RegistryError(
-                f"{where}: a place needs a concordance to be identified"
-            )
+        wanted, pairs = self._candidate(concordances, kind, where)
         hits = sorted({self._index[pair] for pair in pairs if pair in self._index})
         if len(hits) > 1:
             raise RegistryError(f"{where}: concordances name several places {hits}")
@@ -469,21 +476,12 @@ class Registry:
             (place_id,) = hits
             row = self.rows[place_id]
             if row["kind"] != kind:
-                raise RegistryError(
-                    f"{where}: {place_id} is a {row['kind']}, not a {kind}"
+                raise KindConflict(
+                    f"{where}: {place_id} is a {row['kind']}, not a {kind}",
+                    place_id,
+                    row["kind"],
                 )
-            # A detachment on the survivor or on any alias merged into it
-            # stands: enrichment must not undo a curated correction.
-            for owner, detached_row in self.rows.items():
-                if _survivor(self.rows, owner) != place_id:
-                    continue
-                for namespace, entries in detached_row.get("detached", {}).items():
-                    for entry in entries:
-                        if (namespace, entry["value"]) in pairs:
-                            raise RegistryError(
-                                f"{where}: {namespace}:{entry['value']} was detached "
-                                f"from {owner} ({entry['reason']})"
-                            )
+            self._refuse_detached(place_id, pairs, where)
             missing = [pair for pair in pairs if self._index.get(pair) != place_id]
             if missing:
                 self._refuse_change(f"{place_id} would gain {missing}")
@@ -493,8 +491,137 @@ class Registry:
                 self.enriched += 1
             return place_id
         self._refuse_change(f"{where}: a new place would be minted")
-        # Everything is validated before anything is mutated, so a refused
-        # candidate consumes no id and leaves the session unchanged.
+        return self._mint(
+            wanted,
+            pairs,
+            kind=kind,
+            name=name,
+            country_code=country_code,
+            minted_from=minted_from,
+            minted_in=minted_in,
+        )
+
+    def supersede(
+        self,
+        place_id,
+        *,
+        kind,
+        concordances,
+        minted_from,
+        minted_in,
+        reason,
+        name=None,
+        country_code=None,
+    ):
+        """Mint a place of ``kind`` from ``concordances`` and merge the live
+        place ``place_id`` into it, returning the new id. A registered kind
+        never changes, so a place its source now gives another kind (a city
+        minted as its own region) is a new id that the old one resolves to.
+        The concordances may name no other place, nor a value detached from
+        ``place_id``; the merge is dated by ``minted_in``."""
+        where = f"{minted_from}"
+        wanted, pairs = self._candidate(concordances, kind, where)
+        others = sorted(
+            {self._index[p] for p in pairs if p in self._index} - {place_id}
+        )
+        if others:
+            raise RegistryError(f"{where}: concordances name several places {others}")
+        row = self.rows.get(place_id)
+        if row is None or row.get("status") is not None:
+            raise RegistryError(f"{where}: {place_id} is not a live place")
+        if row["kind"] == kind:
+            raise RegistryError(f"{where}: {place_id} already is a {kind}")
+        self._refuse_detached(place_id, pairs, where)
+        _text(reason, where, "reason")
+        self._refuse_change(f"{where}: {place_id} would be superseded")
+        new_id = self._mint(
+            wanted,
+            pairs,
+            kind=kind,
+            name=name,
+            country_code=country_code,
+            minted_from=minted_from,
+            minted_in=minted_in,
+        )
+        self.merge(place_id, new_id, at=minted_in, reason=reason)
+        return new_id
+
+    def merge(self, place_id, into, *, at, reason):
+        """Merge the live place ``place_id`` into the live place ``into``: its
+        row keeps its concordances and detachments, which now resolve to
+        ``into``, and the rows already merged into it are retargeted there
+        (flattening, so no chain forms). A value either place resolves that
+        the other, or an alias of it, detached refuses the merge: it would
+        resolve again to the place a curator took it from."""
+        where = f"merging {place_id} into {into}"
+        if place_id == into:
+            raise RegistryError(f"{where}: a place cannot merge into itself")
+        for each in (place_id, into):
+            row = self.rows.get(each)
+            if row is None or row.get("status") is not None:
+                raise RegistryError(f"{where}: {each} is not a live place")
+        for keeps, joins in ((into, place_id), (place_id, into)):
+            resolved = [pair for pair, owner in self._index.items() if owner == joins]
+            self._refuse_detached(keeps, resolved, where)
+        _text(at, where, "at")
+        _text(reason, where, "reason")
+        self._refuse_change(where)
+        row = self.rows[place_id]
+        merged = {
+            "place_id": place_id,
+            "status": "merged",
+            "into": into,
+            "concordances": row["concordances"],
+            "at": at,
+            "reason": reason,
+        }
+        if "detached" in row:
+            merged["detached"] = row["detached"]
+        self.rows[place_id] = merged
+        aliases = self._former.pop(place_id, [])
+        for alias in aliases:
+            self.rows[alias]["into"] = into
+        self._former[into] = sorted(
+            [*self._former.get(into, []), place_id, *aliases], key=_number
+        )
+        for pair, owner in self._index.items():
+            if owner == place_id:
+                self._index[pair] = into
+        self.merged += 1
+
+    def _candidate(self, concordances, kind, where):
+        """``(concordances, pairs)`` of a candidate place, validated: a known
+        kind and at least one concordance."""
+        if kind not in KINDS:
+            raise RegistryError(f"{where}: kind {kind!r}")
+        wanted = _concordances(concordances, where)
+        pairs = [(ns, v) for ns, values in wanted.items() for v in values]
+        if not pairs:
+            raise RegistryError(
+                f"{where}: a place needs a concordance to be identified"
+            )
+        return wanted, pairs
+
+    def _refuse_detached(self, place_id, pairs, where):
+        """Refuse ``pairs`` naming a value detached from ``place_id`` or from
+        any alias merged into it: identification must not undo a curated
+        correction."""
+        for owner, row in self.rows.items():
+            if _survivor(self.rows, owner) != place_id:
+                continue
+            for namespace, entries in row.get("detached", {}).items():
+                for entry in entries:
+                    if (namespace, entry["value"]) in pairs:
+                        raise RegistryError(
+                            f"{where}: {namespace}:{entry['value']} was detached "
+                            f"from {owner} ({entry['reason']})"
+                        )
+
+    def _mint(self, wanted, pairs, *, kind, name, country_code, minted_from, minted_in):
+        """The next id, minted for a validated candidate. Everything is
+        validated before anything is mutated, so a refused candidate consumes
+        no id and leaves the session unchanged."""
+        where = f"{minted_from}"
         row = {
             "kind": kind,
             "concordances": wanted,
@@ -515,7 +642,7 @@ class Registry:
 
     @property
     def changed(self):
-        return bool(self.minted or self.enriched)
+        return bool(self.minted or self.enriched or self.merged)
 
     def save(self):
         """Replace the file atomically with the current state, if anything
@@ -541,12 +668,16 @@ class Registry:
         return self.digest
 
     def manifest(self):
+        """The session's registry provenance for a stage manifest: the digest
+        loaded and the one saved, the counter, and how many places it
+        minted, enriched and merged."""
         return {
             "registry_base": self.base,
             "registry_digest": self.digest,
             "next_id": self.header["next_id"],
             "minted": self.minted,
             "enriched": self.enriched,
+            "merged": self.merged,
         }
 
 

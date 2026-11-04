@@ -233,13 +233,17 @@ def city_qids(dataset, qids):
     """The QIDs among ``qids`` that a locality or localadmin carries in the
     theme — one scan by QID. A district or region sharing its QID with a
     city-level division is a city that is its own district; the place is the
-    city, as ``match`` decides for a declared name."""
+    city, as ``match`` decides for a declared name. A hamlet carrying its
+    county's QID (Piney Grove in Wayne County, Georgia) makes no city."""
     wanted = {qid for qid in qids if qid}
     if not wanted:
         return set()
-    predicate = ds.field("subtype").isin(list(CITY_SUBTYPES)) & ds.field(
-        "wikidata"
-    ).isin(sorted(wanted))
+    not_hamlet = (ds.field("class") != "hamlet") | ds.field("class").is_null()
+    predicate = (
+        ds.field("subtype").isin(list(CITY_SUBTYPES))
+        & ds.field("wikidata").isin(sorted(wanted))
+        & not_hamlet
+    )
     found = set()
     for batch in dataset.to_batches(columns=["wikidata"], filter=predicate):
         found.update(batch.column("wikidata").to_pylist())
@@ -947,7 +951,14 @@ def _key_concordance(key, registry):
     return {namespace: [value]}
 
 
-def _identify_places(places, registry, places_digest, report=None):
+# The kinds a registered place may be superseded between: a city and the
+# region or county its QID also names.
+RETYPABLE_KINDS = frozenset({"city", "region"})
+
+
+def _identify_places(
+    places, registry, places_digest, report=None, city_dataset=None, release=None
+):
     """Give every place its registry id — found by its concordances or
     minted — and the QID the registry keys it by; ``rekey_by_own_id`` then
     makes the id the key. A place whose concordances conflict with an
@@ -955,64 +966,204 @@ def _identify_places(places, registry, places_digest, report=None):
     e.g. a city that shares its QID with a like-named region — cannot be
     identified; it is logged, appended to ``report`` as a ``conflict`` row
     when one is given, and dropped from ``places`` so one collision no longer
-    aborts the gazetteer, whether or not the registry is read-only. A mint or
-    an enrichment a read-only registry refuses still stops it. Returns the
-    number identified."""
+    aborts the gazetteer, whether or not the registry is read-only. With
+    ``city_dataset``, a zero-argument opener of the release's divisions, a
+    city or region registered as the other kind is first judged by the
+    release (``_supersede_retyped``); ``release`` names the Overture release
+    the rows were read from, the process's own by default. A mint, an
+    enrichment or a supersede a read-only registry refuses still stops it.
+    Returns the number identified."""
     if registry is None:
         return 0
-    from transitio_index import ucdb  # ucdb -> fao -> geometry -> seed
-
     skipped = []
+    retyped = []
     for place_id in sorted(places):
         row = places[place_id]
-        concordances = _key_concordance(place_id, registry)
-        if row.get("overture_id"):
-            concordances["overture"] = [row["overture_id"]]
-            minted_from = f"overture:{row['overture_id']}"
-            minted_in = f"overture {overture.current_release()}"
-        elif row.get("resolution_method") == "ghs_ucdb":
-            minted_from = place_id
-            minted_in = f"GHS-UCDB {ucdb.RELEASE}"
-        else:
-            minted_from = f"places.yaml:{place_id}"
-            minted_in = f"places.yaml {places_digest}"
-        if row.get("osm_relation_id"):
-            concordances["osm_relation"] = [str(row["osm_relation_id"])]
         try:
-            row["tp_id"] = registry.identify(
-                concordances,
-                kind=row["kind"],
-                name=row.get("name"),
-                country_code=row.get("country_code"),
-                minted_from=minted_from,
-                minted_in=minted_in,
+            row["tp_id"] = _identify_row(
+                place_id, row, registry, places_digest, release
             )
         except _registry.ReadOnlyError:
             # A mint or an enrichment a read-only session cannot make.
             raise
+        except _registry.KindConflict as exc:
+            if city_dataset is not None and {row["kind"], exc.kind} <= RETYPABLE_KINDS:
+                retyped.append((place_id, exc))
+            else:
+                _skip_place(place_id, row, exc, skipped, report)
+            continue
         except _registry.RegistryError as exc:
             # An identity conflict is a per-item miss in a read-only session
             # too, so a build against a read-only registry drops the places a
             # writable one drops.
-            log.warning("seed: %s not identified (%s); skipped", place_id, exc)
-            skipped.append(place_id)
-            if report is not None:
-                report.append(
-                    {
-                        "kind": "conflict",
-                        "place_id": place_id,
-                        "overture_id": row.get("overture_id"),
-                        "name": row.get("name"),
-                        "reason": str(exc),
-                    }
-                )
+            _skip_place(place_id, row, exc, skipped, report)
             continue
-        row["wikidata_id"] = registry.canonical_qid(row["tp_id"])
-        if row["kind"] == "metro" and not row.get("statistical_area_id"):
-            _restore_statistical_identity(row, registry.effective(row["tp_id"]))
+        _record_identity(row, registry)
+    if retyped:
+        skipped += _supersede_retyped(
+            places, registry, places_digest, retyped, city_dataset(), report, release
+        )
+        # A row identified before another superseded its place names an id
+        # that is now an alias: it is identified again, against the successor.
+        for place_id in sorted(places):
+            row = places[place_id]
+            if place_id in skipped or "tp_id" not in row:
+                continue
+            if registry.survivor(row["tp_id"]) == row["tp_id"]:
+                continue
+            try:
+                row["tp_id"] = _identify_row(
+                    place_id, row, registry, places_digest, release
+                )
+            except _registry.ReadOnlyError:
+                raise
+            except _registry.RegistryError as exc:
+                _skip_place(place_id, row, exc, skipped, report)
+                continue
+            _record_identity(row, registry)
     if skipped:
         _drop_places(places, skipped)
     return len(places)
+
+
+def _identify_row(place_id, row, registry, places_digest, release=None):
+    """The registry id of one place row (``Registry.identify`` over its
+    ``_registry_candidate``), raising the registry's refusal."""
+    concordances, minted_from, minted_in = _registry_candidate(
+        place_id, row, registry, places_digest, release
+    )
+    return registry.identify(
+        concordances,
+        kind=row["kind"],
+        name=row.get("name"),
+        country_code=row.get("country_code"),
+        minted_from=minted_from,
+        minted_in=minted_in,
+    )
+
+
+def _registry_candidate(place_id, row, registry, places_digest, release=None):
+    """``(concordances, minted_from, minted_in)`` a place row is identified
+    by: its key's concordance, its Overture division and OSM relation, and
+    the source it would be minted from (an Overture division in ``release``,
+    the process's own by default)."""
+    from transitio_index import ucdb  # ucdb -> fao -> geometry -> seed
+
+    concordances = _key_concordance(place_id, registry)
+    if row.get("overture_id"):
+        concordances["overture"] = [row["overture_id"]]
+        minted_from = f"overture:{row['overture_id']}"
+        minted_in = f"overture {release or overture.current_release()}"
+    elif row.get("resolution_method") == "ghs_ucdb":
+        minted_from = place_id
+        minted_in = f"GHS-UCDB {ucdb.RELEASE}"
+    else:
+        minted_from = f"places.yaml:{place_id}"
+        minted_in = f"places.yaml {places_digest}"
+    if row.get("osm_relation_id"):
+        concordances["osm_relation"] = [str(row["osm_relation_id"])]
+    return concordances, minted_from, minted_in
+
+
+def _record_identity(row, registry):
+    """Set an identified row's ``wikidata_id`` from the registry, and restore
+    a metro's statistical identity from its concordances."""
+    row["wikidata_id"] = registry.canonical_qid(row["tp_id"])
+    if row["kind"] == "metro" and not row.get("statistical_area_id"):
+        _restore_statistical_identity(row, registry.effective(row["tp_id"]))
+
+
+def _skip_place(place_id, row, exc, skipped, report):
+    """Log a place the registry cannot identify, add its key to ``skipped``
+    and, given a ``report``, a ``conflict`` row."""
+    log.warning("seed: %s not identified (%s); skipped", place_id, exc)
+    skipped.append(place_id)
+    if report is not None:
+        report.append(
+            {
+                "kind": "conflict",
+                "place_id": place_id,
+                "overture_id": row.get("overture_id"),
+                "name": row.get("name"),
+                "reason": str(exc),
+            }
+        )
+
+
+def _supersede_retyped(
+    places, registry, places_digest, retyped, dataset, report, release=None
+):
+    """Judge each place in ``retyped`` (``(key, KindConflict)`` pairs) by the
+    release in ``dataset``: a QID is a city when a city-level division other
+    than a hamlet carries it (``city_qids``, one scan) and a region when none
+    does; a QID-less place keeps its own division's kind. When that is the
+    row's kind, the registered place is superseded by a new one of it and
+    the row takes the new id (Kuala Lumpur, registered as its federal
+    territory, is now its city; Redland City, whose locality Overture
+    removed, its council area). When it is the registered kind — a region
+    row of a QID whose city stands — the row is skipped as before. Returns
+    the keys skipped."""
+    cities = city_qids(
+        dataset, [key for key, _ in retyped if overture.QID_PATTERN.match(key)]
+    )
+    skipped = []
+    for place_id, conflict in retyped:
+        row = places[place_id]
+        if overture.QID_PATTERN.match(place_id):
+            kind = "city" if place_id in cities else "region"
+        else:
+            kind = row["kind"]
+        if kind != row["kind"]:
+            _skip_place(place_id, row, conflict, skipped, report)
+            continue
+        concordances, minted_from, minted_in = _registry_candidate(
+            place_id, row, registry, places_digest, release
+        )
+        try:
+            if registry.survivor(conflict.place_id) != conflict.place_id:
+                # Another row of this pass named the same place and superseded
+                # it: this one lands on the successor.
+                row["tp_id"] = _identify_row(
+                    place_id, row, registry, places_digest, release
+                )
+                _record_identity(row, registry)
+                continue
+            row["tp_id"] = registry.supersede(
+                conflict.place_id,
+                kind=kind,
+                concordances=concordances,
+                name=row.get("name"),
+                country_code=row.get("country_code"),
+                minted_from=minted_from,
+                minted_in=minted_in,
+                reason=f"a {conflict.kind} in the registry, a {kind} in {minted_in}",
+            )
+        except _registry.ReadOnlyError:
+            raise
+        except _registry.RegistryError as exc:
+            _skip_place(place_id, row, exc, skipped, report)
+            continue
+        log.warning(
+            "seed: %s superseded %s (a %s) by %s (a %s)",
+            place_id,
+            conflict.place_id,
+            conflict.kind,
+            row["tp_id"],
+            kind,
+        )
+        if report is not None:
+            report.append(
+                {
+                    "kind": "superseded",
+                    "place_id": place_id,
+                    "from": conflict.place_id,
+                    "into": row["tp_id"],
+                    "place_kind": kind,
+                    "name": row.get("name"),
+                }
+            )
+        _record_identity(row, registry)
+    return skipped
 
 
 def _drop_places(places, keys):
@@ -1313,7 +1464,9 @@ def resolve_seed(
             _no_candidate(entry)
     _add_twins(places, skeleton)
     before = set(places)
-    identified = _identify_places(places, registry, places_digest)
+    identified = _identify_places(
+        places, registry, places_digest, city_dataset=lambda: dataset
+    )
     conflicts = before - set(places)
     if registry is not None:
         placements = [p for p in placements if p["place_id"] in places]

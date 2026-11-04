@@ -751,7 +751,16 @@ def _discover(
         # here, before it can stand in for its aliases, read a boundary, or
         # seed a metro's membership — and reported, so the coverage stage
         # knows a stop landing on it is not proof of a stale expansion.
-        identified = seed._identify_places(discovered, registry, digest, report=report)
+        identified = seed._identify_places(
+            discovered,
+            registry,
+            digest,
+            report=report,
+            city_dataset=lambda: dataset
+            or lookup.division_dataset()
+            or overture.overture_dataset(release),
+            release=release,
+        )
         for qid in set(canonical) - set(discovered):
             del canonical[qid]
     new_ids = []

@@ -450,6 +450,114 @@ def test_a_seed_place_conflicting_with_a_registry_place_is_skipped_not_fatal(
     assert sum("not identified" in m and "skipped" in m for m in caplog.messages) == 3
 
 
+@pytest.mark.parametrize("read_only", [False, True], ids=["writable", "read-only"])
+def test_a_place_whose_kind_overture_changed_is_superseded_not_dropped(
+    tmp_path, read_only
+):
+    """Rebuild 2026-10c dropped 15 places with stops: the registry had minted
+    Kuala Lumpur as its federal territory and Redland City as a locality
+    Overture has since removed, and a registered kind never changes, so the
+    city and the council area the build now asks for were refused. The
+    release now decides — a QID a city-level division carries is a city, one
+    no such division carries a region — and a place of that kind supersedes
+    the registered one, whose id (and every alias of it) resolves to the new
+    one; a second row naming the same place through an alias lands on that
+    successor, and one identified as the old place is identified again. A
+    hamlet carrying its county's QID (Piney Grove in Wayne County, Georgia)
+    makes no city, and a read-only registry refuses the supersede like a
+    mint."""
+    from transitio_index import registry_history
+
+    path = tmp_path / "places_registry.jsonl"
+    path.write_text('{"next_id": 1, "registry": 1}\n')
+    registered = (
+        ("Q1", "country", "my"),
+        ("Q1865", "region", "kl-territory"),
+        ("Q1492782", "city", "redland-locality"),
+        ("Q491762", "region", "wayne-county"),
+        ("Q99", "region", "kl-alias"),
+        ("Q98", "region", "kl-alias-2"),
+    )
+    with registry.session(path) as reg:
+        ids = {
+            qid: reg.identify(
+                {"wikidata": [qid], "overture": [division]},
+                kind=kind,
+                minted_from=f"overture:{division}",
+                minted_in="overture 2026-08-19.0",
+            )
+            for qid, kind, division in registered
+        }
+        for alias in ("Q99", "Q98"):
+            reg.merge(ids[alias], ids["Q1865"], at="test", reason="an alias")
+        reg.save()
+    base = registry.parse(path.read_bytes(), "base")
+    dataset = fx.write_dataset(
+        tmp_path / "divisions.parquet",
+        [
+            {
+                **fx.division("kl-city", "MY", "locality", wikidata="Q1865"),
+                "class": "city",
+            },
+            {
+                **fx.division("kl-twin", "MY", "locality", wikidata="Q99"),
+                "class": "city",
+            },
+            {
+                **fx.division("piney-grove", "US", "locality", wikidata="Q491762"),
+                "class": "hamlet",
+            },
+        ],
+    )
+    assert seed.city_qids(dataset, {"Q1865", "Q491762"}) == {"Q1865"}
+    places = {
+        "Q1": {"kind": "country", "overture_id": "my"},
+        "Q1865": {"kind": "city", "overture_id": "kl-city", "parent_id": "Q1"},
+        "Q1492782": {"kind": "region", "overture_id": "redland-county"},
+        "Q491762": {"kind": "city", "overture_id": "wayne-county"},
+        "Q99": {"kind": "city", "overture_id": "kl-twin"},
+        # Identified as the old region before its place was superseded.
+        "Q98": {"kind": "region", "overture_id": "kl-alias-2"},
+    }
+    with registry.session(path, read_only=read_only) as reg:
+        if read_only:
+            with pytest.raises(registry.ReadOnlyError, match="superseded"):
+                seed._identify_places(places, reg, "d", city_dataset=lambda: dataset)
+            return
+        report = []
+        identified = seed._identify_places(
+            places, reg, "d", report=report, city_dataset=lambda: dataset
+        )
+        reg.save()
+    assert identified == 4 and set(places) == {"Q1", "Q1865", "Q1492782", "Q99"}
+    head = registry.parse(path.read_bytes(), "head")
+    rows = head[1]
+    for qid, kind in (("Q1865", "city"), ("Q1492782", "region")):
+        new = places[qid]["tp_id"]
+        assert new != ids[qid] and rows[new]["kind"] == kind
+        assert rows[ids[qid]]["status"] == "merged" and rows[ids[qid]]["into"] == new
+    assert rows[ids["Q99"]]["into"] == places["Q1865"]["tp_id"]  # flattened
+    assert places["Q99"]["tp_id"] == places["Q1865"]["tp_id"]
+    assert {r["from"] for r in report if r["kind"] == "superseded"} == {
+        ids["Q1865"],
+        ids["Q1492782"],
+    }
+    assert registry_history.violations(base, head) == []
+    # A merge must not hand a place back an Overture id a curator detached.
+    curated = tmp_path / "curated.jsonl"
+    detached = {"overture": [{"value": "a", "at": "t", "reason": "not this place"}]}
+    rows = [
+        {"next_id": 3, "registry": 1},
+        {"place_id": "tp_1", "kind": "city", "concordances": {"overture": ["a"]}}
+        | {"detached": detached, "minted_from": "t", "minted_in": "t"},
+        {"place_id": "tp_2", "kind": "city", "concordances": {"overture": ["a"]}}
+        | {"minted_from": "t", "minted_in": "t"},
+    ]
+    curated.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    with registry.session(curated) as reg, pytest.raises(registry.RegistryError):
+        reg.merge("tp_2", "tp_1", at="t", reason="one town")
+
+
 def test_the_boundary_memo_grows_by_appended_parts(tmp_path, monkeypatch):
     """The memo used to be one file rewritten whole on every ensure(), so a
     memo accumulated over enough countries crossed the store's artifact
@@ -730,12 +838,16 @@ def test_the_boundary_lookup_reads_only_the_row_groups_its_cells_touch(tmp_path)
         assert lookup.divisions_at(5.5, 5.5) == []
 
 
-def test_a_crawled_division_the_registry_refuses_is_reported_by_expand(tmp_path):
+@pytest.mark.parametrize("registered", ["region", "metro"])
+def test_a_crawled_division_the_registry_refuses_is_reported_by_expand(
+    tmp_path, registered
+):
     """A discovered division whose QID the registry holds under another kind
-    (a city that is its own district, registered as a region from its county)
     was dropped with only a log line; the coverage stage then read a stop in it
     as proof of a stale expansion and aborted. The drop is now a ``conflict``
-    row of the expansion report."""
+    row of the expansion report. A city registered as its region is no
+    refusal any more: the release has Tampere's locality, so the city
+    supersedes the region and is reported as such."""
     import test_index_expand as ex
 
     cache = tmp_path / "cache"
@@ -744,18 +856,24 @@ def test_a_crawled_division_the_registry_refuses_is_reported_by_expand(tmp_path)
     path = tmp_path / "places_registry.jsonl"
     ex._publish_run(cache, ex._seeded_registry(path))
     with registry.session(path) as reg:
-        # Tampere's QID, held as a region before the crawl discovers the city.
+        # Tampere's QID, held as another kind before the crawl discovers the city.
         reg.identify(
             {"wikidata": ["Q40840"]},
-            kind="region",
+            kind=registered,
             country_code="FI",
             minted_from="t",
             minted_in="t 1",
         )
         manifest, places, report = ex._expand(tmp_path, cache, registry=reg)
     assert manifest["mode"] == "expanded"
+    found = [p for p in places.values() if p.get("overture_id") == "fi-tre"]
+    if registered == "region":
+        (row,) = [r for r in report if r.get("kind") == "superseded"]
+        assert row["place_id"] == "Q40840" and row["place_kind"] == "city"
+        assert [p["kind"] for p in found] == ["city"]
+        return
     # Dropped: no returned row is the discovered division, under any key.
-    assert all(p.get("overture_id") != "fi-tre" for p in places.values())
+    assert found == []
     (row,) = [r for r in report if r.get("kind") == "conflict"]
     assert row["place_id"] == "Q40840" and row["overture_id"] == "fi-tre"
     assert "not a city" in row["reason"]
