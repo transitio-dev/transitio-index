@@ -687,11 +687,10 @@ def test_a_discovered_city_gains_the_functional_urban_area_the_run_derived(
     assert metro["country_code"] == "FI"
     assert metro["member_ids"] == (["Q1", "Q40840"] if seeded else ["Q40840"])
     assert places["Q40840"]["metro_ids"] == ["eurostat_fua:FI002F"]
-    # A metro minted here takes its official area; one the seed published
-    # and this expansion joined keeps the boundary its run gave it.
-    assert metro["geometry_source"] == (
-        "member_union" if seeded else geometry.OFFICIAL_AREA
-    )
+    # A metro minted here or joined takes its official area, the discovered
+    # city's among its parts.
+    assert metro["official_parts"] == ["fi-tre"]
+    assert metro["geometry_source"] == geometry.OFFICIAL_AREA
     assert manifest["metros_added"] == (0 if seeded else 1)
 
 

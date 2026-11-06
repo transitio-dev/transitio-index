@@ -798,7 +798,7 @@ def _discover(
         rows = areas.get(place["overture_id"])
         _attach_boundary(place, rows, inventory, shipped, omitted)
         if place["geometry"] and place["overture_id"] in given:
-            place["geometry_source"] = given[place["overture_id"]]
+            place["geometry_source"] = given[place["overture_id"]][1]
         places_by_id[qid] = place
     # A curated boundary replaces the Overture one before any metro is drawn
     # from it.
@@ -857,15 +857,20 @@ def _discover(
         added, touched, rows = _attach_eurostat_metros(
             places_by_id, codes, city_rows, areas, inputs, definition, land=euro
         )
-        if added:
+        # A joined metro's parts are taken again: a discovered city's area
+        # may be one, whatever its division's kind.
+        if added or touched:
             metros.eurostat_parts(
-                [places_by_id[key] for key in added],
+                [places_by_id[key] for key in sorted(touched | set(added))],
                 definition,
                 inputs,
                 lookup,
                 cache_dir,
                 area_dataset,
                 euro[1] if euro is not None else None,
+                places_by_id.values(),
+                release=release,
+                reopen=reopen,
             )
         eurostat_metros += added
         eurostat_touched |= touched

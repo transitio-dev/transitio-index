@@ -510,7 +510,19 @@ def official_parts(rows, delineation, wikidata, skeleton, places_by_qid):
     return took, missing
 
 
-def eurostat_parts(rows, definition, inputs, lookup, cache_dir, dataset, land=None):
+def eurostat_parts(
+    rows,
+    definition,
+    inputs,
+    lookup,
+    cache_dir,
+    dataset,
+    land=None,
+    places=(),
+    *,
+    release=None,
+    reopen=None,
+):
     """Give each ``definition`` row whose code ``inputs``' composition lists
     the parts of its official area — the union of its regions' polygons —
     as ``official_parts``: the Overture ids of the city-kind divisions the
@@ -518,10 +530,15 @@ def eurostat_parts(rows, definition, inputs, lookup, cache_dir, dataset, land=No
     the largest share of, at least ``urau.MIN_SHARE`` (shares per metro, the
     land inside the NUTS-3 regions of ``land`` when given, as
     :func:`eurostat.assign` measures them; footprints from
-    ``geometry.place_areas`` over ``dataset``). A row none joins keeps an
-    empty list. Returns ``(took, empty)``: rows with parts and without."""
+    ``geometry.place_areas`` over ``dataset`` of ``release``, ``reopen``
+    reopening it). The division a city of ``places`` takes its area from
+    counts too, whatever its kind: the city's own, else the one it borrows
+    (``geometry.lend_areas``: its QID twin's or its council's), as its
+    membership does. A row none joins keeps an empty list. Returns ``(took,
+    empty)``: rows with parts and without."""
     from transitio_index import crawl
 
+    places = list(places)
     composition, boundaries, _ = inputs
     wanted = collections.defaultdict(list)
     for row in rows:
@@ -537,19 +554,44 @@ def eurostat_parts(rows, definition, inputs, lookup, cache_dir, dataset, land=No
         for code in sorted(wanted)
     }
     lookup.ensure(crawl.zone_boxes(official.values()))
-    records = {
+    reached = {
         record["overture_id"]: record
         for area in official.values()
         for record in lookup.divisions_reached(area)
-        if record.get("kind") == "city" and record.get("overture_id")
+        if record.get("overture_id")
     }
-    candidates = sorted(records)
-    # The read is scoped to the candidates' countries: an area may cross a
-    # border.
-    countries = {r.get("country") for r in records.values()} - {None}
+    cities = {
+        p["overture_id"]
+        for p in places
+        if p.get("kind") == "city" and p.get("overture_id")
+    }
+    # A city's own division may be of another kind: Overture files a German
+    # kreisfreie Stadt as a county.
+    records = {
+        key: r for key, r in reached.items() if r.get("kind") == "city" or key in cities
+    }
+    lent = {
+        own: lenders
+        for own, lenders in geometry.lenders(places).items()
+        if own in cities
+        and own not in reached
+        and any(area in reached for area, _ in lenders)
+    }
+    # The read is scoped to the reached divisions' countries: an area may
+    # cross a border.
+    countries = {r.get("country") for r in reached.values()} - {None}
     areas = geometry.place_areas(
-        cache_dir, dataset, [{"country_code": c} for c in sorted(countries)], candidates
+        cache_dir,
+        dataset,
+        [{"country_code": c} for c in sorted(countries)],
+        set(records) | set(lent) | {a for c in lent.values() for a, _ in c},
+        release=release,
+        reopen=reopen,
     )
+    for lender, _ in geometry.lend_areas(areas, lent).values():
+        if lender in reached:
+            records[lender] = reached[lender]
+    candidates = sorted(records)
     footprints = [eurostat._footprint(areas.get(i)) for i in candidates]
     chosen = eurostat._by_share(
         eurostat.Containment(official), footprints, urau.MIN_SHARE, land
@@ -567,10 +609,13 @@ def eurostat_parts(rows, definition, inputs, lookup, cache_dir, dataset, land=No
     return took, empty
 
 
-def _eurostat_official_areas(rows, branches, cache_dir, dataset, divisions, land):
+def _eurostat_official_areas(
+    rows, branches, cache_dir, dataset, divisions, land, places
+):
     """:func:`eurostat_parts` for each definition of ``branches`` whose
-    inputs were read, through one boundary lookup opened only when a row of
-    one is there; ``{subtype: {"took", "empty"}}``."""
+    inputs were read, over the cities of ``places``, through one boundary
+    lookup opened only when a row of one is there; ``{subtype: {"took",
+    "empty"}}``."""
     rows = list(rows)
     found = {}
     wanted = [
@@ -590,7 +635,7 @@ def _eurostat_official_areas(rows, branches, cache_dir, dataset, divisions, land
     ) as lookup:
         for definition, inputs in wanted:
             took, empty = eurostat_parts(
-                rows, definition, inputs, lookup, cache_dir, dataset, land
+                rows, definition, inputs, lookup, cache_dir, dataset, land, places
             )
             found[definition.subtype] = {"took": took, "empty": empty}
     return found
@@ -1578,6 +1623,7 @@ def attach_metros(
                 dataset,
                 division_dataset,
                 euro[1] if land is not None else None,
+                places,
             )
             parts = 0
             if delineation is not None:

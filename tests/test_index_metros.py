@@ -1595,7 +1595,10 @@ def test_a_eurostat_metro_takes_the_municipalities_mostly_inside_its_area(tmp_pa
     # AA001F is one area; AA002M is two NUTS-3 regions, R1 and R2; R0 is land
     # in no metro. m-in lies inside AA001F, m-split half in R1 and half in R2
     # (all in AA002M), m-out 40 % inside AA001F and the rest in R0, and
-    # m-coast 40 % in R2 and the rest at sea, outside every land region.
+    # m-coast 40 % in R2 and the rest at sea, outside every land region. In
+    # AA001F, the city "core" has no area of its own and borrows its QID
+    # twin's, a county; the city "seat" is a county itself; the county
+    # "other" is no city's.
     regions = {
         "AA001F": shapely.box(0, 0, 2, 2),
         "R1": shapely.box(4, 0, 6, 2),
@@ -1606,7 +1609,21 @@ def test_a_eurostat_metro_takes_the_municipalities_mostly_inside_its_area(tmp_pa
         "m-split": shapely.box(5.5, 0.5, 6.5, 1.5),
         "m-out": shapely.box(1.6, 0.5, 2.6, 1.5),
         "m-coast": shapely.box(7.2, 0.5, 8.2, 1.5),
+        "core-county": shapely.box(0.1, 1.6, 0.6, 1.9),
+        "seat": shapely.box(0.7, 1.6, 1.2, 1.9),
+        "other": shapely.box(1.3, 1.6, 1.8, 1.9),
     }
+    regional = {"core-county", "seat", "other"}
+    places = [
+        {
+            "place_id": "Q1",
+            "kind": "city",
+            "country_code": "AA",
+            "overture_id": "core",
+            "twin_overture_ids": ["core-county"],
+        },
+        {"place_id": "Q2", "kind": "city", "country_code": "AA", "overture_id": "seat"},
+    ]
 
     class Lookup:
         def ensure(self, boxes):
@@ -1614,7 +1631,11 @@ def test_a_eurostat_metro_takes_the_municipalities_mostly_inside_its_area(tmp_pa
 
         def divisions_reached(self, shape):
             return [
-                {"overture_id": key, "kind": "city", "country": "AA"}
+                {
+                    "overture_id": key,
+                    "kind": "region" if key in regional else "city",
+                    "country": "AA",
+                }
                 for key, town in towns.items()
                 if town.intersects(shape) and not town.touches(shape)
             ]
@@ -1643,8 +1664,9 @@ def test_a_eurostat_metro_takes_the_municipalities_mostly_inside_its_area(tmp_pa
         tmp_path / "cache",
         dataset,
         land={**regions, "R0": shapely.box(2, 0, 4, 2)},
+        places=places,
     )
     assert (took, empty) == (2, 0)
-    assert rows[0]["official_parts"] == ["m-in"]
+    assert rows[0]["official_parts"] == ["core-county", "m-in", "seat"]
     assert rows[1]["official_parts"] == ["m-coast", "m-split"]
     assert "official_parts" not in rows[2]
