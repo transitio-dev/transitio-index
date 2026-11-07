@@ -115,6 +115,20 @@ class GazetteerError(RuntimeError):
     """The gazetteer stage could not resolve its inputs."""
 
 
+class WikidataApiError(GazetteerError):
+    """The Wikidata API answered with an error object, or without the data
+    asked for; ``code`` is the API's error code."""
+
+    def __init__(self, code):
+        super().__init__(f"{WIKIDATA_API}: API error {code}")
+        self.code = code
+
+
+# The API error codes a server raises for its own trouble, not the request's:
+# retried like a transport failure. ``internal_api_error_`` is a prefix.
+_SERVER_API_ERRORS = ("internal_api_error_", "ratelimited", "readonly", "maxlag")
+
+
 def s3_filesystem(region=OVERTURE_REGION):
     """An anonymous S3 filesystem for the public Overture bucket.
 
@@ -425,9 +439,28 @@ def _retry_delay(error, attempt):
     return min(2**attempt, 8)
 
 
-def _label(error):
+def _api_error_code(reply):
+    """The code of the error object a Wikidata API reply holds instead of its
+    data, or None for a reply without one."""
+    error = reply.get("error") if isinstance(reply, dict) else None
+    if not isinstance(error, dict):
+        return None
+    return str(error.get("code") or "unknown")
+
+
+def _server_api_error(code):
+    """Whether an API error code is the server's own trouble (see
+    :data:`_SERVER_API_ERRORS`), which a retry may clear."""
+    return code.startswith(_SERVER_API_ERRORS[0]) or code in _SERVER_API_ERRORS[1:]
+
+
+def _error_label(error):
+    """A Wikidata failure in a few words for the log: its HTTP status, its API
+    error code, else its exception type."""
     if isinstance(error, urllib.error.HTTPError):
         return f"HTTP {error.code}"
+    if isinstance(error, WikidataApiError):
+        return f"API error {error.code}"
     return type(error).__name__
 
 
@@ -660,14 +693,18 @@ class WikidataClient:
 
     def _fetch_bisecting(self, batch, apply, what):
         """Run ``apply(batch)``, halving the batch when the transport truncates
-        or drops the response — even after ``_get_json``'s own retries — so one
-        oversized or repeatedly-dropped reply degrades to smaller reads instead
-        of aborting the build. A single id that still fails is logged and
-        skipped: its labels stay un-enriched, never fatal, since this is an
-        optional enrichment."""
+        or drops the response, or the API answers with an error — even after
+        ``_get_json``'s own retries — so one oversized, repeatedly-dropped or
+        refused reply degrades to smaller reads instead of aborting the build.
+        A single id that still fails is logged and skipped: its labels stay
+        un-enriched, never fatal, since this is an optional enrichment."""
         try:
             apply(batch)
-        except (http.client.IncompleteRead, *_TRANSIENT_ERRORS) as error:
+        except (
+            http.client.IncompleteRead,
+            WikidataApiError,
+            *_TRANSIENT_ERRORS,
+        ) as error:
             if not _transient(error) or _rate_limited(error):
                 # A 4xx is our request's fault, not a transport hiccup, and stays
                 # fatal even though HTTPError is a urllib.error.URLError subclass;
@@ -679,7 +716,7 @@ class WikidataClient:
                     "%s: %s failed (%s); labels skipped",
                     what,
                     ",".join(batch) or "(empty)",
-                    _label(error),
+                    _error_label(error),
                 )
                 return
             mid = len(batch) // 2
@@ -687,6 +724,9 @@ class WikidataClient:
             self._fetch_bisecting(batch[mid:], apply, what)
 
     def _entities_batch(self, batch, out):
+        """Add the labels and aliases of the QIDs in ``batch`` to ``out`` from
+        one ``wbgetentities`` call; a QID Wikidata reports missing is left
+        out, and a reply without entities raises :class:`WikidataApiError`."""
         url = (
             WIKIDATA_API
             + "?"
@@ -701,7 +741,7 @@ class WikidataClient:
         )
         entities = self._get_json(url).get("entities")
         if not isinstance(entities, dict):
-            raise GazetteerError(f"{WIKIDATA_API}: response has no entities")
+            raise WikidataApiError("no entities")
         for qid, entity in entities.items():
             if not QID_PATTERN.match(qid) or "missing" in entity:
                 continue
@@ -740,26 +780,37 @@ class WikidataClient:
         timeout) or an HTTP 5xx — the server's or a gateway's failure to answer —
         is retried with a short back-off, so one network hiccup does not abort a
         build; a 429 is retried after its ``Retry-After`` (:func:`_retry_delay`).
-        The last failure is raised once the attempts run out. Any other 4xx is
-        our request's fault and is raised at once, and a truncated body
-        (``IncompleteRead``) is left to the caller's batch bisection."""
+        A reply holding an API error object raises :class:`WikidataApiError`,
+        retried the same way when its code is the server's own trouble
+        (:func:`_server_api_error`). The last failure is raised once the
+        attempts run out. Any other 4xx or API error is our request's fault and
+        is raised at once, and a truncated body (``IncompleteRead``) is left to
+        the caller's batch bisection."""
         request = urllib.request.Request(
             url, headers={"Accept": accept, "User-Agent": USER_AGENT}
         )
         for attempt in range(self.attempts):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                    reply = json.loads(response.read().decode("utf-8"))
             except _TRANSIENT_ERRORS as error:  # an HTTPError is a URLError too
                 if not _transient(error) or attempt + 1 >= self.attempts:
                     raise
-                log.warning(
-                    "wikidata: %s (attempt %d/%d); retrying",
-                    _label(error),
-                    attempt + 1,
-                    self.attempts,
-                )
-                time.sleep(_retry_delay(error, attempt))
+                failure = error
+            else:
+                code = _api_error_code(reply)
+                if code is None:
+                    return reply
+                failure = WikidataApiError(code)
+                if not _server_api_error(code) or attempt + 1 >= self.attempts:
+                    raise failure
+            log.warning(
+                "wikidata: %s (attempt %d/%d); retrying",
+                _error_label(failure),
+                attempt + 1,
+                self.attempts,
+            )
+            time.sleep(_retry_delay(failure, attempt))
 
 
 def resolve_qid(record, p402_map):
