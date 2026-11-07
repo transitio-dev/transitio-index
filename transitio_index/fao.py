@@ -312,8 +312,10 @@ def _patch_of(footprint, containment, geoms, region_by_patch):
     return eurostat._pick(hits, footprint, geoms, region_by_patch)
 
 
-def place_cities(places, areas, regions, patches):
-    """Every city placed in its FAO region by its representative point:
+def place_cities(places, areas, regions, patches, curated=None, urban_centres=False):
+    """Every city placed in its FAO region by its footprint's representative
+    point (``eurostat.place_footprint``, with the ``curated`` boundaries and
+    ``urban_centres``):
     ``(grouped, countries, unplaced, qid_of)`` — the cities per region,
     whatever other metros they belong to (a city-region is one more
     definition of a city's area, never suppressed by another), the
@@ -332,7 +334,7 @@ def place_cities(places, areas, regions, patches):
             continue
         city = place["place_id"]
         qid_of[city] = place.get("wikidata_id")
-        footprint = eurostat.place_footprint(areas, place)
+        footprint = eurostat.place_footprint(areas, place, curated, urban_centres)
         if footprint is None:
             unplaced.append({"city_id": city, "reason": "no usable land area"})
             continue
@@ -352,9 +354,20 @@ def place_cities(places, areas, regions, patches):
     return grouped, countries, unplaced, qid_of
 
 
-def suggest(places, areas, regions, patches, provenance, names=None):
+def suggest(
+    places,
+    areas,
+    regions,
+    patches,
+    provenance,
+    names=None,
+    curated=None,
+    urban_centres=False,
+):
     """``(entries, unplaced)``: one report entry per city-region holding a
-    city, and every city that could not be placed (no usable land area, or
+    city, placed as :func:`place_cities` places them with the ``curated``
+    boundaries and ``urban_centres``, and every city that could not be
+    placed (no usable land area, or
     a footprint on a boundary between regions) with the reason. ``provenance`` (DOI, cutoff,
     licence, credit, input digests) is copied into every entry so each stands
     on its own. ``names`` maps a centre id to its matched UCDB name row; a
@@ -362,7 +375,9 @@ def suggest(places, areas, regions, patches, provenance, names=None):
     match's ambiguity and candidates carried along, and the pasteable
     ``add_place`` prefilled with the name — a region without one keeps the
     placeholder."""
-    grouped, countries, unplaced, qid_of = place_cities(places, areas, regions, patches)
+    grouped, countries, unplaced, qid_of = place_cities(
+        places, areas, regions, patches, curated, urban_centres
+    )
     entries = []
     for region_id, cities in progress(sorted(grouped.items()), "fao"):
         region = regions[region_id]
@@ -410,12 +425,24 @@ def suggest(places, areas, regions, patches, provenance, names=None):
     return entries, sorted(unplaced, key=lambda row: row["city_id"])
 
 
-def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=None):
+def suggest_metros(
+    cache_dir,
+    *,
+    dataset=None,
+    pins=None,
+    ucdb_pins=None,
+    run=None,
+    overrides_dir=None,
+    registry=None,
+):
     """Publish ``gazetteer/fao.json``: the report of the FAO city-regions
     holding cities, each named after its centre's GHS-UCDB match. ``dataset``
     is the Overture ``division_area``
     dataset (the build's release by default), ``pins`` the FAO inputs' digests
-    and ``ucdb_pins`` the UCDB inputs'. Returns the generation manifest."""
+    and ``ucdb_pins`` the UCDB inputs'. The ``set_boundary`` entries of the
+    place overrides under ``overrides_dir`` (keyed through ``registry``)
+    place the cities they name, as in the metros stage. Returns the
+    generation manifest."""
     # Both build on this module, so imported here.
     from transitio_index import metros, ucdb
 
@@ -447,8 +474,21 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
             # (its inputs unavailable) — never a stage aborting on the same
             # inputs. A generation recording none reads the caller's pins.
             derived = metros_manifest.get("derived_inputs")
+            # Urban centres place cities here only where they placed them there.
+            urban_centres = ucdb.DERIVED in geometry.DERIVED_SOURCE_ALLOWLIST
             if derived is not None:
                 pins, ucdb_pins = derived.get("fao"), derived.get("ucdb")
+                urban_centres = derived.get("urban_centres") is not None
+            place_overrides, places_digest = overrides.load_place_overrides(
+                overrides_dir, registry=registry
+            )
+            overrides.expect_digest(
+                metros_manifest.get("places_overrides_sha256"),
+                places_digest,
+                "places.yaml",
+                "gazetteer",
+            )
+            curated = geometry.boundary_overrides(place_overrides)
             inputs_manifest = names_manifest = names = {}
             if pins is not None:
                 regions, patches, inputs_manifest = load_inputs(
@@ -493,6 +533,8 @@ def suggest_metros(cache_dir, *, dataset=None, pins=None, ucdb_pins=None, run=No
                     patches,
                     provenance,
                     names if allowed else {},
+                    curated,
+                    urban_centres,
                 )
             manifest = {
                 "source": "fao",

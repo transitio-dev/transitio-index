@@ -123,6 +123,8 @@ SOUTH = shapely.box(24.0, 59.0, 26.0, 60.0)  # FI1E1, the Tampere metro
 FAR = shapely.box(10.0, 50.0, 11.0, 51.0)  # DE300, an uncovered country
 ATTICA = shapely.box(23.0, 37.5, 24.0, 38.5)  # EL301, prefix EL = GR
 LONDON = shapely.box(-1.0, 51.0, 1.0, 52.0)  # UKI31, prefix UK = GB
+IN_WEST = shapely.box(24.4, 60.4, 24.6, 60.6)  # an outline inside FI1B1
+IN_EAST = shapely.box(25.1, 60.1, 25.3, 60.3)  # an outline inside FI1C1
 
 COMPOSITION = [
     ("FI1B1", "Y", "FI001MC", "Helsinki"),
@@ -268,6 +270,13 @@ def test_every_assignment_status():
         _city("Q_ATH", "GR", "ath"),  # gazetteer GR, Eurostat prefix EL
         _city("Q_LON", "GB", "lon"),  # gazetteer GB, Eurostat prefix UK
         _city("Q_BER", "DE", "ber"),  # an uncovered country: no row
+        # No land area: placed by the outline it ships, a UCDB urban centre,
+        # its own curated boundary, or a set_boundary override.
+        {**_city("Q_UCDB", "FI", "none"), "ucdb_boundary": IN_WEST.wkb_hex},
+        {**_city("Q_WKT", "FI", None), "boundary_wkt": IN_EAST.wkt},
+        _city("Q_SET", "FI", "none"),
+        # A land area wins over the urban centre.
+        {**_city("Q_OUL2", "FI", "oul"), "ucdb_boundary": IN_WEST.wkb_hex},
         {
             "place_id": "Q_FI",
             "kind": "country",
@@ -293,7 +302,14 @@ def test_every_assignment_status():
         "ber": [{"geom": shapely.box(10.4, 50.4, 10.6, 50.6), "sources": []}],
         "fi": [{"geom": WEST, "sources": []}],
     }
-    rows = eurostat.assign(places, areas, metros, boundaries)
+    rows = eurostat.assign(
+        places,
+        areas,
+        metros,
+        boundaries,
+        curated={"Q_SET": IN_WEST.wkt},
+        urban_centres=True,
+    )
     assert rows == [
         {
             "city_id": "Q_ATH",
@@ -356,10 +372,22 @@ def test_every_assignment_status():
             "metro_code": None,
         },
         {
+            "city_id": "Q_OUL2",
+            "status": "unassigned",
+            "nuts_id": "FI1D1",
+            "metro_code": None,
+        },
+        {
             "city_id": "Q_SEA",
             "status": "unassigned",
             "nuts_id": None,
             "metro_code": None,
+        },
+        {
+            "city_id": "Q_SET",
+            "status": "assigned",
+            "nuts_id": "FI1B1",
+            "metro_code": "FI001MC",
         },
         {
             "city_id": "Q_TIE",
@@ -367,7 +395,23 @@ def test_every_assignment_status():
             "nuts_id": None,
             "metro_code": None,
         },
+        {
+            "city_id": "Q_UCDB",
+            "status": "assigned",
+            "nuts_id": "FI1B1",
+            "metro_code": "FI001MC",
+        },
+        {
+            "city_id": "Q_WKT",
+            "status": "assigned",
+            "nuts_id": "FI1C1",
+            "metro_code": "FI001MC",
+        },
     ]
+    # Urban centres left out, a city with nothing else stays unplaceable.
+    urban = [p for p in places if p["place_id"] == "Q_UCDB"]
+    (row,) = eurostat.assign(urban, areas, metros, boundaries)
+    assert row["status"] == "unplaceable"
 
 
 def test_a_boundary_point_is_settled_by_footprint_share():

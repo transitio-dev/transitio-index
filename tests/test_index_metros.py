@@ -257,6 +257,37 @@ def _urau_inputs(tmp_path, cache, areas=URAU_AREAS):
     return pins
 
 
+def _give_urban_centres(cache, polygons, pins):
+    """Republish the seed generation with each place of ``polygons`` (by QID)
+    carrying that polygon as its GHS-UCDB urban centre, recorded as derived
+    from the UCDB inputs ``pins``."""
+    files = (
+        "places_seed.jsonl",
+        "feed_places.jsonl",
+        "seed_report.jsonl",
+        "override_report.jsonl",
+    )
+    rows = {}
+    for name in files:
+        rows[name], manifest = store.read_jsonl(cache / "gazetteer", "seed.json", name)
+    for place in rows["places_seed.jsonl"]:
+        polygon = polygons.get(place.get("wikidata_id") or place["place_id"])
+        if polygon is not None:
+            place["ucdb_boundary"] = shapely.to_wkb(polygon, hex=True)
+    directory = store.open_subdir(cache, "gazetteer")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "gazetteer",
+                "seed.json",
+                {name: store.jsonl_chunks(records) for name, records in rows.items()},
+                {**manifest, "centre_sources": dict(pins)},
+                held=directory,
+            )
+    finally:
+        directory.close()
+
+
 def _run(
     tmp_path,
     metro_map,
@@ -267,6 +298,7 @@ def _run(
     ucdb=None,
     urau=None,
     areas=AREAS,
+    urban=None,
 ):
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
@@ -280,6 +312,8 @@ def _run(
         overrides_dir=overrides_dir,
         registry=registry,
     )
+    if urban is not None:
+        _give_urban_centres(cache, urban, (ucdb or _ucdb_inputs(tmp_path))[1])
     pins = _inputs(tmp_path, cache)
     urau_pins = _urau_inputs(tmp_path, cache, urau) if urau is not None else None
     if fao is not None:
@@ -729,6 +763,7 @@ def test_an_unavailable_eurostat_input_degrades_to_no_eu_metros(tmp_path, monkey
         "fao": None,
         "ucdb": None,
         "fao_centres": None,
+        "urban_centres": None,
     }
     assert manifest["derived_inventory"] == []
 
@@ -1518,6 +1553,71 @@ def test_a_sliver_fao_metro_takes_its_region_as_a_core(tmp_path, curated):
         assert metro["member_ids"] == ["Q1204", "Q1297"]
         assert places["Q1204"]["metro_ids"] == ["fao_city_region:50"]
         assert manifest["fao"] == {"published": 1, "memberships": 2, "cores": 1}
+
+
+def test_a_city_without_a_land_area_is_placed_by_its_curated_boundary(tmp_path):
+    from test_index_place_overrides import write_overrides
+
+    from transitio_index import fao
+
+    # Helsinki and Chicago read no land area but ship curated boundaries,
+    # which place them in the Eurostat metro and the FAO region, in the
+    # report as in the published metros.
+    boxes = {"Q1757": (24.4, 60.1, 24.6, 60.3), "Q1297": (-87.9, 41.6, -87.5, 42.0)}
+    entries = [
+        {"place": place, "set_boundary": shapely.to_wkt(shapely.box(*box))}
+        for place, box in boxes.items()
+    ]
+    directory = write_overrides(tmp_path, places=entries)
+    manifest, places = _fao_run(tmp_path, areas=[AREAS[1]], overrides_dir=directory)
+    assert places["Q1757"]["metro_ids"] == ["eurostat_metro:FI001MC"]
+    assert places["Q1297"]["metro_ids"] == ["fao_city_region:50"]
+    fao.suggest_metros(
+        tmp_path / "cache",
+        dataset=fx.write_area_dataset(tmp_path / "again.parquet", [AREAS[1]]),
+        pins=manifest["derived_inputs"]["fao"],
+        ucdb_pins=manifest["derived_inputs"]["ucdb"],
+        overrides_dir=directory,
+    )
+    report, _ = store.read_jsonl(
+        tmp_path / "cache" / "gazetteer", "fao.json", "suggested_metros_report.jsonl"
+    )
+    assert [entry["cities"] for entry in report] == [["Q1297"]]
+
+
+@pytest.mark.parametrize("allowed", [True, False], ids=["allowlisted", "unlisted"])
+def test_a_city_without_a_land_area_is_placed_by_its_urban_centre(
+    tmp_path, monkeypatch, allowed
+):
+    from transitio_index import ucdb
+
+    if not allowed:
+        allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {ucdb.DERIVED}
+        monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
+    # Helsinki and Chicago read no land area; Illinois's holds region 50's
+    # centre.
+    illinois = fx.area(
+        "us-il", shapely.to_wkb(shapely.box(-88.5, 41.5, -87.0, 42.5)), [OSM]
+    )
+    urban = {
+        "Q1757": shapely.box(24.4, 60.1, 24.6, 60.3),
+        "Q1297": shapely.box(-87.9, 41.6, -87.5, 42.0),
+    }
+    manifest, places = _fao_run(tmp_path, areas=[AREAS[1], illinois], urban=urban)
+    inventory = {r["dataset"]: r for r in manifest["derived_inventory"]}
+    if allowed:
+        # Placed by their urban centres, the memberships derived from the UCDB
+        # too. Chicago's centre, the polygon it ships, covers a sliver of the
+        # region, so Illinois joins as the core.
+        assert places["Q1757"]["metro_ids"] == ["eurostat_metro:FI001MC"]
+        assert places["Q1297"]["metro_ids"] == ["fao_city_region:50"]
+        assert places["fao_city_region:50"]["member_ids"] == ["Q1204", "Q1297"]
+        assert inventory[ucdb.DERIVED[0]]["memberships"] == 3
+        assert manifest["derived_inputs"]["urban_centres"] is not None
+    else:
+        assert places["Q1757"]["metro_ids"] == places["Q1297"]["metro_ids"] == []
+        assert ucdb.DERIVED[0] not in inventory
+        assert manifest["derived_inputs"]["urban_centres"] is None
 
 
 def test_a_us_metro_takes_its_delineated_counties_as_official_parts():
