@@ -98,7 +98,13 @@ matching registry together.
    catalogue feeds, and a catalogue feed with the same data keeps its own id.
 3. `gazetteer` — resolve Overture administrative divisions to Wikidata QIDs,
    seed the cities the feeds declare, attach metros, boundary geometry, centre
-   points and names, and mint the place registry.
+   points and names, and mint the place registry. Every stage reads Overture
+   from a local copy of the release's divisions tables, which the first stage
+   that needs them downloads once (5.2 GB for 2026-10-21.0) into
+   `~/.cache/transitio-index/overture/<release>/`; `--overture-dir` names
+   another folder, and `--overture-remote` reads the Overture bucket instead.
+   A copy found incomplete is downloaded again into a folder of its own, and
+   the old folder can then be removed by hand.
 4. `resolve` — settle each feed's identity, its access details and whether
    it is crawlable (from the overrides), before anything is fetched. A feed
    that needs a key takes its provider from `overrides/access_providers.yaml`;

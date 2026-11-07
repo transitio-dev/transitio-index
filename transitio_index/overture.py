@@ -12,17 +12,23 @@ matched from feed municipalities in a later stage rather than bulk-resolved here
 
 The Overture read uses ``pyarrow.fs.S3FileSystem`` against the anonymous public
 bucket; tests pass a local dataset and a stub Wikidata client instead, so the
-stage runs offline with no network and no live counts.
+stage runs offline with no network and no live counts. A build reads a local
+copy of the release's divisions tables (:func:`use_local_copy`), downloaded
+from the bucket the first time a stage needs one.
 """
 
+import contextlib
 import datetime
 import http.client
 import json
 import logging
 import math
 import os
+import pathlib
 import re
+import shutil
 import socket
+import stat
 import time
 import urllib.error
 import urllib.parse
@@ -59,6 +65,28 @@ DIVISION_PATH = "release/{release}/theme=divisions/type=division"
 RELEASE_NAME = re.compile(r"(\d{4}-\d{2}-\d{2})\.(\d+)")
 # The release this process reads, once chosen (``current_release``).
 _release = None
+# The divisions tables a build reads, and a local copy holds, by their path
+# under the release.
+LOCAL_TABLES = ("theme=divisions/type=division", "theme=divisions/type=division_area")
+# Written last into a release's local copy: every file and its size.
+LOCAL_COMPLETE = "complete.json"
+# Names the complete copy of a release: ``{"copy": "copy-<id>"}``.
+LOCAL_CURRENT = "current.json"
+_COPY_NAME = re.compile(r"copy-[A-Za-z0-9_]+")
+# A file of a local copy: a Parquet file directly in one of its tables.
+_LOCAL_FILE = re.compile(
+    r"theme=divisions/type=division(?:_area)?/[A-Za-z0-9_=-][A-Za-z0-9_=.-]*\.parquet"
+)
+# The lock over the local copies, and how long a waiting build sleeps.
+LOCAL_LOCK = ".overture.lock"
+LOCAL_LOCK_WAIT = 10
+# The largest complete.json a copy's check reads.
+LOCAL_MARKER_MAX = 2**20
+
+# The directory holding one local copy per release (``use_local_copy``), and
+# the copies checked this process, by release.
+_local_root = None
+_local_copies = {}
 
 # Overture ``subtype`` to the gazetteer's ``kind``. Finer subtypes (borough,
 # neighborhood, macrohood, microhood) are below the resolution feeds are worth
@@ -220,10 +248,241 @@ def current_release():
     return _release
 
 
+def use_local_copy(root):
+    """Read every Overture table from a local copy under ``root``, one
+    directory per release that :func:`ensure_local_copy` downloads, for the
+    rest of the process; None reads the bucket."""
+    global _local_root
+    _local_root = None if root is None else pathlib.Path(root)
+    _local_copies.clear()
+
+
+def ensure_local_copy(root, release, filesystem=None):
+    """A folder holding a complete local copy of ``release``'s divisions
+    tables (``LOCAL_TABLES``): the one ``root/<release>/current.json``
+    names, else a new one downloaded from the Overture bucket
+    (``filesystem``, by default the anonymous S3 one). A download runs under
+    a writer lock over ``root`` (another build needing a download waits;
+    one finding its copy complete does not) into a new private
+    folder ``root/<release>/copy-<id>``, every folder and file created
+    through held folder descriptors without following links (see
+    :class:`store.Directory`), ``complete.json`` (every file with its size)
+    last; the copy is checked as a later read checks it, then
+    ``current.json`` names it. A copy is never changed afterwards, so a build
+    reading one is not disturbed by another that downloads again. pyarrow
+    opens the checked files by path again; as for the build cache (see
+    :mod:`transitio_index.store`), the copies are the maintainer's own
+    scratch, and that window is accepted."""
+    if not isinstance(release, str) or RELEASE_NAME.fullmatch(release) is None:
+        raise ValueError(f"not an Overture release name: {release!r}")
+    root = pathlib.Path(root)
+    if not store._redirects(root):
+        current = _current_copy(root / release, release)
+        if current is not None:
+            return current
+    with _local_copy_lock(root) as directory, directory.child(release) as folder:
+        current = _current_copy(folder.path, release)
+        if current is not None:
+            return current
+        filesystem = filesystem or s3_filesystem()
+        base = f"{OVERTURE_BUCKET}/release/{release}"
+        files = _remote_files(filesystem, base, release)
+        listing = json.dumps({"release": release, "files": files}, indent=2)
+        if len(listing.encode()) > LOCAL_MARKER_MAX:
+            raise GazetteerError(f"release {release} lists too many files to copy")
+        name = f"copy-{os.urandom(8).hex()}"
+        with folder.make_subdirectory(name) as copy:
+            try:
+                _download_tables(filesystem, base, files, copy)
+                copy.sync()
+                store.write_bytes(copy, LOCAL_COMPLETE, listing.encode())
+                copy.sync()
+                if not _complete(copy.path, release):
+                    raise GazetteerError(f"{copy.path}: changed while downloading")
+                store.write_bytes(
+                    folder, LOCAL_CURRENT, json.dumps({"copy": name}).encode()
+                )
+                folder.sync()
+            except BaseException:
+                # Once current.json names the copy, a reader may hold it.
+                pointer = _read_json(folder.path / LOCAL_CURRENT)
+                if not isinstance(pointer, dict) or pointer.get("copy") != name:
+                    shutil.rmtree(copy.path, ignore_errors=True)
+                raise
+        return copy.path
+
+
+def _download_tables(filesystem, base, files, copy):
+    """Download ``files`` (``{path under the release: size}``) from ``base``
+    into ``copy``, a :class:`store.Directory`: each table folder opened
+    through its parent's descriptor, each file created exclusively and
+    synced to disk with its folder; a file of another size than listed is
+    refused."""
+    opened = {}
+    try:
+        for name, size in sorted(files.items()):
+            table, leaf = name.rsplit("/", 1)
+            if table not in opened:
+                theme, kind = table.split("/")
+                if theme not in opened:
+                    opened[theme] = copy.child(theme)
+                opened[table] = opened[theme].child(kind)
+            with filesystem.open_input_stream(f"{base}/{name}") as source:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | store.O_BINARY
+                with os.fdopen(opened[table].open(leaf, flags), "wb") as sink:
+                    shutil.copyfileobj(source, sink, 2**24)
+                    sink.flush()
+                    os.fsync(sink.fileno())
+                    written = os.fstat(sink.fileno()).st_size
+            if written != size:
+                raise GazetteerError(f"{name}: downloaded {written} bytes of {size}")
+        for directory in opened.values():
+            directory.sync()
+    finally:
+        for directory in opened.values():
+            directory.close()
+
+
+def _current_copy(folder, release):
+    """The complete copy ``folder/current.json`` names, or None."""
+    if store._redirects(folder):
+        return None
+    pointer = _read_json(folder / LOCAL_CURRENT)
+    name = pointer.get("copy") if isinstance(pointer, dict) else None
+    if not isinstance(name, str) or not _COPY_NAME.fullmatch(name):
+        return None
+    copy = folder / name
+    return copy if _complete(copy, release) else None
+
+
+def _remote_files(filesystem, base, release):
+    """``{path under the release: size}`` of the files of ``LOCAL_TABLES``
+    the bucket holds under ``base``; every path must name a Parquet file
+    directly in one of those tables."""
+    from pyarrow.fs import FileSelector, FileType
+
+    files = {}
+    for table in LOCAL_TABLES:
+        selector = FileSelector(f"{base}/{table}", recursive=True)
+        try:
+            found = filesystem.get_file_info(selector)
+        except FileNotFoundError as error:
+            raise GazetteerError(
+                f"Overture release {release} is not in {OVERTURE_BUCKET}, which "
+                f"keeps only recent releases: no {base}/{table}"
+            ) from error
+        for info in found:
+            if info.type != FileType.File:
+                continue
+            name = info.path[len(base) + 1 :]
+            if not info.path.startswith(base + "/") or not _LOCAL_FILE.fullmatch(name):
+                raise GazetteerError(f"unexpected Overture file {info.path!r}")
+            files[name] = info.size
+    if not all(any(n.startswith(t + "/") for n in files) for t in LOCAL_TABLES):
+        raise GazetteerError(f"no complete divisions tables for release {release}")
+    return files
+
+
+def _complete(target, release):
+    """Whether the copy ``target`` is complete for ``release``: its
+    ``complete.json`` names the release and files of every table, and the
+    tables hold exactly those files, regular and at those sizes, with no
+    link anywhere below ``target``."""
+    if store._redirects(target) or not target.is_dir():
+        return False
+    recorded = _read_json(target / LOCAL_COMPLETE)
+    if not isinstance(recorded, dict) or recorded.get("release") != release:
+        return False
+    files = recorded.get("files")
+    if not isinstance(files, dict) or not all(
+        isinstance(name, str)
+        and _LOCAL_FILE.fullmatch(name)
+        and type(size) is int
+        and size >= 0
+        for name, size in files.items()
+    ):
+        return False
+    if not all(any(n.startswith(t + "/") for n in files) for t in LOCAL_TABLES):
+        return False
+    folders = {
+        "/".join(pathlib.PurePosixPath(t).parts[: i + 1])
+        for t in LOCAL_TABLES
+        for i in range(len(pathlib.PurePosixPath(t).parts))
+    }
+    found = {}
+    for here, dirnames, filenames in os.walk(target):
+        prefix = pathlib.Path(here).relative_to(target).as_posix()
+        for name in dirnames + filenames:
+            rel = name if prefix == "." else f"{prefix}/{name}"
+            path = os.path.join(here, name)
+            info = os.lstat(path)
+            if store._redirects(path):
+                return False
+            if stat.S_ISDIR(info.st_mode) and rel in folders:
+                continue
+            if not stat.S_ISREG(info.st_mode) or (
+                rel != LOCAL_COMPLETE and rel not in files
+            ):
+                return False
+            if rel != LOCAL_COMPLETE:
+                found[rel] = info.st_size
+    return found == files
+
+
+def _read_json(path):
+    """The JSON of a copy's small file at ``path`` (``complete.json``,
+    ``current.json``), opened without following a link; None unless it is a
+    regular file of at most ``LOCAL_MARKER_MAX`` bytes holding JSON."""
+    try:
+        handle = store.open_regular_path(path)
+    except (OSError, store.StoreError):
+        return None
+    try:
+        return json.loads(store.read_all(handle, LOCAL_MARKER_MAX))
+    except (store.StoreError, ValueError, RecursionError):
+        return None
+    finally:
+        os.close(handle)
+
+
+@contextlib.contextmanager
+def _local_copy_lock(root):
+    """Hold the writer lock over the local copies under ``root``, waiting
+    while another build holds it; yields ``root`` opened as a
+    :class:`store.Directory`."""
+    directory = store.open_directory(root)
+    try:
+        waited = False
+        while True:
+            stack = contextlib.ExitStack()
+            try:
+                stack.enter_context(store.exclusive_writer(directory, LOCAL_LOCK))
+            except store.LockHeld:
+                if not waited:
+                    log.info("overture: another build is downloading; waiting")
+                    waited = True
+                time.sleep(LOCAL_LOCK_WAIT)
+                continue
+            with stack:
+                yield directory
+            return
+    finally:
+        directory.close()
+
+
 def theme_dataset(path, release=None):
     """The Overture table at ``path`` (a template naming ``{release}``) of
-    ``release``, by default ``current_release()``, as a dataset over S3."""
+    ``release``, by default ``current_release()``: from the local copy
+    :func:`use_local_copy` names, downloaded first when absent, else as a
+    dataset over S3."""
     release = release or current_release()
+    if _local_root is not None:
+        table = path.format(release=release).removeprefix(f"release/{release}/")
+        if table not in LOCAL_TABLES:
+            raise GazetteerError(f"{table}: not a table of the local Overture copy")
+        if release not in _local_copies:
+            _local_copies[release] = ensure_local_copy(_local_root, release)
+        return ds.dataset(str(_local_copies[release] / table), format="parquet")
     location = f"{OVERTURE_BUCKET}/{path.format(release=release)}"
     try:
         return ds.dataset(location, filesystem=s3_filesystem(), format="parquet")

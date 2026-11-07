@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import os
@@ -581,7 +582,7 @@ class FakeMsvcrt:
     def locking(self, handle, mode, length):
         self.calls.append((mode, length))
         if self._fail and mode == self.LK_NBLCK:
-            raise OSError("already locked")
+            raise OSError(errno.EACCES, "Permission denied")
 
 
 def test_the_lock_uses_msvcrt_where_there_is_no_fcntl(tmp_path, monkeypatch):
