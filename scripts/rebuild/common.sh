@@ -300,6 +300,26 @@ for line in open(fix_map, encoding="utf-8"):
 PYEOF
 }
 
+# The checkout holds the code every label's newest build used: the first
+# run's commit, or, once a fix has started, the fix's, with every label of the
+# fix map rebuilt at it (after check_maps and check_archive_root).
+check_built_code() {
+  local head started unfixed
+  head=$(git -C "$REPO" rev-parse HEAD) || refuse "cannot read HEAD in $REPO"
+  started=$(sed -n 1p "$STARTED")
+  if [ ! -e "$FIXED" ] && [ ! -L "$FIXED" ]; then
+    [ "$head" = "$started" ] || refuse "the checkout is at ${head:0:7}, the labels were built at ${started:0:7}"
+    return 0
+  fi
+  [ -f "$FIXED" ] && [ ! -L "$FIXED" ] || refuse "$FIXED is not a regular file"
+  [ "$head" = "$(sed -n 1p "$FIXED")" ] \
+    || refuse "the checkout is at ${head:0:7}; the labels were built at ${started:0:7}, the fix at $(sed -n 1p "$FIXED" | cut -c1-7)"
+  check_fix_map
+  [ "$(fix_map_digest)" = "$(sed -n 2p "$FIXED")" ] || refuse "$FIX_MAP changed since the fix run started"
+  unfixed=$(set -o pipefail; unfixed_labels | awk '{ printf "%s ", $1 }') || refuse "cannot list the labels the fix has not rebuilt"
+  [ -z "$unfixed" ] || refuse "labels of the fix not rebuilt at ${head:0:7}: ${unfixed}(run '$HERE/rebuild.sh $RUN fix' again)"
+}
+
 # True for a missing path or an empty real directory; an unreadable one, a
 # symlink or a file is not empty.
 empty_dir() {

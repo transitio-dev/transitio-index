@@ -82,6 +82,15 @@ def _run_script(name, *args, checkout, **env):
         ("rebuild.sh", ["2026-11", "go"], [], {}, "usage"),
         ("rebuild.sh", ["Run 1", "check"], [], {}, "bad run name"),
         ("rebuild.sh", ["2026-11", "check"], [], {"RUN_DIR": "runs/a"}, "plain"),
+        ("release.sh", ["2026-11"], [], {}, "usage"),
+        ("release.sh", ["2026-11", "go"], [], {}, "usage"),
+        (
+            "release.sh",
+            ["2026-11", "merge"],
+            [],
+            {"RUN_DIR": "/no/run"},
+            "no run folder",
+        ),
         (
             "rebuild.sh",
             ["2026-11", "check"],

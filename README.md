@@ -29,7 +29,7 @@ scripts/export_divisions.py   export the Overture division hierarchy to inspect
 scripts/export_index_layer.py export a produced index as a map layer (feeds/tiers)
 scripts/index_viewer.py       inspect a built index in the browser
 scripts/check_place_geometry.py flag cities whose area disagrees with Wikidata
-scripts/rebuild/              run a full rebuild: every label of a partition
+scripts/rebuild/              run a full rebuild (its README is the runbook)
 overrides/             the place registry and curated override files
 golden/                the golden feed set the publish stage diffs against
 tests/                 the build's pytest suite and its fixtures
@@ -267,7 +267,8 @@ cut, then `scripts/rebuild/archive_index.sh` keeps the published index under
 another root), and the label's crawl is parked as `cache/crawl.<label>.bak`.
 `PYTHON` names the Python that runs the build (default `python3`). One line
 per label goes to `~/.cache/transitio-index/logs/progress.log` (`LOGDIR`
-names another folder), each label's own log beside it.
+names another folder), each label's own log beside it. A whole rebuild,
+from the checks to the release, is described in `scripts/rebuild/README.md`.
 
 ### Inspect a build in the browser
 
