@@ -1860,6 +1860,8 @@ def merge_builds(
 
 
 def parse_args(argv=None):
+    """The merge's command-line options from ``argv``, by default
+    ``sys.argv``."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--builds",
@@ -1893,6 +1895,9 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    """Merge the newest build of every label into ``--cache-dir`` and print
+    what the snapshot holds; return the exit status, 1 when the merge is
+    refused."""
     arguments = parse_args(argv)
     try:
         manifest = merge_builds(
