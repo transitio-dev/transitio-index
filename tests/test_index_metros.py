@@ -292,7 +292,7 @@ def _give_urban_centres(cache, polygons, pins, ids=None):
         directory.close()
 
 
-def _run(
+def _attach_metros(
     tmp_path,
     metro_map,
     overrides_dir=None,
@@ -306,6 +306,9 @@ def _run(
     ucdb_ids=None,
     seed_pins=None,
 ):
+    """Publish the fixture inputs into a cache under ``tmp_path``, run the
+    metros stage over them and return its manifest with the places by QID
+    (by place id where a place has none)."""
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
     areas = fx.write_area_dataset(tmp_path / "areas.parquet", areas)
@@ -363,7 +366,7 @@ def test_metro_rows_are_identified_with_their_statistical_code(tmp_path):
     path = tmp_path / "places_registry.jsonl"
     path.write_text('{"next_id": 1, "registry": 1}\n')
     with registry.session(path) as reg:
-        manifest, places = _run(
+        manifest, places = _attach_metros(
             tmp_path,
             {"Q1297": [CHICAGO_METRO], "Q28515": [CHICAGO_METRO]},
             registry=reg,
@@ -397,7 +400,7 @@ def test_a_curated_metro_gains_its_discovered_code_before_identification(tmp_pat
     path = tmp_path / "places_registry.jsonl"
     path.write_text('{"next_id": 1, "registry": 1}\n')
     with registry.session(path) as reg:
-        _, places = _run(
+        _, places = _attach_metros(
             tmp_path, {"Q28515": [CHICAGO_METRO]}, overrides_dir=directory, registry=reg
         )
         # The seed minted the curated metro by its QID; the metros stage
@@ -411,7 +414,7 @@ def test_a_curated_metro_gains_its_discovered_code_before_identification(tmp_pat
 
 
 def test_a_metro_place_and_its_memberships_are_attached(tmp_path):
-    manifest, places = _run(
+    manifest, places = _attach_metros(
         tmp_path, {"Q1297": [CHICAGO_METRO], "Q28515": [CHICAGO_METRO]}
     )
     metro = places["Q1754965"]
@@ -433,7 +436,7 @@ def test_a_metro_place_and_its_memberships_are_attached(tmp_path):
 
 
 def test_a_city_with_no_metro_keeps_an_empty_list(tmp_path):
-    _, places = _run(tmp_path, {"Q1297": [CHICAGO_METRO]})
+    _, places = _attach_metros(tmp_path, {"Q1297": [CHICAGO_METRO]})
     assert places["Q28515"]["metro_ids"] == []
     # And the seed cities/ancestors all carry the new uniform fields.
     assert places["Q30"]["statistical_area_id"] is None
@@ -443,7 +446,9 @@ def test_a_city_with_no_metro_keeps_an_empty_list(tmp_path):
 def test_a_metro_without_a_cbsa_is_reported_not_published(tmp_path):
     codeless = {"qid": "Q999", "name": "Codeless metro", "cbsa": None}
     # Two cities linked to one codeless MSA: one reported metro, two links.
-    manifest, places = _run(tmp_path, {"Q1297": [codeless], "Q28515": [codeless]})
+    manifest, places = _attach_metros(
+        tmp_path, {"Q1297": [codeless], "Q28515": [codeless]}
+    )
     assert "Q999" not in places
     assert places["Q1297"]["metro_ids"] == []
     # No US metro, but the Eurostat branch auto-derives the Helsinki metro from
@@ -469,7 +474,9 @@ def test_only_us_cities_are_looked_up_for_metros(tmp_path):
     # Helsinki is offered a US metro by the stub, but it is not a US city, so
     # the US branch never asks about it: it never takes the CBSA metro. The
     # metro it does get is the Eurostat one derived from its stops.
-    _, places = _run(tmp_path, {"Q1757": [CHICAGO_METRO], "Q1297": [CHICAGO_METRO]})
+    _, places = _attach_metros(
+        tmp_path, {"Q1757": [CHICAGO_METRO], "Q1297": [CHICAGO_METRO]}
+    )
     assert "Q1754965" not in places["Q1757"]["metro_ids"]
     assert all(
         places[m]["source_subtype"] != "metropolitan statistical area"
@@ -538,7 +545,7 @@ def test_set_place_members_replaces_a_metros_members_reciprocally(tmp_path):
         },
         {"place": "Q404", "set_place_members": ["Q1297"]},  # another build's metro
     ]
-    manifest, places = _run(
+    manifest, places = _attach_metros(
         tmp_path, both, overrides_dir=write_overrides(tmp_path, places=entries)
     )
     assert manifest["places_overrides_sha256"] == overrides.places_digest(
@@ -559,7 +566,7 @@ def test_set_place_members_replaces_a_metros_members_reciprocally(tmp_path):
     # still held under its concordance key.
     for place, members in (("Q1297", ["Q28515"]), ("Q404", ["tp_4"])):
         with pytest.raises(overrides.OverrideError, match="needs a seeded metro"):
-            _run(
+            _attach_metros(
                 tmp_path / place,
                 both,
                 overrides_dir=write_overrides(
@@ -585,7 +592,7 @@ def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
         }
     ]
     directory = write_overrides(tmp_path, places=entries)
-    manifest, places = _run(
+    manifest, places = _attach_metros(
         tmp_path, {"Q28515": [CHICAGO_METRO]}, overrides_dir=directory
     )
     metro = places["Q1754965"]
@@ -619,7 +626,7 @@ def test_a_curated_metro_and_its_statistical_twin_are_one_row(tmp_path):
 def test_a_metro_qid_already_seeded_as_a_city_fails_the_build(tmp_path):
     collided = {"Q28515": [{**CHICAGO_METRO, "qid": "Q1297"}]}
     with pytest.raises(overture.GazetteerError, match="already seeded"):
-        _run(tmp_path, collided)
+        _attach_metros(tmp_path, collided)
     places = {
         qid: {"place_id": qid, "kind": "city", "country_code": "US", "metro_ids": []}
         for qid in ("Q28515", "Q1297")
@@ -635,7 +642,7 @@ def test_a_eurostat_metro_publishes_through_the_crosswalk(tmp_path, stale):
     from test_index_place_overrides import write_overrides
 
     entry = _crosswalk("0" * 64) if stale else _crosswalk()
-    manifest, places = _run(
+    manifest, places = _attach_metros(
         tmp_path, {}, overrides_dir=write_overrides(tmp_path, places=[entry])
     )
     metro = places["Q673425"]
@@ -669,7 +676,7 @@ def test_a_curated_twin_keeps_its_name_and_gains_the_eurostat_identity(tmp_path)
 
     curated = {"kind": "metro", "name": "Greater Helsinki", "member_ids": ["Q1757"]}
     entries = [{"place": "Q673425", "add_place": curated}, _crosswalk()]
-    _, places = _run(
+    _, places = _attach_metros(
         tmp_path, {}, overrides_dir=write_overrides(tmp_path, places=entries)
     )
     metro = places["Q673425"]
@@ -686,7 +693,7 @@ def test_a_eurostat_metro_without_a_crosswalk_auto_publishes(tmp_path):
 
     # Tampere has a crosswalk but no city; Helsinki has cities but no crosswalk.
     tampere = _crosswalk("0" * 64, place="Q999", code="FI002M")
-    manifest, places = _run(
+    manifest, places = _attach_metros(
         tmp_path, {}, overrides_dir=write_overrides(tmp_path, places=[tampere])
     )
     # Helsinki has member cities and no crosswalk: it auto-publishes keyed by
@@ -724,7 +731,7 @@ def test_the_derived_gate_closes_the_eurostat_branch(tmp_path, monkeypatch, miss
 
     allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {missing}
     monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
-    manifest, places = _run(
+    manifest, places = _attach_metros(
         tmp_path,
         {},
         overrides_dir=write_overrides(tmp_path, places=[_crosswalk("0" * 64)]),
@@ -753,7 +760,7 @@ def test_an_unavailable_eurostat_input_degrades_to_no_eu_metros(tmp_path, monkey
         raise eurostat.EurostatError("composition.xlsx: unavailable")
 
     monkeypatch.setattr(eurostat, "load_inputs", unavailable)
-    manifest, places = _run(tmp_path, {"Q1297": [CHICAGO_METRO]})
+    manifest, places = _attach_metros(tmp_path, {"Q1297": [CHICAGO_METRO]})
     # The US branch still publishes Chicago; the Eurostat branch, its input
     # unavailable, degrades to no metros rather than aborting the stage, and
     # the run records no Eurostat snapshot for the expand stage to derive from.
@@ -776,7 +783,7 @@ def test_an_unavailable_eurostat_input_degrades_to_no_eu_metros(tmp_path, monkey
 
 
 def test_a_city_gets_a_metro_of_each_definition_it_falls_in(tmp_path):
-    manifest, places = _run(tmp_path, {}, urau=URAU_AREAS)
+    manifest, places = _attach_metros(tmp_path, {}, urau=URAU_AREAS)
     area = places["eurostat_fua:FI001F"]
     assert area["kind"] == "metro" and area["source_subtype"] == "functional urban area"
     assert area["statistical_area_id"] == "FI001F" and area["country_code"] == "FI"
@@ -818,7 +825,7 @@ def test_an_unavailable_urban_audit_input_leaves_the_other_definition(
         raise urau.UrauError("areas: unavailable")
 
     monkeypatch.setattr(urau, "load_inputs", unavailable)
-    manifest, places = _run(tmp_path, {}, urau=URAU_AREAS)
+    manifest, places = _attach_metros(tmp_path, {}, urau=URAU_AREAS)
     assert manifest["urau"] == {"status": "inputs unavailable", "metros_published": 0}
     assert places["Q1757"]["metro_ids"] == ["eurostat_metro:FI001MC"]
     assert manifest["derived_inputs"]["urau"] is None
@@ -833,7 +840,7 @@ def test_without_nuts_land_a_functional_urban_area_measures_the_footprint(
         raise eurostat.EurostatError("composition.xlsx: unavailable")
 
     monkeypatch.setattr(eurostat, "load_inputs", unavailable)
-    manifest, places = _run(tmp_path, {}, urau=URAU_AREAS)
+    manifest, places = _attach_metros(tmp_path, {}, urau=URAU_AREAS)
     assert places["eurostat_fua:FI001F"]["member_ids"] == ["Q1757"]
     assert manifest["urau"]["land"] == "footprint, NUTS-3 unavailable"
     datasets = {row["dataset"] for row in manifest["derived_inventory"]}
@@ -845,7 +852,7 @@ def test_the_derived_gate_closes_the_urban_audit_definition_alone(
 ):
     allowlist = geometry.DERIVED_SOURCE_ALLOWLIST - {geometry.URAU_DERIVED}
     monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
-    manifest, places = _run(tmp_path, {}, urau=URAU_AREAS)
+    manifest, places = _attach_metros(tmp_path, {}, urau=URAU_AREAS)
     assert "eurostat_fua:FI001F" not in places
     assert places["Q1757"]["metro_ids"] == ["eurostat_metro:FI001MC"]
     report = _artefact(tmp_path, "metro_report.jsonl")
@@ -862,7 +869,7 @@ def test_a_functional_urban_area_publishes_through_its_own_crosswalk(tmp_path):
         "set_statistical_area": {"scheme": "eurostat_fua", "code": "FI001F"},
         "evidence_hash": overrides.canonical_digest(["Q1757"]),
     }
-    manifest, places = _run(
+    manifest, places = _attach_metros(
         tmp_path,
         {},
         overrides_dir=write_overrides(tmp_path, places=[entry]),
@@ -918,7 +925,7 @@ def test_wrong_crosswalk_entries_are_refused(
 
     kind = overrides.OverrideError if error == "override" else overture.GazetteerError
     with pytest.raises(kind, match=message):
-        _run(
+        _attach_metros(
             tmp_path, metro_map, overrides_dir=write_overrides(tmp_path, places=entries)
         )
 
@@ -932,14 +939,16 @@ def test_crosswalk_targets_are_checked_before_the_gates(tmp_path, monkeypatch):
     monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
     entries = [_crosswalk(place="Q1757")]
     with pytest.raises(overture.GazetteerError, match="already seeded as the city"):
-        _run(tmp_path, {}, overrides_dir=write_overrides(tmp_path, places=entries))
+        _attach_metros(
+            tmp_path, {}, overrides_dir=write_overrides(tmp_path, places=entries)
+        )
 
 
 def test_the_derived_credits_reach_the_inventory_and_notice(tmp_path):
     from test_index_place_overrides import write_overrides
 
     overrides_dir = write_overrides(tmp_path, places=[_crosswalk()])
-    _run(tmp_path, {}, overrides_dir=overrides_dir)
+    _attach_metros(tmp_path, {}, overrides_dir=overrides_dir)
     cache = tmp_path / "cache"
     areas = fx.write_area_dataset(tmp_path / "areas-geometry.parquet", AREAS)
     geometry.attach_geometry(cache, dataset=areas, overrides_dir=overrides_dir)
@@ -965,14 +974,16 @@ def test_curated_members_resolve_through_the_registry(tmp_path):
     path.write_text('{"next_id": 1, "registry": 1}\n')
     metro_map = {"Q1297": [CHICAGO_METRO], "Q28515": [CHICAGO_METRO]}
     with registry.session(path) as reg:
-        _run(tmp_path, metro_map, registry=reg)
+        _attach_metros(tmp_path, metro_map, registry=reg)
         reg.save()
     chicago = registry.load(path).resolve("Q1297")
     directory = write_overrides(
         tmp_path, places=[{"place": "cbsa:16980", "set_place_members": [chicago]}]
     )
     with registry.session(path) as reg:
-        _, places = _run(tmp_path, metro_map, overrides_dir=directory, registry=reg)
+        _, places = _attach_metros(
+            tmp_path, metro_map, overrides_dir=directory, registry=reg
+        )
     assert places["Q1754965"]["member_ids"] == [places["Q1297"]["place_id"]]
 
 
@@ -1021,7 +1032,7 @@ def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
     path = tmp_path / "places_registry.jsonl"
     path.write_text('{"next_id": 1, "registry": 1}\n')
     with registry.session(path) as reg:
-        _, places = _run(
+        _, places = _attach_metros(
             tmp_path, {"Q28515": [CHICAGO_METRO]}, overrides_dir=directory, registry=reg
         )
         assert reg.enriched == 1
@@ -1037,7 +1048,7 @@ def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
     # A rebuild keys the curated metro by its own id and still joins on the
     # code it carries; nothing is minted.
     with registry.session(path) as again:
-        _, places = _run(
+        _, places = _attach_metros(
             tmp_path,
             {"Q28515": [CHICAGO_METRO]},
             overrides_dir=directory,
@@ -1184,9 +1195,9 @@ def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, co
             with pytest.raises(
                 overture.GazetteerError, match="carries statistical code"
             ):
-                _run(tmp_path, metro_map, registry=reg)
+                _attach_metros(tmp_path, metro_map, registry=reg)
             return
-        _, places = _run(tmp_path, metro_map, registry=reg)
+        _, places = _attach_metros(tmp_path, metro_map, registry=reg)
     assert (
         sum(1 for p in places.values() if p.get("statistical_area_id") == "16980") == 1
     )
@@ -1249,9 +1260,11 @@ def _ucdb_inputs(tmp_path, centre=CHICAGO_PATCH, country="United States", nested
     return files, expected
 
 
-def _fao_run(tmp_path, country="United States", nested=False, **kw):
+def _attach_metros_with_fao(tmp_path, country="United States", nested=False, **kw):
+    """:func:`_attach_metros` with the FAO regions and UCDB centres, nested
+    in tiers when ``nested``, a centre in ``country``."""
     tmp_path.mkdir(parents=True, exist_ok=True)
-    return _run(
+    return _attach_metros(
         tmp_path,
         {},
         fao=_fao_inputs(tmp_path, nested=nested),
@@ -1281,7 +1294,7 @@ def test_a_fao_metro_auto_publishes_under_the_derived_gate(
         monkeypatch.setattr(geometry, "DERIVED_SOURCE_ALLOWLIST", allowlist)
     from transitio_index import ucdb
 
-    manifest, places = _fao_run(tmp_path, country)
+    manifest, places = _attach_metros_with_fao(tmp_path, country)
     # One inventory row per source the branches read: Overture once, though
     # the Eurostat and FAO branches both place cities by it, and the UCDB the
     # FAO metros are named from.
@@ -1336,7 +1349,9 @@ def test_members_for_a_fao_metro_this_build_mints_are_refused(tmp_path):
     # The FAO metro is minted after the members are set: not another build's.
     entries = [{"place": "fao_city_region:50", "set_place_members": ["Q1297"]}]
     with pytest.raises(overrides.OverrideError, match="needs a seeded metro"):
-        _fao_run(tmp_path, overrides_dir=write_overrides(tmp_path, places=entries))
+        _attach_metros_with_fao(
+            tmp_path, overrides_dir=write_overrides(tmp_path, places=entries)
+        )
 
 
 def test_a_registry_backed_fao_metro_carries_its_region_not_a_cbsa(tmp_path):
@@ -1345,14 +1360,14 @@ def test_a_registry_backed_fao_metro_carries_its_region_not_a_cbsa(tmp_path):
     path = tmp_path / "places_registry.jsonl"
     path.write_text('{"next_id": 1, "registry": 1}\n')
     with registry.session(path) as reg:
-        manifest, places = _fao_run(tmp_path, registry=reg)
+        manifest, places = _attach_metros_with_fao(tmp_path, registry=reg)
         reg.save()
     metro = next(p for p in places.values() if p.get("statistical_area_id") == "50")
     assert manifest["fao"] == {"published": 1, "memberships": 1, "cores": 0}
     identity = registry.load(path).effective(metro["place_id"])
     assert identity.get("fao_city_region") == ["50"] and "cbsa" not in identity
     with registry.session(path) as again:
-        _fao_run(tmp_path / "again", registry=again)
+        _attach_metros_with_fao(tmp_path / "again", registry=again)
         assert again.minted == 0
 
 
@@ -1545,7 +1560,7 @@ def test_a_sliver_fao_metro_takes_its_region_as_a_core(tmp_path, curated):
     )
     boundary = shapely.to_wkt(shapely.box(-88.9, 41.1, -88.6, 41.4))
     entries = [{"place": "Q1204", "set_boundary": boundary}]
-    manifest, places = _fao_run(
+    manifest, places = _attach_metros_with_fao(
         tmp_path,
         areas=AREAS + [illinois],
         overrides_dir=write_overrides(tmp_path, places=entries) if curated else None,
@@ -1576,7 +1591,9 @@ def test_a_city_without_a_land_area_is_placed_by_its_curated_boundary(tmp_path):
         for place, box in boxes.items()
     ]
     directory = write_overrides(tmp_path, places=entries)
-    manifest, places = _fao_run(tmp_path, areas=[AREAS[1]], overrides_dir=directory)
+    manifest, places = _attach_metros_with_fao(
+        tmp_path, areas=[AREAS[1]], overrides_dir=directory
+    )
     assert places["Q1757"]["metro_ids"] == ["eurostat_metro:FI001MC"]
     assert places["Q1297"]["metro_ids"] == ["fao_city_region:50"]
     fao.suggest_metros(
@@ -1610,7 +1627,9 @@ def test_a_city_without_a_land_area_is_placed_by_its_urban_centre(
         "Q1757": shapely.box(24.4, 60.1, 24.6, 60.3),
         "Q1297": shapely.box(-87.9, 41.6, -87.5, 42.0),
     }
-    manifest, places = _fao_run(tmp_path, areas=[AREAS[1], illinois], urban=urban)
+    manifest, places = _attach_metros_with_fao(
+        tmp_path, areas=[AREAS[1], illinois], urban=urban
+    )
     inventory = {r["dataset"]: r for r in manifest["derived_inventory"]}
     if allowed:
         # Placed by their urban centres, the memberships derived from the UCDB
@@ -1638,7 +1657,7 @@ def test_a_city_joins_its_own_centres_region_from_the_reviewed_list(tmp_path, li
         "us-spring", shapely.to_wkb(shapely.box(-88.9, 41.1, -88.7, 41.3)), [OSM]
     )
     rows = ["60,2,Springfield,US,keep,a city"] if listed else []
-    manifest, places = _fao_run(
+    manifest, places = _attach_metros_with_fao(
         tmp_path,
         nested=True,
         areas=AREAS + [springfield],
@@ -1670,7 +1689,9 @@ def test_urban_centre_ids_of_another_ucdb_snapshot_are_refused(tmp_path):
     # The seed recorded other UCDB inputs than the names the stage reads.
     other = {ucdb.CENTRES_FILE: "0" * 64, ucdb.UCDB_FILE: "0" * 64}
     with pytest.raises(overture.GazetteerError, match="re-run the gazetteer"):
-        _fao_run(tmp_path, nested=True, ucdb_ids={"Q28515": 2}, seed_pins=other)
+        _attach_metros_with_fao(
+            tmp_path, nested=True, ucdb_ids={"Q28515": 2}, seed_pins=other
+        )
 
 
 def test_a_us_metro_takes_its_delineated_counties_as_official_parts():
