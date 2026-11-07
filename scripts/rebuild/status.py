@@ -110,8 +110,9 @@ def model_estimate(
     """Minutes left, from a least-squares fit of each finished build's minutes
     on its catalogue entries and place count (``minutes``: label -> minutes).
     Remaining builds take their place count from the previous rebuild's
-    archive of the same label (``PREVIOUS``), else the median. Returns (minutes left, entries done, entries
-    total, R²) or None without a cut or enough builds."""
+    archive of the same label (``PREVIOUS``), else the median. Returns
+    (minutes left, entries done, entries total, R²) or None without a cut or
+    enough builds."""
     import json
 
     import numpy as np
@@ -411,20 +412,30 @@ def main():
     if model:
         left, entries_done, entries_total, r2 = model
         eta = dt.timedelta(minutes=left)
-        entries = f"{entries_done:,} of {entries_total:,} ({100 * entries_done / entries_total:.0f}%)"
+        share = 100 * entries_done / entries_total
+        entries = f"{entries_done:,} of {entries_total:,} ({share:.0f}%)"
     else:
         entries = "-"
     cut = cut_labels()
     in_cut = f"{len(archived_labels(cut, archives))} of {len(cut)}" if cut else "-"
     free = free_space()
     print(f"Rebuild {rebuild} ({mode}) at {now:%H:%M}:\n")
-    print(
-        "| Builds done | OK | Failed | Archived of the cut | Places (distinct) | Feeds (distinct) | Catalogue entries done | Free disk | Running for | Estimate left |"
-    )
-    print("|---|---|---|---|---|---|---|---|---|---|")
-    print(
-        f"| {len(done)} of {total} | {ok} | {len(fail)}{(' (' + ', '.join(fail) + ')') if fail else ''} | {in_cut} | {places[0]:,} | {feeds[0]:,} | {entries} | {free} | {hm(elapsed)} | {hm(eta)} |"
-    )
+    failed = f"{len(fail)} ({', '.join(fail)})" if fail else "0"
+    columns = {
+        "Builds done": f"{len(done)} of {total}",
+        "OK": str(ok),
+        "Failed": failed,
+        "Archived of the cut": in_cut,
+        "Places (distinct)": f"{places[0]:,}",
+        "Feeds (distinct)": f"{feeds[0]:,}",
+        "Catalogue entries done": entries,
+        "Free disk": free,
+        "Running for": hm(elapsed),
+        "Estimate left": hm(eta),
+    }
+    print("| " + " | ".join(columns) + " |")
+    print("|" + "---|" * len(columns))
+    print("| " + " | ".join(columns.values()) + " |")
     if over:
         word = (
             "stopped"
