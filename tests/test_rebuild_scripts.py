@@ -29,6 +29,8 @@ def _run_script(name, *args, checkout, **env):
         "PYTHON": sys.executable,
         "PYTHONPATH": str(_REPO),
         "LOGDIR": str(checkout / "logs"),
+        # A locale in which a range such as a-z also matches capitals.
+        "LC_ALL": "en_US.UTF-8",
         **env,
     }
     return subprocess.run(

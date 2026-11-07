@@ -12,12 +12,13 @@
 # repository), PYTHON its Python (default: python3).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/checks.sh"
 REPO="${BUILD_CHECKOUT:-$HERE/../..}"
 PY="${PYTHON:-python3}"
 cd "$REPO" || { echo "cannot enter $REPO" >&2; exit 2; }
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo "usage: archive_index.sh <label> [expected-snapshot-id]" >&2; exit 2; }
 LABEL="$1"; EXPECT="${2:-}"
-case "$LABEL" in *[!a-z0-9-]*|"") echo "bad label '$LABEL'" >&2; exit 2;; esac
+case "$LABEL" in *[!$LOWER$DIGITS-]*|"") echo "bad label '$LABEL'" >&2; exit 2;; esac
 # A plain absolute path, so the staging and feeds-only folders beside it are
 # never inside it.
 ROOT="${ARCHIVE_ROOT:-$HOME/.cache/transitio-index/builds}"
@@ -35,7 +36,7 @@ if [ -L cache ] || [ -L cache/index ] || [ -L "$ROOT" ] || [ -L "$STAGING" ] || 
 fi
 snapshot_id() { "$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['snapshot_id'])" "$1"; }
 SNAP=$(snapshot_id cache/index/snapshot.json)
-case "$SNAP" in *[!0-9a-f]*|"") echo "bad snapshot id '$SNAP'" >&2; exit 2;; esac
+case "$SNAP" in *[!$HEX]*|"") echo "bad snapshot id '$SNAP'" >&2; exit 2;; esac
 # The index must be the snapshot the caller's build published, not a later one.
 [ -z "$EXPECT" ] || [ "$SNAP" = "$EXPECT" ] || { echo "cache/index holds $SNAP, expected $EXPECT" >&2; exit 2; }
 mkdir -p "$ROOT" "$STAGING"

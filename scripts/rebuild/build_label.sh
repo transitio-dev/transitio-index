@@ -18,14 +18,15 @@
 # 4 archiving failed; 5 parking the crawl failed; 130/143 interrupted.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
+. "$HERE/checks.sh" || exit 2
 REPO="${BUILD_CHECKOUT:-$HERE/../..}"
 PY="${PYTHON:-python3}"
 cd "$REPO" || { echo "refusing: cannot enter $REPO" >&2; exit 2; }
 [ "$#" -eq 2 ] || { echo "usage: build_label.sh <label> <sample-run-dir>" >&2; exit 2; }
 LABEL="$1"; B="$2"
-case "$LABEL" in *[!a-z0-9-]*|"") echo "refusing: bad label '$LABEL'" >&2; exit 2;; esac
+case "$LABEL" in *[!$LOWER$DIGITS-]*|"") echo "refusing: bad label '$LABEL'" >&2; exit 2;; esac
 case "$B" in
-  cache/sample/run-*[!A-Za-z0-9_]*|cache/sample/run-) echo "refusing: bad run dir '$B'" >&2; exit 2;;
+  cache/sample/run-*[!$UPPER$LOWER${DIGITS}_]*|cache/sample/run-) echo "refusing: bad run dir '$B'" >&2; exit 2;;
   cache/sample/run-*) ;;
   *) echo "refusing: bad run dir '$B'" >&2; exit 2;;
 esac
@@ -41,11 +42,10 @@ done
 SEED=""
 if [ -e "$B/countries.txt" ] || [ -L "$B/countries.txt" ]; then
   [ -f "$B/countries.txt" ] && [ ! -L "$B/countries.txt" ] || { echo "refusing: $B/countries.txt is not a regular file" >&2; exit 2; }
-  U=ABCDEFGHIJKLMNOPQRSTUVWXYZ
   while IFS= read -r code || [ -n "$code" ]; do
     [ -n "$code" ] || continue
     case "$code" in
-      [$U][$U]) SEED="${SEED:+$SEED,}$code";;
+      [$UPPER][$UPPER]) SEED="${SEED:+$SEED,}$code";;
       *) echo "refusing: bad country code '$code' in $B/countries.txt" >&2; exit 2;;
     esac
   done < "$B/countries.txt"
@@ -54,7 +54,7 @@ if [ -n "${MDB_CATALOGUE:-}" ]; then
   [ -f "$MDB_CATALOGUE" ] && [ ! -L "$MDB_CATALOGUE" ] || { echo "refusing: MDB_CATALOGUE '$MDB_CATALOGUE' is not a regular file" >&2; exit 2; }
 fi
 case "${OVERTURE_RELEASE:-}" in
-  *[!0-9.-]*) echo "refusing: bad OVERTURE_RELEASE '$OVERTURE_RELEASE'" >&2; exit 2;;
+  *[!$DIGITS.-]*) echo "refusing: bad OVERTURE_RELEASE '$OVERTURE_RELEASE'" >&2; exit 2;;
 esac
 LOG="${LOGDIR:-${TMPDIR:-/tmp}}/$LABEL.log"
 [ -L "$LOG" ] && { echo "refusing: $LOG is a symlink" >&2; exit 2; }
@@ -106,7 +106,7 @@ print(commits.pop() if len(commits) == 1 else "")
 PYEOF
 ) || ATLAS=""
 case "$ATLAS" in
-  *[!0-9a-f]*) ATLAS="";;
+  *[!$HEX]*) ATLAS="";;
 esac
 snapshot_id() { "$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['snapshot_id'])" cache/index/snapshot.json 2>/dev/null || echo; }
 BEFORE=$(snapshot_id)

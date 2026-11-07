@@ -8,6 +8,7 @@
 # ARCHIVE_ROOT reach build_label.sh and archive_index.sh;
 # STOP_IF_FIRST_FAILS=1 stops the run when the map's first label fails.
 HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/checks.sh" || exit 2
 REPO="$(cd "${BUILD_CHECKOUT:-$HERE/../..}" && pwd)" || exit 2
 export BUILD_CHECKOUT="$REPO"
 [ "$#" -eq 1 ] || { echo "usage: build_labels.sh <map-file>" >&2; exit 2; }
@@ -22,9 +23,9 @@ done < "$MAP" || exit 2
 [ "${#LINES[@]}" -gt 0 ] || { echo "refusing: no labels in $MAP" >&2; exit 2; }
 for line in "${LINES[@]}"; do
   read -r label run extra <<< "$line"
-  case "$label" in *[!a-z0-9-]*) label="";; esac
+  case "$label" in *[!$LOWER$DIGITS-]*) label="";; esac
   case "$run" in
-    cache/sample/run-*[!A-Za-z0-9_]*|cache/sample/run-) run="";;
+    cache/sample/run-*[!$UPPER$LOWER${DIGITS}_]*|cache/sample/run-) run="";;
     cache/sample/run-*) ;;
     *) run="";;
   esac
