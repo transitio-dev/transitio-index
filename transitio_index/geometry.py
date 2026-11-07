@@ -1310,6 +1310,27 @@ def curated_polygon(place_id, wkt):
     return simplified
 
 
+def boundary_overrides(place_overrides):
+    """``{place key: WKT}``: the ``set_boundary`` entries of the place
+    overrides."""
+    return {
+        entry["place"]: entry["set_boundary"]
+        for entry in overrides.by_operation(place_overrides, "set_boundary")
+    }
+
+
+def ucdb_polygon(wkb):
+    """A GHS-UCDB urban centre's polygon (WKB) forced to 2D and simplified to
+    the shipping tolerance, or None when it is not a valid polygon before and
+    after."""
+    try:
+        geom = shapely.force_2d(shapely.from_wkb(wkb))
+        simplified = _simplify(geom) if _valid_polygon(geom) else None
+    except Exception:  # noqa: B902 - shapely raises its own hierarchy
+        return None
+    return simplified if _valid_polygon(simplified) else None
+
+
 def _curated_geometry(place, wkt):
     """A curator-supplied boundary shipped with ``geometry_source =
     "curated"`` — the curator, not a licence audit, vouches for it."""
@@ -1450,12 +1471,8 @@ def attach_geometry(
                 polygon = place.pop("ucdb_boundary", None)
                 if polygon is None or place.get("geometry"):
                     continue
-                try:
-                    geom = shapely.force_2d(shapely.from_wkb(polygon))
-                    simplified = _simplify(geom) if _valid_polygon(geom) else None
-                except Exception:  # noqa: B902 - shapely raises its own hierarchy
-                    simplified = None
-                if not _valid_polygon(simplified):
+                simplified = ucdb_polygon(polygon)
+                if simplified is None:
                     invalid += 1
                     continue
                 place["geometry"] = shapely.to_wkb(simplified).hex()

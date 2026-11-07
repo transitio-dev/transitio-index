@@ -273,11 +273,31 @@ def _footprint(rows):
     return None if merged.is_empty else merged
 
 
-def place_footprint(areas, place):
+def place_footprint(areas, place, curated=None, urban_centres=False):
     """A place's land footprint from ``areas`` (``geometry.read_areas`` output
-    keyed by Overture id), or None without a usable one."""
+    keyed by Overture id); without a usable one, the outline the place ships
+    instead: its curated boundary (a ``set_boundary`` WKT in ``curated`` by
+    place key, or its own ``boundary_wkt``), else, with ``urban_centres``,
+    its GHS-UCDB urban centre. None without any."""
     overture_id = place.get("overture_id")
-    return _footprint(areas.get(overture_id)) if overture_id else None
+    footprint = _footprint(areas.get(overture_id)) if overture_id else None
+    if footprint is not None:
+        return footprint
+    wkt = (curated or {}).get(place.get("place_id")) or place.get("boundary_wkt")
+    if wkt:
+        return geometry.curated_polygon(place.get("place_id"), wkt)
+    polygon = place.get("ucdb_boundary")
+    return geometry.ucdb_polygon(polygon) if polygon and urban_centres else None
+
+
+def placed_by_urban_centre(areas, place, curated=None):
+    """Whether :func:`place_footprint` takes the place's footprint from its
+    GHS-UCDB urban centre: it has neither a usable land area nor a curated
+    boundary, and a valid urban centre."""
+    return (
+        place_footprint(areas, place, curated) is None
+        and place_footprint(areas, place, curated, urban_centres=True) is not None
+    )
 
 
 def _pick(candidates, footprint, boundaries, by_nuts3):
@@ -346,15 +366,27 @@ def _by_share(containment, footprints, min_share, land):
     return chosen
 
 
-def assign(places, areas, metros, boundaries, *, min_share=None, land=None):
+def assign(
+    places,
+    areas,
+    metros,
+    boundaries,
+    *,
+    min_share=None,
+    land=None,
+    curated=None,
+    urban_centres=False,
+):
     """One assignment row per city of a covered country, by ``city_id``.
 
     ``status`` is ``"assigned"`` with the ``metro_code`` whose composition
     holds the city's NUTS-3 region, ``"unassigned"`` when that region is in
     no metro (or the city's land overlaps no region), ``"ambiguous"`` when
     the candidate regions imply different metros and hold equal shares of
-    its footprint, and ``"unplaceable"`` when the city has no usable land
-    area. The city's region is the one covering its footprint's
+    its footprint, and ``"unplaceable"`` when the city has no footprint
+    (:func:`place_footprint`, with the ``curated`` boundaries and
+    ``urban_centres``). The city's
+    region is the one covering its footprint's
     representative point; when that point lies in no region — a coastal
     municipality whose Overture polygon runs out to sea, against the
     coastline-clipped NUTS boundaries — the regions its land overlaps are
@@ -377,7 +409,9 @@ def assign(places, areas, metros, boundaries, *, min_share=None, land=None):
         for place in places
         if place.get("kind") == "city" and place.get("country_code") in covered
     ]
-    footprints = [place_footprint(areas, place) for place in cities]
+    footprints = [
+        place_footprint(areas, place, curated, urban_centres) for place in cities
+    ]
     if min_share is not None:
         shared = _by_share(containment, footprints, min_share, land)
     rows = []

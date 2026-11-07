@@ -997,16 +997,21 @@ def fao_centres(rows, centres):
             metro["centre"] = shapely.to_wkb(point).hex()
 
 
-def _shipped_area(areas, boundaries, place):
+def _shipped_area(areas, boundaries, place, urban_centres=False):
     """The polygon ``place`` ships: its curated boundary — a ``set_boundary``
     WKT in ``boundaries`` by place key, or its own — else the one its
     Overture ``areas`` (``geometry.read_areas`` output keyed by Overture id)
-    ship, or None when it ships none."""
+    ship, else, with ``urban_centres``, its GHS-UCDB urban centre; None when
+    it ships none."""
     wkt = boundaries.get(place["place_id"]) or place.get("boundary_wkt")
     if wkt:
         return geometry.curated_polygon(place["place_id"], wkt)
     rows = areas.get(place.get("overture_id"))
-    return geometry.shipped_geometry(rows)[1] if rows else None
+    shipped = geometry.shipped_geometry(rows)[1] if rows else None
+    polygon = place.get("ucdb_boundary")
+    if shipped is None and polygon and urban_centres:
+        return geometry.ucdb_polygon(polygon)
+    return shipped
 
 
 def _snapshot(inputs, keys):
@@ -1032,10 +1037,13 @@ def _apply_fao(
     boundaries,
     cache_dir,
     dataset,
+    ucdb_version=None,
 ):
     """Publish an FAO city-region metro for every region of the loaded
     ``inputs`` holding cities, whatever other metros those cities belong
-    to. Each metro is keyed by its FAO region id, named from the
+    to — a city without a land area placed by its curated ``boundaries`` or,
+    with a ``ucdb_version`` (the GHS-UCDB snapshot its urban centre comes
+    from), by its urban centre. Each metro is keyed by its FAO region id, named from the
     region's GHS-UCDB centre match in ``names`` (empty unless the UCDB derived
     input was read), its country its centre's (:func:`fao_country`) — a
     region holding no city there is reported — and the cities joined as
@@ -1056,9 +1064,13 @@ def _apply_fao(
         p["overture_id"] for p in places if p["kind"] == "city" and p.get("overture_id")
     }
     areas = geometry.place_areas(cache_dir, dataset, places, wanted)
-    grouped, _, _, _ = fao.place_cities(places, areas, regions, patches)
+    urban_centres = ucdb_version is not None
+    grouped, _, _, _ = fao.place_cities(
+        places, areas, regions, patches, boundaries, urban_centres
+    )
     allowed = all(key in geometry.DERIVED_SOURCE_ALLOWLIST for key in FAO_DERIVED)
     touched = {}
+    by_urban_centre = False
     for region_id in sorted(grouped):
         derived = sorted(grouped[region_id])
         # A metro belongs to one country partition, its centre's, whichever
@@ -1076,7 +1088,16 @@ def _apply_fao(
             region_id,
             derived,
             by_id,
-            functools.partial(eurostat.place_footprint, areas),
+            functools.partial(
+                eurostat.place_footprint,
+                areas,
+                curated=boundaries,
+                urban_centres=urban_centres,
+            ),
+        )
+        by_urban_centre = by_urban_centre or any(
+            eurostat.placed_by_urban_centre(areas, by_id[city_id], boundaries)
+            for city_id in derived
         )
         make_row = functools.partial(_fao_place, key, region_id, name, country)
         for city_id in derived:
@@ -1108,7 +1129,9 @@ def _apply_fao(
         settle_fao_cores(
             {key: metros[key] for key in touched},
             by_id,
-            functools.partial(_shipped_area, shipped, boundaries),
+            functools.partial(
+                _shipped_area, shipped, boundaries, urban_centres=urban_centres
+            ),
             regions,
             patches,
             centres,
@@ -1126,6 +1149,8 @@ def _apply_fao(
             inputs_manifest, centre_pin if centres is not None else None
         ),
     }
+    if by_urban_centre:
+        versions[geometry.UCDB_DERIVED] = ucdb_version
     return versions, touched, cores
 
 
@@ -1143,11 +1168,14 @@ def _attach_definition(
     wikidata,
     place_overrides,
     land=None,
+    ucdb_version=None,
 ):
     """The Eurostat branch for one ``definition`` over its loaded ``inputs``
     and the cities' land ``areas`` — measured, for a definition with a
     ``min_share``, inside the NUTS-3 regions of ``land`` (the Eurostat
-    inputs, None for none); returns ``(assignments, consumed,
+    inputs, None for none); a city without one is placed by its curated
+    boundary or, with a ``ucdb_version`` (the GHS-UCDB snapshot its urban
+    centre comes from), by its urban centre. Returns ``(assignments, consumed,
     summary, applied)`` — the assignment rows (each naming the definition's
     subtype), the derived inputs read as ``{(dataset, licence): (version,
     memberships)}``, the branch summary, and the crosswalk entries that
@@ -1167,6 +1195,7 @@ def _attach_definition(
     covered = eurostat.countries(composition)
     if definition.min_share is None:
         land = None
+    curated = geometry.boundary_overrides(place_overrides)
     assignments = eurostat.assign(
         places,
         areas,
@@ -1174,6 +1203,8 @@ def _attach_definition(
         boundaries,
         min_share=definition.min_share,
         land=land[1] if land is not None else None,
+        curated=curated,
+        urban_centres=ucdb_version is not None,
     )
     for row in assignments:
         row["subtype"] = definition.subtype
@@ -1254,12 +1285,17 @@ def _attach_definition(
             "NUTS-3 regions" if land is not None else "footprint, NUTS-3 unavailable"
         )
     assigned = sum(1 for row in assignments if row["status"] == "assigned")
-    return (
-        assignments,
-        _consumed(definition, inputs_manifest, assigned, land),
-        summary,
-        crosswalked,
+    consumed = _consumed(definition, inputs_manifest, assigned, land)
+    # A membership placed by an urban centre is derived from the UCDB too.
+    urban = sum(
+        1
+        for row in assignments
+        if row["status"] == "assigned"
+        and eurostat.placed_by_urban_centre(areas, by_id[row["city_id"]], curated)
     )
+    if urban:
+        consumed[geometry.UCDB_DERIVED] = (ucdb_version, urban)
+    return assignments, consumed, summary, crosswalked
 
 
 def _identify_metros(metros, registry, derived):
@@ -1418,6 +1454,15 @@ def attach_metros(
                 "places.yaml",
                 "gazetteer",
             )
+            # The urban centres the seed gave its cities place those without a
+            # land area while the UCDB's derived use is allowlisted.
+            centre_sources = seed_manifest.get("centre_sources") or {}
+            urban_centres = {k: v for k, v in centre_sources.items() if k in ucdb.PINS}
+            if ucdb.DERIVED not in geometry.DERIVED_SOURCE_ALLOWLIST:
+                urban_centres = {}
+            ucdb_version = (
+                overrides.canonical_digest(urban_centres) if urban_centres else None
+            )
 
             # The branches' inputs, read before anything is joined: one that
             # is missing, altered or unreadable disables its branch (None)
@@ -1509,6 +1554,7 @@ def attach_metros(
                     wikidata=wikidata,
                     place_overrides=place_overrides,
                     land=land,
+                    ucdb_version=ucdb_version,
                 )
                 assignments.extend(rows)
                 consumed.append(consumed_by)
@@ -1558,14 +1604,10 @@ def attach_metros(
                     names=names,
                     centres=centres,
                     centre_pin=ucdb_pins.get(ucdb.CENTRES_FILE),
-                    boundaries={
-                        entry["place"]: entry["set_boundary"]
-                        for entry in overrides.by_operation(
-                            place_overrides, "set_boundary"
-                        )
-                    },
+                    boundaries=geometry.boundary_overrides(place_overrides),
                     cache_dir=cache_dir,
                     dataset=dataset,
+                    ucdb_version=ucdb_version,
                 )
                 # A seeded FAO metro joined here is repartitioned over its
                 # grown membership; one with no city in its centre's country
@@ -1667,6 +1709,7 @@ def attach_metros(
                     names_manifest["sources"] if names_manifest is not None else None
                 ),
                 "fao_centres": dict(ucdb_pins) if centres is not None else None,
+                "urban_centres": urban_centres or None,
             }
             for metro in metros.values():
                 metro["member_ids"].sort()

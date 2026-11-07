@@ -239,7 +239,12 @@ def run_gazetteer(arguments):
         lambda places, run: names.merge_names(
             cache_dir, registry=places, run=run, **options
         ),
-        lambda places, run: fao.suggest_metros(cache_dir, run=run),
+        lambda places, run: fao.suggest_metros(
+            cache_dir,
+            run=run,
+            overrides_dir=arguments.overrides_dir,
+            registry=places,
+        ),
     ]
     return commit_run(
         cache_dir,
