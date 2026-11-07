@@ -23,11 +23,7 @@ case "$LABEL" in *[!$LOWER$DIGITS-]*|"") echo "bad label '$LABEL'" >&2; exit 2;;
 # never inside it.
 ROOT="${ARCHIVE_ROOT:-$HOME/.cache/transitio-index/builds}"
 ROOT="${ROOT%/}"
-case "$ROOT" in
-  */|*//*|*/.|*/./*|*/..|*/../*|"") echo "ARCHIVE_ROOT must be a plain absolute path" >&2; exit 2;;
-  /*) ;;
-  *) echo "ARCHIVE_ROOT must be a plain absolute path" >&2; exit 2;;
-esac
+plain_path "$ROOT" || { echo "ARCHIVE_ROOT must be a plain absolute path" >&2; exit 2; }
 STAGING="$ROOT.staging"
 FEEDS_ONLY="$ROOT-feeds-only"
 # Nothing under cache is written through a symlink.

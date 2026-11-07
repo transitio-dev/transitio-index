@@ -3,8 +3,10 @@ one published index."""
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -76,6 +78,17 @@ def _run_script(name, *args, checkout, **env):
             "bad map line",
         ),
         ("build_labels.sh", ["map.txt"], [("map.txt", "\n  \n")], {}, "no labels"),
+        ("rebuild.sh", ["2026-11"], [], {}, "usage"),
+        ("rebuild.sh", ["2026-11", "go"], [], {}, "usage"),
+        ("rebuild.sh", ["Run 1", "check"], [], {}, "bad run name"),
+        ("rebuild.sh", ["2026-11", "check"], [], {"RUN_DIR": "runs/a"}, "plain"),
+        (
+            "rebuild.sh",
+            ["2026-11", "check"],
+            [],
+            {"RUN_DIR": "/nonexistent/run"},
+            "no run folder",
+        ),
     ],
 )
 def test_the_rebuild_scripts_refuse_bad_input(
@@ -117,3 +130,28 @@ def test_a_published_index_is_archived_once(tmp_path):
     assert list((tmp_path / "builds.staging").iterdir()) == []
     again = _run_script("archive_index.sh", "us2", checkout=tmp_path, **env)
     assert again.returncode == 2 and "already exists" in again.stderr
+
+
+def test_the_supervisor_records_how_the_run_ended(tmp_path):
+    progress = tmp_path / "progress.log"
+    supervise = str(_SCRIPTS / "supervise.sh")
+    done = subprocess.run([supervise, str(progress), "sh", "-c", "exit 3"], check=False)
+    assert done.returncode == 3
+    assert progress.read_text().endswith("REBUILD ENDED: sh exited with code 3\n")
+    # A TERM is passed on, and the command's own status is the one recorded.
+    ready = tmp_path / "ready"
+    child = f'trap "exit 7" TERM; : > "{ready}"; sleep 30 & wait'
+    lock = tmp_path / ".lock"
+    environ = {**os.environ, "RUN_LOCK": str(lock)}
+    run = subprocess.Popen([supervise, str(progress), "sh", "-c", child], env=environ)
+    lock.mkdir()
+    (lock / "pid").write_text(f"{run.pid}\n")
+    for _ in range(100):
+        if ready.exists():
+            break
+        time.sleep(0.05)
+    run.send_signal(signal.SIGTERM)
+    assert run.wait(timeout=10) == 7
+    assert progress.read_text().endswith("REBUILD ENDED: sh exited with code 7\n")
+    # The run lock it was handed, still naming it, is released.
+    assert not lock.exists()

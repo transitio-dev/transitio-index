@@ -29,7 +29,7 @@ scripts/export_divisions.py   export the Overture division hierarchy to inspect
 scripts/export_index_layer.py export a produced index as a map layer (feeds/tiers)
 scripts/index_viewer.py       inspect a built index in the browser
 scripts/check_place_geometry.py flag cities whose area disagrees with Wikidata
-scripts/rebuild/              build and archive every label of a partition
+scripts/rebuild/              run a full rebuild: every label of a partition
 overrides/             the place registry and curated override files
 golden/                the golden feed set the publish stage diffs against
 tests/                 the build's pytest suite and its fixtures
