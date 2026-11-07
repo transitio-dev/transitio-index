@@ -74,6 +74,13 @@ still lists those checks.
   goes, but not with the lid closed on battery.
 - Progress: `tail -f ~/.cache/transitio-index/runs/<run>/logs/progress.log`;
   one label's log is `logs/<label>.log` beside it.
+- A status table (labels done and failed, places and feeds archived, free
+  disk, the label being built and an estimate of the time left):
+  `${PYTHON:-python3} $R/status.py --run <run>`. With `--previous-archive` naming an
+  earlier rebuild's archive root, the estimate uses its place counts for the
+  labels not built yet. `$R/watch.sh <run>` prints the table every five
+  minutes (`INTERVAL` seconds) and stops once the `rest`, `resume` or `fix`
+  run has ended.
 - Stop after the current label with `kill <pid>`: the driver prints the pid,
   which is also in `cache/.rebuild.lock/pid`. A `REBUILD ENDED` line then
   closes the progress log; continue later with `resume`.

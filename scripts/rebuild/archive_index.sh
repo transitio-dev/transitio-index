@@ -30,9 +30,13 @@ FEEDS_ONLY="$ROOT-feeds-only"
 if [ -L cache ] || [ -L cache/index ] || [ -L "$ROOT" ] || [ -L "$STAGING" ] || [ -L "$FEEDS_ONLY" ]; then
   echo "a symlink under cache" >&2; exit 2
 fi
-snapshot_id() { "$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['snapshot_id'])" "$1"; }
-SNAP=$(snapshot_id cache/index/snapshot.json)
-case "$SNAP" in *[!$HEX]*|"") echo "bad snapshot id '$SNAP'" >&2; exit 2;; esac
+# The manifest's snapshot id, checked before the shell sees it: 16 hex digits.
+snapshot_id() {
+  "$PY" -c "import json,re,sys
+v = json.load(open(sys.argv[1])).get('snapshot_id')
+sys.exit(2) if not (isinstance(v, str) and re.fullmatch('[0-9a-f]{16}', v)) else print(v)" "$1"
+}
+SNAP=$(snapshot_id cache/index/snapshot.json) || { echo "bad snapshot id in cache/index/snapshot.json" >&2; exit 2; }
 # The index must be the snapshot the caller's build published, not a later one.
 [ -z "$EXPECT" ] || [ "$SNAP" = "$EXPECT" ] || { echo "cache/index holds $SNAP, expected $EXPECT" >&2; exit 2; }
 mkdir -p "$ROOT" "$STAGING"
@@ -54,7 +58,7 @@ LINKS=$(find "$STAGE/index" -type l)
 [ -z "$LINKS" ] || { echo "a symlink inside cache/index" >&2; exit 2; }
 # The copy must be the snapshot the name says: a publish landing mid-copy
 # would leave a mixed archive.
-STAGED=$(snapshot_id "$STAGE/index/snapshot.json")
+STAGED=$(snapshot_id "$STAGE/index/snapshot.json") || { echo "bad snapshot id in the copied index" >&2; exit 2; }
 [ "$STAGED" = "$SNAP" ] || { echo "index changed during the copy ($SNAP -> $STAGED)" >&2; exit 2; }
 # An index with places goes to the merge root with its map layer; one with
 # feeds but no places to the feeds-only root, without a layer (the export

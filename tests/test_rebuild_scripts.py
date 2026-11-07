@@ -122,20 +122,27 @@ def test_a_published_index_is_archived_once(tmp_path):
     index.mkdir(parents=True)
     # The manifest's counts decide: an empty places table is no places.
     counts = {"feeds": 1, "places": 0}
-    snapshot = {"snapshot_id": "ab12", "counts": counts}
+    snapshot = {"snapshot_id": "ab12" * 4, "counts": counts}
     (index / "snapshot.json").write_text(json.dumps(snapshot))
     (index / "places.parquet").write_bytes(b"")
     env = {"ARCHIVE_ROOT": str(tmp_path / "builds")}
+    (index / "snapshot.json").write_text(json.dumps({**snapshot, "snapshot_id": 12}))
+    numeric = _run_script("archive_index.sh", "us2", checkout=tmp_path, **env)
+    assert numeric.returncode == 2 and "bad snapshot id" in numeric.stderr
+    (index / "snapshot.json").write_text(json.dumps(snapshot))
     wrong = _run_script("archive_index.sh", "us2", "cd34", checkout=tmp_path, **env)
     assert wrong.returncode == 2 and "expected cd34" in wrong.stderr
     (index / "linked.parquet").symlink_to(tmp_path / "elsewhere.parquet")
     linked = _run_script("archive_index.sh", "us2", checkout=tmp_path, **env)
     assert linked.returncode == 2 and "symlink inside" in linked.stderr
     (index / "linked.parquet").unlink()
-    first = _run_script("archive_index.sh", "us2", "ab12", checkout=tmp_path, **env)
+    first = _run_script("archive_index.sh", "us2", "ab12" * 4, checkout=tmp_path, **env)
     assert first.returncode == 0, first.stderr
-    archived = tmp_path / "builds-feeds-only" / "us2-ab12" / "index" / "snapshot.json"
-    assert json.loads(archived.read_text())["snapshot_id"] == "ab12"
+    archived = tmp_path / "builds-feeds-only" / f"us2-{'ab12' * 4}" / "index"
+    assert (
+        json.loads((archived / "snapshot.json").read_text())["snapshot_id"]
+        == "ab12" * 4
+    )
     assert list((tmp_path / "builds.staging").iterdir()) == []
     again = _run_script("archive_index.sh", "us2", checkout=tmp_path, **env)
     assert again.returncode == 2 and "already exists" in again.stderr
@@ -164,3 +171,42 @@ def test_the_supervisor_records_how_the_run_ended(tmp_path):
     assert progress.read_text().endswith("REBUILD ENDED: sh exited with code 7\n")
     # The run lock it was handed, still naming it, is released.
     assert not lock.exists()
+
+
+def test_the_status_tables_follow_a_run(tmp_path):
+    pytest.importorskip("pyarrow")
+    run_dir, archive = tmp_path / "runs" / "2026-11", tmp_path / "builds"
+    (run_dir / "logs").mkdir(parents=True)
+    progress = run_dir / "logs" / "progress.log"
+    progress.write_text("")
+    (run_dir / "started").write_text(f"abc\n{archive}\nmdb\ninputs\n2026-10-21.0\n")
+    (run_dir / "map-check.txt").write_text(
+        "us2 cache/sample/run-us2_a\nfr1 cache/sample/run-fr1_b\n"
+    )
+
+    def status():
+        result = subprocess.run(
+            [sys.executable, str(_SCRIPTS / "status.py"), "--run", "2026-11"]
+            + ["--run-dir", str(run_dir)],
+            env={**os.environ, "BUILD_CHECKOUT": str(tmp_path)},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    assert status().startswith("No 2026-11 run")
+    with progress.open("a") as log:
+        log.write(
+            f"[11-07 10:00:00] REBUILD 2026-11 first: map {run_dir}/map-check.txt, 2 labels\n"
+        )
+        log.write(
+            "[11-07 11:00:00] (1/2) OK us2 (fresh crawl) | [us2 done: runner exit 0]\n"
+        )
+    running = status()
+    assert "| 1 of 2 | 1 | 0 |" in running and "| fr1 |" in running
+    with progress.open("a") as log:
+        log.write(
+            "[11-07 12:00:00] (2/2) FAIL fr1 (fresh crawl) | [fr1 done: runner exit 1]\n"
+        )
+    assert status().rstrip().endswith("This run (first) is finished with failures.")
