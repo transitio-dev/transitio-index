@@ -2242,7 +2242,7 @@ def test_a_fao_metro_carries_its_fao_centre_not_its_members_centroid(tmp_path):
     import test_index_metros as mt
 
     centre = shapely.box(-87.9, 41.9, -87.8, 42.0)
-    mt._run(
+    mt._attach_metros(
         tmp_path,
         {},
         fao=mt._fao_inputs(tmp_path),
