@@ -415,13 +415,14 @@ def lenders(places):
 def lend_areas(areas, lent):
     """Give each place in ``lent`` (from :func:`lenders`) that read no area of
     its own the rows of its first lender that read some, in place;
-    ``{place overture_id: geometry_source}`` for the places given one."""
+    ``{place overture_id: (lender overture_id, geometry_source)}`` for the
+    places given one."""
     given = {}
     for own, candidates in lent.items():
         found = [(area, source) for area, source in candidates if area in areas]
         if own not in areas and found:
             areas[own] = areas[found[0][0]]
-            given[own] = found[0][1]
+            given[own] = found[0]
     return given
 
 
@@ -1427,7 +1428,7 @@ def attach_geometry(
                     reopen=reopen,
                     countries=countries,
                 )
-                for own, source in lend_areas(areas, twins).items():
+                for own, (_, source) in lend_areas(areas, twins).items():
                     # A twin that read an area settles the place, shipped or
                     # not: the council area comes after it, as in lend_areas.
                     absent.discard(own)
