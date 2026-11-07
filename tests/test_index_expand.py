@@ -1048,16 +1048,22 @@ def test_unparsable_stop_rows_are_skipped(tmp_path):
     assert "Q40840" in places
 
 
-def test_places_yaml_edited_after_the_gazetteer_refuses_to_expand(tmp_path):
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"places": [{"place": "Q1", "set_aliases": ["x"]}]},
+        {"own_centres": ["60,2,Springfield,US,keep,a city"]},
+    ],
+    ids=["places.yaml", "fao_own_centres"],
+)
+def test_an_override_edited_after_the_gazetteer_refuses_to_expand(tmp_path, edit):
     from test_index_place_overrides import write_overrides
 
     from transitio_index import overrides
 
     cache = tmp_path / "cache"
     _publish_names(cache, [])
-    directory = write_overrides(
-        tmp_path, places=[{"place": "Q1", "set_aliases": ["x"]}]
-    )
+    directory = write_overrides(tmp_path, **edit)
     with pytest.raises(overrides.OverrideError, match="re-run the gazetteer"):
         expand.expand(cache, overrides_dir=directory)
 

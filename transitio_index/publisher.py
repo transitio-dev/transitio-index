@@ -153,6 +153,33 @@ def _archive(members):
     return sink.getvalue()
 
 
+def release_notes(snapshot_id, notice):
+    """The release body: the snapshot line, then the credit each credential
+    provider's terms ask to be shown beside the data, from ``notice`` (the
+    NOTICE the release ships)."""
+    from transitio_index import merge  # merge imports the publish stage
+
+    try:
+        credits = merge.provider_notices(notice)
+    except merge.MergeError as error:
+        raise PublishIndexError(f"the release's NOTICE: {error}") from None
+    lines = [f"transitio feed index snapshot {snapshot_id}"]
+    if credits:
+        lines += ["", "Data credited as its providers' terms require:"]
+        for name, credit in credits:
+            if len(credit) == 1:
+                lines.append(f"- {name}: {credit[0]}")
+            else:
+                lines += [f"- {name}:", *(f"  - {line}" for line in credit)]
+    return "\n".join(lines)
+
+
+def _packed_notice(archive):
+    """The NOTICE inside the gzip tar ``archive`` the release ships."""
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+        return tar.extractfile("NOTICE").read()
+
+
 def _lock_stages(stack, cache_dir):
     """Hold every lock the publish stage holds, in its order: the stages,
     then the crawl."""
@@ -657,7 +684,8 @@ def publish_index(
 ):
     """Pack ``index_dir`` and publish it as the release for its snapshot,
     its ``report`` (:func:`~transitio_index.release_report.build_report`)
-    attached as ``transitio-index-<snapshot_id>-report.md``; returns a
+    attached as ``transitio-index-<snapshot_id>-report.md`` and its notes
+    the providers' credits (:func:`release_notes`); returns a
     summary. A report of another snapshot is refused, before packing and
     after it (a snapshot id is derived from the build's inputs and contents,
     so the report describes the index packed), and so is a report with
@@ -696,6 +724,9 @@ def publish_index(
     # First, so the manifest stays the last asset uploaded.
     assets = {**rendered, **assets}
     tag = contract.release_tag(snapshot_id)
+    notes = release_notes(
+        snapshot_id, _packed_notice(assets[manifest["archive"]["name"]])
+    )
     repo = f"/repos/{repository}"
     with _client(api_url, token, transport) as client:
         try:
@@ -714,7 +745,7 @@ def publish_index(
                 json={
                     "tag_name": tag,
                     "name": f"Index snapshot {snapshot_id}",
-                    "body": f"transitio feed index snapshot {snapshot_id}",
+                    "body": notes,
                     "draft": True,
                     "prerelease": False,
                     # Index data never displaces the software release

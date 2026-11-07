@@ -29,6 +29,8 @@ from transitio.index import release as contract  # noqa: E402
 
 
 def parse_args(argv=None):
+    """The publish command's options from ``argv``, by default
+    ``sys.argv``."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--cache-dir",
@@ -106,6 +108,9 @@ def _previous(snapshot_id):
 
 
 def main(argv=None):
+    """Print the release report, publish the index as a GitHub release and
+    print its summary as JSON; return the exit status, 1 when the token or
+    the reference tests are missing or the publish fails."""
     arguments = parse_args(argv)
     token = os.environ.get(arguments.token_env)
     if not token:

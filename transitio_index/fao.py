@@ -354,6 +354,63 @@ def place_cities(places, areas, regions, patches, curated=None, urban_centres=Fa
     return grouped, countries, unplaced, qid_of
 
 
+def own_regions(names, regions):
+    """``{ucdb_id: (region_id, matched)}`` by GHS-UCDB urban centre id (as
+    text): the highest-tier FAO region (ties to the lower id) whose centre the
+    UCDB ``names`` match to it unambiguously, None without one, and every
+    region whose centre is matched to it. FAO lists a large city at several
+    tiers; only the highest is its own region."""
+    matched = collections.defaultdict(set)
+    top = {}
+    for region_id, row in names.items():
+        if region_id not in regions:
+            continue
+        key = str(row["ucdb_id"])
+        matched[key].add(region_id)
+        if row.get("ambiguous"):
+            continue
+        rank = (regions[region_id]["tier"], -int(region_id))
+        if key not in top or rank > top[key][0]:
+            top[key] = (rank, region_id)
+    return {
+        key: (top[key][1] if key in top else None, regions_of)
+        for key, regions_of in matched.items()
+    }
+
+
+def join_own_centres(
+    places, grouped, countries, unplaced, names, regions, listed=None, held=None
+):
+    """Also join each city to the FAO region of its own urban centre
+    (:func:`own_regions` of its ``ucdb_id``), in place in ``grouped`` and
+    ``countries`` from :func:`place_cities`. A city in its ``unplaced``, or
+    placed in a region matched to its own urban centre, joins nothing. The
+    region is joined while it is ``held`` (by default: holds a city by
+    placement), or when the reviewed ``listed`` (``{region_id: ucdb_id}``)
+    names it for that urban centre; the regions left out are returned as
+    ``{region_id: city ids}``."""
+    own = own_regions(names, regions)
+    home = {city: region_id for region_id, cities in grouped.items() for city in cities}
+    skipped = {row["city_id"] for row in unplaced}
+    held = set(grouped) if held is None else held
+    listed = listed or {}
+    left_out = {}
+    for place in places:
+        city = place.get("place_id")
+        if place.get("kind") != "city" or city in skipped:
+            continue
+        key = str(place.get("ucdb_id"))
+        region_id, matched = own.get(key, (None, ()))
+        if region_id is None or home.get(city) in matched:
+            continue
+        if region_id in held or listed.get(region_id) == key:
+            grouped.setdefault(region_id, []).append(city)
+            countries.setdefault(region_id, set()).add(place.get("country_code"))
+        else:
+            left_out.setdefault(region_id, []).append(city)
+    return left_out
+
+
 def suggest(
     places,
     areas,
@@ -363,10 +420,13 @@ def suggest(
     names=None,
     curated=None,
     urban_centres=False,
+    own_centres=None,
 ):
     """``(entries, unplaced)``: one report entry per city-region holding a
     city, placed as :func:`place_cities` places them with the ``curated``
-    boundaries and ``urban_centres``, and every city that could not be
+    boundaries and ``urban_centres`` and joined to their own centre's region
+    (:func:`join_own_centres`, with the reviewed ``own_centres``) while
+    ``names`` are given, and every city that could not be
     placed (no usable land area, or
     a footprint on a boundary between regions) with the reason. ``provenance`` (DOI, cutoff,
     licence, credit, input digests) is copied into every entry so each stands
@@ -378,6 +438,10 @@ def suggest(
     grouped, countries, unplaced, qid_of = place_cities(
         places, areas, regions, patches, curated, urban_centres
     )
+    if names:
+        join_own_centres(
+            places, grouped, countries, unplaced, names, regions, own_centres
+        )
     entries = []
     for region_id, cities in progress(sorted(grouped.items()), "fao"):
         region = regions[region_id]
@@ -489,6 +553,15 @@ def suggest_metros(
                 "gazetteer",
             )
             curated = geometry.boundary_overrides(place_overrides)
+            own_centres, own_centres_digest = overrides.load_fao_own_centres(
+                overrides_dir
+            )
+            overrides.expect_digest(
+                metros_manifest.get("fao_own_centres_sha256"),
+                own_centres_digest,
+                overrides.FAO_OWN_CENTRES_FILE,
+                "gazetteer",
+            )
             inputs_manifest = names_manifest = names = {}
             if pins is not None:
                 regions, patches, inputs_manifest = load_inputs(
@@ -535,6 +608,7 @@ def suggest_metros(
                     names if allowed else {},
                     curated,
                     urban_centres,
+                    own_centres,
                 )
             manifest = {
                 "source": "fao",

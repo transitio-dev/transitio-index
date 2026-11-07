@@ -299,6 +299,45 @@ def test_a_patches_file_without_a_crs_is_refused():
         fao._patches_table(ffx.patches_zip(PATCHES, crs=None))
 
 
+def test_a_city_also_joins_its_own_centres_region():
+    # Urban centre 1 is FAO's at two tiers (regions 50 and 51), 2 at two (60,
+    # 61), 3 only ambiguously (70), 4 and 5 have regions holding no city (80,
+    # 90); the reviewed list keeps 80 for urban centre 4, and 90 for another
+    # urban centre than the one it now matches.
+    tiers = {"50": 3, "51": 1, "60": 2, "61": 1, "70": 2, "80": 1, "90": 1}
+    regions = {region_id: {"tier": tier} for region_id, tier in tiers.items()}
+    urban = {"50": 1, "51": 1, "60": 2, "61": 2, "70": 3, "80": 4, "90": 5}
+    names = {region_id: {"ucdb_id": u} for region_id, u in urban.items()}
+    names["70"]["ambiguous"] = True
+    owner = {"big": 1, "dup": 1, "held": 2, "amb": 3, "listed": 4, "unlisted": 5}
+    places = [
+        {"place_id": c, "kind": "city", "country_code": "US", "ucdb_id": u}
+        for c, u in {**owner, "other": None, "lost": 4}.items()
+    ]
+    grouped = {
+        "50": ["big", "held", "amb", "listed", "unlisted"],
+        "51": ["dup"],
+        "60": ["other"],
+    }
+    countries = {region_id: {"US"} for region_id in grouped}
+    unplaced = [{"city_id": "lost", "reason": "no usable land area"}]
+    left_out = fao.join_own_centres(
+        places, grouped, countries, unplaced, names, regions, {"80": "4", "90": "9"}
+    )
+    # A city already in a region of its own centre joins nothing (big, dup);
+    # held joins its centre's highest region, which holds another city;
+    # listed joins a region only the list publishes; unlisted is left out,
+    # its listing reviewed for another urban centre.
+    assert grouped == {
+        "50": ["big", "held", "amb", "listed", "unlisted"],
+        "51": ["dup"],
+        "60": ["other", "held"],
+        "80": ["listed"],
+    }
+    assert countries["80"] == {"US"}
+    assert left_out == {"90": ["unlisted"]}
+
+
 def test_the_stage_reports_eligible_cities_by_highest_tier_region(
     tmp_path, monkeypatch
 ):

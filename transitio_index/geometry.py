@@ -1587,6 +1587,7 @@ def attach_geometry(
                 "ucdb_geometry": sum(p.get("geometry_source") == UCDB for p in places),
                 "centres": centres,
                 "places_overrides_sha256": places_digest,
+                "fao_own_centres_sha256": metros_manifest.get("fao_own_centres_sha256"),
                 "stale_overrides": len(override_report),
                 "stale_place_overrides": (
                     metros_manifest.get("stale_place_overrides") or 0
