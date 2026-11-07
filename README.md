@@ -29,6 +29,7 @@ scripts/export_divisions.py   export the Overture division hierarchy to inspect
 scripts/export_index_layer.py export a produced index as a map layer (feeds/tiers)
 scripts/index_viewer.py       inspect a built index in the browser
 scripts/check_place_geometry.py flag cities whose area disagrees with Wikidata
+scripts/rebuild/              build and archive every label of a partition
 overrides/             the place registry and curated override files
 golden/                the golden feed set the publish stage diffs against
 tests/                 the build's pytest suite and its fixtures
@@ -255,6 +256,18 @@ for the `--country` codes that have no label of their own. The cuts go to
 gets `rebuild_map.txt` (a `<label> <cut>` line per label) and
 `partition.json` (each label's cut, countries and digests, and the label of
 every GTFS id).
+
+### Build every label
+
+`scripts/rebuild/build_labels.sh <map>` builds every label a map such as a
+partition's `rebuild_map.txt` lists, one after another, each with
+`scripts/rebuild/build_label.sh <label> <cut>`: ingest to publish from the
+cut, then `scripts/rebuild/archive_index.sh` keeps the published index under
+`~/.cache/transitio-index/builds/<label>-<snapshot>/` (`ARCHIVE_ROOT` names
+another root), and the label's crawl is parked as `cache/crawl.<label>.bak`.
+`PYTHON` names the Python that runs the build (default `python3`). One line
+per label goes to `~/.cache/transitio-index/logs/progress.log` (`LOGDIR`
+names another folder), each label's own log beside it.
 
 ### Inspect a build in the browser
 
