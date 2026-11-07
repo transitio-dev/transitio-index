@@ -1605,6 +1605,27 @@ def _provider_entries(lines, build_id):
     return entries
 
 
+def provider_notices(notice):
+    """``[(provider name, credit lines)]`` by provider id: the credit each
+    credential provider's terms ask for, from the ``notice:`` lines of the
+    credential-provider paragraph of ``notice`` (NOTICE bytes), the only
+    paragraph read; empty when it has none."""
+    try:
+        text = notice.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise MergeError("NOTICE is not UTF-8") from error
+    for block in text.split("\n\n"):
+        lines = block.strip("\n").split("\n")
+        if lines[0].startswith(licensing.PROVIDER_OPENING):
+            entries = _provider_entries(lines[1:], "NOTICE")
+            return [
+                (name, [line.removeprefix(PROVIDER_LINES[0]) for line in credit])
+                for _, (name, credit, _, _) in sorted(entries.items())
+                if credit
+            ]
+    return []
+
+
 def _licence_records(feeds):
     """The merged feeds as the records ``licensing._feed_rows`` inventories:
     their catalogue blocks decoded and the licence judgement the stage

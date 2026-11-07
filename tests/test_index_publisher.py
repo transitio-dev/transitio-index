@@ -170,6 +170,13 @@ def test_pack_is_deterministic_and_lists_only_index_members(tmp_path):
 
 def test_publish_drafts_verifies_publishes_and_round_trips(tmp_path):
     fake = FakeGitHub()
+    notes = []
+
+    def recording(request):
+        if request.method == "POST" and request.url.path == "/repos/o/r/releases":
+            notes.append(json.loads(request.content)["body"])
+        return fake.handle(request)
+
     software = fake.seed("v0.11.0", {})
     fake.seed("index-0000000000000001", {"manifest.json": _manifest_bytes()})
     # A newer but unreadable snapshot is passed over, never chosen.
@@ -177,17 +184,24 @@ def test_publish_drafts_verifies_publishes_and_round_trips(tmp_path):
         "index-0000000000000002",
         {"manifest.json": _manifest_bytes(schema_version=999)},
     )
+    index_dir = _index(tmp_path)
     summary = _publish(
-        _index(tmp_path),
+        index_dir,
         cache_dir=tmp_path / "cache",
         repository="o/r",
         token="secret",
         api_url=API,
         out_dir=tmp_path / "out",
-        transport=fake.transport(),
+        transport=httpx.MockTransport(recording),
     )
     release = fake.releases[summary["release_id"]]
     assert release["draft"] is False and release["tag_name"] == summary["tag"]
+    # The notes come from the NOTICE inside the archive uploaded.
+    uploaded = {a["name"]: fake.blobs[a["id"]] for a in release["assets"]}
+    archive = uploaded[contract.core_archive_name(summary["snapshot_id"])]
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+        notice = tar.extractfile("NOTICE").read()
+    assert notes == [publisher.release_notes(summary["snapshot_id"], notice)]
     # Index data never becomes the repository's latest release.
     assert fake.latest == software["id"]
     # Every asset written is uploaded as it is, the parts included.
@@ -215,6 +229,35 @@ def test_publish_drafts_verifies_publishes_and_round_trips(tmp_path):
     assert skipped == [
         ("index-0000000000000003", "schema_version 999 is not one this transitio reads")
     ]
+
+
+@pytest.mark.parametrize("credited", [False, True], ids=["no provider", "provider"])
+def test_the_release_notes_carry_the_providers_credits(credited):
+    from transitio_index import merge
+
+    paragraphs = [f"{merge.GEOMETRY_OPENING} (release x).", merge.CATALOGUE_OPENING]
+    if credited:
+        # One provider asks for one credit line, the other for two.
+        provider = [
+            licensing.PROVIDER_OPENING,
+            licensing.provider_head("mtc-511", "511 SF Bay", {"2026-10-03"}),
+            "      notice: data provided by 511.org (http://www.511.org)",
+            "      feed: f-511; CC-BY-4.0; https://api.511.org/transit/x",
+            licensing.provider_head("tmb", "TMB API", set()),
+            "      notice: Source: TMB",
+            "      notice: Date of the last update: the feed's.",
+        ]
+        paragraphs.append("\n".join(provider))
+    paragraphs.append(f"{merge.LICENCE_OPENING}:")
+    text = ("\n\n".join(paragraphs) + "\n").encode()
+    expected = "transitio feed index snapshot 0123456789abcdef"
+    if credited:
+        expected += (
+            "\n\nData credited as its providers' terms require:\n"
+            "- 511 SF Bay: data provided by 511.org (http://www.511.org)\n"
+            "- TMB API:\n  - Source: TMB\n  - Date of the last update: the feed's."
+        )
+    assert publisher.release_notes("0123456789abcdef", text) == expected
 
 
 @pytest.mark.parametrize(
