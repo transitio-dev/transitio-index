@@ -81,6 +81,13 @@ class StoreError(RuntimeError):
     """The build cache could not be read or published as specified."""
 
 
+class LockHeld(StoreError):
+    """Another process holds the writer lock.
+
+    Distinguished from other store failures because waiting can resolve it.
+    """
+
+
 class MissingEntry(StoreError):
     """A cache entry named by a manifest is no longer there.
 
@@ -586,6 +593,11 @@ def _unlock(handle):
         msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
 
 
+# What a non-blocking lock attempt reports while another process holds the
+# lock: EWOULDBLOCK/EAGAIN from flock, EACCES or EDEADLOCK from msvcrt.
+_LOCK_HELD = {errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES, errno.EDEADLK}
+
+
 @contextlib.contextmanager
 def exclusive_writer(directory, name=".lock"):
     """A non-blocking writer lock over the cache, so runs cannot interleave.
@@ -597,9 +609,11 @@ def exclusive_writer(directory, name=".lock"):
     handle = directory.open(name, os.O_RDWR | os.O_CREAT | O_BINARY)
     try:
         _lock(handle)
-    except OSError:
+    except OSError as error:
         os.close(handle)
-        raise StoreError("another build is publishing to this cache") from None
+        if error.errno in _LOCK_HELD:
+            raise LockHeld("another build is publishing to this cache") from None
+        raise StoreError(f"{directory.path / name}: {error.strerror}") from None
     try:
         yield
     finally:

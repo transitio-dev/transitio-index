@@ -687,11 +687,10 @@ def test_a_discovered_city_gains_the_functional_urban_area_the_run_derived(
     assert metro["country_code"] == "FI"
     assert metro["member_ids"] == (["Q1", "Q40840"] if seeded else ["Q40840"])
     assert places["Q40840"]["metro_ids"] == ["eurostat_fua:FI002F"]
-    # A metro minted here takes its official area; one the seed published
-    # and this expansion joined keeps the boundary its run gave it.
-    assert metro["geometry_source"] == (
-        "member_union" if seeded else geometry.OFFICIAL_AREA
-    )
+    # A metro minted here or joined takes its official area, the discovered
+    # city's among its parts.
+    assert metro["official_parts"] == ["fi-tre"]
+    assert metro["geometry_source"] == geometry.OFFICIAL_AREA
     assert manifest["metros_added"] == (0 if seeded else 1)
 
 
@@ -1049,16 +1048,22 @@ def test_unparsable_stop_rows_are_skipped(tmp_path):
     assert "Q40840" in places
 
 
-def test_places_yaml_edited_after_the_gazetteer_refuses_to_expand(tmp_path):
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"places": [{"place": "Q1", "set_aliases": ["x"]}]},
+        {"own_centres": ["60,2,Springfield,US,keep,a city"]},
+    ],
+    ids=["places.yaml", "fao_own_centres"],
+)
+def test_an_override_edited_after_the_gazetteer_refuses_to_expand(tmp_path, edit):
     from test_index_place_overrides import write_overrides
 
     from transitio_index import overrides
 
     cache = tmp_path / "cache"
     _publish_names(cache, [])
-    directory = write_overrides(
-        tmp_path, places=[{"place": "Q1", "set_aliases": ["x"]}]
-    )
+    directory = write_overrides(tmp_path, **edit)
     with pytest.raises(overrides.OverrideError, match="re-run the gazetteer"):
         expand.expand(cache, overrides_dir=directory)
 

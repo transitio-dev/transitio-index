@@ -227,6 +227,40 @@ def test_feeds_edges_and_places_merge_by_source(tmp_path):
     assert snapshot["skipped"] == [{"id": "nl", "reason": "no feeds"}]
 
 
+def test_a_metros_membership_merges_over_every_build(tmp_path):
+    # Each build lists the metro's members among the places it kept; the
+    # metro's copy taken (the newest: nothing serves it) lists only its own
+    # build's, so both sides are the union, kept to the places merged.
+    def places(member, members):
+        rows = [
+            {**p, "metro_ids": ["met"] if p["place_id"] == member else []}
+            for p in PLACES
+        ]
+        metro = _place("met", "metro", "Helsinki", None, BOX(24, 60, 26, 61))
+        return [*rows, {**metro, "metro_ids": [], "member_ids": members}]
+
+    sources = []
+    for label, digit, member, members in (
+        ("fi", 1, "hel", ["gone", "hel"]),
+        ("de", 2, "esp", ["esp"]),
+    ):
+        run = _run(
+            tmp_path,
+            label,
+            digit,
+            places=places(member, members),
+            built_at=BUILT(digit),
+        )
+        snapshot, _, tables = builds.load_tables(tmp_path / run / "index")
+        sources.append((run, snapshot, tables))
+    _, tables = merge.merge_tables(sources)
+    merged = _frame(tables, "places.parquet", "place_id")
+    assert list(merged.loc["met", "member_ids"]) == ["esp", "hel"]
+    assert list(merged.loc["hel", "metro_ids"]) == ["met"]
+    assert list(merged.loc["esp", "metro_ids"]) == ["met"]
+    assert list(merged.loc["rov", "metro_ids"]) == []
+
+
 def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
     def feed(feed_id, *aliases, contained_in=(), companions=()):
         row = _feed7(feed_id, feed_id, "FI", "domestic")
@@ -993,7 +1027,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
     read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
     assert set(read["snapshot"].to_pylist()) == {snapshot_id}
-    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 24
+    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 25
     assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
     assert manifest["min_reader_version"] == MIN_READER_VERSIONS[12]
     assert manifest["built_with"] == transitio.__version__

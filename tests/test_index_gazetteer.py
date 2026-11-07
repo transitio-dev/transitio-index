@@ -1,3 +1,4 @@
+import errno
 import json
 
 import pytest
@@ -293,6 +294,180 @@ def test_the_newest_release_with_a_division_table_is_read(tmp_path, monkeypatch)
         overture.latest_release()
 
 
+def test_a_local_copy_is_downloaded_once_and_read_after(tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    release = "2026-10-21.0"
+    bucket = _bucket(tmp_path / "bucket", {release: True})
+    theme = tmp_path / "bucket" / overture.OVERTURE_BUCKET / "release" / release
+    for table, ids in (("division", ["a", "b"]), ("division_area", ["a"])):
+        (theme / "theme=divisions" / f"type={table}").mkdir(parents=True, exist_ok=True)
+        part = theme / "theme=divisions" / f"type={table}" / "part-0.parquet"
+        pq.write_table(pa.table({"id": ids}), part)
+    monkeypatch.setattr(overture, "s3_filesystem", lambda: bucket)
+    overture.use_local_copy(tmp_path / "copies")
+    assert overture.overture_dataset(release).to_table()["id"].to_pylist() == ["a", "b"]
+    first = overture._local_copies[release]
+    assert first.parent == tmp_path / "copies" / release
+    assert (first / overture.LOCAL_COMPLETE).is_file()
+
+    # Later reads, in this process or another, use the copy: the bucket is gone.
+    def gone():
+        raise AssertionError("the bucket was read again")
+
+    monkeypatch.setattr(overture, "s3_filesystem", gone)
+    overture.use_local_copy(tmp_path / "copies")
+    area = overture.theme_dataset(
+        "release/{release}/theme=divisions/type=division_area", release
+    )
+    assert area.to_table()["id"].to_pylist() == ["a"]
+    with pytest.raises(overture.GazetteerError, match="not a table of the local"):
+        overture.theme_dataset("release/{release}/theme=base/type=land", release)
+    # A complete copy is found without the lock another build may hold.
+    with monkeypatch.context() as patched:
+        patched.setattr(overture, "_local_copy_lock", None)
+        assert overture.ensure_local_copy(tmp_path / "copies", release) == first
+
+    # A copy is complete only with exactly the files listed, no link below
+    # it and a well-formed listing; any other copy is downloaded anew into a
+    # folder of its own, the old one left as it was for a build reading it.
+    def damage(copy, how):
+        tables = copy / "theme=divisions"
+        marker = copy / overture.LOCAL_COMPLETE
+        if how == "size":
+            (tables / "type=division" / "part-0.parquet").write_bytes(b"cut")
+        elif how == "extra file":
+            (tables / "type=division_area" / "extra.parquet").write_bytes(b"x")
+        elif how == "listing without a table":
+            listed = json.loads(marker.read_text())
+            listed["files"] = {
+                k: v for k, v in listed["files"].items() if "division_area" not in k
+            }
+            marker.write_text(json.dumps(listed))
+        elif how == "linked listing":
+            (tmp_path / "elsewhere.json").write_text(marker.read_text())
+            marker.unlink()
+            marker.symlink_to(tmp_path / "elsewhere.json")
+        elif how == "listing not an object":
+            marker.write_text("null")
+        elif how == "deeply nested listing":
+            marker.write_text("[" * 100_000 + "]" * 100_000)
+        elif how == "link beside the tables":
+            (tables / "type=other").symlink_to(tmp_path / "elsewhere.json")
+        else:
+            tables.rename(tmp_path / "outside")
+            tables.symlink_to(tmp_path / "outside")
+
+    try:
+        (tmp_path / "probe").symlink_to(tmp_path)
+        links = True
+    except OSError:  # no symlinks on this platform
+        links = False
+    copy = first
+    for how in (
+        "size",
+        "extra file",
+        "listing without a table",
+        "linked listing",
+        "listing not an object",
+        "deeply nested listing",
+        "link beside the tables",
+        "linked table folder",
+    ):
+        if "link" in how and not links:
+            continue
+        damage(copy, how)
+        new = overture.ensure_local_copy(tmp_path / "copies", release, bucket)
+        assert new != copy and new.parent == copy.parent, how
+        table = new / "theme=divisions" / "type=division" / "part-0.parquet"
+        assert pq.read_table(table)["id"].to_pylist() == ["a", "b"], how
+        assert copy.exists(), how
+        copy = new
+
+    # A failure after current.json names the new copy leaves that copy in place.
+    def failing_sync(directory):
+        if directory.path == tmp_path / "copies" / release:
+            raise OSError("sync failed")
+
+    damage(copy, "size")
+    with monkeypatch.context() as patched:
+        patched.setattr(store.Directory, "sync", failing_sync)
+        with pytest.raises(OSError, match="sync failed"):
+            overture.ensure_local_copy(tmp_path / "copies", release, bucket)
+    damaged, copy = copy, overture.ensure_local_copy(tmp_path / "copies", release)
+    table = copy / "theme=divisions" / "type=division" / "part-0.parquet"
+    assert copy != damaged and pq.read_table(table)["id"].to_pylist() == ["a", "b"]
+    # A release the bucket lacks, a linked release or copies folder, a listing
+    # over the marker bound or a file outside the tables is refused.
+    with pytest.raises(overture.GazetteerError, match="2026-08-19.0 is not in"):
+        overture.ensure_local_copy(tmp_path / "copies", "2026-08-19.0", bucket)
+    if links:
+        (tmp_path / "planted").mkdir()
+        (tmp_path / "copies" / "2026-08-20.0").symlink_to(tmp_path / "planted")
+        with pytest.raises(store.StoreError, match="symlink"):
+            overture.ensure_local_copy(tmp_path / "copies", "2026-08-20.0", bucket)
+        (tmp_path / "linked copies").symlink_to(tmp_path / "copies")
+        with pytest.raises(store.StoreError, match="symlink"):
+            overture.ensure_local_copy(tmp_path / "linked copies", release, bucket)
+    limit = overture.LOCAL_MARKER_MAX
+    monkeypatch.setattr(overture, "LOCAL_MARKER_MAX", 10)
+    with pytest.raises(overture.GazetteerError, match="too many files"):
+        overture.ensure_local_copy(tmp_path / "copies", release, bucket)
+    monkeypatch.setattr(overture, "LOCAL_MARKER_MAX", limit)
+    (theme / "theme=divisions" / "type=division" / "nested").mkdir()
+    pq.write_table(
+        pa.table({"id": ["c"]}),
+        theme / "theme=divisions" / "type=division" / "nested" / "p.parquet",
+    )
+    damage(copy, "size")
+    with pytest.raises(overture.GazetteerError, match="unexpected Overture file"):
+        overture.ensure_local_copy(tmp_path / "copies", release, bucket)
+
+
+def test_a_build_waits_while_another_downloads(tmp_path, monkeypatch):
+    from transitio_index import store
+
+    real = store.exclusive_writer
+    attempts = []
+
+    def busy_once(directory, name):
+        attempts.append(name)
+        if len(attempts) == 1:
+            raise store.LockHeld("another build is publishing to this cache")
+        return real(directory, name)
+
+    monkeypatch.setattr(store, "exclusive_writer", busy_once)
+    monkeypatch.setattr(overture.time, "sleep", lambda seconds: None)
+    with overture._local_copy_lock(tmp_path):
+        pass
+    assert attempts == [overture.LOCAL_LOCK, overture.LOCAL_LOCK]
+    # Any other failure is reported at once: a lock the platform cannot take,
+    # or a lock entry that is a link.
+    monkeypatch.setattr(store, "exclusive_writer", real)
+
+    def waited(seconds):
+        raise AssertionError("waited on a lock that is not held")
+
+    def no_locks(handle):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(overture.time, "sleep", waited)
+    with monkeypatch.context() as patched:
+        patched.setattr(store, "_lock", no_locks)
+        with pytest.raises(store.StoreError, match="No locks available"):
+            with overture._local_copy_lock(tmp_path):
+                pass
+    try:
+        (tmp_path / "planted" / overture.LOCAL_LOCK).parent.mkdir()
+        (tmp_path / "planted" / overture.LOCAL_LOCK).symlink_to(tmp_path)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(store.StoreError, match="symlink"):
+        with overture._local_copy_lock(tmp_path / "planted"):
+            pass
+
+
 def test_the_build_reads_the_release_its_option_names(tmp_path, monkeypatch):
     from transitio_index import build
 
@@ -305,6 +480,10 @@ def test_the_build_reads_the_release_its_option_names(tmp_path, monkeypatch):
     options = ["--stage", "ingest", "--cache-dir", str(tmp_path), "--overture-release"]
     assert build.main(options + ["2026-10-21.0"]) == 0
     assert seen == ["2026-10-21.0"]
+    # Every stage reads a local copy unless the bucket is asked for.
+    assert overture._local_root == build.DEFAULT_OVERTURE_DIR
+    assert build.main(options + ["2026-10-21.0", "--overture-remote"]) == 0
+    assert overture._local_root is None
     for value in ("latest", "2026-10-21", "2026-10-21.0/x"):
         with pytest.raises(SystemExit):
             build.parse_args(options + [value])

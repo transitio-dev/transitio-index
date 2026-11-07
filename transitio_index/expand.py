@@ -376,6 +376,7 @@ class _SeededPlacement:
         regions,
         patches,
         *,
+        names=None,
         release=None,
         reopen=None,
     ):
@@ -390,17 +391,31 @@ class _SeededPlacement:
         )
         self._regions = regions
         self._patches = patches
+        self._names = names
         self._grouped = None
 
     def cities(self, region_id):
-        """The seeded cities in ``region_id``."""
+        """The seeded cities in ``region_id``: placed in it, or, with the UCDB
+        ``names``, joined to it as their own urban centre's region — asked only
+        for a region a discovered city holds, so it is held."""
         if self._grouped is None:
             from transitio_index import fao
 
             wanted = {r["overture_id"] for r in self._rows if r.get("overture_id")}
-            self._grouped, _, _, _ = fao.place_cities(
+            grouped, countries, unplaced, _ = fao.place_cities(
                 self._rows, self._read(self._rows, wanted), self._regions, self._patches
             )
+            if self._names:
+                fao.join_own_centres(
+                    self._rows,
+                    grouped,
+                    countries,
+                    unplaced,
+                    self._names,
+                    self._regions,
+                    held=set(self._regions),
+                )
+            self._grouped = grouped
         return self._grouped.get(region_id, [])
 
 
@@ -506,6 +521,7 @@ def _attach_fao_metros(
         city_rows,
         regions,
         patches,
+        names=names,
         release=release,
         reopen=reopen,
     )
@@ -751,7 +767,16 @@ def _discover(
         # here, before it can stand in for its aliases, read a boundary, or
         # seed a metro's membership — and reported, so the coverage stage
         # knows a stop landing on it is not proof of a stale expansion.
-        identified = seed._identify_places(discovered, registry, digest, report=report)
+        identified = seed._identify_places(
+            discovered,
+            registry,
+            digest,
+            report=report,
+            city_dataset=lambda: dataset
+            or lookup.division_dataset()
+            or overture.overture_dataset(release),
+            release=release,
+        )
         for qid in set(canonical) - set(discovered):
             del canonical[qid]
     new_ids = []
@@ -789,7 +814,7 @@ def _discover(
         rows = areas.get(place["overture_id"])
         _attach_boundary(place, rows, inventory, shipped, omitted)
         if place["geometry"] and place["overture_id"] in given:
-            place["geometry_source"] = given[place["overture_id"]]
+            place["geometry_source"] = given[place["overture_id"]][1]
         places_by_id[qid] = place
     # A curated boundary replaces the Overture one before any metro is drawn
     # from it.
@@ -848,15 +873,20 @@ def _discover(
         added, touched, rows = _attach_eurostat_metros(
             places_by_id, codes, city_rows, areas, inputs, definition, land=euro
         )
-        if added:
+        # A joined metro's parts are taken again: a discovered city's area
+        # may be one, whatever its division's kind.
+        if added or touched:
             metros.eurostat_parts(
-                [places_by_id[key] for key in added],
+                [places_by_id[key] for key in sorted(touched | set(added))],
                 definition,
                 inputs,
                 lookup,
                 cache_dir,
                 area_dataset,
                 euro[1] if euro is not None else None,
+                places_by_id.values(),
+                release=release,
+                reopen=reopen,
             )
         eurostat_metros += added
         eurostat_touched |= touched
@@ -1151,6 +1181,14 @@ def expand(
                 "places.yaml",
                 "gazetteer",
             )
+            # The reviewed own-centre regions the metros stage published from.
+            _, own_centres_digest = overrides.load_fao_own_centres(overrides_dir)
+            overrides.expect_digest(
+                names_manifest.get("fao_own_centres_sha256"),
+                own_centres_digest,
+                overrides.FAO_OWN_CENTRES_FILE,
+                "gazetteer",
+            )
             digest = names_manifest.get("places_overrides_sha256")
             anchor = run_generation = None
             if registry is not None:
@@ -1229,6 +1267,7 @@ def expand(
                 "places_overrides_sha256": names_manifest.get(
                     "places_overrides_sha256"
                 ),
+                "fao_own_centres_sha256": own_centres_digest,
                 "stale_place_overrides": (
                     names_manifest.get("stale_place_overrides") or 0
                 )

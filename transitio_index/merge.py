@@ -101,7 +101,8 @@ OVERRIDE_FIELDS = (
 # so are the international edges' repeat blocks. 22: the manifest lists the
 # feeds without a read by cause. 23: feeds whose zones differ never fold.
 # 24: the NOTICE credits the whole MDB catalogue a build found twins in.
-MERGE_FORMAT = 24
+# 25: a place's metro_ids and member_ids are every build's, merged.
+MERGE_FORMAT = 25
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
@@ -616,6 +617,10 @@ def merge_tables(sources, skipped=()):
         tables["places.parquet"] = _populations(
             tables["places.parquet"], merged["places.parquet"]
         )
+    if "member_ids" in tables["places.parquet"].column_names:
+        tables["places.parquet"] = _memberships(
+            tables["places.parquet"], merged["places.parquet"]
+        )
     tables["feeds.parquet"], tables["edges.parquet"] = _homes(
         tables["feeds.parquet"], tables["edges.parquet"], tables["places.parquet"]
     )
@@ -692,6 +697,23 @@ def _populations(places, stacked):
     )
     values = [by_id.get(place_id) for place_id in places["place_id"].to_pylist()]
     return _replaced(places, "population", values, publish._PLACES_SCHEMA)
+
+
+def _memberships(places, stacked):
+    """``places`` with each place's ``metro_ids`` and ``member_ids`` the union
+    of every source row's, kept to the places the merged table holds: a
+    build lists a metro's members among the places it kept, so the one copy
+    taken would lack the members other builds listed, and only the union
+    stays reciprocal."""
+    held = set(places["place_id"].to_pylist())
+    stacked_ids = stacked["place_id"].to_pylist()
+    for name in ("metro_ids", "member_ids"):
+        found = collections.defaultdict(set)
+        for place_id, ids in zip(stacked_ids, stacked[name].to_pylist()):
+            found[place_id].update(i for i in ids or () if i in held)
+        values = [sorted(found[p]) for p in places["place_id"].to_pylist()]
+        places = _replaced(places, name, values, publish._PLACES_SCHEMA)
+    return places
 
 
 def _homes(feeds, edges, places):
@@ -1583,6 +1605,27 @@ def _provider_entries(lines, build_id):
     return entries
 
 
+def provider_notices(notice):
+    """``[(provider name, credit lines)]`` by provider id: the credit each
+    credential provider's terms ask for, from the ``notice:`` lines of the
+    credential-provider paragraph of ``notice`` (NOTICE bytes), the only
+    paragraph read; empty when it has none."""
+    try:
+        text = notice.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise MergeError("NOTICE is not UTF-8") from error
+    for block in text.split("\n\n"):
+        lines = block.strip("\n").split("\n")
+        if lines[0].startswith(licensing.PROVIDER_OPENING):
+            entries = _provider_entries(lines[1:], "NOTICE")
+            return [
+                (name, [line.removeprefix(PROVIDER_LINES[0]) for line in credit])
+                for _, (name, credit, _, _) in sorted(entries.items())
+                if credit
+            ]
+    return []
+
+
 def _licence_records(feeds):
     """The merged feeds as the records ``licensing._feed_rows`` inventories:
     their catalogue blocks decoded and the licence judgement the stage
@@ -1817,6 +1860,8 @@ def merge_builds(
 
 
 def parse_args(argv=None):
+    """The merge's command-line options from ``argv``, by default
+    ``sys.argv``."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--builds",
@@ -1850,6 +1895,9 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    """Merge the newest build of every label into ``--cache-dir`` and print
+    what the snapshot holds; return the exit status, 1 when the merge is
+    refused."""
     arguments = parse_args(argv)
     try:
         manifest = merge_builds(

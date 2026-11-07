@@ -415,13 +415,14 @@ def lenders(places):
 def lend_areas(areas, lent):
     """Give each place in ``lent`` (from :func:`lenders`) that read no area of
     its own the rows of its first lender that read some, in place;
-    ``{place overture_id: geometry_source}`` for the places given one."""
+    ``{place overture_id: (lender overture_id, geometry_source)}`` for the
+    places given one."""
     given = {}
     for own, candidates in lent.items():
         found = [(area, source) for area, source in candidates if area in areas]
         if own not in areas and found:
             areas[own] = areas[found[0][0]]
-            given[own] = found[0][1]
+            given[own] = found[0]
     return given
 
 
@@ -1309,6 +1310,27 @@ def curated_polygon(place_id, wkt):
     return simplified
 
 
+def boundary_overrides(place_overrides):
+    """``{place key: WKT}``: the ``set_boundary`` entries of the place
+    overrides."""
+    return {
+        entry["place"]: entry["set_boundary"]
+        for entry in overrides.by_operation(place_overrides, "set_boundary")
+    }
+
+
+def ucdb_polygon(wkb):
+    """A GHS-UCDB urban centre's polygon (WKB) forced to 2D and simplified to
+    the shipping tolerance, or None when it is not a valid polygon before and
+    after."""
+    try:
+        geom = shapely.force_2d(shapely.from_wkb(wkb))
+        simplified = _simplify(geom) if _valid_polygon(geom) else None
+    except Exception:  # noqa: B902 - shapely raises its own hierarchy
+        return None
+    return simplified if _valid_polygon(simplified) else None
+
+
 def _curated_geometry(place, wkt):
     """A curator-supplied boundary shipped with ``geometry_source =
     "curated"`` — the curator, not a licence audit, vouches for it."""
@@ -1427,7 +1449,7 @@ def attach_geometry(
                     reopen=reopen,
                     countries=countries,
                 )
-                for own, source in lend_areas(areas, twins).items():
+                for own, (_, source) in lend_areas(areas, twins).items():
                     # A twin that read an area settles the place, shipped or
                     # not: the council area comes after it, as in lend_areas.
                     absent.discard(own)
@@ -1449,12 +1471,8 @@ def attach_geometry(
                 polygon = place.pop("ucdb_boundary", None)
                 if polygon is None or place.get("geometry"):
                     continue
-                try:
-                    geom = shapely.force_2d(shapely.from_wkb(polygon))
-                    simplified = _simplify(geom) if _valid_polygon(geom) else None
-                except Exception:  # noqa: B902 - shapely raises its own hierarchy
-                    simplified = None
-                if not _valid_polygon(simplified):
+                simplified = ucdb_polygon(polygon)
+                if simplified is None:
                     invalid += 1
                     continue
                 place["geometry"] = shapely.to_wkb(simplified).hex()
@@ -1569,6 +1587,7 @@ def attach_geometry(
                 "ucdb_geometry": sum(p.get("geometry_source") == UCDB for p in places),
                 "centres": centres,
                 "places_overrides_sha256": places_digest,
+                "fao_own_centres_sha256": metros_manifest.get("fao_own_centres_sha256"),
                 "stale_overrides": len(override_report),
                 "stale_place_overrides": (
                     metros_manifest.get("stale_place_overrides") or 0

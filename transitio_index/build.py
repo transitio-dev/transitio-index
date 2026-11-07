@@ -60,6 +60,7 @@ from transitio_index import (  # noqa: E402
 log = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = pathlib.Path("cache")
+DEFAULT_OVERTURE_DIR = pathlib.Path("~/.cache/transitio-index/overture").expanduser()
 
 SOURCES = ("atlas", "mdb", "gbfs")
 
@@ -239,7 +240,12 @@ def run_gazetteer(arguments):
         lambda places, run: names.merge_names(
             cache_dir, registry=places, run=run, **options
         ),
-        lambda places, run: fao.suggest_metros(cache_dir, run=run),
+        lambda places, run: fao.suggest_metros(
+            cache_dir,
+            run=run,
+            overrides_dir=arguments.overrides_dir,
+            registry=places,
+        ),
     ]
     return commit_run(
         cache_dir,
@@ -370,6 +376,8 @@ STAGES = {
 
 
 def parse_args(argv=None):
+    """The build's command-line options from ``argv``, by default
+    ``sys.argv``."""
     parser = argparse.ArgumentParser(
         prog="python -m transitio_index.build",
         description="Build the transitio feed index",
@@ -421,6 +429,19 @@ def parse_args(argv=None):
         "--overture-release",
         help="the Overture release every stage reads, such as 2026-10-21.0 "
         "(default: the newest release the Overture bucket holds)",
+    )
+    parser.add_argument(
+        "--overture-dir",
+        type=pathlib.Path,
+        default=DEFAULT_OVERTURE_DIR,
+        help="the local copies of the Overture releases every stage reads, "
+        "one directory per release, downloaded once when absent "
+        f"(default: {DEFAULT_OVERTURE_DIR})",
+    )
+    parser.add_argument(
+        "--overture-remote",
+        action="store_true",
+        help="read Overture from its bucket at every stage, not a local copy",
     )
     parser.add_argument(
         "--commit",
@@ -545,9 +566,15 @@ def _highlights(summaries):
 
 
 def main(argv=None):
+    """Run the stage the command line names (and, with ``--downstream``, the
+    stages after it), print each stage's summary as JSON; return the exit
+    status, 1 after any stage failure."""
     arguments = parse_args(argv)
     if arguments.overture_release is not None:
         overture.use_release(arguments.overture_release)
+    overture.use_local_copy(
+        None if arguments.overture_remote else arguments.overture_dir
+    )
     stage = arguments.stage
     try:
         progress.configure(

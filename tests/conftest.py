@@ -1,4 +1,5 @@
-"""Put the shared index fixture on the path, and fix the Overture release.
+"""Put the shared index fixture on the path, and fix the Overture release and
+read no local Overture copy.
 
 The build ships as the installed ``transitio_index`` package, so the suite
 imports it directly. The publisher test also imports ``index_fixture``, whose
@@ -29,3 +30,6 @@ def overture_release(monkeypatch):
     from transitio_index import overture
 
     monkeypatch.setattr(overture, "_release", FIXTURE_RELEASE)
+    # The bucket stand-ins are read directly unless a test names a local copy.
+    monkeypatch.setattr(overture, "_local_root", None)
+    monkeypatch.setattr(overture, "_local_copies", {})

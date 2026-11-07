@@ -1,20 +1,97 @@
 """The places.yaml loader and the shared override staleness helpers."""
 
+import io
+import zipfile
+
 import pytest
 import yaml
 
 from transitio_index import overrides  # noqa: E402
 
+OWN_CENTRES_HEADER = ",".join(overrides.FAO_OWN_CENTRES_COLUMNS)
 
-def write_overrides(tmp_path, *, places=None, feeds=None, name="overrides"):
-    """An overrides directory holding the given places.yaml / feeds.yaml."""
+
+def write_overrides(
+    tmp_path, *, places=None, feeds=None, own_centres=None, name="overrides"
+):
+    """An overrides directory holding the given places.yaml / feeds.yaml, and
+    ``own_centres`` (CSV lines after the header) as fao_own_centres.csv.zip."""
     directory = tmp_path / name
     directory.mkdir(parents=True, exist_ok=True)
     if places is not None:
         (directory / "places.yaml").write_text(yaml.safe_dump(places, sort_keys=False))
     if feeds is not None:
         (directory / "feeds.yaml").write_text(yaml.safe_dump(feeds, sort_keys=False))
+    if own_centres is not None:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            text = "\n".join([OWN_CENTRES_HEADER, *own_centres]) + "\n"
+            archive.writestr("fao_own_centres.csv", text)
+        (directory / overrides.FAO_OWN_CENTRES_FILE).write_bytes(buffer.getvalue())
     return directory
+
+
+@pytest.mark.parametrize(
+    "lines, error",
+    [
+        (["60,2,Springfield,US,keep,a city", "61,3,Joliet,US,drop,a suburb"], None),
+        (["x60,2,Springfield,US,keep,a city"], "row 2"),
+        (["60,2,Springfield,US,maybe,a city"], "row 2"),
+        (["60,2,Springfield,US,keep,"], "row 2"),
+        (
+            ["60,2,Springfield,US,keep,a city", "60,2,Springfield,US,drop,a suburb"],
+            "twice",
+        ),
+        (["60,x,Springfield,US,keep,a city"], "row 2"),
+        (["60,2,Springfield,USA,keep,a city"], "row 2"),
+        (["60,2,Springfield,US,keep,a city,extra"], "row 2"),
+        (["٦٠,2,Springfield,US,keep,a city"], "row 2"),
+        (["60,2,Springfield,us,keep,a city"], "row 2"),
+    ],
+    ids=[
+        "valid",
+        "region id",
+        "decision",
+        "reason",
+        "twice",
+        "ucdb id",
+        "country",
+        "surplus",
+        "unicode digits",
+        "lower-case country",
+    ],
+)
+def test_the_reviewed_own_centre_regions_load(tmp_path, lines, error):
+    directory = write_overrides(tmp_path, own_centres=lines)
+    if error is None:
+        keep, digest = overrides.load_fao_own_centres(directory)
+        assert keep == {"60": "2"} and digest
+    else:
+        with pytest.raises(overrides.OverrideError, match=error):
+            overrides.load_fao_own_centres(directory)
+
+
+@pytest.mark.parametrize("case", ["encrypted", "oversized", "two members"])
+def test_an_unreadable_own_centres_archive_is_refused(tmp_path, monkeypatch, case):
+    directory = write_overrides(
+        tmp_path, own_centres=["60,2,Springfield,US,keep,a city"]
+    )
+    if case == "oversized":
+        monkeypatch.setattr(overrides, "FAO_OWN_CENTRES_MAX_BYTES", 10)
+    else:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("fao_own_centres.csv", OWN_CENTRES_HEADER + "\n")
+            if case == "two members":
+                archive.writestr("other.csv", "")
+        data = bytearray(buffer.getvalue())
+        if case == "encrypted":
+            # zipfile writes no encrypted member: flag it in both headers.
+            data[6] |= 0x1
+            data[data.index(b"PK\x01\x02") + 8] |= 0x1
+        (directory / overrides.FAO_OWN_CENTRES_FILE).write_bytes(bytes(data))
+    with pytest.raises(overrides.OverrideError, match="fao_own_centres"):
+        overrides.load_fao_own_centres(directory)
 
 
 def test_every_operation_loads_with_its_operation_key(tmp_path):
