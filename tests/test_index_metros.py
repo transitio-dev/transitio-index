@@ -189,6 +189,8 @@ AREAS = [
 MEMBERS = ["Q1757", "Q7"]
 # FAO region 50's single patch, holding Chicago's land area.
 CHICAGO_PATCH = shapely.box(-89.0, 41.0, -86.0, 43.0)
+# Springfield's own urban centre and FAO region 60, outside region 50.
+SPRINGFIELD_CENTRE = shapely.box(-90.0, 39.5, -89.5, 40.0)
 # One functional urban area, over Helsinki's land area alone: Helsinki falls
 # in it and in the metropolitan region, Espoo in the region only.
 URAU_AREAS = [("FI001F", "F", "FI", "Helsinki", shapely.box(24.3, 60.0, 24.8, 60.5))]
@@ -257,10 +259,10 @@ def _urau_inputs(tmp_path, cache, areas=URAU_AREAS):
     return pins
 
 
-def _give_urban_centres(cache, polygons, pins):
+def _give_urban_centres(cache, polygons, pins, ids=None):
     """Republish the seed generation with each place of ``polygons`` (by QID)
-    carrying that polygon as its GHS-UCDB urban centre, recorded as derived
-    from the UCDB inputs ``pins``."""
+    carrying that polygon as its GHS-UCDB urban centre, and each of ``ids``
+    that urban centre id, recorded as derived from the UCDB inputs ``pins``."""
     files = (
         "places_seed.jsonl",
         "feed_places.jsonl",
@@ -271,9 +273,11 @@ def _give_urban_centres(cache, polygons, pins):
     for name in files:
         rows[name], manifest = store.read_jsonl(cache / "gazetteer", "seed.json", name)
     for place in rows["places_seed.jsonl"]:
-        polygon = polygons.get(place.get("wikidata_id") or place["place_id"])
-        if polygon is not None:
-            place["ucdb_boundary"] = shapely.to_wkb(polygon, hex=True)
+        key = place.get("wikidata_id") or place["place_id"]
+        if polygons.get(key) is not None:
+            place["ucdb_boundary"] = shapely.to_wkb(polygons[key], hex=True)
+        if key in (ids or {}):
+            place["ucdb_id"] = ids[key]
     directory = store.open_subdir(cache, "gazetteer")
     try:
         with store.exclusive_writer(directory):
@@ -299,6 +303,8 @@ def _run(
     urau=None,
     areas=AREAS,
     urban=None,
+    ucdb_ids=None,
+    seed_pins=None,
 ):
     cache = tmp_path / "cache"
     dataset = fx.write_dataset(tmp_path / "divisions.parquet", ROWS)
@@ -312,8 +318,9 @@ def _run(
         overrides_dir=overrides_dir,
         registry=registry,
     )
-    if urban is not None:
-        _give_urban_centres(cache, urban, (ucdb or _ucdb_inputs(tmp_path))[1])
+    if urban is not None or ucdb_ids is not None:
+        recorded = seed_pins or (ucdb or _ucdb_inputs(tmp_path))[1]
+        _give_urban_centres(cache, urban or {}, recorded, ucdb_ids)
     pins = _inputs(tmp_path, cache)
     urau_pins = _urau_inputs(tmp_path, cache, urau) if urau is not None else None
     if fao is not None:
@@ -1190,17 +1197,23 @@ def test_a_metro_alias_meets_its_survivor_in_any_order(tmp_path, alias_first, co
     )
 
 
-def _fao_inputs(tmp_path, patch=CHICAGO_PATCH, iso3="USA"):
+def _fao_inputs(tmp_path, patch=CHICAGO_PATCH, iso3="USA", nested=False):
     """One FAO region, 50, of FAO's country ``iso3``, whose single ``patch``
-    holds Chicago's land area."""
+    holds Chicago's land area; ``nested`` adds region 60, Springfield's own,
+    over ``SPRINGFIELD_CENTRE``."""
     import hashlib
 
     import fao_fixture as ffx
     from transitio_index import fao
 
+    patches = [(7, (50, 0, 0, 0), patch)]
+    rows = [("50", iso3, 1, ["7"], "S")]
+    if nested:
+        patches.append((8, (60, 0, 0, 0), SPRINGFIELD_CENTRE))
+        rows.append(("60", iso3, 1, ["8"], "S"))
     payloads = {
-        fao.PATCHES_FILE: ffx.patches_zip([(7, (50, 0, 0, 0), patch)]),
-        fao.REGIONS_FILE: ffx.regions_csv([("50", iso3, 1, ["7"], "S")]),
+        fao.PATCHES_FILE: ffx.patches_zip(patches),
+        fao.REGIONS_FILE: ffx.regions_csv(rows),
     }
     files = {}
     for name, data in payloads.items():
@@ -1210,29 +1223,23 @@ def _fao_inputs(tmp_path, patch=CHICAGO_PATCH, iso3="USA"):
     return files, expected
 
 
-def _ucdb_inputs(tmp_path, centre=CHICAGO_PATCH, country="United States"):
+def _ucdb_inputs(tmp_path, centre=CHICAGO_PATCH, country="United States", nested=False):
     """A UCDB fixture that names FAO region 50's centre, drawn as ``centre``,
-    'Chicago' in ``country`` where the two overlap."""
+    'Chicago' in ``country`` where the two overlap; ``nested`` adds region
+    60's centre, matched to urban centre 2, 'Springfield'."""
     import hashlib
 
     import fao_fixture as ffx
     from transitio_index import ucdb
 
+    centres = [(50, 1, centre)]
+    urban = [(1, "Chicago", "Chicago", country, shapely.box(-88.5, 41.2, -87.0, 42.5))]
+    if nested:
+        centres.append((60, 1, SPRINGFIELD_CENTRE))
+        urban.append((2, "Springfield", "Springfield", country, SPRINGFIELD_CENTRE))
     payloads = {
-        ucdb.CENTRES_FILE: ffx.centres_zip([(50, 1, centre)]),
-        ucdb.UCDB_FILE: ffx.ucdb_zip(
-            [
-                (
-                    1,
-                    "Chicago",
-                    "Chicago",
-                    country,
-                    shapely.box(-88.5, 41.2, -87.0, 42.5),
-                )
-            ],
-            ucdb.UCDB_MEMBER,
-            ucdb.UCDB_LAYER,
-        ),
+        ucdb.CENTRES_FILE: ffx.centres_zip(centres),
+        ucdb.UCDB_FILE: ffx.ucdb_zip(urban, ucdb.UCDB_MEMBER, ucdb.UCDB_LAYER),
     }
     files = {}
     for name, data in payloads.items():
@@ -1242,13 +1249,13 @@ def _ucdb_inputs(tmp_path, centre=CHICAGO_PATCH, country="United States"):
     return files, expected
 
 
-def _fao_run(tmp_path, country="United States", **kw):
+def _fao_run(tmp_path, country="United States", nested=False, **kw):
     tmp_path.mkdir(parents=True, exist_ok=True)
     return _run(
         tmp_path,
         {},
-        fao=_fao_inputs(tmp_path),
-        ucdb=_ucdb_inputs(tmp_path, country=country),
+        fao=_fao_inputs(tmp_path, nested=nested),
+        ucdb=_ucdb_inputs(tmp_path, country=country, nested=nested),
         **kw,
     )
 
@@ -1618,6 +1625,52 @@ def test_a_city_without_a_land_area_is_placed_by_its_urban_centre(
         assert places["Q1757"]["metro_ids"] == places["Q1297"]["metro_ids"] == []
         assert ucdb.DERIVED[0] not in inventory
         assert manifest["derived_inputs"]["urban_centres"] is None
+
+
+@pytest.mark.parametrize("listed", [False, True], ids=["unlisted", "listed"])
+def test_a_city_joins_its_own_centres_region_from_the_reviewed_list(tmp_path, listed):
+    from test_index_place_overrides import write_overrides
+
+    # Springfield lies in Chicago's region 50 by its land area; region 60,
+    # its own urban centre's, holds no other city, so it publishes only from
+    # the reviewed list and is reported otherwise.
+    springfield = fx.area(
+        "us-spring", shapely.to_wkb(shapely.box(-88.9, 41.1, -88.7, 41.3)), [OSM]
+    )
+    rows = ["60,2,Springfield,US,keep,a city"] if listed else []
+    manifest, places = _fao_run(
+        tmp_path,
+        nested=True,
+        areas=AREAS + [springfield],
+        ucdb_ids={"Q28515": 2},
+        overrides_dir=write_overrides(tmp_path, own_centres=rows),
+    )
+    left = [
+        (r["code"], r["member_ids"])
+        for r in _artefact(tmp_path, "metro_report.jsonl")
+        if r.get("reason") == "an own-centre region not on the reviewed list"
+    ]
+    if listed:
+        assert places["Q28515"]["metro_ids"] == [
+            "fao_city_region:50",
+            "fao_city_region:60",
+        ]
+        assert places["fao_city_region:60"]["member_ids"] == ["Q28515"]
+        assert manifest["own_centres"] == {"listed": 1, "left_out": 0} and not left
+    else:
+        assert places["Q28515"]["metro_ids"] == ["fao_city_region:50"]
+        assert "fao_city_region:60" not in places
+        assert manifest["own_centres"] == {"listed": 0, "left_out": 1}
+        assert left == [("60", ["Q28515"])]
+
+
+def test_urban_centre_ids_of_another_ucdb_snapshot_are_refused(tmp_path):
+    from transitio_index import ucdb
+
+    # The seed recorded other UCDB inputs than the names the stage reads.
+    other = {ucdb.CENTRES_FILE: "0" * 64, ucdb.UCDB_FILE: "0" * 64}
+    with pytest.raises(overture.GazetteerError, match="re-run the gazetteer"):
+        _fao_run(tmp_path, nested=True, ucdb_ids={"Q28515": 2}, seed_pins=other)
 
 
 def test_a_us_metro_takes_its_delineated_counties_as_official_parts():

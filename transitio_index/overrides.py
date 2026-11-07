@@ -8,12 +8,15 @@ stages. Place overrides are added with the stage that applies them.
 """
 
 import collections
+import csv
 import datetime
 import hashlib
+import io
 import itertools
 import json
 import os
 import pathlib
+import zipfile
 
 from transitio_index import registry as _registry
 from transitio_index import store
@@ -25,6 +28,16 @@ EDGES_FILE = "edges.yaml"
 PLACES_FILE = "places.yaml"
 CATALOGUE_EXCEPTIONS_FILE = "catalogue_exceptions.yaml"
 ACCESS_PROVIDERS_FILE = "access_providers.yaml"
+FAO_OWN_CENTRES_FILE = "fao_own_centres.csv.zip"
+FAO_OWN_CENTRES_COLUMNS = (
+    "region_id",
+    "ucdb_id",
+    "city",
+    "country",
+    "decision",
+    "reason",
+)
+FAO_OWN_CENTRES_MAX_BYTES = 8 * 2**20
 PLACE_KINDS = ("country", "region", "city", "metro")
 COVERAGE_LEVELS = ("municipality", "subdivision", "country", "bbox", "geohash")
 TIERS = ("local", "regional", "national", "international", "unknown")
@@ -662,6 +675,84 @@ def load_access_providers(overrides_dir):
                 "url_prefixes"
             )
     return providers, refused, digest
+
+
+# ---- fao_own_centres.csv.zip ----
+
+
+def load_fao_own_centres(overrides_dir):
+    """``(keep, digest)``: ``{region_id: ucdb_id}`` of the FAO regions
+    ``fao_own_centres.csv.zip`` lists ``keep`` — reviewed regions that may
+    publish holding only their centre's city, the GHS-UCDB urban centre it
+    was reviewed for — and the digest of the file's bytes; ``({}, None)``
+    when there is no file. The zip holds one CSV of
+    ``FAO_OWN_CENTRES_COLUMNS``; every row names a digit ``region_id`` and
+    ``ucdb_id``, a ``city``, a two-letter ``country``, a ``decision`` of
+    ``keep`` or ``drop`` and a ``reason``, each region once."""
+    if overrides_dir is None:
+        return {}, None
+    data, digest = read_override(overrides_dir, FAO_OWN_CENTRES_FILE)
+    if data is None:
+        return {}, None
+    reader = csv.DictReader(io.StringIO(_own_centres_text(data)))
+    if tuple(reader.fieldnames or ()) != FAO_OWN_CENTRES_COLUMNS:
+        raise OverrideError(f"{FAO_OWN_CENTRES_FILE}: columns {reader.fieldnames}")
+    keep, seen = {}, set()
+    try:
+        for line, row in enumerate(reader, 2):
+            if None in row or None in row.values() or not _own_centre_row(row):
+                raise OverrideError(f"{FAO_OWN_CENTRES_FILE}: row {line}: {row}")
+            if row["region_id"] in seen:
+                raise OverrideError(
+                    f"{FAO_OWN_CENTRES_FILE}: row {line}: region "
+                    f"{row['region_id']} twice"
+                )
+            seen.add(row["region_id"])
+            if row["decision"] == "keep":
+                keep[row["region_id"]] = row["ucdb_id"]
+    except csv.Error as error:
+        raise OverrideError(f"{FAO_OWN_CENTRES_FILE}: {error}") from None
+    return keep, digest
+
+
+def _own_centres_text(data):
+    """The CSV text of the ``fao_own_centres`` zip ``data``: its one member,
+    stored or deflated, unencrypted and at most ``FAO_OWN_CENTRES_MAX_BYTES``
+    once expanded, read through a bounded stream."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            (info,) = archive.infolist()
+            if (
+                info.flag_bits & 0x1
+                or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                or info.file_size > FAO_OWN_CENTRES_MAX_BYTES
+            ):
+                raise OverrideError(
+                    f"{FAO_OWN_CENTRES_FILE}: an encrypted, unsupported or "
+                    "oversized member"
+                )
+            with archive.open(info) as member:
+                raw = member.read(FAO_OWN_CENTRES_MAX_BYTES + 1)
+        if len(raw) > FAO_OWN_CENTRES_MAX_BYTES:
+            raise OverrideError(f"{FAO_OWN_CENTRES_FILE}: an oversized member")
+        return raw.decode("utf-8")
+    except OverrideError:
+        raise
+    except Exception as error:  # noqa: B902 - zipfile and zlib raise their own
+        raise OverrideError(f"{FAO_OWN_CENTRES_FILE}: not readable: {error}") from None
+
+
+def _own_centre_row(row):
+    """Whether a ``fao_own_centres`` row is well formed: ASCII digit ids, a
+    city, a two-letter upper-case country, a known decision and a reason."""
+    return bool(
+        re.fullmatch(r"[0-9]+", row["region_id"])
+        and re.fullmatch(r"[0-9]+", row["ucdb_id"])
+        and row["city"].strip()
+        and re.fullmatch(r"[A-Z]{2}", row["country"])
+        and row["decision"] in ("keep", "drop")
+        and row["reason"].strip()
+    )
 
 
 def read_override(overrides_dir, name):

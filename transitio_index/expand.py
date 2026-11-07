@@ -376,6 +376,7 @@ class _SeededPlacement:
         regions,
         patches,
         *,
+        names=None,
         release=None,
         reopen=None,
     ):
@@ -390,17 +391,31 @@ class _SeededPlacement:
         )
         self._regions = regions
         self._patches = patches
+        self._names = names
         self._grouped = None
 
     def cities(self, region_id):
-        """The seeded cities in ``region_id``."""
+        """The seeded cities in ``region_id``: placed in it, or, with the UCDB
+        ``names``, joined to it as their own urban centre's region — asked only
+        for a region a discovered city holds, so it is held."""
         if self._grouped is None:
             from transitio_index import fao
 
             wanted = {r["overture_id"] for r in self._rows if r.get("overture_id")}
-            self._grouped, _, _, _ = fao.place_cities(
+            grouped, countries, unplaced, _ = fao.place_cities(
                 self._rows, self._read(self._rows, wanted), self._regions, self._patches
             )
+            if self._names:
+                fao.join_own_centres(
+                    self._rows,
+                    grouped,
+                    countries,
+                    unplaced,
+                    self._names,
+                    self._regions,
+                    held=set(self._regions),
+                )
+            self._grouped = grouped
         return self._grouped.get(region_id, [])
 
 
@@ -506,6 +521,7 @@ def _attach_fao_metros(
         city_rows,
         regions,
         patches,
+        names=names,
         release=release,
         reopen=reopen,
     )
@@ -1165,6 +1181,14 @@ def expand(
                 "places.yaml",
                 "gazetteer",
             )
+            # The reviewed own-centre regions the metros stage published from.
+            _, own_centres_digest = overrides.load_fao_own_centres(overrides_dir)
+            overrides.expect_digest(
+                names_manifest.get("fao_own_centres_sha256"),
+                own_centres_digest,
+                overrides.FAO_OWN_CENTRES_FILE,
+                "gazetteer",
+            )
             digest = names_manifest.get("places_overrides_sha256")
             anchor = run_generation = None
             if registry is not None:
@@ -1243,6 +1267,7 @@ def expand(
                 "places_overrides_sha256": names_manifest.get(
                     "places_overrides_sha256"
                 ),
+                "fao_own_centres_sha256": own_centres_digest,
                 "stale_place_overrides": (
                     names_manifest.get("stale_place_overrides") or 0
                 )

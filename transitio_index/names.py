@@ -180,6 +180,9 @@ def merge_names(
                 "centres": sum(bool(p.get("centre")) for p in places),
                 "centres_from_wikidata": from_wikidata,
                 "places_overrides_sha256": places_digest,
+                "fao_own_centres_sha256": geometry_manifest.get(
+                    "fao_own_centres_sha256"
+                ),
                 "overrides_applied": applied,
                 "stale_overrides": len(override_report),
                 "stale_place_overrides": (
