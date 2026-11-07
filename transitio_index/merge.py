@@ -101,7 +101,8 @@ OVERRIDE_FIELDS = (
 # so are the international edges' repeat blocks. 22: the manifest lists the
 # feeds without a read by cause. 23: feeds whose zones differ never fold.
 # 24: the NOTICE credits the whole MDB catalogue a build found twins in.
-MERGE_FORMAT = 24
+# 25: a place's metro_ids and member_ids are every build's, merged.
+MERGE_FORMAT = 25
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
@@ -616,6 +617,10 @@ def merge_tables(sources, skipped=()):
         tables["places.parquet"] = _populations(
             tables["places.parquet"], merged["places.parquet"]
         )
+    if "member_ids" in tables["places.parquet"].column_names:
+        tables["places.parquet"] = _memberships(
+            tables["places.parquet"], merged["places.parquet"]
+        )
     tables["feeds.parquet"], tables["edges.parquet"] = _homes(
         tables["feeds.parquet"], tables["edges.parquet"], tables["places.parquet"]
     )
@@ -692,6 +697,23 @@ def _populations(places, stacked):
     )
     values = [by_id.get(place_id) for place_id in places["place_id"].to_pylist()]
     return _replaced(places, "population", values, publish._PLACES_SCHEMA)
+
+
+def _memberships(places, stacked):
+    """``places`` with each place's ``metro_ids`` and ``member_ids`` the union
+    of every source row's, kept to the places the merged table holds: a
+    build lists a metro's members among the places it kept, so the one copy
+    taken would lack the members other builds listed, and only the union
+    stays reciprocal."""
+    held = set(places["place_id"].to_pylist())
+    stacked_ids = stacked["place_id"].to_pylist()
+    for name in ("metro_ids", "member_ids"):
+        found = collections.defaultdict(set)
+        for place_id, ids in zip(stacked_ids, stacked[name].to_pylist()):
+            found[place_id].update(i for i in ids or () if i in held)
+        values = [sorted(found[p]) for p in places["place_id"].to_pylist()]
+        places = _replaced(places, name, values, publish._PLACES_SCHEMA)
+    return places
 
 
 def _homes(feeds, edges, places):
