@@ -122,9 +122,10 @@ PROJECT = [
     "geometry",
 ]
 
-# An OSM relation reference inside a source ``record_id`` (``relation/123`` or a
-# bare ``123``); ways and nodes are not admin boundaries and are not matched.
-_OSM_RELATION = re.compile(r"\Arelation[/:]?(\d+)\Z|\A(\d+)\Z")
+# An OSM relation reference inside a source ``record_id``: ``r123@4`` (the
+# relation and its version, as Overture writes it), ``relation/123`` or a bare
+# ``123``; ways and nodes are not admin boundaries and are not matched.
+_OSM_RELATION = re.compile(r"\Ar(\d+)@\d+\Z|\Arelation[/:](\d+)\Z|\A(\d+)\Z")
 
 WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
@@ -609,7 +610,7 @@ def _osm_relation_ids(sources):
             continue
         match = _OSM_RELATION.match((source.get("record_id") or "").strip())
         if match:
-            relation = match.group(1) or match.group(2)
+            relation = next(group for group in match.groups() if group)
             if relation not in found:
                 found.append(relation)
     return found

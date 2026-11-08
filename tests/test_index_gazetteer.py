@@ -425,6 +425,24 @@ def test_a_local_copy_is_downloaded_once_and_read_after(tmp_path, monkeypatch):
         overture.ensure_local_copy(tmp_path / "copies", release, bucket)
 
 
+def test_osm_relations_are_read_in_every_source_form():
+    # Overture writes "r<id>@<version>"; older releases wrote "relation/<id>".
+    sources = [
+        fx.osm(record)
+        for record in (
+            "r5626274@1",
+            "relation/61320",
+            "relation:7",
+            "8",
+            "n184@3",
+            "w9@2",
+            "relation123",
+        )
+    ]
+    sources.append({"dataset": "geoBoundaries", "record_id": "r10@1"})
+    assert overture._osm_relation_ids(sources) == ["5626274", "61320", "7", "8"]
+
+
 @pytest.mark.parametrize(
     "case, downloaded",
     [
