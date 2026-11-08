@@ -51,18 +51,66 @@ def test_the_decision_table(route_type, local, regions, span, tier, confidence, 
 
 
 @pytest.mark.parametrize(
-    ("local", "regions", "tier", "rule"),
+    ("route_type", "local", "regions", "zone", "gap", "tier", "rule"),
     [
-        ("one_metro", 2, "local", "one_metro"),  # one metro holds the zone
-        (None, 1, "regional", "regional"),
-        (None, 2, "regional", "zone"),  # two regions and long: still regional
+        # A zone is regional at most, however long or far apart.
+        (3, "one_metro", 2, True, None, "local", "one_metro"),
+        (3, None, 1, True, None, "regional", "regional"),
+        (3, None, 2, True, 25.0, "regional", "zone"),
+        # Boarding stops far apart make a route national, even in one region.
+        (3, None, 1, False, 25.0, "national", "intercity"),
+        (3, None, 1, False, 15.0, "regional", "regional"),
+        (3, "one_city", 1, False, 25.0, "local", "one_city"),
+        (109, None, 2, False, 30.0, "regional", "declared"),
     ],
 )
-def test_a_route_with_a_zone_is_regional_at_most(local, regions, tier, rule):
+def test_zones_and_boarding_gaps_in_the_decision_table(
+    route_type, local, regions, zone, gap, tier, rule
+):
     decision = classify.classify_route(
-        3, _stops(AA=2), 400.0, local, regions, 140.0, zone=True
+        route_type, _stops(AA=2), 400.0, local, regions, 140.0, zone=zone, gap_km=gap
     )
     assert (decision["tier"], decision["rule"]) == (tier, rule)
+
+
+def test_the_boarding_gap_skips_the_stops_a_trip_passes_through(monkeypatch):
+    import io
+
+    # In t, b and c are passed through (no pickup, no drop-off); s runs the
+    # same stops serving b; v is longer; u boards at every stop of its own.
+    # With two patterns kept (v's and t's), the boarding stops come from
+    # their trips, both variants of t's: not u's longer boarding run.
+    monkeypatch.setattr(classify, "PATTERN_SAMPLE", 2)
+    rows = (
+        b"trip_id,stop_id,stop_sequence,pickup_type,drop_off_type\n"
+        b"t,a,1,0,1\nt,b,2,1,1\nt,c,3,1,1\nt,d,4,1,0\n"
+        b"s,a,1,0,1\ns,b,2,0,0\ns,c,3,1,1\ns,d,4,1,0\n"
+        b"v,p,1,,\nv,q,2,,\nv,r,3,,\nv,w,4,,\nv,o,5,,\n"
+        b"u,x,1,0,0\nu,y,2,0,0\nu,z,3,0,0\n"
+    )
+    trips = {"t": "r", "s": "r", "v": "r", "u": "r"}
+    _, sequences, *_, boarding = classify._read_stop_times(io.BytesIO(rows), trips, {})
+    assert sequences == {"r": [("p", "q", "r", "w", "o"), ("a", "b", "c", "d")]}
+    assert boarding == {"r": [("a", "b", "d"), ("a", "d"), ("p", "q", "r", "w", "o")]}
+    boarding = {"r": [("a", "d")]}
+    coords = {"a": (10.0, 1.0), "d": (10.2, 1.0), "e": crawl.PLACEHOLDER_POSITION}
+    gap = classify._boarding_gap(boarding["r"], coords)
+    assert gap == pytest.approx(classify.haversine_km(coords["a"], coords["d"]))
+    # A Flex row and a placeholder stop bridge nothing; a stop without
+    # coordinates leaves the gap unmeasured.
+    assert classify._boarding_gap([("a", "", "d"), ("a", "e", "d")], coords) is None
+    assert classify._boarding_gap([("a", "d", "q")], coords) is None
+
+
+@pytest.mark.parametrize(
+    ("gap", "tier", "margin"),
+    [(27.0, "national", True), (23.0, "regional", True), (10.0, "regional", False)],
+)
+def test_a_boarding_gap_near_its_threshold_is_flagged_on_either_side(gap, tier, margin):
+    decision = classify.classify_route(
+        3, _stops(AA=2), 30.0, None, 1, 140.0, gap_km=gap
+    )
+    assert (decision["tier"], decision["margin"]) == (tier, margin)
 
 
 def test_the_margin_penalty_applies_within_a_fifth_of_the_reference():
@@ -1613,10 +1661,11 @@ def test_a_route_across_a_border_counts_its_departures_at_its_own_tier(
 ):
     # A tram across two regions with two of its four stops abroad keeps its
     # own tier, compared with its reference, and also serves at the
-    # international tier.
+    # international tier. The stub's stops lie degrees apart: no intercity.
     monkeypatch.setattr(
         classify, "route_span_reference", lambda: {("*", "tram"): 10000.0}
     )
+    monkeypatch.setattr(classify, "INTERCITY_GAP_KM", 1e9)
     cache = tmp_path / "cache"
     xs = (10.0, 50.0, 60.0, 60.0)
     feed, candidate = _lines(cache, "f-x", [("D", 0)], xs=xs)
@@ -1736,7 +1785,8 @@ def test_every_decider_constant_is_published_in_the_classifier_settings():
         if isinstance(getattr(classify, name, None), (int, float))
         and not isinstance(getattr(classify, name), bool)
     }
-    assert {"BORDER_CLEAR_KM", "MARGIN", "MARGIN_PENALTY"} <= numeric
+    expected = {"BORDER_CLEAR_KM", "INTERCITY_GAP_KM", "MARGIN", "MARGIN_PENALTY"}
+    assert expected <= numeric
     assert {name.lower() for name in numeric} <= set(settings)
     # And every published number is the module's constant, as run.
     for key, value in settings.items():
@@ -1748,7 +1798,9 @@ def test_near_threshold_decisions_are_flagged_and_counted(tmp_path, monkeypatch)
     # A bus across two top-level regions whose span (4447 km) lies within
     # MARGIN of its reference (4000 km) is flagged and penalised; a tram in
     # one city and a declared-only feed are not; the manifest counts them.
+    # The bus's stops lie degrees apart: the intercity rule is set aside.
     monkeypatch.setattr(classify, "route_span_reference", lambda: NEAR_REFERENCE)
+    monkeypatch.setattr(classify, "INTERCITY_GAP_KM", 1e9)
     lookup = StubLookup({**LOOKUP.by_x, 50.0: FAR_RECORDS})
     places = PLACES + FAR_PLACES
     cache = tmp_path / "cache"
