@@ -24,7 +24,7 @@ from builds_fixture import (
     _place,
     _rewrite_snapshot,
     _rt,
-    _run,
+    _archived_build,
     write_build,
 )
 from test_index_publish import _read_on_demand
@@ -41,29 +41,39 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
     cache = tmp_path / "cache"
     archived = cache / "builds"
     day = BUILT
-    _run(archived, "fi", 1, built_at=day(13))
-    fi = _run(archived, "fi", 2, built_at=day(14))
-    de = _run(archived, "de", 3, built_at=day(15))
-    se = _run(archived, "se", 6, built_at=day(15))  # a tie: the lower id wins
-    _run(archived, "se", 7, built_at=day(15))
-    nl = _run(archived, "nl", 4, feeds=[], edges={})
-    gone = _run(archived, "gone", 5)
+    _archived_build(archived, "fi", 1, built_at=day(13))
+    fi = _archived_build(archived, "fi", 2, built_at=day(14))
+    de = _archived_build(archived, "de", 3, built_at=day(15))
+    se = _archived_build(
+        archived, "se", 6, built_at=day(15)
+    )  # a tie: the lower id wins
+    _archived_build(archived, "se", 7, built_at=day(15))
+    nl = _archived_build(archived, "nl", 4, feeds=[], edges={})
+    gone = _archived_build(archived, "gone", 5)
     _notice_listed_but_gone(archived / gone / "index")
-    six = _run(archived, "six", 8)  # partitioned, yet claiming schema 6
+    six = _archived_build(archived, "six", 8)  # partitioned, yet claiming schema 6
     _rewrite_snapshot(archived / six / "index", lambda s: s.update(schema_version=6))
-    _run(archived, "bad", 9, built_at=day(13))  # a run whose snapshot cannot be
-    bad = _run(archived, "bad", 10)  # read ranks first, so the label is skipped
+    _archived_build(
+        archived, "bad", 9, built_at=day(13)
+    )  # a run whose snapshot cannot be
+    bad = _archived_build(
+        archived, "bad", 10
+    )  # read ranks first, so the label is skipped
     (archived / bad / "index" / "snapshot.json").write_text("{")
-    _run(archived, "when", 11, built_at=day(13))  # so does one without a date
-    when = _run(archived, "when", 12, built_at="yesterday")
-    nodate = _run(archived, "nodate", 13)
+    _archived_build(
+        archived, "when", 11, built_at=day(13)
+    )  # so does one without a date
+    when = _archived_build(archived, "when", 12, built_at="yesterday")
+    nodate = _archived_build(archived, "nodate", 13)
     _rewrite_snapshot(archived / nodate / "index", lambda s: s.pop("built_at"))
     # Claiming schema 11 without the providers table it lists.
-    eleven = _run(archived, "eleven", 16)
+    eleven = _archived_build(archived, "eleven", 16)
     _rewrite_snapshot(
         archived / eleven / "index", lambda s: s.update(schema_version=11)
     )
-    _run(archived, "raw", 14, built_at=day(13))  # a run without its index yet
+    _archived_build(
+        archived, "raw", 14, built_at=day(13)
+    )  # a run without its index yet
     (archived / "raw-000000000000000f").mkdir()
     write_build(archived / "old" / "index")
     write_build(cache / "index")  # the cache's own index is not an archived run
@@ -90,8 +100,10 @@ def test_the_newest_run_of_each_label_is_a_source_or_is_skipped_with_a_reason(
 
 def test_a_run_whose_index_is_a_link_is_skipped_unread_and_not_replaced(tmp_path):
     archived = tmp_path / "builds"
-    real = _run(archived, "fi", 1, built_at=BUILT(14))
-    _run(archived, "se", 2, built_at=BUILT(13))  # an older, complete run of se
+    real = _archived_build(archived, "fi", 1, built_at=BUILT(14))
+    _archived_build(
+        archived, "se", 2, built_at=BUILT(13)
+    )  # an older, complete run of se
     linked = archived / "se-0000000000000003"
     linked.mkdir()
     try:
@@ -116,7 +128,7 @@ def _frame(tables, name, index):
 
 def test_feeds_edges_and_places_merge_by_source(tmp_path):
     spill = json.dumps({"feeds": 2})  # the German build's own view of Finland
-    a = _run(
+    a = _archived_build(
         tmp_path,
         "fi",
         1,
@@ -142,7 +154,7 @@ def test_feeds_edges_and_places_merge_by_source(tmp_path):
         },
         built_at="2026-09-14T00:00:00+00:00",
     )
-    b = _run(
+    b = _archived_build(
         tmp_path,
         "de",
         2,
@@ -244,7 +256,7 @@ def test_a_metros_membership_merges_over_every_build(tmp_path):
         ("fi", 1, "hel", ["gone", "hel"]),
         ("de", 2, "esp", ["esp"]),
     ):
-        run = _run(
+        run = _archived_build(
             tmp_path,
             label,
             digit,
@@ -271,7 +283,7 @@ def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
             "realtime_feed_ids": list(companions),
         }
 
-    a = _run(
+    a = _archived_build(
         tmp_path,
         "fi",
         1,
@@ -288,7 +300,7 @@ def test_an_id_another_build_folded_into_a_feed_is_that_feed(tmp_path):
     # The newer build did not fold x into c but folded z, whose companion is
     # in the older build; n claims o (a chain m->n->o), and r claims q, which
     # p claims too.
-    b = _run(
+    b = _archived_build(
         tmp_path,
         "se",
         2,
@@ -373,7 +385,7 @@ def test_feeds_another_build_kept_with_the_same_content_fold(
         }
 
     runs = [
-        _run(
+        _archived_build(
             tmp_path,
             "at",
             1,
@@ -393,7 +405,7 @@ def test_feeds_another_build_kept_with_the_same_content_fold(
             },
             built_at=BUILT(14),
         ),
-        _run(
+        _archived_build(
             tmp_path,
             "atlas6",
             2,
@@ -1653,7 +1665,7 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
     fi, de = _two_runs(
         fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
     )
-    _run(builds, "nl", 3, feeds=[], edges={})  # no feeds: skipped, reported
+    _archived_build(builds, "nl", 3, feeds=[], edges={})  # no feeds: skipped, reported
     partition = _partition(tmp_path, lambda p: p["atlas"].update(lost="fi"))
     assert (
         merge.main(
@@ -1883,7 +1895,7 @@ def _merged_cache(fx, tmp_path, partition=None, overrides_dir=None):
     fi, de = _two_runs(
         fx, builds, fi_notice=_notice_text([ESRI]), de_notice=_notice_text([OSM])
     )
-    _run(builds, "nl", 3, feeds=[], edges={})  # skipped: no feeds
+    _archived_build(builds, "nl", 3, feeds=[], edges={})  # skipped: no feeds
     manifest = merge.merge_builds(
         builds,
         cache,

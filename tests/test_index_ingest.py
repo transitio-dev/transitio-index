@@ -461,6 +461,7 @@ def test_failed_download_leaves_nothing_behind(tmp_path, monkeypatch):
         return FakeResponse(None)
 
     monkeypatch.setattr(atlas.download.urllib.request, "urlopen", explode)
+    monkeypatch.setattr(atlas.download.time, "sleep", lambda *a, **k: None)
     directory = store.open_directory(tmp_path)
 
     try:

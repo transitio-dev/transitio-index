@@ -160,7 +160,10 @@ def _catalogue_access(feed):
     }
 
 
-def _apply(feed, entry):
+def _apply_feed_override(feed, entry):
+    """Apply one curated feed entry to ``feed`` in place: its identity (the
+    old id kept as an alias), access, uncrawlable mark, mark and
+    registration page."""
     identity = entry.get("set_identity") or {}
     old_id = feed["feed_id"]
     new_id = identity.get("feed_id")
@@ -330,7 +333,7 @@ def resolve(cache_dir, *, overrides_dir=None):
                     f"override matches several feeds: {ambiguous}"
                 )
             for ref, hit in ref_to_feeds.items():
-                _apply(hit[0], feed_overrides[ref])
+                _apply_feed_override(hit[0], feed_overrides[ref])
             matched = set(ref_to_feeds)
             _check_namespace(feeds)
             report = [{"kind": "refused_provider", **row} for row in refused]

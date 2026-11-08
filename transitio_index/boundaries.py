@@ -637,42 +637,31 @@ class BoundaryLookup:
         memoized polygons (simplified to the shipping tolerance); call
         :meth:`ensure` for the area first.
         """
-        if self._tree is None:
-            self._build_tree()
-        if self._tree_empty:
-            return []
         point = shapely.Point(x, y)
-        found = {}
-        for index in self._tree.query(point, predicate="covered_by"):
-            record = self._tree_entries[index]
-            found[record["division_id"]] = record
-        return _most_specific(found)
+        return self._selected(lambda tree: tree.query(point, predicate="covered_by"))
 
     def divisions_reached(self, shape):
         """The divisions a polygon reaches into, most specific first: those
         whose polygons share interior with ``shape``
         (:func:`geometry.interior_hits`); call :meth:`ensure` for its cells
         first."""
-        if self._tree is None:
-            self._build_tree()
-        if self._tree_empty:
-            return []
-        found = {}
-        for index in geometry.interior_hits(self._tree, shape):
-            record = self._tree_entries[index]
-            found[record["division_id"]] = record
-        return _most_specific(found)
+        return self._selected(lambda tree: geometry.interior_hits(tree, shape))
 
     def divisions_covering(self, shape):
         """The divisions one of whose polygons covers the whole of
         ``shape``, most specific first; call :meth:`ensure` for its cells
         first."""
+        return self._selected(lambda tree: tree.query(shape, predicate="covered_by"))
+
+    def _selected(self, select):
+        """The divisions of the memoized polygons ``select(tree)`` picks by
+        index, most specific first."""
         if self._tree is None:
             self._build_tree()
         if self._tree_empty:
             return []
         found = {}
-        for index in self._tree.query(shape, predicate="covered_by"):
+        for index in select(self._tree):
             record = self._tree_entries[index]
             found[record["division_id"]] = record
         return _most_specific(found)

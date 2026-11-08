@@ -1448,7 +1448,7 @@ def test_the_merge_rescores_relevance_over_the_merged_edges(tmp_path):
     and outranked Paris's main feed from another build."""
     import json
 
-    from builds_fixture import BOX, _feed7, _place, _run
+    from builds_fixture import BOX, _archived_build, _feed7, _place
 
     from transitio_index import builds, merge, rank
 
@@ -1497,7 +1497,7 @@ def test_the_merge_rescores_relevance_over_the_merged_edges(tmp_path):
         ("atlas1", 1, ["x"], older, 10),
         ("mdb", 2, ["y", "z", "s"], newer, 15),
     ):
-        run = _run(
+        run = _archived_build(
             tmp_path,
             label,
             digit,
@@ -1627,7 +1627,7 @@ def test_a_merged_places_service_and_validity_sum_every_builds_feeds(tmp_path):
     """The merge kept a place's service and validity from the build serving
     it most, so Prague stored 16 feeds and 822 departures a day against 42
     feeds over the merged edges."""
-    from builds_fixture import BOX, _feed7, _place, _run
+    from builds_fixture import BOX, _archived_build, _feed7, _place
 
     from transitio_index import merge
 
@@ -1664,7 +1664,7 @@ def test_a_merged_places_service_and_validity_sum_every_builds_feeds(tmp_path):
             [edge("a", 50, 800.0), edge("b", 23, 22.0), edge("dpp", 400, 5e5, **ended)],
         ),
     ):
-        run = _run(
+        run = _archived_build(
             tmp_path,
             label,
             digit,
@@ -3405,7 +3405,7 @@ def test_the_crawl_reads_the_files_that_place_a_flex_trip(tmp_path, range_thresh
         "locations.geojson": b'{"type": "FeatureCollection", "features": []}',
         "location_group_stops.txt": b"location_group_id,stop_id\ng1,s1\n",
     }
-    members = {**crt._members(), **zones}
+    members = {**crt._feed_members(), **zones}
     archive = crt._zip_bytes({f"gtfs/{name}": data for name, data in members.items()})
     server = crt._server({"/f.zip": (archive, '"v1"')})
     lookup = crt.StubLookup({24.9: crt.CITY_RECORDS})

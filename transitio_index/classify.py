@@ -1139,7 +1139,7 @@ def _service_trips(feed_dir, state):
         return None
 
 
-def _members(feed_dir, state, names, calendar=None):
+def _read_feed_members(feed_dir, state, names, calendar=None):
     """The digest-verified members parsed, or None on an unverifiable or
     unparsable member — one feed's problem, never the run's. Only data
     errors are caught; a programming defect surfaces."""
@@ -1788,7 +1788,7 @@ def _classify_feed(
     """
     mode = (state.get("stop_times") or {}).get("state")
     names = ("trips.txt",) if mode == "complete" else ()
-    parsed = _members(feed_dir, state, names, calendar)
+    parsed = _read_feed_members(feed_dir, state, names, calendar)
     if parsed is None:
         return (
             [

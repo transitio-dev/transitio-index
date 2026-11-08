@@ -37,7 +37,7 @@ from builds_fixture import (
     write_partitioned_build,
     _rewrite_snapshot,
     _notice_listed_but_gone,
-    _run,
+    _archived_build,
 )
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "index_viewer.py"
@@ -1256,8 +1256,8 @@ def test_the_cache_and_the_api_serve_the_catalogue(tmp_path):
             "skipped": [],
         }
     ]
-    fi = _run(builds, "fi", 1, built_at="2026-09-14T00:00:00+00:00")
-    de = _run(
+    fi = _archived_build(builds, "fi", 1, built_at="2026-09-14T00:00:00+00:00")
+    de = _archived_build(
         builds,
         "de",
         2,
@@ -1272,7 +1272,7 @@ def test_the_cache_and_the_api_serve_the_catalogue(tmp_path):
         },
         built_at="2026-09-15T00:00:00+00:00",
     )
-    nl = _run(builds, "nl", 3, feeds=[], edges={})
+    nl = _archived_build(builds, "nl", 3, feeds=[], edges={})
     first = cached.get(iv.CATALOGUE)
     assert first is not None and cached.get(iv.CATALOGUE) is first
     assert first.snapshot["skipped"] == [{"id": nl, "reason": "no feeds"}]
@@ -1306,12 +1306,12 @@ def test_the_cache_and_the_api_serve_the_catalogue(tmp_path):
     assert feed["build_id"] == de
     # A new run reassembles the catalogue; one that does not verify is
     # skipped, whether its digests mismatch or its tables are not a build's.
-    broken = _run(builds, "xx", 4)
+    broken = _archived_build(builds, "xx", 4)
     edges_file = builds / broken / "index" / "FI" / "edges.parquet"
     intact = edges_file.read_bytes()
     edges_file.write_bytes(intact[:-1] + bytes([intact[-1] ^ 1]))  # same size
     repairs[edges_file] = intact  # restored right after the failed read
-    junk = _run(
+    junk = _archived_build(
         builds,
         "yy",
         5,
@@ -1354,7 +1354,7 @@ def test_the_cache_and_the_api_serve_the_catalogue(tmp_path):
     # too: the change time cannot be kept — except on Windows, whose change
     # time is the creation time, so the repair there keeps its new mtime.
     edges_file.write_bytes(intact[:-1] + bytes([intact[-1] ^ 1]))
-    _run(builds, "zz", 6)  # a new source: the next request reassembles
+    _archived_build(builds, "zz", 6)  # a new source: the next request reassembles
     sixth = cached.get(iv.CATALOGUE)
     assert [run["id"] for run in sixth.snapshot["skipped"]] == [broken, junk]
     tampered = os.stat(edges_file)

@@ -43,7 +43,9 @@ def _hex(x, y):
     return shapely.to_wkb(shapely.Point(x, y)).hex()
 
 
-def _run(tmp_path, overrides_dir=None, strict=False):
+def _merge_fixture_names(tmp_path, overrides_dir=None, strict=False):
+    """Publish ``PLACES`` as a geometry generation and run the names stage
+    over stub labels; ``(manifest, places by id)``."""
     from transitio_index import overrides
 
     cache = tmp_path / "cache"
@@ -75,7 +77,7 @@ def _run(tmp_path, overrides_dir=None, strict=False):
 
 
 def test_wikidata_fills_missing_languages_and_overture_wins(tmp_path):
-    _, places = _run(tmp_path)
+    _, places = _merge_fixture_names(tmp_path)
     hel = places["Q1757"]
     assert hel["names"]["sv"] == "Helsingfors"  # filled from Wikidata
     assert hel["names"]["en"] == "Helsinki"  # Overture keeps the shared language
@@ -83,24 +85,24 @@ def test_wikidata_fills_missing_languages_and_overture_wins(tmp_path):
 
 
 def test_name_becomes_the_english_label(tmp_path):
-    _, places = _run(tmp_path)
+    _, places = _merge_fixture_names(tmp_path)
     assert places["Q1757"]["name"] == "Helsinki"
 
 
 def test_aliases_are_the_union_minus_the_name(tmp_path):
-    _, places = _run(tmp_path)
+    _, places = _merge_fixture_names(tmp_path)
     # "Helsinki" is dropped (it equals the name); Stadi/Hesa remain, sorted, and
     # the Wikidata label Overture replaced joins them.
     assert places["Q1757"]["aliases"] == ["Helsinki (wd)", "Hesa", "Stadi"]
 
 
 def test_existing_aliases_are_preserved(tmp_path):
-    _, places = _run(tmp_path)
+    _, places = _merge_fixture_names(tmp_path)
     assert set(places["Q3000"]["aliases"]) == {"OldAlias", "New"}
 
 
 def test_a_place_without_wikidata_is_left_unchanged(tmp_path):
-    manifest, places = _run(tmp_path)
+    manifest, places = _merge_fixture_names(tmp_path)
     assert places["Q2000"]["names"] == {"en": "Nowhere"}
     assert places["Q2000"]["aliases"] == []
     assert manifest["enriched"] == 2  # Q1757 and Q3000, not Q2000
@@ -172,7 +174,7 @@ def test_set_aliases_adds_the_curators_names(tmp_path):
         {"place": "Q2000", "set_aliases": ["Nowheresville", "Nowhere"]},
         {"place": "Q404", "set_aliases": ["Elsewhere"]},  # another build's place
     ]
-    manifest, places = _run(
+    manifest, places = _merge_fixture_names(
         tmp_path, overrides_dir=write_overrides(tmp_path, places=entries)
     )
     # The place's own name never doubles as an alias.
@@ -188,13 +190,13 @@ def test_a_stale_alias_override_fails_strict_after_publishing_its_report(tmp_pat
     entries = [
         {"place": "Q2000", "set_aliases": ["Nowheresville"], "evidence_hash": "0" * 64}
     ]
-    manifest, places = _run(
+    manifest, places = _merge_fixture_names(
         tmp_path, overrides_dir=write_overrides(tmp_path, places=entries)
     )
     assert manifest["stale_overrides"] == 1
     assert places["Q2000"]["aliases"] == ["Nowheresville"]
     with pytest.raises(overrides.OverrideError, match="stale override"):
-        _run(
+        _merge_fixture_names(
             tmp_path / "strict",
             overrides_dir=write_overrides(tmp_path / "strict", places=entries),
             strict=True,
