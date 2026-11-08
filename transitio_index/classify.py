@@ -8,15 +8,16 @@ much service that is. For every crawled feed with complete
 its stops, span (greatest distance between any two stops), median inter-stop
 distance and the places and countries its stops fall in — and decides its
 tier: the class its GTFS type declares; else ``local`` when one city or one
-metro holds every located stop; else ``national`` when its stops in its
-majority country lie in more than one top-level region and its span exceeds
-the 90th percentile of the route spans of its feed's home country and mode
+metro holds every located stop; else ``national`` when its stops lie in more
+than one top-level region and its span exceeds the 90th percentile of the
+route spans of its feed's home country and mode
 (``route_span_reference.csv``), with the margin penalty within 20 % of that
-value; else ``regional``. A route past the border gate — at least
-``BORDER_STOPS`` and ``BORDER_SHARE`` of its located stops outside its
-majority country — keeps its tier and serves at the ``international`` tier
-too, so one stop across a simplified boundary decides nothing; each feed
-counts the boundary artefacts among its stops (in several countries, in
+value; else ``regional``. A stop counts in a country when no other country's
+division lies within ``BORDER_CLEAR_KM`` of it, so one stop across a
+simplified boundary decides nothing: the regions are counted in every
+country holding such a stop, and a route with such stops in two or more
+countries keeps its tier and serves at the ``international`` tier too. Each
+feed counts the boundary artefacts among its stops (in several countries, in
 none, on a route's minority side). A route serves a place when enough of its
 stops lie inside it; a feed then gets one edge per ``(place, tier)`` for
 which a serving route classifies to that tier, its ``tier_confidence`` the
@@ -124,11 +125,11 @@ HOME_SHARE = 0.80
 # multiplied by the penalty.
 MARGIN = 0.20
 MARGIN_PENALTY = 0.7
-# A route crosses a border when the stops outside its majority country are at
-# least this share of its located stops and at least this many: one stop on
-# the wrong side of a simplified boundary decides nothing.
-BORDER_SHARE = 0.10
-BORDER_STOPS = 2
+# A stop counts in a country when every division within this many km of it
+# belongs to that country: a boundary simplified by SIMPLIFY_TOLERANCE_DEG
+# (about 55 m) can put a stop by the border line on the wrong side, while
+# twin towns keep stops a few hundred metres from it.
+BORDER_CLEAR_KM = 0.2
 
 # A route's span is exact over every pair of its distinct stops up to this
 # many; past it the span is unmeasurable within bounds and stays a missing
@@ -162,8 +163,10 @@ DEPARTURES_VERSION = 5
 # edge, by their own tier; 7 reads the zones and stop groups of
 # demand-responsive trips; 8 leaves the zones a trip only sets riders down in
 # out of its route's places and span; 9 reads a zone an older Flex draft names
-# in stop_id; 10 keeps a route with a zone regional at most.
-RULES_VERSION = 10
+# in stop_id; 10 keeps a route with a zone regional at most; 11 counts a stop
+# in a country only away from its border, crosses a border on one such stop
+# and counts the regions in every country holding one.
+RULES_VERSION = 11
 
 # The route-span reference (written by ``scripts/route_span_reference.py``):
 # per home country and basic mode, the 90th percentile of the spans of the
@@ -223,8 +226,8 @@ def classifier_settings(route_min_stops=ROUTE_MIN_STOPS):
         "home_share": HOME_SHARE,
         "margin": MARGIN,
         "margin_penalty": MARGIN_PENALTY,
-        "border_share": BORDER_SHARE,
-        "border_stops": BORDER_STOPS,
+        "border_clear_km": BORDER_CLEAR_KM,
+        "earth_radius_km": EARTH_RADIUS_KM,
         "route_span_reference": ROUTE_SPAN_REFERENCE,
         "min_reference_routes": MIN_REFERENCE_ROUTES,
         "span_max_stops": SPAN_MAX_STOPS,
@@ -310,6 +313,65 @@ def _outside(ids, held):
     return {s for s in ids if s not in held or isinstance(s, tuple)}
 
 
+def _clear_boxes(x, y):
+    """The boxes ``(minx, miny, maxx, maxy)`` holding every point within
+    ``BORDER_CLEAR_KM`` of ``(x, y)``: split at the antimeridian, and around
+    the whole parallel within that distance of a pole."""
+    dlat = math.degrees(BORDER_CLEAR_KM / EARTH_RADIUS_KM)
+    miny, maxy = max(y - dlat, -90.0), min(y + dlat, 90.0)
+    # A degree of longitude is narrowest on the box's poleward edge.
+    edge = min(abs(y) + dlat, 90.0)
+    cos = math.cos(math.radians(edge))
+    dlon = dlat / cos if cos > 1e-9 else 180.0
+    if dlon >= 180.0:
+        return [(-180.0, miny, 180.0, maxy)]
+    boxes = [(max(x - dlon, -180.0), miny, min(x + dlon, 180.0), maxy)]
+    if x - dlon < -180.0:
+        boxes.append((x - dlon + 360.0, miny, 180.0, maxy))
+    if x + dlon > 180.0:
+        boxes.append((-180.0, miny, x + dlon - 360.0, maxy))
+    return boxes
+
+
+def _clear_country(lookup, boxes):
+    """The one country of every division ``boxes`` reach (a stop's
+    :func:`_clear_boxes`, ensured), else None."""
+    import shapely
+
+    codes = {
+        record["country"]
+        for box in boxes
+        for record in lookup.divisions_reached(shapely.box(*box))
+        if record.get("country")
+    }
+    return codes.pop() if len(codes) == 1 else None
+
+
+def _clear_countries(stop_ids, coords, located_countries, lookup, memo):
+    """The countries holding one of the route's stops clearly: no other
+    country's division within ``BORDER_CLEAR_KM`` of it (memoized per stop in
+    ``memo``); a zone counts in every country it reaches past the
+    simplification."""
+    boxes = {
+        stop_id: _clear_boxes(*coords[stop_id])
+        for stop_id in stop_ids
+        if not isinstance(stop_id, tuple)
+        and stop_id not in memo
+        and coords.get(stop_id) not in (None, crawl.PLACEHOLDER_POSITION)
+    }
+    if boxes:
+        lookup.ensure([box for found in boxes.values() for box in found])
+    for stop_id, found in boxes.items():
+        memo[stop_id] = _clear_country(lookup, found)
+    countries = set()
+    for stop_id in stop_ids:
+        if isinstance(stop_id, tuple):
+            countries.update(located_countries.get(stop_id, ()))
+        elif memo.get(stop_id):
+            countries.add(memo[stop_id])
+    return frozenset(countries)
+
+
 def classify_route(
     route_type,
     countries,
@@ -319,6 +381,7 @@ def classify_route(
     reference=None,
     *,
     zone=False,
+    clear=frozenset(),
 ):
     """The decision table; ``{tier, tier_confidence, rule, margin,
     border_stops, international}``.
@@ -326,36 +389,38 @@ def classify_route(
     A type that declares a class takes it (``declared``). Any other type of a
     known mode is ``local`` when ``local`` names the rule holding every
     located stop of the route in one place (``one_city``, ``one_metro``);
-    otherwise ``national`` when its stops in its majority country lie in more
-    than one top-level region (``regions``) and its span exceeds
-    ``reference``, the 90th percentile of the spans of its feed's home
-    country and mode (``regions_and_span``), else ``regional``, with less
-    confidence when the span or the reference is missing. A route with a
-    demand-responsive ``zone`` reaching several regions is ``regional``
-    whatever its span (``zone``). A route without a
-    type, or of no known mode, is ``unknown``; air, taxi and miscellaneous
-    services are out of scope by design (``out_of_scope``).
+    otherwise ``national`` when its stops lie in more than one top-level
+    region (``regions``) and its span exceeds ``reference``, the 90th
+    percentile of the spans of its feed's home country and mode
+    (``regions_and_span``), else ``regional``, with less confidence when the
+    span or the reference is missing. A route with a demand-responsive
+    ``zone`` reaching several regions is ``regional`` whatever its span
+    (``zone``). A route without a type, or of no known mode, is ``unknown``;
+    air, taxi and miscellaneous services are out of scope by design
+    (``out_of_scope``).
 
     ``international`` says the route also serves at the international tier:
-    ``countries`` (each code's located stop ids on the route, or None) puts
-    at least ``BORDER_STOPS`` and ``BORDER_SHARE`` of its distinct located
-    stops outside the majority country. Below that gate ``border_stops``
-    counts the minority stops per country.
+    ``clear`` names two or more countries holding one of its stops clearly
+    (:func:`_clear_countries`). Otherwise ``border_stops`` counts, per
+    country, the route's stops outside its home (``countries``: each code's
+    located stop ids on the route, or None): the one country ``clear``
+    names, else the country holding most of its stops.
     """
     decision = _scale(route_type, span_km, local, regions, reference, zone)
     decision.update(border_stops={}, international=False)
     if not countries:
         return decision
-    majority, minority = _border(countries)
-    total = len(set().union(*countries.values()))
-    if len(minority) >= BORDER_STOPS and len(minority) >= BORDER_SHARE * total:
+    if len(clear) >= 2:
         decision["international"] = decision["tier"] != "international"
         return decision
-    held = countries[majority]
+    home = next(iter(clear), None)
+    if home not in countries:
+        home, _ = _border(countries)
+    held = countries[home]
     decision["border_stops"] = {
         code: len(_outside(stops, held))
         for code, stops in sorted(countries.items())
-        if code != majority and _outside(stops, held)
+        if code != home and _outside(stops, held)
     }
     return decision
 
@@ -1599,25 +1664,21 @@ def _stop_reach(hit, places, metros, holders=None):
     return cities, frozenset(held), tops
 
 
-def _route_places(stop_ids, countries, majority, reach, places):
+def _route_places(stop_ids, majority, reach, places, clear=frozenset()):
     """``(local, regions)`` for a route: ``one_city`` when one city holds
     every located stop of it, else ``one_metro`` when one metro does, else
-    None; and how many top-level regions of its majority country hold its
-    stops there."""
+    None; and how many top-level regions hold its stops in the countries
+    ``clear`` names, or in its ``majority`` country when it names none."""
     located = [reach[s] for s in stop_ids if s in reach]
     local = None
     if located and frozenset.intersection(*(r[0] for r in located)):
         local = "one_city"
     elif located and frozenset.intersection(*(r[1] for r in located)):
         local = "one_metro"
-    regions = set()
-    for stop_id in countries[majority] if countries else ():
-        if stop_id in reach:
-            regions.update(
-                p
-                for p in reach[stop_id][2]
-                if places[p].get("country_code") == majority
-            )
+    counted = clear or {majority}
+    regions = {
+        p for r in located for p in r[2] if places[p].get("country_code") in counted
+    }
     return local, len(regions)
 
 
@@ -1865,6 +1926,7 @@ def _classify_feed(
     references = route_span_reference()
     measured = {}
     minority_stops = set()
+    clear_of = {}
     for route_id, info in routes.items():
         route_type = info["route_type"]
         # Its stops and the zones and stop groups its trips name; a zone an
@@ -1877,10 +1939,15 @@ def _classify_feed(
         )
         countries = _country_sets(stop_ids, located_countries)
         majority = None
+        clear = frozenset(countries or ())
         if countries:
             majority, minority = _border(countries)
             minority_stops |= minority
-        local, regions = _route_places(stop_ids, countries, majority, reach, places)
+        if len(clear) > 1:
+            clear = _clear_countries(
+                stop_ids, coords, located_countries, lookup, clear_of
+            )
+        local, regions = _route_places(stop_ids, majority, reach, places, clear)
         # A zone is keyed by a tuple; a stop group adds its stops' ids.
         zone = any(isinstance(key, tuple) for key in parsed["flex"].get(route_id, ()))
         mode_key = basic_mode(route_type)
@@ -1898,6 +1965,7 @@ def _classify_feed(
                 regions,
                 reference,
                 zone=zone,
+                clear=clear,
             ),
             "route_id": route_id,
             "route_type": route_type,

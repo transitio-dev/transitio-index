@@ -1296,18 +1296,18 @@ def test_a_complete_crawl_without_a_schedule_keeps_its_edges_and_home(
 
 @pytest.mark.parametrize(
     ("abroad", "tiers"),
-    [(1, ["regional"]), (3, ["international", "regional"])],
-    ids=["one-stop", "three"],
+    [(62.0, ["regional"]), (60.0, ["international", "regional"])],
+    ids=["by-the-border", "clearly-abroad"],
 )
-def test_one_stop_across_a_boundary_does_not_make_a_route_international(
+def test_a_route_crosses_a_border_only_on_a_stop_clearly_abroad(
     tmp_path, abroad, tiers
 ):
     """Rule 1 fired on any second country among a route's stops, so a stop on
     the wrong side of a simplified boundary, or on an overlap sliver resolving
     to two countries, made a city route international at 0.95 and hid its
-    scale. The gate needs two minority stops and a tenth of the route, a
-    route past it keeps its own tier too, and the artefacts are counted per
-    feed."""
+    scale. A stop abroad now counts only when no division of another country
+    lies within BORDER_CLEAR_KM of it; one such stop is enough, a route past
+    it keeps its own tier too, and the artefacts are counted per feed."""
     from test_index_classify import LOOKUP, _candidate, _coverage, _write_crawl
 
     cache = tmp_path / "cache"
@@ -1315,7 +1315,7 @@ def test_one_stop_across_a_boundary_does_not_make_a_route_international(
         {"feed_id": "f-b", "spec": "gtfs", "coverage_source": "crawl", "aliases": []}
     ]
     stops = [(f"h{i}", 1.0 + i / 1000, 10.0) for i in range(17)]  # AA, in Q-city
-    stops += [(f"b{i}", 1.0, 60.0) for i in range(abroad)]  # BB only
+    stops += [("b0", 1.0, abroad)]  # BB only
     stops += [("sliver", 1.0, 65.0), ("nowhere", 1.0, 30.0)]  # AA+BB; no country
     stops_txt = "stop_id,stop_lat,stop_lon\n" + "".join(
         f"{s},{lat},{lon}\n" for s, lat, lon in stops
@@ -1342,18 +1342,19 @@ def test_one_stop_across_a_boundary_does_not_make_a_route_international(
     assert [edge["tier"] for edge in edges] == tiers
     assert all(e["evidence"]["scale_tiers"] == ["regional"] for e in edges)
     regional = edges[-1]["evidence"]
-    assert regional.get("border_stops") == ({"BB": 1} if abroad == 1 else None)
+    crossing = "international" in tiers
+    assert regional.get("border_stops") == (None if crossing else {"BB": 1})
     records, _ = store.read_jsonl(
         cache / "classify", "edges.json", classify.FEEDS_ARTIFACT
     )
     (feed,) = records
     assert feed["stops_in_several_countries"] == 1
     assert feed["stops_without_country"] == 1
-    assert feed["border_stops"] == abroad and feed["home_country"] == "AA"
+    assert feed["border_stops"] == 1 and feed["home_country"] == "AA"
     assert manifest["stop_artefacts"] == {
         "stops_in_several_countries": 1,
         "stops_without_country": 1,
-        "border_stops": abroad,
+        "border_stops": 1,
     }
 
 
@@ -3009,32 +3010,36 @@ TIER_PLACES = {
 
 
 @pytest.mark.parametrize(
-    ("route_type", "cities", "span", "reference", "tier", "international"),
+    ("route_type", "cities", "span", "reference", "clear", "tier", "international"),
     [
         # Strasbourg tram D into Kehl: local in one metro, and international.
-        (0, ["strasbourg"] * 3 + ["kehl"] * 2, 9.0, 20.2, "local", True),
+        (0, ["strasbourg"] * 3 + ["kehl"] * 2, 9.0, 20.2, None, "local", True),
         # S-Bahn Rhein-Neckar declares regional rail across Länder.
-        (109, ["kehl", "ilsenburg"], 200.0, 140.8, "regional", False),
+        (109, ["kehl", "ilsenburg"], 200.0, 140.8, None, "regional", False),
         # A Long Island branch within New York's metro, and Montauk beyond it.
-        (2, ["new-york", "mineola"], 30.0, 606.2, "local", False),
-        (2, ["new-york", "mineola", "montauk"], 190.0, 60.0, "regional", False),
+        (2, ["new-york", "mineola"], 30.0, 606.2, None, "local", False),
+        (2, ["new-york", "mineola", "montauk"], 190.0, 60.0, None, "regional", False),
         # A 13 km bus across two Länder; a long train across them.
-        (3, ["ilsenburg", "bad-harzburg"], 13.0, 22.7, "regional", False),
-        (2, ["ilsenburg", "bad-harzburg"], 300.0, 140.8, "national", False),
+        (3, ["ilsenburg", "bad-harzburg"], 13.0, 22.7, None, "regional", False),
+        (2, ["ilsenburg", "bad-harzburg"], 300.0, 140.8, None, "national", False),
         # Long-distance trains declare national, however short.
-        (101, ["ilsenburg", "ilsenburg"], 5.0, 140.8, "national", False),
-        # One stop in Kehl does not give a German route a second region.
-        (3, ["ilsenburg"] * 9 + ["strasbourg"], 300.0, 22.7, "regional", False),
+        (101, ["ilsenburg", "ilsenburg"], 5.0, 140.8, None, "national", False),
+        # A stop in Strasbourg by the border gives a German route no second
+        # region; one clearly in France gives it Grand Est, and the border.
+        (3, ["ilsenburg"] * 9 + ["strasbourg"], 300.0, 22.7, {"DE"}, "regional", False),
+        (3, ["ilsenburg"] * 9 + ["strasbourg"], 300.0, 22.7, None, "national", True),
     ],
 )
 def test_route_tiers_follow_the_declared_class_the_places_and_the_country(
-    route_type, cities, span, reference, tier, international
+    route_type, cities, span, reference, clear, tier, international
 ):
     """Global distance cuts made the S-Bahn Rhein-Neckar national, Long
     Island commuter rail national, short buses across Länder national and a
     tram into Kehl international only. The tier now follows the declared
-    class, one city or metro, and, across top-level regions, the span against
-    the reference of the feed's country and mode."""
+    class, one city or metro, and, across top-level regions in every country
+    holding a stop clearly, the span against the reference of the feed's
+    country and mode. ``clear`` None: every stop lies clearly in its
+    country."""
     metros = classify.metros_of(TIER_PLACES)
     reach, countries = {}, {}
     for i, city in enumerate(cities):
@@ -3043,12 +3048,13 @@ def test_route_tiers_follow_the_declared_class_the_places_and_the_country(
         reach[f"s{i}"] = classify._stop_reach(hit, TIER_PLACES, metros)
         countries.setdefault(place["country_code"], set()).add(f"s{i}")
     countries = {code: frozenset(ids) for code, ids in countries.items()}
+    clear = frozenset(countries if clear is None else clear)
     majority, _ = classify._border(countries)
     local, regions = classify._route_places(
-        list(reach), countries, majority, reach, TIER_PLACES
+        list(reach), majority, reach, TIER_PLACES, clear
     )
     decision = classify.classify_route(
-        route_type, countries, span, local, regions, reference
+        route_type, countries, span, local, regions, reference, clear=clear
     )
     assert (decision["tier"], decision["international"]) == (tier, international)
 

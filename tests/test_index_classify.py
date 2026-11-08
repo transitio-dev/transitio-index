@@ -1,6 +1,7 @@
 import hashlib
 import datetime
 import json
+import math
 import os
 
 import pytest
@@ -385,6 +386,13 @@ class StubLookup:
     def divisions_at(self, x, y):
         return self.by_x.get(x, [])
 
+    def divisions_reached(self, shape):
+        # Every keyed point within the shape's longitudes.
+        xmin, _, xmax, _ = shape.bounds
+        return [
+            r for x, records in self.by_x.items() if xmin <= x <= xmax for r in records
+        ]
+
 
 LOOKUP = StubLookup(
     {
@@ -395,8 +403,11 @@ LOOKUP = StubLookup(
         20.0: _records("Q-other"),
         # A point only the metro's own polygon places.
         40.0: [{"kind": "metro", "wikidata": "Q-metro", "country": "AA"}],
-        # Across a border: country BB only; on an overlap sliver: both countries.
+        # Across a border: country BB only, and BB by the border, AA about a
+        # hundred metres away; on an overlap sliver: both countries.
         60.0: [{"kind": "country", "country": "BB"}],
+        62.0: [{"kind": "country", "country": "BB"}],
+        62.001: [{"kind": "country", "country": "AA"}],
         65.0: [
             {"kind": "country", "country": "AA"},
             {"kind": "country", "country": "BB"},
@@ -1714,6 +1725,7 @@ def test_every_decider_constant_is_published_in_the_classifier_settings():
         classify._scale,
         classify._decide,
         classify._near,
+        classify._clear_boxes,
     )
     for decider in deciders:
         names |= {name for name in decider.__code__.co_names if name.isupper()}
@@ -1723,7 +1735,7 @@ def test_every_decider_constant_is_published_in_the_classifier_settings():
         if isinstance(getattr(classify, name, None), (int, float))
         and not isinstance(getattr(classify, name), bool)
     }
-    assert {"BORDER_STOPS", "MARGIN", "MARGIN_PENALTY"} <= numeric
+    assert {"BORDER_CLEAR_KM", "MARGIN", "MARGIN_PENALTY"} <= numeric
     assert {name.lower() for name in numeric} <= set(settings)
     # And every published number is the module's constant, as run.
     for key, value in settings.items():
@@ -1828,34 +1840,126 @@ def test_scheduled_stops_resolving_to_no_country_leave_no_basis(tmp_path):
     assert manifest["feeds_by_country_basis"] == {"none": 1}
 
 
-def test_the_border_gate_needs_two_minority_stops_and_a_tenth():
-    def route(countries, route_type=0):
-        return classify.classify_route(route_type, countries, None, "one_city")
+def test_one_stop_clearly_abroad_crosses_a_border():
+    def route(countries, clear, route_type=0):
+        return classify.classify_route(
+            route_type, countries, None, "one_city", clear=frozenset(clear)
+        )
 
-    # One stop abroad among twenty: no border crossing, the stop recorded.
-    decision = route(_stops(AA=19, BB=1))
-    assert (decision["tier"], decision["international"]) == ("local", False)
-    assert decision["border_stops"] == {"BB": 1}
-    # Three among twenty: the route keeps its tier and crosses the border.
-    decision = route(_stops(AA=17, BB=3))
+    # One stop clearly abroad among twenty: the route keeps its tier and
+    # crosses the border.
+    decision = route(_stops(AA=19, BB=1), {"AA", "BB"})
     assert (decision["tier"], decision["rule"]) == ("local", "one_city")
     assert decision["international"] is True and decision["border_stops"] == {}
-    # Two of ten is a fifth; two of forty is a twentieth.
-    assert route(_stops(AA=8, BB=2))["international"] is True
-    far = route(_stops(AA=38, BB=2))
-    assert far["international"] is False and far["border_stops"] == {"BB": 2}
+    # Abroad only by the border: no crossing, the stop recorded.
+    decision = route(_stops(AA=19, BB=1), {"AA"})
+    assert decision["international"] is False and decision["border_stops"] == {"BB": 1}
     # A stop on a boundary sliver sits in both countries: never a minority stop.
     sliver = {"AA": frozenset({"a0", "a1", "x"}), "BB": frozenset({"x"})}
-    decision = route(sliver)
+    decision = route(sliver, {"AA"})
     assert decision["international"] is False and decision["border_stops"] == {}
-    # A zone reaching the other country serves it there, whatever else it
-    # reaches; it counts once among the route's locations.
-    zones = {("zone", "z1"), ("zone", "z2")}
-    decision = route({"AA": frozenset({"a0", *zones}), "BB": frozenset(zones)})
-    assert decision["international"] is True
+    # The one country holding stops clearly is the route's home, whichever
+    # holds most of them.
+    decision = route(_stops(AA=3, BB=2), {"BB"})
+    assert decision["border_stops"] == {"AA": 3}
     # A route declared international is not added a second time.
-    declared = route(_stops(AA=17, BB=3), route_type=201)
+    declared = route(_stops(AA=17, BB=3), {"AA", "BB"}, route_type=201)
     assert (declared["tier"], declared["international"]) == ("international", False)
+
+
+def test_a_stop_counts_in_a_country_only_away_from_its_border():
+    # BB clearly at 60.0; at 62.0 an AA division lies about a hundred metres
+    # away; 65.0 sits on a sliver of both.
+    coords = {
+        "b": (60.0, 1.0),
+        "n": (62.0, 1.0),
+        "s": (65.0, 1.0),
+        "p": crawl.PLACEHOLDER_POSITION,
+    }
+    zone = ("zone", "z")
+    memo = {}
+    found = classify._clear_countries(
+        {"b", "n", "s", "p", zone}, coords, {zone: {"AA", "CC"}}, LOOKUP, memo
+    )
+    # A zone counts in every country it reaches; a placeholder stop in none.
+    assert found == {"AA", "BB", "CC"}
+    assert memo == {"b": "BB", "n": None, "s": None}
+
+
+@pytest.mark.parametrize(
+    ("x", "y", "boxes"),
+    [
+        (10.0, 1.0, 1),
+        (179.999, 1.0, 2),  # across the antimeridian
+        (-179.999, 1.0, 2),
+        (10.0, 89.999, 1),  # by the pole: the whole parallel
+    ],
+)
+def test_the_clear_boxes_cover_the_distance_everywhere(x, y, boxes):
+    found = classify._clear_boxes(x, y)
+    assert len(found) == boxes
+    dlat = math.degrees(classify.BORDER_CLEAR_KM / classify.EARTH_RADIUS_KM)
+    assert all(b[1] == pytest.approx(max(y - dlat, -90.0)) for b in found)
+    if y > 89.0:
+        assert found == [(-180.0, found[0][1], 180.0, 90.0)]
+    # Every point BORDER_CLEAR_KM east and west of the stop lies in a box.
+    for bearing in (90.0, 270.0):
+        east = math.radians(bearing)
+        lon = x + math.degrees(
+            classify.BORDER_CLEAR_KM
+            / classify.EARTH_RADIUS_KM
+            * math.sin(east)
+            / math.cos(math.radians(y))
+        )
+        lon = (lon + 180.0) % 360.0 - 180.0
+        assert any(b[0] <= lon <= b[2] for b in found)
+
+
+def test_clear_stops_are_judged_on_real_boundaries(tmp_path):
+    import overture_fixture as fx
+    import shapely
+
+    from transitio_index import boundaries
+
+    cc0 = [{"dataset": "OpenStreetMap", "license": "ODbL", "property": ""}]
+    countries = {
+        "AA": (-1.0, 0.0, 0.0, 2.0),
+        "BB": (0.0, 0.0, 1.0, 2.0),
+        "CC": (179.0, 0.0, 180.0, 2.0),
+        "DD": (-180.0, 0.0, -179.0, 2.0),
+    }
+    divisions = fx.write_dataset(
+        tmp_path / "divisions.parquet",
+        [fx.division(c.lower(), c, "country") for c in countries],
+    )
+    areas = fx.write_area_dataset(
+        tmp_path / "areas.parquet",
+        [
+            fx.area(c.lower(), shapely.to_wkb(shapely.box(*box)), cc0, country=c)
+            for c, box in countries.items()
+        ],
+    )
+    lookup = boundaries.BoundaryLookup(
+        tmp_path / "cache",
+        release="test",
+        area_dataset=areas,
+        division_dataset=divisions,
+    )
+    # 55 km inside AA; 330 m from BB, as a twin town's stop; 110 m from BB;
+    # 110 m from DD across the antimeridian; 55 km inside CC. The lookup is
+    # ensured for the boxes on the way.
+    coords = {
+        "a": (-0.5, 1.0),
+        "twin": (-0.003, 1.0),
+        "ab": (-0.001, 1.0),
+        "cd": (179.999, 1.0),
+        "c": (179.5, 1.0),
+    }
+    memo = {}
+    with lookup:
+        found = classify._clear_countries(set(coords), coords, {}, lookup, memo)
+    assert memo == {"a": "AA", "twin": "AA", "ab": None, "cd": None, "c": "CC"}
+    assert found == {"AA", "CC"}
 
 
 def test_a_foreign_stop_that_breaks_a_skip_is_counted_as_a_border_stop(tmp_path):
