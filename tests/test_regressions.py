@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from transitio_index import (  # noqa: E402
     crawl,
     crosswalk,
     csv_source,
+    download,
     eurostat,
     fetch,
     geometry,
@@ -49,6 +51,7 @@ from transitio_index import (  # noqa: E402
     resolve,
     seed,
     store,
+    tiger,
 )
 from transitio.index import release as contract  # noqa: E402
 
@@ -3571,3 +3574,20 @@ def test_a_few_trips_dated_far_ahead_do_not_keep_a_timetable_current(
     # Without trips per service the calendar's last running date stands.
     calendar = classify._read_calendar(io.BytesIO(members["calendar.txt"]), None)
     assert classify._service_span(calendar) == ("2026-09-01", "2099-12-31")
+
+
+def test_an_unreachable_pinned_input_disables_its_branch(tmp_path, monkeypatch):
+    """A pinned input whose server cannot be reached raises the caller's
+    error, which disables the branch reading it instead of aborting the
+    stage."""
+
+    def urlopen(request, timeout=None):
+        raise urllib.error.URLError("Tunnel connection failed: 403")
+
+    def prepare():
+        return tiger.prepare_inputs(tmp_path / "cache")
+
+    monkeypatch.setattr(download.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(download.time, "sleep", lambda *a, **k: None)
+    assert metros._available(prepare) is None
+    assert list((tmp_path / "cache" / "raw").glob(".tmp-*")) == []

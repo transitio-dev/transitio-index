@@ -453,26 +453,42 @@ def test_duplicate_dmfr_basenames_are_refused(tmp_path):
     assert [feed["source_file"] for feed in parsed["feeds"]] == ["mta.info.dmfr.json"]
 
 
-def test_failed_download_leaves_nothing_behind(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "local_fault, raised, message, expected_attempts",
+    [
+        # A reset connection is retried, then raised as the caller's error.
+        (False, atlas.IngestError, "connection reset", atlas.DOWNLOAD_ATTEMPTS),
+        # A file the machine cannot reopen is raised as is, at once.
+        (True, OSError, "input/output error", 1),
+    ],
+)
+def test_failed_download_leaves_nothing_behind(
+    tmp_path, monkeypatch, local_fault, raised, message, expected_attempts
+):
     attempts = []
 
     def explode(url, timeout=None):
         attempts.append(url)
-        return FakeResponse(None)
+        return FakeResponse(b"data" if local_fault else None)
+
+    def unreadable(*args, **kwargs):
+        raise OSError("input/output error")
 
     monkeypatch.setattr(atlas.download.urllib.request, "urlopen", explode)
     monkeypatch.setattr(atlas.download.time, "sleep", lambda *a, **k: None)
     directory = store.open_directory(tmp_path)
+    if local_fault:
+        monkeypatch.setattr(atlas.download.store, "open_regular", unreadable)
 
     try:
-        with pytest.raises(OSError):
+        with pytest.raises(raised, match=message):
             atlas.download_archive(directory, "atlas.tar.gz", commit="d" * 40)
     finally:
         directory.close()
 
     # A truncated file here would be treated as a cached archive forever,
     # and every retry must clean up after itself.
-    assert len(attempts) == atlas.DOWNLOAD_ATTEMPTS
+    assert len(attempts) == expected_attempts
     assert not (tmp_path / "atlas.tar.gz").exists()
     assert list(tmp_path.glob(".tmp-*")) == []
 
