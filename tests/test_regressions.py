@@ -2251,7 +2251,7 @@ def test_a_fao_metro_carries_its_fao_centre_not_its_members_centroid(tmp_path):
     )
     cache = tmp_path / "cache"
     areas = fx.write_area_dataset(tmp_path / "areas-again.parquet", mt.AREAS)
-    manifest = geometry.attach_geometry(cache, dataset=areas)
+    manifest = geometry.attach_geometry(cache, dataset=areas, derive_census=False)
     places, _ = store.read_jsonl(
         cache / "gazetteer", "geometry.json", "places_seed.jsonl"
     )

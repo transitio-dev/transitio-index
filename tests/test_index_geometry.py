@@ -813,6 +813,76 @@ def test_a_seeded_city_ships_its_urban_centre_only_without_another_boundary(
     assert _read_text(cache, "NOTICE").count(credit) == 1
 
 
+def test_a_us_city_without_a_boundary_ships_its_census_place(tmp_path, monkeypatch):
+    import fao_fixture as ffx
+
+    from transitio_index import coverage, tiger
+
+    hialeah = shapely.box(-80.35, 25.83, -80.25, 25.90)
+    houston = shapely.box(-95.8, 29.5, -95.0, 30.1)
+    rows = [
+        ("1230000", "Hialeah", "FL", hialeah),
+        ("4835000", "Houston", "TX", houston),
+    ]
+    files, expected = ffx.pinned_files(
+        tmp_path / "in", {tiger.PLACES_FILE: ffx.places_zip(rows, crs="EPSG:4326")}
+    )
+
+    def city(place_id, name, overture_id, x, y, country="US"):
+        place = _place(place_id, "city", overture_id=overture_id, country=country)
+        centre = shapely.to_wkb(shapely.Point(x, y)).hex()
+        return {**place, "name": name, "centre": centre}
+
+    records = [
+        city("Q_HIA", "Hialeah", "no-area", -80.30, 25.86),
+        city("Q_ATA", "Atascocita", "no-area-2", -95.2, 29.99),  # inside Houston
+        city("Q_OWN", "Hialeah", "fi-helsinki", -80.30, 25.86),  # its own area
+        city("Q_FI", "Hialeah", "no-area-3", -80.30, 25.86, country="FI"),
+    ]
+    cache = tmp_path / "cache"
+    _publish(cache, records)
+    dataset = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
+    manifest = geometry.attach_geometry(
+        cache, dataset=dataset, tiger_files=files, tiger_pins=expected
+    )
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    places = {p["place_id"]: p for p in places}
+    assert {key: places[key]["geometry_source"] for key in ("Q_HIA", "Q_ATA")} == {
+        "Q_HIA": geometry.CENSUS_PLACE,
+        "Q_ATA": None,
+    }
+    assert places["Q_OWN"]["geometry_source"] == "overture"
+    assert places["Q_FI"]["geometry_source"] is None
+    assert shapely.from_wkb(places["Q_HIA"]["geometry"]).equals(hialeah)
+    assert manifest["census_geometry"] == 1 and manifest["census_inputs"] == expected
+    assert "|".join(tiger.DERIVED) in manifest["licence_sources"]
+    inventory, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    (row,) = [row for row in inventory if row["dataset"] == tiger.DERIVED[0]]
+    assert (row["version"], row["geometries"]) == (tiger.VINTAGE, 1)
+    credit = geometry.DERIVED_SOURCES[tiger.DERIVED]["credit"]
+    assert credit in _read_text(cache, "NOTICE")
+    # Stops land in it by its polygon: no Overture area stands for it.
+    _, ids = coverage.curated_boundaries(places)
+    assert "Q_HIA" in ids
+
+    # A build without US cities never reads the Census input.
+    def refused(*args, **kwargs):
+        raise AssertionError("the Census input was prepared")
+
+    monkeypatch.setattr(tiger, "prepare_inputs", refused)
+    _publish(tmp_path / "other", [records[-1]])
+    manifest = geometry.attach_geometry(tmp_path / "other", dataset=dataset)
+    assert manifest["census_inputs"] is None
+    # A seed that gained US cities after the look before the lock is refused.
+    monkeypatch.setattr(geometry, "_has_us_cities", lambda *args: False)
+    with pytest.raises(store.StoreError, match="changed before"):
+        geometry.attach_geometry(cache, dataset=dataset)
+
+
 def test_area_chunking_matches_a_single_pass(tmp_path):
     # Resolving the seeded areas in small chunks (a memory-tight host's setting)
     # must produce exactly the same attached geometry as one full-set pass.

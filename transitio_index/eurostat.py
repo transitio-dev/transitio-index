@@ -287,7 +287,7 @@ def place_footprint(areas, place, curated=None, urban_centres=False):
     if wkt:
         return geometry.curated_polygon(place.get("place_id"), wkt)
     polygon = place.get("ucdb_boundary")
-    return geometry.ucdb_polygon(polygon) if polygon and urban_centres else None
+    return geometry.simplified_polygon(polygon) if polygon and urban_centres else None
 
 
 def placed_by_urban_centre(areas, place, curated=None):

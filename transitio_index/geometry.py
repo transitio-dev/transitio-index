@@ -235,8 +235,8 @@ UCDB_DERIVED = ("GHS-UCDB R2024A", "CC-BY-4.0")
 # The Census places: the boundary a US city with no Overture area ships.
 TIGER_DERIVED = ("Census cartographic boundary places 2024", "US-PD")
 # The derived inputs whose polygons ship (a FAO metro's city-region, a city's
-# urban centre), credited as their terms require.
-SHIPPED_DERIVED = (FAO_DERIVED, UCDB_DERIVED)
+# urban centre or Census place), credited as their terms require.
+SHIPPED_DERIVED = (FAO_DERIVED, UCDB_DERIVED, TIGER_DERIVED)
 # The Urban Audit functional urban areas as a derived input, like the NUTS
 # boundaries: point-in-polygon at build time, never shipped.
 URAU_DERIVED = ("GISCO Urban Audit 2024", "EuroGeographics-NC")
@@ -280,6 +280,8 @@ CURATED = "curated"
 QID_TWIN = "qid_twin"
 # The geometry source of a seeded city that ships its GHS-UCDB urban centre.
 UCDB = "ghs_ucdb"
+# The geometry source of a US city that ships its Census place.
+CENSUS_PLACE = "census_place"
 
 
 def division_area_dataset(release=None):
@@ -1334,10 +1336,10 @@ def boundary_overrides(place_overrides):
     }
 
 
-def ucdb_polygon(wkb):
-    """A GHS-UCDB urban centre's polygon (WKB) forced to 2D and simplified to
-    the shipping tolerance, or None when it is not a valid polygon before and
-    after."""
+def simplified_polygon(wkb):
+    """A derived input's polygon (WKB: an urban centre, a Census place) forced
+    to 2D and simplified to the shipping tolerance, or None when it is not a
+    valid polygon before and after."""
     try:
         geom = shapely.force_2d(shapely.from_wkb(wkb))
         simplified = _simplify(geom) if _valid_polygon(geom) else None
@@ -1369,6 +1371,45 @@ def set_boundary(place, entry, report):
     _curated_geometry(place, entry["set_boundary"])
 
 
+def _us_city(place):
+    return place.get("kind") == "city" and place.get("country_code") == "US"
+
+
+def _has_us_cities(cache_dir, run):
+    """Whether the seed the stage reads holds a US city: only such a build
+    reads the Census places. An unreadable seed answers no, for the stage's
+    own read to report."""
+    try:
+        places, _ = store.read_jsonl(
+            cache_dir / "gazetteer",
+            "metros.json",
+            "places_seed.jsonl",
+            generations=run,
+        )
+    except store.StoreError:
+        return False
+    return any(_us_city(place) for place in places)
+
+
+def _census_matches(places, census_places):
+    """``(place, Census place)`` for each US city without a boundary whose
+    label point (``centre``) the Census place holds under its name
+    (:func:`tiger.match_outlines`)."""
+    from transitio_index import tiger
+
+    wanting = [
+        p for p in places if _us_city(p) and not p.get("geometry") and p.get("centre")
+    ]
+    points = shapely.from_wkb([p["centre"] for p in wanting], on_invalid="ignore")
+    cities = [
+        (i, place.get("name"), point.x, point.y)
+        for i, (place, point) in enumerate(zip(wanting, points))
+        if point is not None and point.geom_type == "Point" and not point.is_empty
+    ]
+    found = tiger.match_outlines(census_places, cities)
+    return [(wanting[i], match) for i, match in sorted(found.items())]
+
+
 def attach_geometry(
     cache_dir,
     *,
@@ -1378,6 +1419,9 @@ def attach_geometry(
     registry=None,
     run=None,
     area_chunk=None,
+    tiger_files=None,
+    tiger_pins=None,
+    derive_census=True,
 ):
     """Attach simplified geometry to the seeded places and write the NOTICE.
 
@@ -1386,10 +1430,31 @@ def attach_geometry(
     recording the audit in the licence inventory and NOTICE; a place
     with a disallowed source, no source, or invalid geometry keeps a null
     geometry; a metro gets the union of its official area's divisions, else
-    of its members' areas, or none.
+    of its members' areas, or none. A US city left without a boundary ships
+    the Census place :func:`tiger.match_outlines` gives it, read from the
+    pinned input (``tiger_files`` and ``tiger_pins``, the module's pins by
+    default) when the build has US cities; ``derive_census`` (on by default)
+    runs that fallback.
     One writer lock spans the read, the geometry read and the publish.
     Returns the generation manifest.
     """
+    from transitio_index import metros, tiger
+
+    tiger_pins = dict(tiger_pins or tiger.PINS)
+    # Prepared under the raw store's own lock, before the gazetteer lock, so
+    # the two are never held together; an input that cannot be fetched or
+    # verified leaves the US cities without one.
+    derive_census = derive_census and TIGER_DERIVED in DERIVED_SOURCE_ALLOWLIST
+    us_cities = derive_census and _has_us_cities(cache_dir, run)
+    census_ready = (
+        us_cities
+        and metros._available(
+            lambda: tiger.prepare_inputs(
+                cache_dir, files=tiger_files, expected=tiger_pins
+            )
+        )
+        is not None
+    )
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
         with store.exclusive_writer(directory):
@@ -1399,6 +1464,13 @@ def attach_geometry(
                 "places_seed.jsonl",
                 generations=run,
             )
+            if derive_census and not us_cities and any(map(_us_city, places)):
+                # The seed changed between the look before the lock and this
+                # read: its US cities would miss their Census places.
+                raise store.StoreError(
+                    "gazetteer/metros.json changed before the geometry stage "
+                    "took its lock; run the stage again"
+                )
             wanted = sorted({p["overture_id"] for p in places if p.get("overture_id")})
             # Opened under the read's deadline on first need — a fully cached
             # build never touches S3 — and reopened, fresh, after a stall.
@@ -1486,7 +1558,7 @@ def attach_geometry(
                 polygon = place.pop("ucdb_boundary", None)
                 if polygon is None or place.get("geometry"):
                     continue
-                simplified = ucdb_polygon(polygon)
+                simplified = simplified_polygon(polygon)
                 if simplified is None:
                     invalid += 1
                     continue
@@ -1525,6 +1597,25 @@ def attach_geometry(
                 curated += 1
             # A council area's curated boundary is its cities' too.
             _lend_council_boundaries(places, by_id, lent, absent)
+            # A US city with no boundary yet ships its Census place.
+            census, census_inputs = 0, None
+            loaded = census_ready and metros._available(
+                lambda: tiger.load_places(cache_dir, expected=tiger_pins)
+            )
+            if loaded:
+                census_places, census_manifest = loaded
+                census_inputs = census_manifest.get("digests")
+                for place, match in _census_matches(places, census_places):
+                    simplified = simplified_polygon(shapely.to_wkb(match["geometry"]))
+                    if simplified is None:
+                        invalid += 1
+                        continue
+                    place["geometry"] = shapely.to_wkb(simplified).hex()
+                    place["geometry_source"] = CENSUS_PLACE
+                    census += 1
+            if census:
+                shipped.add(TIGER_DERIVED)
+                inventory[(*TIGER_DERIVED, True)] += census
             # Drawn once curated boundaries are in, so a curated member or city
             # counts with its own boundary; a metro set_boundary gave a geometry
             # keeps it. Every member must have shipped its own polygon: a metro
@@ -1532,8 +1623,6 @@ def attach_geometry(
             # over its official area, whose divisions are audited as drawn.
             # The FAO city-regions a FAO metro ships, under the digests the
             # metros stage derived its FAO metros from.
-            from transitio_index import metros
-
             fao_inputs = _fao_inputs(cache_dir, metros_manifest)
             fao_regions = fao_inputs[0] if fao_inputs is not None else {}
             unions = [
@@ -1577,7 +1666,11 @@ def attach_geometry(
                 inventory,
                 with_geometry,
                 derived,
-                {UCDB_DERIVED: ucdb.RELEASE, FAO_DERIVED: fao.DOI},
+                {
+                    UCDB_DERIVED: ucdb.RELEASE,
+                    FAO_DERIVED: fao.DOI,
+                    TIGER_DERIVED: tiger.VINTAGE,
+                },
             )
             notice = _notice(shipped, overture.current_release(), derived)
             omissions = omission_rows(omitted)
@@ -1600,6 +1693,10 @@ def attach_geometry(
                     p.get("geometry_source") == COUNCIL_AREA for p in places
                 ),
                 "ucdb_geometry": sum(p.get("geometry_source") == UCDB for p in places),
+                "census_geometry": sum(
+                    p.get("geometry_source") == CENSUS_PLACE for p in places
+                ),
+                "census_inputs": census_inputs,
                 "centres": centres,
                 "places_overrides_sha256": places_digest,
                 "fao_own_centres_sha256": metros_manifest.get("fao_own_centres_sha256"),

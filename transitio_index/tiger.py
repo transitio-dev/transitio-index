@@ -19,8 +19,9 @@ import shapely
 from transitio_index import fao, geometry, pinned, ucdb
 
 POINTER = "tiger.json"
-PLACES_FILE = "cb_2024_us_place_500k.zip"
-PLACES_URL = "https://www2.census.gov/geo/tiger/GENZ2024/shp/" + PLACES_FILE
+VINTAGE = "2024"
+PLACES_FILE = f"cb_{VINTAGE}_us_place_500k.zip"
+PLACES_URL = f"https://www2.census.gov/geo/tiger/GENZ{VINTAGE}/shp/{PLACES_FILE}"
 COLUMNS = ("GEOID", "NAME", "STUSPS")
 
 # The bytes verified live on 2026-11-08; a fetch that differs is refused.
