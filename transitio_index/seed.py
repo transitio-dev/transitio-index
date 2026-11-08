@@ -830,11 +830,13 @@ def prepare_centres(cache_dir, dataset, *, expected=None):
     }
 
     def build():
-        generation, _ = pinned.resolve(
-            cache_dir, pointer=ucdb.POINTER, expected=expected, error=ucdb.UcdbError
+        data, _ = pinned.read_input(
+            cache_dir,
+            pointer=ucdb.POINTER,
+            expected=expected,
+            name=ucdb.UCDB_FILE,
+            error=ucdb.UcdbError,
         )
-        with generation:
-            data = generation.read_bytes(ucdb.UCDB_FILE)
         centres, _ = ucdb.read_ucdb(data, "EPSG:4326")
         rows = centre_rows([c for c in centres if ucdb.qualifies(c)], dataset)
         return {CENTRES_FILE: store.jsonl_chunks(rows)}, {

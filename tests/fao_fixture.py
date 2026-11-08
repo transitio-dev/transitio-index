@@ -1,6 +1,7 @@
-"""Builders for the FAO city-region, GHS-UCDB and Urban Audit inputs the
-tests pin: zipped shapefiles, a zipped GeoPackage and a regions table, as
-bytes, and the files-and-digests pair a pinned input is prepared from."""
+"""Builders for the FAO city-region, GHS-UCDB, Urban Audit and Census place
+inputs the tests pin: zipped shapefiles, a zipped GeoPackage and a regions
+table, as bytes, and the files-and-digests pair a pinned input is prepared
+from."""
 
 import hashlib
 import io
@@ -85,6 +86,21 @@ def fua_zip(rows, crs="EPSG:4326"):
         crs=crs,
     )
     return _zipped(frame, "areas.shp")
+
+
+def places_zip(rows, crs="EPSG:4269"):
+    """A zipped shapefile of Census places: ``(geoid, name, state,
+    geometry)`` rows, in NAD83 as the Census ships them."""
+    frame = geopandas.GeoDataFrame(
+        {
+            "GEOID": [row[0] for row in rows],
+            "NAME": [row[1] for row in rows],
+            "STUSPS": [row[2] for row in rows],
+        },
+        geometry=[row[3] for row in rows],
+        crs=crs,
+    )
+    return _zipped(frame, "places.shp")
 
 
 def pinned_files(directory, payloads):

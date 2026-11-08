@@ -183,6 +183,18 @@ DERIVED_SOURCES = {
         ),
         "share_alike": False,
     },
+    ("Census cartographic boundary places 2024", "US-PD"): {
+        "credit": (
+            "U.S. Census Bureau, cartographic boundary file of places, 2024 "
+            "(1:500,000)"
+        ),
+        "licence": "Public domain (a work of the U.S. federal government)",
+        "url": (
+            "https://www.census.gov/geographies/mapping-files/time-series/geo/"
+            "cartographic-boundary.html"
+        ),
+        "share_alike": False,
+    },
     ("GHS-UCDB R2024A", "CC-BY-4.0"): {
         "credit": (
             "GHS Urban Centre Database 2025 (GHS-UCDB R2024A), European "
@@ -210,6 +222,7 @@ DERIVED_SOURCE_ALLOWLIST = frozenset(
         ("GHS-UCDB R2024A", "CC-BY-4.0"),
         ("FAO city-regions 2024", "CC-BY-4.0"),
         ("OMB CBSA delineation July 2023", "US-PD"),
+        ("Census cartographic boundary places 2024", "US-PD"),
     }
 )
 
@@ -219,6 +232,8 @@ FAO_DERIVED = ("FAO city-regions 2024", "CC-BY-4.0")
 # The GHS-UCDB urban centres: a derived input, and the boundary a seeded city
 # with no other ships.
 UCDB_DERIVED = ("GHS-UCDB R2024A", "CC-BY-4.0")
+# The Census places: the boundary a US city with no Overture area ships.
+TIGER_DERIVED = ("Census cartographic boundary places 2024", "US-PD")
 # The derived inputs whose polygons ship (a FAO metro's city-region, a city's
 # urban centre), credited as their terms require.
 SHIPPED_DERIVED = (FAO_DERIVED, UCDB_DERIVED)

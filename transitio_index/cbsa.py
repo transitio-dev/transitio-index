@@ -61,12 +61,14 @@ def prepare_inputs(cache_dir, *, files=None, expected=PINS):
 def load_inputs(cache_dir, *, expected=PINS):
     """``(counties, manifest)``: :func:`read_delineation` over the verified
     bytes of the generation published under ``expected``."""
-    generation, manifest = pinned.resolve(
-        cache_dir, pointer=POINTER, expected=expected, error=CbsaError
+    data, manifest = pinned.read_input(
+        cache_dir,
+        pointer=POINTER,
+        expected=expected,
+        name=DELINEATION_FILE,
+        error=CbsaError,
     )
-    with generation:
-        counties = read_delineation(generation.read_bytes(DELINEATION_FILE))
-    return counties, manifest
+    return read_delineation(data), manifest
 
 
 def _cell(value):
