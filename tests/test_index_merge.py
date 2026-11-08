@@ -1039,7 +1039,7 @@ def test_assemble_names_the_snapshot_by_its_sources_and_records_them(
     assert len(snapshot_id) == 16 and int(snapshot_id, 16) >= 0
     read = pq.read_table(io.BytesIO(files[("FI", "feeds")]))
     assert set(read["snapshot"].to_pylist()) == {snapshot_id}
-    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 26
+    assert manifest["schema_version"] == 12 and merge.MERGE_FORMAT == 27
     assert manifest["discovery_semantics_version"] == DISCOVERY_SEMANTICS_VERSION
     assert manifest["min_reader_version"] == MIN_READER_VERSIONS[12]
     assert manifest["built_with"] == transitio.__version__
@@ -1256,6 +1256,7 @@ def test_overlap_evidence_names_the_merged_feeds(others, named):
     evidence = {"near_threshold": False}
     if others is not None:
         evidence["overlap"] = {"departures": {"bus": 2.0}, "with": others}
+        evidence["overlap"]["stop_matched"] = sorted(others)
     edges = pa.table(
         {"feed_id": ["f-a", "f-a"], "evidence": [json.dumps(evidence), None]}
     )
@@ -1271,6 +1272,7 @@ def test_overlap_evidence_names_the_merged_feeds(others, named):
         assert first == edges["evidence"][0].as_py()
     else:
         assert json.loads(first)["overlap"]["with"] == named
+        assert json.loads(first)["overlap"].get("stop_matched", []) == sorted(named)
 
 
 def test_overlap_evidence_lists_the_feeds_its_build_measured():
@@ -1294,6 +1296,43 @@ def test_overlap_evidence_lists_the_feeds_its_build_measured():
     evidence = merged["evidence"].to_pylist()
     compared = [json.loads(e)["overlap"]["compared"] for e in evidence]
     assert compared == [["f-mvg"], ["f-delfi"], ["f-delfi"]]
+
+
+@pytest.mark.parametrize(
+    "case, matched",
+    [("stop cells", True), ("other agency", False), ("rows before cells", False)],
+)
+def test_overlap_across_builds_matches_a_copy_by_its_stops(case, matched):
+    # f-copy, classified in another build than f-op, runs f-op's line "1" as
+    # "Route 1": only the stop cells the builds kept can match them.
+    from transitio_index import classify
+
+    cells = sorted(classify._stop_cells([(10.0 + k * 0.01, 1.0) for k in range(4)]))
+    box = [10.0, 1.0, 10.03, 1.0]
+    op = {"overlap_routes": [["1", "bus", 10.0, *box, cells]]}
+    copy = {"overlap_routes": [["Route 1", "bus", 10.0, *box, cells]]}
+    op["overlap_agencies"] = ["lawndale"]
+    copy["overlap_agencies"] = ["sunrise" if case == "other agency" else "lawndale"]
+    if case == "rows before cells":
+        op["overlap_routes"][0].pop()
+    edges = pa.table(
+        {
+            "place_id": ["p", "p"],
+            "feed_id": ["f-op", "f-copy"],
+            "evidence": [json.dumps(op), json.dumps(copy)],
+        }
+    )
+    merged = merge._cross_build_overlaps(edges)
+    found = {
+        feed: json.loads(e)
+        for feed, e in zip(["f-op", "f-copy"], merged["evidence"].to_pylist())
+    }
+    block = found["f-copy"]["overlap"]
+    assert block["with"] == ({"f-op": {"bus": 1.0}} if matched else {})
+    assert block.get("stop_matched", []) == (["f-op"] if matched else [])
+    assert not any(
+        {"overlap_routes", "overlap_agencies"} & e.keys() for e in found.values()
+    )
 
 
 def test_an_edge_without_evidence_counts_as_not_near_a_threshold():

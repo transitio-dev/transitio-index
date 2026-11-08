@@ -102,7 +102,8 @@ OVERRIDE_FIELDS = (
 # 24: the NOTICE credits the whole MDB catalogue a build found twins in.
 # 25: a place's metro_ids and member_ids are every build's, merged.
 # 26: route rows carry their stop cells; the agency words never ship.
-MERGE_FORMAT = 26
+# 27: overlap across builds also matches routes by their stops.
+MERGE_FORMAT = 27
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
@@ -435,6 +436,11 @@ def _merged_overlaps(edges, mapping, feed_ids, measured=None):
             for mode, share in shares.items():
                 into[mode] = max(share, into.get(mode, share))
         overlap["with"] = named
+        if "stop_matched" in overlap:
+            renamed = {mapping.get(other, other) for other in overlap["stop_matched"]}
+            overlap["stop_matched"] = sorted(renamed & named.keys())
+            if not overlap["stop_matched"]:
+                del overlap["stop_matched"]
         if measured is not None:
             overlap["compared"] = sorted((measured.get(key, set()) & kept) - {feed_id})
         values[i] = publish._json_block(evidence)
@@ -444,12 +450,14 @@ def _merged_overlaps(edges, mapping, feed_ids, measured=None):
 def _cross_build_overlaps(edges):
     """``edges`` with the overlap block of every edge carrying route rows
     (``evidence["overlap_routes"]``, see :func:`classify.overlap_routes`)
-    measured again against every other such edge at its place, whichever
-    build classified it, its ``compared`` listing those edges' other feeds;
-    so is each ``overlap_repeats`` block of an international edge from its
-    ``overlap_repeats_routes``. The route rows go from every edge. An edge
-    without them keeps its build's block as :func:`_merged_overlaps` left
-    it."""
+    measured again (:func:`classify.overlap_blocks`) against every other
+    such edge at its place, whichever build classified it — by line key, and
+    by stops with the route cells and agency words (``overlap_agencies``)
+    the builds kept — its ``compared`` listing those edges' other feeds; so
+    is each ``overlap_repeats`` block of an international edge from its
+    ``overlap_repeats_routes``. The route rows and agency words go from every
+    edge. An edge without route rows keeps its build's block as
+    :func:`_merged_overlaps` left it."""
     if "evidence" not in edges.column_names:
         return edges
     evidence = _json_records(edges, "evidence")
@@ -459,26 +467,32 @@ def _cross_build_overlaps(edges):
     for i, (place_id, record) in enumerate(
         zip(edges["place_id"].to_pylist(), evidence)
     ):
-        record.pop("overlap_agencies", None)
+        agencies = record.pop("overlap_agencies", None) or []
         routes = record.pop("overlap_routes", None)
         if routes is not None:
-            rows, _ = classify.route_rows(routes, interned)
-            by_place[place_id].append((i, None, rows))
+            rows, cells = classify.route_rows(routes, interned)
+            by_place[place_id].append((i, None, rows, cells, agencies))
         repeats = record.pop("overlap_repeats_routes", None)
         if isinstance(repeats, dict):
             record.pop("overlap_repeats", None)
             for tier, routes in sorted(repeats.items()):
-                rows, _ = classify.route_rows(routes, interned)
-                by_place[place_id].append((i, tier, rows))
+                rows, cells = classify.route_rows(routes, interned)
+                by_place[place_id].append((i, tier, rows, cells, agencies))
     if not by_place:
         return edges
-    for entries in by_place.values():
-        feeds = [feed_ids[i] for i, _, _ in entries]
-        blocks = classify.place_overlaps(
-            feeds, [rows for _, _, rows in entries], interned
-        )
-        measured = set(feeds)
-        for (i, tier, _), block in zip(entries, blocks):
+    measured_blocks = classify.overlap_blocks(
+        {
+            place_id: [
+                (feed_ids[i], rows, cells, agencies, tier is None)
+                for i, tier, rows, cells, agencies in entries
+            ]
+            for place_id, entries in by_place.items()
+        },
+        interned,
+    )
+    for place_id, entries in by_place.items():
+        measured = {feed_ids[i] for i, *_ in entries}
+        for (i, tier, *_), block in zip(entries, measured_blocks[place_id]):
             if block is not None:
                 block["compared"] = sorted(measured - {feed_ids[i]})
             if tier is not None:
