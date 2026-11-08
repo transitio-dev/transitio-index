@@ -167,11 +167,9 @@ def convert_patches(cache_dir, *, expected=PINS):
     """Publish ``raw/fao-patches.json`` holding the patches as GeoParquet,
     converted once from the verified shapefile bytes and reused while its
     manifest names the same source digest. Returns the manifest."""
-    generation, manifest = pinned.resolve(
-        cache_dir, pointer=POINTER, expected=expected, error=FaoError
+    data, manifest = pinned.read_input(
+        cache_dir, pointer=POINTER, expected=expected, name=PATCHES_FILE, error=FaoError
     )
-    with generation:
-        data = generation.read_bytes(PATCHES_FILE)
 
     def build():
         table = _patches_table(data)
@@ -260,11 +258,10 @@ def load_inputs(cache_dir, *, expected=PINS):
     region — only the listed ones: on the pinned data 15 unlisted patches name
     a primary region at its tier yet belong to a higher-tier one; and the
     converted patches derive from the pinned shapefile."""
-    generation, manifest = pinned.resolve(
-        cache_dir, pointer=POINTER, expected=expected, error=FaoError
+    data, manifest = pinned.read_input(
+        cache_dir, pointer=POINTER, expected=expected, name=REGIONS_FILE, error=FaoError
     )
-    with generation:
-        regions = read_regions(generation.read_bytes(REGIONS_FILE))
+    regions = read_regions(data)
     converted, converted_manifest = store.resolve(cache_dir / "raw", CONVERTED_POINTER)
     with converted:
         if converted_manifest.get("sources") != {

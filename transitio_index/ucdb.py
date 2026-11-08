@@ -78,18 +78,22 @@ def prepare_inputs(cache_dir, *, files=None, expected=PINS):
     return manifest
 
 
-def _polygons(frame, name, crs=EQUAL_AREA):
+def _polygons(frame, name, crs=EQUAL_AREA, error=UcdbError):
     """The frame's geometries in ``crs`` (the equal-area projection by
-    default) as valid polygons: repaired where the source's are not, refused
-    where missing, empty, of another type or without area."""
+    default) as valid polygons: repaired where the source's are not, keeping
+    the polygonal part (:func:`geometry._repaired_polygon`), refused
+    (``error``) where missing, empty, of another type, beyond repair or
+    without area."""
     geoms = frame.geometry
     if geoms.isna().any() or geoms.is_empty.any():
-        raise UcdbError(f"{name}: a geometry is missing or empty")
+        raise error(f"{name}: a geometry is missing or empty")
     if not set(geoms.geom_type) <= {"Polygon", "MultiPolygon"}:
-        raise UcdbError(f"{name}: a geometry is not a polygon")
-    valid = shapely.make_valid(geoms.to_crs(crs).to_numpy())
+        raise error(f"{name}: a geometry is not a polygon")
+    valid = [geometry._repaired_polygon(g) for g in geoms.to_crs(crs).to_numpy()]
+    if any(g is None for g in valid):
+        raise error(f"{name}: a geometry is not a valid polygon")
     if (shapely.area(valid) <= 0).any():
-        raise UcdbError(f"{name}: a geometry has no area")
+        raise error(f"{name}: a geometry has no area")
     return valid
 
 
@@ -122,11 +126,13 @@ def read_centres(data):
 def centre_points(cache_dir, *, expected=PINS):
     """``{centre_id: Point}``: a point on each FAO urban centre's polygon, in
     WGS84, read from the pinned inputs. A FAO region's id is its centre's."""
-    generation, _ = pinned.resolve(
-        cache_dir, pointer=POINTER, expected=expected, error=UcdbError
+    data, _ = pinned.read_input(
+        cache_dir,
+        pointer=POINTER,
+        expected=expected,
+        name=CENTRES_FILE,
+        error=UcdbError,
     )
-    with generation:
-        data = generation.read_bytes(CENTRES_FILE)
     frame, ids, _ = _centre_frame(data)
     points = shapely.point_on_surface(_polygons(frame, CENTRES_FILE, "EPSG:4326"))
     return {str(i): point for i, point in zip(ids, points)}

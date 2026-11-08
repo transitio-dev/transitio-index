@@ -110,6 +110,16 @@ def resolve(cache_dir, *, pointer, expected, error=PinnedInputError):
     return generation, manifest
 
 
+def read_input(cache_dir, *, pointer, expected, name, error=PinnedInputError):
+    """``(data, manifest)``: the verified bytes of the input ``name`` in the
+    generation :func:`resolve` finds, and its manifest."""
+    generation, manifest = resolve(
+        cache_dir, pointer=pointer, expected=expected, error=error
+    )
+    with generation:
+        return generation.read_bytes(name), manifest
+
+
 def derive(cache_dir, *, pointer, sources, build):
     """Ensure ``raw/<pointer>`` holds an artifact derived once from verified
     inputs; return its manifest. ``sources`` maps each input name to the

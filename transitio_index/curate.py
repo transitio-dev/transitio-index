@@ -193,7 +193,7 @@ class _Feed:
         self.kind = kind
         self.sole_agency = sole_agency
 
-    def expand(self, spec):
+    def route_ids(self, spec):
         """The route ids a curator predicate selects, ANDed across clauses.
         The effective agency is what the predicate matches; the fingerprint
         keeps the raw field, so build and fetch canonicalise alike."""
@@ -227,9 +227,12 @@ def _sole_agency(feed_dir, state):
 
 
 def _read_feed(feed_dir, state):
+    """The crawled feed as a :class:`_Feed` (routes, stops and the fingerprint
+    kind its stop_times state calls for), or None without routes, with
+    another state, or when a member cannot be verified or parsed."""
     mode = (state.get("stop_times") or {}).get("state")
     names = ("trips.txt",) if mode == "complete" else ()
-    parsed = classify._members(feed_dir, state, names)
+    parsed = classify._read_feed_members(feed_dir, state, names)
     if parsed is None or not parsed["routes"]:
         return None
     sole = _sole_agency(feed_dir, state)
@@ -401,7 +404,7 @@ class _Curator:
             route_ids = sorted(set(spec["route_id"]))
             declared_as = None
         else:
-            route_ids = evidence.expand(spec)
+            route_ids = evidence.route_ids(spec)
             declared_as = {k: spec[k] for k in ("agency_id", "route_type") if k in spec}
         if not route_ids:
             raise CurateError(f"{_where(entry)}: the selector matches no route")
@@ -547,7 +550,7 @@ class _Curator:
         del pair[tier]
         self.counts["edges_removed"] += 1
 
-    def apply(self, entries):
+    def apply_curated_entries(self, entries):
         """One phase: resolve every entry's targets and claims against the
         current state, then apply each entry, in file order, to the targets
         it holds. Returns how many entries applied to anything."""
@@ -724,12 +727,14 @@ def curate(cache_dir, *, overrides_dir=None, strict=False, registry=None):
         rt_entries = [e for e in entries if curator.feed_id(e["feed"]) in rt_ids]
         applied = 0
         for phase in PHASES:
-            applied += curator.apply(
+            applied += curator.apply_curated_entries(
                 [e for e in static_entries if e["operation"] == phase]
             )
         rt_feeds, rt_edges = curator.propagate(feeds)
         for phase in PHASES:
-            applied += curator.apply([e for e in rt_entries if e["operation"] == phase])
+            applied += curator.apply_curated_entries(
+                [e for e in rt_entries if e["operation"] == phase]
+            )
         curator.check_pairs()
         final = curator.edges()
         _write_report(cache_dir, curator.stale)

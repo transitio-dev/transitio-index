@@ -149,7 +149,8 @@ class StubLookup:
         return self.by_x.get(x, [])
 
 
-def _members(routes=ROUTES_FIXED, stops=STOPS):
+def _feed_members(routes=ROUTES_FIXED, stops=STOPS):
+    """The full feed's members with these routes.txt and stops.txt."""
     members = dict(FULL_MEMBERS)
     members["routes.txt"] = routes
     members["stops.txt"] = stops
@@ -160,7 +161,7 @@ def _members(routes=ROUTES_FIXED, stops=STOPS):
 def test_a_single_city_fixed_tier_feed_skips_stop_times(tmp_path, range_threshold):
     cache = tmp_path / "cache"
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
-    data = _zip_bytes(_members())
+    data = _zip_bytes(_feed_members())
     summary, log = _crawl(
         cache,
         _server({"/a.zip": (data, '"v1"')}),
@@ -201,43 +202,47 @@ OTHER_COUNTRY = [
     ("members", "lookup", "reason"),
     [
         (
-            _members(routes=ROUTES),
+            _feed_members(routes=ROUTES),
             StubLookup({24.9: CITY_RECORDS}),
             "route types need geography",
         ),
         # A tram and a coach are both fixed-tier, but two tiers: per-tier
         # selectors need the complete read.
         (
-            _members(routes=b"route_id,route_type\nr1,0\nr2,201\n"),
+            _feed_members(routes=b"route_id,route_type\nr1,0\nr2,201\n"),
             StubLookup({24.9: CITY_RECORDS}),
             "route types span tiers",
         ),
         # 750 sits between the bus and trolleybus ranges: unknown to the
         # classifier, so no whole-feed claim may rest on it.
         (
-            _members(routes=b"route_id,route_type\nr1,0\nr2,750\n"),
+            _feed_members(routes=b"route_id,route_type\nr1,0\nr2,750\n"),
             StubLookup({24.9: CITY_RECORDS}),
             "route types need geography",
         ),
-        (_members(), StubLookup({24.9: CITY_RECORDS[1:]}), "a stop matches no city"),
-        (_members(), StubLookup({}), "a stop matches no division"),
         (
-            _members(stops=TWO_STOPS),
+            _feed_members(),
+            StubLookup({24.9: CITY_RECORDS[1:]}),
+            "a stop matches no city",
+        ),
+        (_feed_members(), StubLookup({}), "a stop matches no division"),
+        (
+            _feed_members(stops=TWO_STOPS),
             StubLookup({24.9: CITY_RECORDS, 25.9: OTHER_CITY}),
             "stops span cities",
         ),
         (
-            _members(),
+            _feed_members(),
             StubLookup({24.9: CITY_RECORDS + OTHER_CITY}),
             "a stop matches several cities",
         ),
         (
-            _members(stops=STOPS + b"sx,not-a-lat,24.9\n"),
+            _feed_members(stops=STOPS + b"sx,not-a-lat,24.9\n"),
             StubLookup({24.9: CITY_RECORDS}),
             "unparsable stop rows",
         ),
         (
-            _members(stops=TWO_STOPS),
+            _feed_members(stops=TWO_STOPS),
             StubLookup({24.9: CITY_RECORDS, 25.9: OTHER_COUNTRY}),
             "stops span countries",
         ),
@@ -260,7 +265,7 @@ def test_without_memo_coverage_the_feed_reads_complete(tmp_path):
     # must fall back to the full read, never fail the feed.
     cache = tmp_path / "cache"
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
-    _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_members()), '"v1"')}))
+    _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_feed_members()), '"v1"')}))
     assert log["f-a"]["stop_times"] == "complete"
     assert log["f-a"]["stop_times_reason"].startswith("predicate error")
 
@@ -286,7 +291,7 @@ def test_a_cached_skip_is_rejudged_against_the_current_lookup(tmp_path):
     # feed is refetched and the complete member lands.
     cache = tmp_path / "cache"
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
-    server = _server({"/a.zip": (_zip_bytes(_members()), '"v1"')})
+    server = _server({"/a.zip": (_zip_bytes(_feed_members()), '"v1"')})
     _crawl(cache, server, lookup=StubLookup({24.9: CITY_RECORDS}))
     assert not (_feed_dir(cache, "f-a") / "stop_times.txt").exists()
     summary, log = _crawl(
@@ -307,7 +312,7 @@ def test_a_recrawl_request_under_an_old_id_still_forces_and_clears(tmp_path):
     _publish_resolved(
         cache, [_feed("f-new", "https://feeds.example/a.zip", aliases=["f-old"])]
     )
-    server = _server({"/a.zip": (_zip_bytes(_members()), '"v1"')})
+    server = _server({"/a.zip": (_zip_bytes(_feed_members()), '"v1"')})
     lookup = StubLookup({24.9: CITY_RECORDS})
     _crawl(cache, server, lookup=lookup)
     assert not (_feed_dir(cache, "f-new") / "stop_times.txt").exists()
@@ -323,7 +328,7 @@ def test_a_recrawl_request_under_an_old_id_still_forces_and_clears(tmp_path):
 def test_a_recrawl_request_forces_the_complete_read(tmp_path):
     cache = tmp_path / "cache"
     _publish_resolved(cache, [_feed("f-a", "https://feeds.example/a.zip")])
-    server = _server({"/a.zip": (_zip_bytes(_members()), '"v1"')})
+    server = _server({"/a.zip": (_zip_bytes(_feed_members()), '"v1"')})
     lookup = StubLookup({24.9: CITY_RECORDS})
     _crawl(cache, server, lookup=lookup)
     assert not (_feed_dir(cache, "f-a") / "stop_times.txt").exists()
@@ -750,7 +755,7 @@ def test_a_stale_skip_is_corrected_on_the_next_build(tmp_path):
     from transitio_index import classify
 
     cache = tmp_path / "cache"
-    members = _members(
+    members = _feed_members(
         routes=b"route_id,route_type\ntram,0\n",
         stops=b"stop_id,stop_lat,stop_lon\ns1,60.1,24.9\ns2,60.1,25.9\n",
     )
@@ -1265,7 +1270,7 @@ def test_the_crawl_log_records_each_feed_source(tmp_path):
     feed = _feed("f-a", "https://feeds.example/a.zip")
     feed["source"] = "atlas"
     _publish_resolved(cache, [feed])
-    _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_members()), '"v1"')}))
+    _, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_feed_members()), '"v1"')}))
     assert log["f-a"]["source"] == "atlas"
 
 
@@ -1281,7 +1286,9 @@ def test_the_crawl_log_records_source_even_when_a_feed_errors(tmp_path, monkeypa
         raise RuntimeError("unexpected")
 
     monkeypatch.setattr(crawl, "_crawl_one", boom)
-    summary, log = _crawl(cache, _server({"/a.zip": (_zip_bytes(_members()), '"v1"')}))
+    summary, log = _crawl(
+        cache, _server({"/a.zip": (_zip_bytes(_feed_members()), '"v1"')})
+    )
     assert log["f-a"]["method"] == "skipped" and log["f-a"]["key_crawl"] == "failed"
     assert log["f-a"]["source"] == "atlas" and summary["by_key_crawl"] == {"failed": 1}
 
@@ -1517,7 +1524,7 @@ def test_a_key_crawl_needs_an_approved_provider_and_credentials(
         _publish_resolved(cache, [feed], overrides_dir)
         _crawl(cache, _key_server(answers), overrides_dir=overrides_dir)
     if case == "reflected":
-        changed = _zip_bytes(_members(stops=TWO_STOPS))
+        changed = _zip_bytes(_feed_members(stops=TWO_STOPS))
         answers[FEED] = _answer(etag=f'"{SENTINEL}"', data=changed)
     feed["access_provider"] = {"unbound": None, "rebound": "q"}.get(case, "p")
     if case == "unapproved":

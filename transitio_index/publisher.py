@@ -76,7 +76,7 @@ def _pieces(data):
         yield data[start : start + UPLOAD_CHUNK]
 
 
-def _members(index_dir):
+def _packed_files(index_dir):
     """The index files to pack as ``(name, bytes)``, in the order the release
     contract lists them (the snapshot, every partition table it lists, the
     NOTICE), and the on-demand files a schema-12 release ships as assets of
@@ -508,7 +508,7 @@ def pack(
     with contextlib.ExitStack() as stack:
         if verify:
             _lock_lineage(stack, cache_dir, merged)
-        members, parts = _members(index_dir)
+        members, parts = _packed_files(index_dir)
         if verify:
             snapshot = json.loads(dict(members)["snapshot.json"].decode("utf-8"))
             if _is_merged(snapshot) != merged:

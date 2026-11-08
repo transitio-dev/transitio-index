@@ -2113,6 +2113,8 @@ def test_margin_share_is_measured_over_the_edges_that_ship(tmp_path, monkeypatch
     monkeypatch.setattr(classify_tests, "SOURCES", SOURCES)
     near = classify_tests.NEAR_REFERENCE
     monkeypatch.setattr(classify, "route_span_reference", lambda: near)
+    # The bus's stops lie degrees apart: the intercity rule is set aside.
+    monkeypatch.setattr(classify, "INTERCITY_GAP_KM", 1e9)
     cache = tmp_path / "cache"
     feeds = [
         _covered_feed("f-near", coverage_source="crawl"),

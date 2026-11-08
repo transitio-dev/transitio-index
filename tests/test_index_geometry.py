@@ -120,7 +120,9 @@ def _publish(cache, records, overrides_dir=None, derived=(), derived_inputs=None
         directory.close()
 
 
-def _run(tmp_path, overrides_dir=None, derived=()):
+def _attach_fixture_geometry(tmp_path, overrides_dir=None, derived=()):
+    """Publish ``PLACES`` and run the geometry stage over ``AREAS``;
+    ``(manifest, places by id, cache)``."""
     cache = tmp_path / "cache"
     _publish(cache, PLACES, overrides_dir, derived)
     dataset = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
@@ -142,7 +144,7 @@ def _read_text(cache, artifact):
 
 
 def test_geometry_is_attached_where_the_licence_allows(tmp_path):
-    manifest, places, _ = _run(tmp_path)
+    manifest, places, _ = _attach_fixture_geometry(tmp_path)
     helsinki = places["Q1757"]
     assert helsinki["geometry_source"] == "overture"
     # Round-trips to a valid polygon.
@@ -152,7 +154,7 @@ def test_geometry_is_attached_where_the_licence_allows(tmp_path):
 
 
 def test_geometry_from_a_disallowed_licence_is_omitted(tmp_path):
-    manifest, places, _ = _run(tmp_path)
+    manifest, places, _ = _attach_fixture_geometry(tmp_path)
     assert places["Q_DENIED"]["geometry"] is None
     assert places["Q_DENIED"]["geometry_source"] is None
     # Q_DENIED, Q_MIXED, Q_MULTI and Q_NOSRC (no sources) are all licence-omitted.
@@ -162,26 +164,26 @@ def test_geometry_from_a_disallowed_licence_is_omitted(tmp_path):
 def test_geometry_with_any_unlicensed_source_is_omitted(tmp_path):
     # One shippable source is not enough: a same-geometry source with no
     # licence leaves the boundary unshippable.
-    _, places, _ = _run(tmp_path)
+    _, places, _ = _attach_fixture_geometry(tmp_path)
     assert places["Q_MIXED"]["geometry"] is None
 
 
 def test_an_unlicensed_land_area_omits_the_whole_division(tmp_path):
     # Sources are audited per land-area row, not flattened: one unlicensed area
     # makes the division unshippable even though another area is shippable.
-    _, places, _ = _run(tmp_path)
+    _, places, _ = _attach_fixture_geometry(tmp_path)
     assert places["Q_MULTI"]["geometry"] is None
 
 
 def test_shippable_land_areas_are_unioned(tmp_path):
-    _, places, _ = _run(tmp_path)
+    _, places, _ = _attach_fixture_geometry(tmp_path)
     shipped = shapely.from_wkb(bytes.fromhex(places["Q_TWOLAND"]["geometry"]))
     # The two disjoint 0.04 and 1.0 boxes union to 1.04.
     assert shipped.area == pytest.approx(1.04, abs=1e-6)
 
 
 def test_an_empty_or_invalid_geometry_is_rejected(tmp_path):
-    manifest, places, _ = _run(tmp_path)
+    manifest, places, _ = _attach_fixture_geometry(tmp_path)
     assert places["Q_EMPTY"]["geometry"] is None
     assert places["Q_EMPTY"]["geometry_source"] is None
     # Empty polygon and malformed WKB are both rejected without aborting.
@@ -270,13 +272,13 @@ def test_settle_centres_keeps_a_licensed_point_inside_the_boundary(
 
 
 def test_a_metro_and_an_arealess_place_have_no_geometry(tmp_path):
-    _, places, _ = _run(tmp_path)
+    _, places, _ = _attach_fixture_geometry(tmp_path)
     assert places["Q_METRO"]["geometry"] is None
     assert places["Q_NOGEO"]["geometry"] is None
 
 
 def test_the_notice_credits_sources_and_records_share_alike(tmp_path):
-    _, _, cache = _run(tmp_path)
+    _, _, cache = _attach_fixture_geometry(tmp_path)
     notice = _read_text(cache, "NOTICE")
     assert "OpenStreetMap contributors" in notice
     assert "ODbL 1.0" in notice
@@ -291,7 +293,7 @@ def test_the_notice_credits_sources_and_records_share_alike(tmp_path):
 
 
 def test_the_licence_inventory_records_sources_and_the_aggregator(tmp_path):
-    _, _, cache = _run(tmp_path)
+    _, _, cache = _attach_fixture_geometry(tmp_path)
     inventory, _ = store.read_jsonl(
         cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
     )
@@ -312,7 +314,7 @@ def test_the_licence_inventory_records_sources_and_the_aggregator(tmp_path):
 def test_a_territorial_area_ships_with_the_land(tmp_path):
     # fi-helsinki has a land box and a territorial box holding it and the sea
     # around it: the place ships their union, its sea included.
-    _, places, _ = _run(tmp_path)
+    _, places, _ = _attach_fixture_geometry(tmp_path)
     shipped = shapely.from_wkb(bytes.fromhex(places["Q1757"]["geometry"]))
     assert shipped.symmetric_difference(TERRITORIAL).area == pytest.approx(
         0.0, abs=1e-9
@@ -325,7 +327,7 @@ def test_set_boundary_attaches_a_curated_polygon(tmp_path):
     from transitio_index import overrides
 
     wkt = "POLYGON((24.5 60.0, 25.5 60.0, 25.5 60.6, 24.5 60.6, 24.5 60.0))"
-    manifest, places, _ = _run(
+    manifest, places, _ = _attach_fixture_geometry(
         tmp_path,
         overrides_dir=write_overrides(
             tmp_path,
@@ -339,7 +341,7 @@ def test_set_boundary_attaches_a_curated_polygon(tmp_path):
     assert metro["geometry_source"] == "curated"
     # A string that is no reference names nothing: refused.
     with pytest.raises(overrides.OverrideError, match="needs a seeded place"):
-        _run(
+        _attach_fixture_geometry(
             tmp_path / "typo",
             overrides_dir=write_overrides(
                 tmp_path / "typo", places=[{"place": "Q-typo", "set_boundary": wkt}]
@@ -371,7 +373,7 @@ def test_set_boundary_attaches_a_curated_polygon(tmp_path):
     assert shapely.from_wkb(bytes.fromhex(metro["geometry"])).area > 0
     assert manifest["curated_geometry"] == 1 and manifest["stale_overrides"] == 0
     with pytest.raises(overrides.OverrideError, match="valid"):
-        _run(
+        _attach_fixture_geometry(
             tmp_path / "bad",
             overrides_dir=write_overrides(
                 tmp_path / "bad",
@@ -384,7 +386,7 @@ def test_set_boundary_attaches_a_curated_polygon(tmp_path):
         "POLYGON((2700000 8400000, 2800000 8400000, 2800000 8500000, 2700000 8400000))"
     )
     with pytest.raises(overrides.OverrideError, match="WGS84"):
-        _run(
+        _attach_fixture_geometry(
             tmp_path / "far",
             overrides_dir=write_overrides(
                 tmp_path / "far",
@@ -451,7 +453,7 @@ def test_derived_inputs_are_inventoried_and_credited(tmp_path):
             "memberships": 0,
         },
     ]
-    _, _, cache = _run(tmp_path, derived=derived)
+    _, _, cache = _attach_fixture_geometry(tmp_path, derived=derived)
     rows, _ = store.read_jsonl(
         cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
     )
@@ -811,6 +813,76 @@ def test_a_seeded_city_ships_its_urban_centre_only_without_another_boundary(
     assert row["geometries"] == 3  # Q_U, and Q_LEE and Q_SET before curation
     credit = geometry.DERIVED_SOURCES[ucdb.DERIVED]["credit"]
     assert _read_text(cache, "NOTICE").count(credit) == 1
+
+
+def test_a_us_city_without_a_boundary_ships_its_census_place(tmp_path, monkeypatch):
+    import fao_fixture as ffx
+
+    from transitio_index import coverage, tiger
+
+    hialeah = shapely.box(-80.35, 25.83, -80.25, 25.90)
+    houston = shapely.box(-95.8, 29.5, -95.0, 30.1)
+    rows = [
+        ("1230000", "Hialeah", "FL", hialeah),
+        ("4835000", "Houston", "TX", houston),
+    ]
+    files, expected = ffx.pinned_files(
+        tmp_path / "in", {tiger.PLACES_FILE: ffx.places_zip(rows, crs="EPSG:4326")}
+    )
+
+    def city(place_id, name, overture_id, x, y, country="US"):
+        place = _place(place_id, "city", overture_id=overture_id, country=country)
+        centre = shapely.to_wkb(shapely.Point(x, y)).hex()
+        return {**place, "name": name, "centre": centre}
+
+    records = [
+        city("Q_HIA", "Hialeah", "no-area", -80.30, 25.86),
+        city("Q_ATA", "Atascocita", "no-area-2", -95.2, 29.99),  # inside Houston
+        city("Q_OWN", "Hialeah", "fi-helsinki", -80.30, 25.86),  # its own area
+        city("Q_FI", "Hialeah", "no-area-3", -80.30, 25.86, country="FI"),
+    ]
+    cache = tmp_path / "cache"
+    _publish(cache, records)
+    dataset = fx.write_area_dataset(tmp_path / "areas.parquet", AREAS)
+    manifest = geometry.attach_geometry(
+        cache, dataset=dataset, tiger_files=files, tiger_pins=expected
+    )
+    places, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "places_seed.jsonl"
+    )
+    places = {p["place_id"]: p for p in places}
+    assert {key: places[key]["geometry_source"] for key in ("Q_HIA", "Q_ATA")} == {
+        "Q_HIA": geometry.CENSUS_PLACE,
+        "Q_ATA": None,
+    }
+    assert places["Q_OWN"]["geometry_source"] == "overture"
+    assert places["Q_FI"]["geometry_source"] is None
+    assert shapely.from_wkb(places["Q_HIA"]["geometry"]).equals(hialeah)
+    assert manifest["census_geometry"] == 1 and manifest["census_inputs"] == expected
+    assert "|".join(tiger.DERIVED) in manifest["licence_sources"]
+    inventory, _ = store.read_jsonl(
+        cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
+    )
+    (row,) = [row for row in inventory if row["dataset"] == tiger.DERIVED[0]]
+    assert (row["version"], row["geometries"]) == (tiger.VINTAGE, 1)
+    credit = geometry.DERIVED_SOURCES[tiger.DERIVED]["credit"]
+    assert credit in _read_text(cache, "NOTICE")
+    # Stops land in it by its polygon: no Overture area stands for it.
+    _, ids = coverage.curated_boundaries(places)
+    assert "Q_HIA" in ids
+
+    # A build without US cities never reads the Census input.
+    def refused(*args, **kwargs):
+        raise AssertionError("the Census input was prepared")
+
+    monkeypatch.setattr(tiger, "prepare_inputs", refused)
+    _publish(tmp_path / "other", [records[-1]])
+    manifest = geometry.attach_geometry(tmp_path / "other", dataset=dataset)
+    assert manifest["census_inputs"] is None
+    # A seed that gained US cities after the look before the lock is refused.
+    monkeypatch.setattr(geometry, "_has_us_cities", lambda *args: False)
+    with pytest.raises(store.StoreError, match="changed before"):
+        geometry.attach_geometry(cache, dataset=dataset)
 
 
 def test_area_chunking_matches_a_single_pass(tmp_path):

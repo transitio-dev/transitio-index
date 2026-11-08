@@ -1012,7 +1012,7 @@ def _shipped_area(areas, boundaries, place, urban_centres=False):
     shipped = geometry.shipped_geometry(rows)[1] if rows else None
     polygon = place.get("ucdb_boundary")
     if shipped is None and polygon and urban_centres:
-        return geometry.ucdb_polygon(polygon)
+        return geometry.simplified_polygon(polygon)
     return shipped
 
 

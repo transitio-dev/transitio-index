@@ -52,6 +52,14 @@ def download_file(directory, name, url, limit=MAX_CSV_BYTES):
     )
 
 
+def cell_text(value):
+    """A spreadsheet or table cell as stripped text; None when it is empty."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def read_rows(text, required_headers):
     """Parse CSV ``text`` into rows, requiring ``required_headers``.
 

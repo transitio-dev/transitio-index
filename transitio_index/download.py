@@ -28,6 +28,20 @@ class DownloadError(RuntimeError):
     """A download could not be completed."""
 
 
+class _NetworkFailure(Exception):
+    """What the server or the connection raised during an attempt (its
+    cause), kept apart from a local file fault in the same attempt."""
+
+
+def _over_network(call, *args, **kwargs):
+    """``call(*args, **kwargs)``, with an OSError or an incomplete read it
+    raises wrapped in :class:`_NetworkFailure`."""
+    try:
+        return call(*args, **kwargs)
+    except (OSError, http.client.IncompleteRead) as exc:
+        raise _NetworkFailure() from exc
+
+
 def _full_length(response):
     """The full resource size a response declares — the total after the slash of
     a 206 ``Content-Range``, else ``Content-Length`` — or None when it does not
@@ -84,10 +98,13 @@ def to_file(
     """Download ``url`` to ``name`` in ``directory``; return its SHA-256.
 
     ``limit`` caps the bytes accepted. ``error`` is the exception class raised
-    for a failed or over-ceiling download. ``validate`` — given the completed
-    temporary file open for reading — may raise ``error`` to reject it (e.g. a
-    tarball check); a rejection is retried within the attempt budget, since a
-    body that arrives complete-by-length can still be corrupt.
+    for a failed or over-ceiling download, also when the last attempt could
+    not reach the server or lost the connection, so a caller that catches it
+    can go on without the file; a local file fault is raised as is, at once.
+    ``validate`` — given the completed temporary file open for reading — may
+    raise ``error`` to reject it (e.g. a tarball check); a rejection is
+    retried within the attempt budget, since a body that arrives
+    complete-by-length can still be corrupt.
     """
     handle, partial = store.create_temporary(directory)
     try:
@@ -114,7 +131,9 @@ def to_file(
                     if if_range:
                         request.add_header("If-Range", if_range)
                 try:
-                    with urllib.request.urlopen(request, timeout=timeout) as response:
+                    with _over_network(
+                        urllib.request.urlopen, request, timeout=timeout
+                    ) as response:
                         status = getattr(response, "status", 200)
                         if written and status != 206:
                             # The range was ignored, or ``If-Range`` saw the
@@ -135,7 +154,10 @@ def to_file(
                             declared = _full_length(response)
                         if if_range is None:
                             if_range = _validator_tag(response)
-                        for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                        chunks = iter(
+                            lambda: _over_network(response.read, 1024 * 1024), b""
+                        )
+                        for chunk in chunks:
                             written += len(chunk)
                             if written > limit:
                                 raise error(f"{url}: exceeds the {limit}-byte ceiling")
@@ -160,12 +182,14 @@ def to_file(
                             restart()
                             continue
                     break
-                except (OSError, http.client.IncompleteRead) as exc:
+                except _NetworkFailure as failure:
                     # A dropped or truncated read: resume from ``written`` on the
                     # next attempt rather than refetching the whole body.
-                    last_error = exc
+                    last_error = failure.__cause__
             else:
-                raise last_error or error(f"{url}: download did not complete")
+                if last_error is None or isinstance(last_error, error):
+                    raise last_error or error(f"{url}: download did not complete")
+                raise error(f"{url}: {last_error}") from last_error
             opened_file.flush()
             os.fsync(opened_file.fileno())
         directory.replace(partial, name)

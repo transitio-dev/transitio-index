@@ -236,14 +236,6 @@ def _read_file(path):
         return opened.read()
 
 
-def _snapshot_digest(snapshot):
-    """One id for a whole snapshot, metadata included: a republish that
-    changes only the edges, or only a count, changes it."""
-    return hashlib.sha256(
-        json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
 def snapshot_digests(snapshot):
     """The digest a snapshot records for each index file, or None if any is missing."""
     digests = {}

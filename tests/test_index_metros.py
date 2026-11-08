@@ -951,7 +951,9 @@ def test_the_derived_credits_reach_the_inventory_and_notice(tmp_path):
     _attach_metros(tmp_path, {}, overrides_dir=overrides_dir)
     cache = tmp_path / "cache"
     areas = fx.write_area_dataset(tmp_path / "areas-geometry.parquet", AREAS)
-    geometry.attach_geometry(cache, dataset=areas, overrides_dir=overrides_dir)
+    geometry.attach_geometry(
+        cache, dataset=areas, overrides_dir=overrides_dir, derive_census=False
+    )
     rows, _ = store.read_jsonl(
         cache / "gazetteer", "geometry.json", "licence_inventory.jsonl"
     )
@@ -1321,7 +1323,7 @@ def test_a_fao_metro_auto_publishes_under_the_derived_gate(
         # Downstream, the derived rows and the FAO credit reach the licence
         # inventory and the NOTICE.
         areas = fx.write_area_dataset(tmp_path / "areas-again.parquet", AREAS)
-        geometry.attach_geometry(tmp_path / "cache", dataset=areas)
+        geometry.attach_geometry(tmp_path / "cache", dataset=areas, derive_census=False)
         inventory, _ = store.read_jsonl(
             tmp_path / "cache" / "gazetteer", "geometry.json", "licence_inventory.jsonl"
         )

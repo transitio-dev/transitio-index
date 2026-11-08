@@ -58,7 +58,6 @@ from .builds import (
     _files_present,
     _plain_directory,
     _read_file,
-    _snapshot_digest,
     archived,
     label_of,
     load_tables,
@@ -673,7 +672,9 @@ def merge_tables(sources, skipped=()):
                 "id": build_id,
                 "label": label_of(build_id),
                 "built_at": snapshot.get("built_at"),
-                "snapshot_id": _snapshot_digest(snapshot),
+                # One id for the whole snapshot, metadata included: a
+                # republish changing only the edges, or a count, changes it.
+                "snapshot_id": overrides.canonical_digest(snapshot),
                 "schema_version": snapshot.get("schema_version"),
                 "partitions": sorted(snapshot.get("partitions") or ()),
             }

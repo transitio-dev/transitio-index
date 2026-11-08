@@ -17,7 +17,7 @@ import re
 
 import shapely
 
-from transitio_index import eurostat, geometry, pinned
+from transitio_index import csv_source, eurostat, geometry, pinned
 
 EDITION = "2024"
 POINTER = "urau.json"
@@ -91,15 +91,15 @@ def read_areas(data):
         raise UrauError(f"{AREAS_FILE}: CRS {frame.crs.to_string()}")
     composition, boundaries = {}, {}
     for row in frame.itertuples(index=False):
-        code = eurostat._cell(row.URAU_CODE)
+        code = csv_source.cell_text(row.URAU_CODE)
         match = AREA_CODE.match(code or "")
         if match is None:
             raise UrauError(f"{AREAS_FILE}: area code {code!r}")
         if code in composition:
             raise UrauError(f"{AREAS_FILE}: {code} twice")
-        if eurostat._cell(row.URAU_CATG) != CATEGORY:
+        if csv_source.cell_text(row.URAU_CATG) != CATEGORY:
             raise UrauError(f"{AREAS_FILE}: {code} is not a functional urban area")
-        name = eurostat._cell(row.URAU_NAME)
+        name = csv_source.cell_text(row.URAU_NAME)
         if name is None:
             raise UrauError(f"{AREAS_FILE}: {code} has no name")
         repaired = None
@@ -107,7 +107,7 @@ def read_areas(data):
             repaired = geometry._repaired_polygon(shapely.force_2d(row.geometry))
         if repaired is None:
             raise UrauError(f"{AREAS_FILE}: {code} is not a valid polygon")
-        prefix = eurostat._cell(row.CNTR_CODE)
+        prefix = csv_source.cell_text(row.CNTR_CODE)
         if prefix is None:
             raise UrauError(f"{AREAS_FILE}: {code} has no country")
         if prefix != match.group(1):
@@ -115,7 +115,7 @@ def read_areas(data):
         if prefix == CROSS_BORDER:
             # The file draws the part of a cross-border area outside its
             # core's country as a row of its own, in a NUTS-3 region it names.
-            nuts3 = eurostat._cell(getattr(row, NUTS3_COLUMN))
+            nuts3 = csv_source.cell_text(getattr(row, NUTS3_COLUMN))
             if nuts3 is None:
                 raise UrauError(f"{AREAS_FILE}: {code} has no NUTS-3 region")
             region = NUTS3_CODE.match(nuts3)

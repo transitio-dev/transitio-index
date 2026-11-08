@@ -454,6 +454,7 @@ def test_a_truncated_download_is_refused_and_retried(tmp_path, monkeypatch):
         return _ShortResponse(b"id,data_type\n", declared=9999)
 
     monkeypatch.setattr(csv_source.download.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(csv_source.download.time, "sleep", lambda *a, **k: None)
     directory = store.open_directory(tmp_path)
     try:
         with pytest.raises(csv_source.IngestError, match="expected 9999"):

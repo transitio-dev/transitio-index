@@ -207,6 +207,14 @@
   set_mark: compilation
   reason: A third-party build of Concord Coach Lines' timetables, not the operator's.
   date: 2026-10-13
+- feed: f-mdb-812
+  set_mark: compilation
+  reason: LA Metro's republication of Santa Clarita Transit's timetable (f-santa~clarita), with renamed lines and placeholder dates.
+  date: 2026-11-08
+- feed: f-mdb-tld-1253
+  set_mark: compilation
+  reason: LA Metro's republication of the Los Angeles County shuttles' timetable (f-9q5-dpwlacounty~ca~us), with renamed lines and placeholder dates.
+  date: 2026-11-08
 
 # DELFI's catalogue link is one registered user's sharing link: the data are
 # open, but downloading them needs a free account.

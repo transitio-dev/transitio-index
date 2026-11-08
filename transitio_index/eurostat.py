@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 import shapely
 from shapely.strtree import STRtree
 
-from transitio_index import geometry, pinned
+from transitio_index import csv_source, geometry, pinned
 
 NUTS_VERSION = "2021"
 NUTS_SCALE = "01M"
@@ -90,13 +90,6 @@ def resolve_inputs(cache_dir, *, expected=PINS):
 Composition = collections.namedtuple("Composition", ["metros", "nuts_ids"])
 
 
-def _cell(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
 def read_composition(data):
     """The workbook's metros and every NUTS-3 id its sheet lists.
 
@@ -119,14 +112,16 @@ def read_composition(data):
         if COMPOSITION_SHEET not in workbook.sheetnames:
             raise EurostatError(f"{COMPOSITION_FILE}: no {COMPOSITION_SHEET!r} sheet")
         rows = workbook[COMPOSITION_SHEET].iter_rows(values_only=True)
-        header = tuple(_cell(value) or "" for value in next(rows, ()))
+        header = tuple(csv_source.cell_text(value) or "" for value in next(rows, ()))
         if header[: len(COMPOSITION_HEADER)] != COMPOSITION_HEADER:
             raise EurostatError(f"{COMPOSITION_FILE}: header {header!r}")
         metros = {}
         seen = set()
         for position, row in enumerate(rows, 2):
             cells = tuple(row) + (None,) * len(COMPOSITION_HEADER)
-            nuts_id, flag, code, label = (_cell(value) for value in cells[:4])
+            nuts_id, flag, code, label = (
+                csv_source.cell_text(value) for value in cells[:4]
+            )
             if nuts_id is None:
                 continue
             if nuts_id in seen:
@@ -287,7 +282,7 @@ def place_footprint(areas, place, curated=None, urban_centres=False):
     if wkt:
         return geometry.curated_polygon(place.get("place_id"), wkt)
     polygon = place.get("ucdb_boundary")
-    return geometry.ucdb_polygon(polygon) if polygon and urban_centres else None
+    return geometry.simplified_polygon(polygon) if polygon and urban_centres else None
 
 
 def placed_by_urban_centre(areas, place, curated=None):

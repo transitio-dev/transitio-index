@@ -52,7 +52,6 @@ from transitio_index.builds import (  # noqa: F401  (two names for the tests)
     _SNAPSHOT_ERRORS,
     _BUILD_ERRORS,
     _read_file,
-    _snapshot_digest,
     snapshot_files,
     _files_present,
     load_tables,
@@ -65,6 +64,7 @@ from transitio_index.builds import (  # noqa: F401  (two names for the tests)
     LATEST,
 )
 from transitio_index.merge import MergeError, merge_tables, select_sources
+from transitio_index.overrides import canonical_digest
 
 # A catalogue whose sources cannot be merged is left out like a malformed one.
 _CATALOGUE_ERRORS = _BUILD_ERRORS + (MergeError,)
@@ -275,7 +275,7 @@ class Build:
         self.path = path
         self.snapshot = snapshot
         self.digests = digests
-        self.snapshot_id = _snapshot_digest(snapshot)
+        self.snapshot_id = canonical_digest(snapshot)
         places = tables["places.parquet"].to_pandas()
         self.search_text = _search_text(tables["places.parquet"])
         self.geoms = shapely.from_wkb(places["geometry"].to_numpy())
@@ -561,8 +561,11 @@ class BuildCache:
         return build
 
     def _catalogue(self):
+        """The merged catalogue of the newest run of every label (see
+        :func:`select_sources`), assembled again when the sources change, a
+        run that did not verify has changed, or the cached copy was evicted."""
         sources, skipped = select_sources(self.cache / "builds", self.read_bytes)
-        key = [(build_id, _snapshot_digest(s)) for build_id, _, s in sources]
+        key = [(build_id, canonical_digest(s)) for build_id, _, s in sources]
         key += [(run["id"], run["reason"]) for run in skipped]
         if self._catalogue_key == key and not self._repaired():
             cached = self._builds.get(CATALOGUE)

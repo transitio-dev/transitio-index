@@ -1,6 +1,7 @@
 import hashlib
 import datetime
 import json
+import math
 import os
 
 import pytest
@@ -23,7 +24,8 @@ def _stops(**counts):
         (109, "one_city", 1, 5.0, "regional", 0.95, "declared"),  # beats one city
         (704, None, 3, 500.0, "local", 0.95, "declared"),
         (3, "one_city", 1, 5.0, "local", 0.90, "one_city"),
-        (2, "one_metro", 2, 90.0, "local", 0.85, "one_metro"),
+        (3, "one_metro", 2, 90.0, "local", 0.85, "one_metro"),
+        (2, "one_metro", 2, 90.0, "regional", 0.85, "metro_rail"),  # rail
         (3, None, 1, 300.0, "regional", 0.75, "regional"),  # one region
         (3, None, 2, 13.0, "regional", 0.75, "regional"),  # two, but short
         (2, None, 2, 400.0, "national", 0.75, "regions_and_span"),
@@ -46,6 +48,69 @@ def test_the_decision_table(route_type, local, regions, span, tier, confidence, 
     assert decision["rule"] == rule
     assert decision["margin"] is False
     assert decision["international"] is False
+
+
+@pytest.mark.parametrize(
+    ("route_type", "local", "regions", "zone", "gap", "tier", "rule"),
+    [
+        # A zone is regional at most, however long or far apart.
+        (3, "one_metro", 2, True, None, "local", "one_metro"),
+        (3, None, 1, True, None, "regional", "regional"),
+        (3, None, 2, True, 25.0, "regional", "zone"),
+        # Boarding stops far apart make a route national, even in one region.
+        (3, None, 1, False, 25.0, "national", "intercity"),
+        (3, None, 1, False, 15.0, "regional", "regional"),
+        (3, "one_city", 1, False, 25.0, "local", "one_city"),
+        (109, None, 2, False, 30.0, "regional", "declared"),
+    ],
+)
+def test_zones_and_boarding_gaps_in_the_decision_table(
+    route_type, local, regions, zone, gap, tier, rule
+):
+    decision = classify.classify_route(
+        route_type, _stops(AA=2), 400.0, local, regions, 140.0, zone=zone, gap_km=gap
+    )
+    assert (decision["tier"], decision["rule"]) == (tier, rule)
+
+
+def test_the_boarding_gap_skips_the_stops_a_trip_passes_through(monkeypatch):
+    import io
+
+    # In t, b and c are passed through (no pickup, no drop-off); s runs the
+    # same stops serving b; v is longer; u boards at every stop of its own.
+    # With two patterns kept (v's and t's), the boarding stops come from
+    # their trips, both variants of t's: not u's longer boarding run.
+    monkeypatch.setattr(classify, "PATTERN_SAMPLE", 2)
+    rows = (
+        b"trip_id,stop_id,stop_sequence,pickup_type,drop_off_type\n"
+        b"t,a,1,0,1\nt,b,2,1,1\nt,c,3,1,1\nt,d,4,1,0\n"
+        b"s,a,1,0,1\ns,b,2,0,0\ns,c,3,1,1\ns,d,4,1,0\n"
+        b"v,p,1,,\nv,q,2,,\nv,r,3,,\nv,w,4,,\nv,o,5,,\n"
+        b"u,x,1,0,0\nu,y,2,0,0\nu,z,3,0,0\n"
+    )
+    trips = {"t": "r", "s": "r", "v": "r", "u": "r"}
+    _, sequences, *_, boarding = classify._read_stop_times(io.BytesIO(rows), trips, {})
+    assert sequences == {"r": [("p", "q", "r", "w", "o"), ("a", "b", "c", "d")]}
+    assert boarding == {"r": [("a", "b", "d"), ("a", "d"), ("p", "q", "r", "w", "o")]}
+    boarding = {"r": [("a", "d")]}
+    coords = {"a": (10.0, 1.0), "d": (10.2, 1.0), "e": crawl.PLACEHOLDER_POSITION}
+    gap = classify._boarding_gap(boarding["r"], coords)
+    assert gap == pytest.approx(classify.haversine_km(coords["a"], coords["d"]))
+    # A Flex row and a placeholder stop bridge nothing; a stop without
+    # coordinates leaves the gap unmeasured.
+    assert classify._boarding_gap([("a", "", "d"), ("a", "e", "d")], coords) is None
+    assert classify._boarding_gap([("a", "d", "q")], coords) is None
+
+
+@pytest.mark.parametrize(
+    ("gap", "tier", "margin"),
+    [(27.0, "national", True), (23.0, "regional", True), (10.0, "regional", False)],
+)
+def test_a_boarding_gap_near_its_threshold_is_flagged_on_either_side(gap, tier, margin):
+    decision = classify.classify_route(
+        3, _stops(AA=2), 30.0, None, 1, 140.0, gap_km=gap
+    )
+    assert (decision["tier"], decision["margin"]) == (tier, margin)
 
 
 def test_the_margin_penalty_applies_within_a_fifth_of_the_reference():
@@ -370,6 +435,13 @@ class StubLookup:
     def divisions_at(self, x, y):
         return self.by_x.get(x, [])
 
+    def divisions_reached(self, shape):
+        # Every keyed point within the shape's longitudes.
+        xmin, _, xmax, _ = shape.bounds
+        return [
+            r for x, records in self.by_x.items() if xmin <= x <= xmax for r in records
+        ]
+
 
 LOOKUP = StubLookup(
     {
@@ -380,8 +452,11 @@ LOOKUP = StubLookup(
         20.0: _records("Q-other"),
         # A point only the metro's own polygon places.
         40.0: [{"kind": "metro", "wikidata": "Q-metro", "country": "AA"}],
-        # Across a border: country BB only; on an overlap sliver: both countries.
+        # Across a border: country BB only, and BB by the border, AA about a
+        # hundred metres away; on an overlap sliver: both countries.
         60.0: [{"kind": "country", "country": "BB"}],
+        62.0: [{"kind": "country", "country": "BB"}],
+        62.001: [{"kind": "country", "country": "AA"}],
         65.0: [
             {"kind": "country", "country": "AA"},
             {"kind": "country", "country": "BB"},
@@ -1586,10 +1661,11 @@ def test_a_route_across_a_border_counts_its_departures_at_its_own_tier(
 ):
     # A tram across two regions with two of its four stops abroad keeps its
     # own tier, compared with its reference, and also serves at the
-    # international tier.
+    # international tier. The stub's stops lie degrees apart: no intercity.
     monkeypatch.setattr(
         classify, "route_span_reference", lambda: {("*", "tram"): 10000.0}
     )
+    monkeypatch.setattr(classify, "INTERCITY_GAP_KM", 1e9)
     cache = tmp_path / "cache"
     xs = (10.0, 50.0, 60.0, 60.0)
     feed, candidate = _lines(cache, "f-x", [("D", 0)], xs=xs)
@@ -1699,6 +1775,7 @@ def test_every_decider_constant_is_published_in_the_classifier_settings():
         classify._scale,
         classify._decide,
         classify._near,
+        classify._clear_boxes,
     )
     for decider in deciders:
         names |= {name for name in decider.__code__.co_names if name.isupper()}
@@ -1708,7 +1785,8 @@ def test_every_decider_constant_is_published_in_the_classifier_settings():
         if isinstance(getattr(classify, name, None), (int, float))
         and not isinstance(getattr(classify, name), bool)
     }
-    assert {"BORDER_STOPS", "MARGIN", "MARGIN_PENALTY"} <= numeric
+    expected = {"BORDER_CLEAR_KM", "INTERCITY_GAP_KM", "MARGIN", "MARGIN_PENALTY"}
+    assert expected <= numeric
     assert {name.lower() for name in numeric} <= set(settings)
     # And every published number is the module's constant, as run.
     for key, value in settings.items():
@@ -1720,7 +1798,9 @@ def test_near_threshold_decisions_are_flagged_and_counted(tmp_path, monkeypatch)
     # A bus across two top-level regions whose span (4447 km) lies within
     # MARGIN of its reference (4000 km) is flagged and penalised; a tram in
     # one city and a declared-only feed are not; the manifest counts them.
+    # The bus's stops lie degrees apart: the intercity rule is set aside.
     monkeypatch.setattr(classify, "route_span_reference", lambda: NEAR_REFERENCE)
+    monkeypatch.setattr(classify, "INTERCITY_GAP_KM", 1e9)
     lookup = StubLookup({**LOOKUP.by_x, 50.0: FAR_RECORDS})
     places = PLACES + FAR_PLACES
     cache = tmp_path / "cache"
@@ -1813,34 +1893,126 @@ def test_scheduled_stops_resolving_to_no_country_leave_no_basis(tmp_path):
     assert manifest["feeds_by_country_basis"] == {"none": 1}
 
 
-def test_the_border_gate_needs_two_minority_stops_and_a_tenth():
-    def route(countries, route_type=0):
-        return classify.classify_route(route_type, countries, None, "one_city")
+def test_one_stop_clearly_abroad_crosses_a_border():
+    def route(countries, clear, route_type=0):
+        return classify.classify_route(
+            route_type, countries, None, "one_city", clear=frozenset(clear)
+        )
 
-    # One stop abroad among twenty: no border crossing, the stop recorded.
-    decision = route(_stops(AA=19, BB=1))
-    assert (decision["tier"], decision["international"]) == ("local", False)
-    assert decision["border_stops"] == {"BB": 1}
-    # Three among twenty: the route keeps its tier and crosses the border.
-    decision = route(_stops(AA=17, BB=3))
+    # One stop clearly abroad among twenty: the route keeps its tier and
+    # crosses the border.
+    decision = route(_stops(AA=19, BB=1), {"AA", "BB"})
     assert (decision["tier"], decision["rule"]) == ("local", "one_city")
     assert decision["international"] is True and decision["border_stops"] == {}
-    # Two of ten is a fifth; two of forty is a twentieth.
-    assert route(_stops(AA=8, BB=2))["international"] is True
-    far = route(_stops(AA=38, BB=2))
-    assert far["international"] is False and far["border_stops"] == {"BB": 2}
+    # Abroad only by the border: no crossing, the stop recorded.
+    decision = route(_stops(AA=19, BB=1), {"AA"})
+    assert decision["international"] is False and decision["border_stops"] == {"BB": 1}
     # A stop on a boundary sliver sits in both countries: never a minority stop.
     sliver = {"AA": frozenset({"a0", "a1", "x"}), "BB": frozenset({"x"})}
-    decision = route(sliver)
+    decision = route(sliver, {"AA"})
     assert decision["international"] is False and decision["border_stops"] == {}
-    # A zone reaching the other country serves it there, whatever else it
-    # reaches; it counts once among the route's locations.
-    zones = {("zone", "z1"), ("zone", "z2")}
-    decision = route({"AA": frozenset({"a0", *zones}), "BB": frozenset(zones)})
-    assert decision["international"] is True
+    # The one country holding stops clearly is the route's home, whichever
+    # holds most of them.
+    decision = route(_stops(AA=3, BB=2), {"BB"})
+    assert decision["border_stops"] == {"AA": 3}
     # A route declared international is not added a second time.
-    declared = route(_stops(AA=17, BB=3), route_type=201)
+    declared = route(_stops(AA=17, BB=3), {"AA", "BB"}, route_type=201)
     assert (declared["tier"], declared["international"]) == ("international", False)
+
+
+def test_a_stop_counts_in_a_country_only_away_from_its_border():
+    # BB clearly at 60.0; at 62.0 an AA division lies about a hundred metres
+    # away; 65.0 sits on a sliver of both.
+    coords = {
+        "b": (60.0, 1.0),
+        "n": (62.0, 1.0),
+        "s": (65.0, 1.0),
+        "p": crawl.PLACEHOLDER_POSITION,
+    }
+    zone = ("zone", "z")
+    memo = {}
+    found = classify._clear_countries(
+        {"b", "n", "s", "p", zone}, coords, {zone: {"AA", "CC"}}, LOOKUP, memo
+    )
+    # A zone counts in every country it reaches; a placeholder stop in none.
+    assert found == {"AA", "BB", "CC"}
+    assert memo == {"b": "BB", "n": None, "s": None}
+
+
+@pytest.mark.parametrize(
+    ("x", "y", "boxes"),
+    [
+        (10.0, 1.0, 1),
+        (179.999, 1.0, 2),  # across the antimeridian
+        (-179.999, 1.0, 2),
+        (10.0, 89.999, 1),  # by the pole: the whole parallel
+    ],
+)
+def test_the_clear_boxes_cover_the_distance_everywhere(x, y, boxes):
+    found = classify._clear_boxes(x, y)
+    assert len(found) == boxes
+    dlat = math.degrees(classify.BORDER_CLEAR_KM / classify.EARTH_RADIUS_KM)
+    assert all(b[1] == pytest.approx(max(y - dlat, -90.0)) for b in found)
+    if y > 89.0:
+        assert found == [(-180.0, found[0][1], 180.0, 90.0)]
+    # Every point BORDER_CLEAR_KM east and west of the stop lies in a box.
+    for bearing in (90.0, 270.0):
+        east = math.radians(bearing)
+        lon = x + math.degrees(
+            classify.BORDER_CLEAR_KM
+            / classify.EARTH_RADIUS_KM
+            * math.sin(east)
+            / math.cos(math.radians(y))
+        )
+        lon = (lon + 180.0) % 360.0 - 180.0
+        assert any(b[0] <= lon <= b[2] for b in found)
+
+
+def test_clear_stops_are_judged_on_real_boundaries(tmp_path):
+    import overture_fixture as fx
+    import shapely
+
+    from transitio_index import boundaries
+
+    cc0 = [{"dataset": "OpenStreetMap", "license": "ODbL", "property": ""}]
+    countries = {
+        "AA": (-1.0, 0.0, 0.0, 2.0),
+        "BB": (0.0, 0.0, 1.0, 2.0),
+        "CC": (179.0, 0.0, 180.0, 2.0),
+        "DD": (-180.0, 0.0, -179.0, 2.0),
+    }
+    divisions = fx.write_dataset(
+        tmp_path / "divisions.parquet",
+        [fx.division(c.lower(), c, "country") for c in countries],
+    )
+    areas = fx.write_area_dataset(
+        tmp_path / "areas.parquet",
+        [
+            fx.area(c.lower(), shapely.to_wkb(shapely.box(*box)), cc0, country=c)
+            for c, box in countries.items()
+        ],
+    )
+    lookup = boundaries.BoundaryLookup(
+        tmp_path / "cache",
+        release="test",
+        area_dataset=areas,
+        division_dataset=divisions,
+    )
+    # 55 km inside AA; 330 m from BB, as a twin town's stop; 110 m from BB;
+    # 110 m from DD across the antimeridian; 55 km inside CC. The lookup is
+    # ensured for the boxes on the way.
+    coords = {
+        "a": (-0.5, 1.0),
+        "twin": (-0.003, 1.0),
+        "ab": (-0.001, 1.0),
+        "cd": (179.999, 1.0),
+        "c": (179.5, 1.0),
+    }
+    memo = {}
+    with lookup:
+        found = classify._clear_countries(set(coords), coords, {}, lookup, memo)
+    assert memo == {"a": "AA", "twin": "AA", "ab": None, "cd": None, "c": "CC"}
+    assert found == {"AA", "CC"}
 
 
 def test_a_foreign_stop_that_breaks_a_skip_is_counted_as_a_border_stop(tmp_path):

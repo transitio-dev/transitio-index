@@ -11,7 +11,7 @@ under that code.
 
 import io
 
-from transitio_index import pinned
+from transitio_index import csv_source, pinned
 
 POINTER = "cbsa.json"
 DELINEATION_FILE = "list1_2023.xlsx"
@@ -61,19 +61,14 @@ def prepare_inputs(cache_dir, *, files=None, expected=PINS):
 def load_inputs(cache_dir, *, expected=PINS):
     """``(counties, manifest)``: :func:`read_delineation` over the verified
     bytes of the generation published under ``expected``."""
-    generation, manifest = pinned.resolve(
-        cache_dir, pointer=POINTER, expected=expected, error=CbsaError
+    data, manifest = pinned.read_input(
+        cache_dir,
+        pointer=POINTER,
+        expected=expected,
+        name=DELINEATION_FILE,
+        error=CbsaError,
     )
-    with generation:
-        counties = read_delineation(generation.read_bytes(DELINEATION_FILE))
-    return counties, manifest
-
-
-def _cell(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
+    return read_delineation(data), manifest
 
 
 def read_delineation(data):
@@ -91,14 +86,15 @@ def read_delineation(data):
         raise CbsaError(f"{DELINEATION_FILE}: not a workbook: {error}") from None
     try:
         rows = workbook.active.iter_rows(min_row=HEADER_ROW, values_only=True)
-        header = [_cell(value) for value in next(rows, ())]
+        header = [csv_source.cell_text(value) for value in next(rows, ())]
         if not set(COLUMNS) <= set(header):
             raise CbsaError(f"{DELINEATION_FILE}: header {header!r}")
         index = {COLUMNS[name]: header.index(name) for name in COLUMNS}
         counties = {}
         for position, row in enumerate(rows, HEADER_ROW + 1):
             cells = {
-                key: _cell(row[i]) if i < len(row) else None for key, i in index.items()
+                key: csv_source.cell_text(row[i]) if i < len(row) else None
+                for key, i in index.items()
             }
             # The notes below the table carry no code.
             if cells["cbsa"] is None or not cells["cbsa"].isdigit():

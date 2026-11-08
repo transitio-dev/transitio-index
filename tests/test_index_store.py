@@ -673,7 +673,8 @@ def test_a_failed_write_leaves_no_temporary_file(tmp_path):
     assert list(tmp_path.glob(".tmp-*")) == []
 
 
-def _stage(directory, text):
+def _staged_seed(directory, text):
+    """Publish ``text`` as a staged seed generation in ``directory``."""
     return store.publish(
         directory,
         "seed.json",
@@ -684,7 +685,7 @@ def _stage(directory, text):
 
 
 def test_a_staged_generation_is_read_by_name_and_kept_while_a_run_lists_it(tmp_path):
-    staged = _stage(tmp_path, "s\n")
+    staged = _staged_seed(tmp_path, "s\n")
     assert staged["staged"] is True
     # Named by no pointer: invisible to `resolve`, verifiable by name.
     with pytest.raises(store.StoreError, match="no published generation"):
@@ -700,9 +701,9 @@ def test_a_staged_generation_is_read_by_name_and_kept_while_a_run_lists_it(tmp_p
         {"run.jsonl": chunks("")},
         {"generations": {"seed": staged["generation"]}},
     )
-    abandoned = _stage(tmp_path, "0\n")
+    abandoned = _staged_seed(tmp_path, "0\n")
     for index in range(1, store.KEEP_GENERATIONS + 2):
-        _stage(tmp_path, f"{index}\n")
+        _staged_seed(tmp_path, f"{index}\n")
     with store.resolve_generation(tmp_path, staged["generation"])[0] as kept:
         assert kept.read_bytes("places.jsonl") == b"s\n"
     with pytest.raises(store.StoreError, match="no such generation"):
@@ -721,7 +722,7 @@ def test_a_staged_generation_is_read_by_name_and_kept_while_a_run_lists_it(tmp_p
 def test_resolve_generation_verifies_the_generation_it_is_given(
     tmp_path, tamper, message
 ):
-    staged = _stage(tmp_path, "s\n")
+    staged = _staged_seed(tmp_path, "s\n")
     name = staged["generation"]
     generation_dir = tmp_path / name
     if tamper == "artifact":
@@ -758,10 +759,10 @@ def test_a_tag_collision_never_prunes_another_pointers_staged_generation(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(store, "_generation_tag", lambda pointer: "deadbeef")
-    pending = _stage(tmp_path, "s\n")
+    pending = _staged_seed(tmp_path, "s\n")
     # A generation whose manifest records no family (or an unreadable one)
     # is preserved too: unknown is never treated as this pointer's.
-    legacy = _stage(tmp_path, "legacy\n")
+    legacy = _staged_seed(tmp_path, "legacy\n")
     manifest_path = tmp_path / legacy["generation"] / "manifest.json"
     manifest_path.write_text(
         json.dumps({k: v for k, v in legacy.items() if k != "family"})
@@ -811,14 +812,14 @@ def test_a_run_manifest_swaps_a_whole_set_at_once(tmp_path):
         }
 
     first = {
-        "seed": _stage(tmp_path, "seed-1\n")["generation"],
+        "seed": _staged_seed(tmp_path, "seed-1\n")["generation"],
         "metros": store.publish(
             tmp_path, "metros.json", {"m.jsonl": chunks("metros-1\n")}, {}, staged=True
         )["generation"],
     }
     run(first)
     second = {
-        "seed": _stage(tmp_path, "seed-2\n")["generation"],
+        "seed": _staged_seed(tmp_path, "seed-2\n")["generation"],
         "metros": store.publish(
             tmp_path, "metros.json", {"m.jsonl": chunks("metros-2\n")}, {}, staged=True
         )["generation"],

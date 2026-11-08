@@ -227,7 +227,7 @@ def _notice_listed_but_gone(path):
     (path / "NOTICE").unlink()
 
 
-def _run(builds, label, digit, **kwargs):
+def _archived_build(builds, label, digit, **kwargs):
     """A partitioned build archived as ``<label>-<16 hex>`` under ``builds``."""
     path = builds / f"{label}-{digit:016x}" / "index"
     write_partitioned_build(path, **kwargs)

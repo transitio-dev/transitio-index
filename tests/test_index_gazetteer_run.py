@@ -9,8 +9,11 @@ from transitio_index import registry, store  # noqa: E402
 HEADER = '{"next_id": 1, "registry": 1}\n'
 
 
-def _stage(cache, pointer, text, identify=None, pointer_publish=False, manifest=None):
-    """A stub stage: one staged generation, and an identification when asked."""
+def _stub_stage(
+    cache, pointer, text, identify=None, pointer_publish=False, manifest=None
+):
+    """A stub stage: one generation (staged, or behind a live pointer with
+    ``pointer_publish``), and an identification when asked."""
 
     def run_stage(places, run):
         if identify:
@@ -54,7 +57,7 @@ def _consume(cache, path):
 
 def _committed(cache, path):
     """A first run that minted Q1: the set a failing rerun must leave current."""
-    stages = [_stage(cache, "seed.json", "first", identify={"wikidata": ["Q1"]})]
+    stages = [_stub_stage(cache, "seed.json", "first", identify={"wikidata": ["Q1"]})]
     build_index.commit_run(cache, path, read_only=False, stages=stages)
     return store.run_generations(cache / "gazetteer"), path.read_bytes()
 
@@ -70,8 +73,8 @@ def _assert_first_run_current(cache, path, first, *, registry_unchanged=True):
 def test_a_run_commits_its_set_and_registry_together(tmp_path):
     cache, path = tmp_path / "cache", _registry(tmp_path)
     stages = [
-        _stage(cache, "seed.json", "s", identify={"wikidata": ["Q1"]}),
-        _stage(cache, "metros.json", "m"),
+        _stub_stage(cache, "seed.json", "s", identify={"wikidata": ["Q1"]}),
+        _stub_stage(cache, "metros.json", "m"),
     ]
     manifest = build_index.commit_run(cache, path, read_only=False, stages=stages)[-1]
     assert set(manifest["generations"]) == {"seed.json", "metros.json"}
@@ -96,7 +99,7 @@ def test_a_failure_before_the_save_leaves_the_previous_run_current(tmp_path):
     cache, path = tmp_path / "cache", _registry(tmp_path)
     first = _committed(cache, path)
     stages = [
-        _stage(cache, "seed.json", "second", identify={"wikidata": ["Q2"]}),
+        _stub_stage(cache, "seed.json", "second", identify={"wikidata": ["Q2"]}),
         _failing,
     ]
     with pytest.raises(RuntimeError, match="boom"):
@@ -123,7 +126,7 @@ def test_a_crash_after_the_save_is_recovered_by_a_rerun(tmp_path, monkeypatch):
         return real(directory, pointer, *args, **kwargs)
 
     monkeypatch.setattr(store, "publish", crash)
-    stages = [_stage(cache, "seed.json", "second", identify={"wikidata": ["Q2"]})]
+    stages = [_stub_stage(cache, "seed.json", "second", identify={"wikidata": ["Q2"]})]
     with pytest.raises(RuntimeError, match="crash"):
         build_index.commit_run(cache, path, read_only=False, stages=stages)
     # The registry holds the mint, valid rows a rerun reproduces; the first
@@ -154,8 +157,8 @@ def test_read_only_refuses_a_change_and_keeps_the_previous_run(
     first = _committed(cache, path)
     # A change the metros stage is first to discover, after seed has
     # already staged its output, is refused the same way.
-    stages = [_stage(cache, "seed.json", "second")] if staged_first else []
-    stages.append(_stage(cache, "metros.json", "m", identify=identify))
+    stages = [_stub_stage(cache, "seed.json", "second")] if staged_first else []
+    stages.append(_stub_stage(cache, "metros.json", "m", identify=identify))
     with pytest.raises(registry.RegistryError, match="read-only"):
         build_index.commit_run(cache, path, read_only=True, stages=stages)
     _assert_first_run_current(cache, path, first)
@@ -193,7 +196,7 @@ def test_runs_on_one_cache_do_not_interleave(tmp_path):
                     cache,
                     path,
                     read_only=False,
-                    stages=[_stage(cache, "seed.json", "s")],
+                    stages=[_stub_stage(cache, "seed.json", "s")],
                 )
     finally:
         directory.close()
@@ -202,9 +205,9 @@ def test_runs_on_one_cache_do_not_interleave(tmp_path):
 
 def test_the_run_manifest_outranks_a_stale_pointer(tmp_path):
     cache, path = tmp_path / "cache", _registry(tmp_path)
-    old = _stage(cache, "seed.json", "old", pointer_publish=True)(None, {})
+    old = _stub_stage(cache, "seed.json", "old", pointer_publish=True)(None, {})
     build_index.commit_run(
-        cache, path, read_only=False, stages=[_stage(cache, "seed.json", "new")]
+        cache, path, read_only=False, stages=[_stub_stage(cache, "seed.json", "new")]
     )
     rows, _ = store.read_jsonl(cache / "gazetteer", "seed.json", "places.jsonl")
     assert rows == [{"place_id": "new"}]
@@ -224,7 +227,10 @@ def test_a_consumer_holds_the_registry_while_it_reads_the_run(tmp_path):
     with build_index.check_registry_state(cache, path):
         with pytest.raises(registry.RegistryError, match="another build"):
             build_index.commit_run(
-                cache, path, read_only=False, stages=[_stage(cache, "seed.json", "s")]
+                cache,
+                path,
+                read_only=False,
+                stages=[_stub_stage(cache, "seed.json", "s")],
             )
 
 
@@ -242,7 +248,7 @@ def test_consumers_follow_the_registry_the_expand_stage_saved(tmp_path):
     run_generation = store.run_manifest(cache / "gazetteer")["generation"]
 
     def expanded(base, generation=run_generation):
-        _stage(
+        _stub_stage(
             cache,
             "expanded.json",
             "x",
@@ -270,7 +276,7 @@ def test_consumers_follow_the_registry_the_expand_stage_saved(tmp_path):
         with pytest.raises(registry.RegistryError, match="rerun expand"):
             _consume(cache, path)
     # A run manifest that records no digest is refused, never skipped.
-    _stage(
+    _stub_stage(
         cache,
         store.RUN_POINTER,
         "r",
