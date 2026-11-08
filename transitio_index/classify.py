@@ -8,7 +8,8 @@ much service that is. For every crawled feed with complete
 its stops, span (greatest distance between any two stops), median inter-stop
 distance and the places and countries its stops fall in — and decides its
 tier: the class its GTFS type declares; else ``local`` when one city or one
-metro holds every located stop; else ``national`` when its stops lie in more
+metro holds every located stop (``regional`` for rail one metro holds but no
+one city); else ``national`` when its stops lie in more
 than one top-level region and its span exceeds the 90th percentile of the
 route spans of its feed's home country and mode
 (``route_span_reference.csv``), with the margin penalty within 20 % of that
@@ -165,8 +166,9 @@ DEPARTURES_VERSION = 5
 # out of its route's places and span; 9 reads a zone an older Flex draft names
 # in stop_id; 10 keeps a route with a zone regional at most; 11 counts a stop
 # in a country only away from its border, crosses a border on one such stop
-# and counts the regions in every country holding one.
-RULES_VERSION = 11
+# and counts the regions in every country holding one; 12 makes rail across
+# the cities of one metro regional.
+RULES_VERSION = 12
 
 # The route-span reference (written by ``scripts/route_span_reference.py``):
 # per home country and basic mode, the 90th percentile of the spans of the
@@ -388,7 +390,8 @@ def classify_route(
 
     A type that declares a class takes it (``declared``). Any other type of a
     known mode is ``local`` when ``local`` names the rule holding every
-    located stop of the route in one place (``one_city``, ``one_metro``);
+    located stop of the route in one place (``one_city``, ``one_metro``),
+    except rail one metro holds, which is ``regional`` (``metro_rail``);
     otherwise ``national`` when its stops lie in more than one top-level
     region (``regions``) and its span exceeds ``reference``, the 90th
     percentile of the spans of its feed's home country and mode
@@ -440,6 +443,8 @@ def _scale(route_type, span_km, local, regions, reference, zone=False):
     if local == "one_city":
         return _decide("local", 0.90, "one_city")
     if local == "one_metro":
+        if basic_mode(route_type) == "rail":
+            return _decide("regional", 0.85, "metro_rail")
         return _decide("local", 0.85, "one_metro")
     if regions < 2:
         return _decide("regional", 0.75, "regional")

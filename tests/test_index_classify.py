@@ -24,7 +24,8 @@ def _stops(**counts):
         (109, "one_city", 1, 5.0, "regional", 0.95, "declared"),  # beats one city
         (704, None, 3, 500.0, "local", 0.95, "declared"),
         (3, "one_city", 1, 5.0, "local", 0.90, "one_city"),
-        (2, "one_metro", 2, 90.0, "local", 0.85, "one_metro"),
+        (3, "one_metro", 2, 90.0, "local", 0.85, "one_metro"),
+        (2, "one_metro", 2, 90.0, "regional", 0.85, "metro_rail"),  # rail
         (3, None, 1, 300.0, "regional", 0.75, "regional"),  # one region
         (3, None, 2, 13.0, "regional", 0.75, "regional"),  # two, but short
         (2, None, 2, 400.0, "national", 0.75, "regions_and_span"),

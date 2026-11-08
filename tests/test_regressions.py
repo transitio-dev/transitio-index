@@ -3016,8 +3016,9 @@ TIER_PLACES = {
         (0, ["strasbourg"] * 3 + ["kehl"] * 2, 9.0, 20.2, None, "local", True),
         # S-Bahn Rhein-Neckar declares regional rail across Länder.
         (109, ["kehl", "ilsenburg"], 200.0, 140.8, None, "regional", False),
-        # A Long Island branch within New York's metro, and Montauk beyond it.
-        (2, ["new-york", "mineola"], 30.0, 606.2, None, "local", False),
+        # A Long Island branch within New York's metro (rail across its
+        # cities: regional), and Montauk beyond it.
+        (2, ["new-york", "mineola"], 30.0, 606.2, None, "regional", False),
         (2, ["new-york", "mineola", "montauk"], 190.0, 60.0, None, "regional", False),
         # A 13 km bus across two Länder; a long train across them.
         (3, ["ilsenburg", "bad-harzburg"], 13.0, 22.7, None, "regional", False),
