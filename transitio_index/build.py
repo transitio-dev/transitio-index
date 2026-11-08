@@ -439,6 +439,13 @@ def parse_args(argv=None):
         f"(default: {DEFAULT_OVERTURE_DIR})",
     )
     parser.add_argument(
+        "--overture-from",
+        type=pathlib.Path,
+        help="a folder holding an earlier download of the release in the "
+        "bucket's layout: a local copy made anew takes each file found there "
+        "at the listed size instead of downloading it",
+    )
+    parser.add_argument(
         "--overture-remote",
         action="store_true",
         help="read Overture from its bucket at every stage, not a local copy",
@@ -573,7 +580,8 @@ def main(argv=None):
     if arguments.overture_release is not None:
         overture.use_release(arguments.overture_release)
     overture.use_local_copy(
-        None if arguments.overture_remote else arguments.overture_dir
+        None if arguments.overture_remote else arguments.overture_dir,
+        arguments.overture_from,
     )
     stage = arguments.stage
     try:

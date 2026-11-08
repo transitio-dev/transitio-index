@@ -10,7 +10,9 @@
 # pinned commit).
 # MDB_CATALOGUE, when set, is the whole MDB CSV the cut was taken from, passed
 # as --mdb-catalogue; OVERTURE_RELEASE, when set, is passed as
-# --overture-release (else the build reads the newest release).
+# --overture-release (else the build reads the newest release); OVERTURE_FROM,
+# when set, as --overture-from (an earlier download a new local copy takes
+# its files from).
 # BUILD_CHECKOUT is the checkout to build in (default: this repository),
 # PYTHON its Python (default: python3), LOGDIR where <label>.log goes
 # (default: $TMPDIR).
@@ -150,6 +152,7 @@ set -- --stage ingest --downstream --no-golden --allow-empty-mdb --workers 4 \
 [ -z "$SEED" ] || set -- "$@" --seed-countries "$SEED"
 [ -z "${MDB_CATALOGUE:-}" ] || set -- "$@" --mdb-catalogue "$MDB_CATALOGUE"
 [ -z "${OVERTURE_RELEASE:-}" ] || set -- "$@" --overture-release "$OVERTURE_RELEASE"
+[ -z "${OVERTURE_FROM:-}" ] || set -- "$@" --overture-from "$OVERTURE_FROM"
 echo "build: $*" >> "$LOG"
 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="" \
   "$PY" -m transitio_index.build "$@" \

@@ -86,6 +86,7 @@ LOCAL_MARKER_MAX = 2**20
 # The directory holding one local copy per release (``use_local_copy``), and
 # the copies checked this process, by release.
 _local_root = None
+_local_earlier = None
 _local_copies = {}
 
 # Overture ``subtype`` to the gazetteer's ``kind``. Finer subtypes (borough,
@@ -248,20 +249,25 @@ def current_release():
     return _release
 
 
-def use_local_copy(root):
+def use_local_copy(root, earlier=None):
     """Read every Overture table from a local copy under ``root``, one
     directory per release that :func:`ensure_local_copy` downloads, for the
-    rest of the process; None reads the bucket."""
-    global _local_root
+    rest of the process, taking the files an ``earlier`` download holds;
+    None reads the bucket."""
+    global _local_root, _local_earlier
     _local_root = None if root is None else pathlib.Path(root)
+    _local_earlier = None if earlier is None else pathlib.Path(earlier)
     _local_copies.clear()
 
 
-def ensure_local_copy(root, release, filesystem=None):
+def ensure_local_copy(root, release, filesystem=None, earlier=None):
     """A folder holding a complete local copy of ``release``'s divisions
     tables (``LOCAL_TABLES``): the one ``root/<release>/current.json``
     names, else a new one downloaded from the Overture bucket
-    (``filesystem``, by default the anonymous S3 one). A download runs under
+    (``filesystem``, by default the anonymous S3 one), each listed file
+    taken instead from the folder ``earlier`` when it holds the file at the
+    same path under the release and at the listed size (an earlier download
+    of the release, in the bucket's layout). A download runs under
     a writer lock over ``root`` (another build needing a download waits;
     one finding its copy complete does not) into a new private
     folder ``root/<release>/copy-<id>``, every folder and file created
@@ -293,7 +299,7 @@ def ensure_local_copy(root, release, filesystem=None):
         name = f"copy-{os.urandom(8).hex()}"
         with folder.make_subdirectory(name) as copy:
             try:
-                _download_tables(filesystem, base, files, copy)
+                _download_tables(filesystem, base, files, copy, earlier)
                 copy.sync()
                 store.write_bytes(copy, LOCAL_COMPLETE, listing.encode())
                 copy.sync()
@@ -312,13 +318,15 @@ def ensure_local_copy(root, release, filesystem=None):
         return copy.path
 
 
-def _download_tables(filesystem, base, files, copy):
+def _download_tables(filesystem, base, files, copy, earlier=None):
     """Download ``files`` (``{path under the release: size}``) from ``base``
-    into ``copy``, a :class:`store.Directory`: each table folder opened
-    through its parent's descriptor, each file created exclusively and
-    synced to disk with its folder; a file of another size than listed is
-    refused."""
+    into ``copy``, a :class:`store.Directory`, or copy each from ``earlier``
+    (:func:`_earlier_file`), downloading it after all when it changed size
+    while being copied: each table folder opened through its parent's
+    descriptor, each file created exclusively and synced to disk with its
+    folder; a file of another size than listed is refused."""
     opened = {}
+    taken = 0
     try:
         for name, size in sorted(files.items()):
             table, leaf = name.rsplit("/", 1)
@@ -327,13 +335,17 @@ def _download_tables(filesystem, base, files, copy):
                 if theme not in opened:
                     opened[theme] = copy.child(theme)
                 opened[table] = opened[theme].child(kind)
-            with filesystem.open_input_stream(f"{base}/{name}") as source:
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | store.O_BINARY
-                with os.fdopen(opened[table].open(leaf, flags), "wb") as sink:
-                    shutil.copyfileobj(source, sink, 2**24)
-                    sink.flush()
-                    os.fsync(sink.fileno())
-                    written = os.fstat(sink.fileno()).st_size
+            written = None
+            source = _earlier_file(earlier, name, size)
+            if source is not None:
+                written = _write_table_file(source, opened[table], leaf)
+                if written == size:
+                    taken += 1
+                else:
+                    opened[table].unlink(leaf)
+            if written != size:
+                source = filesystem.open_input_stream(f"{base}/{name}")
+                written = _write_table_file(source, opened[table], leaf)
             if written != size:
                 raise GazetteerError(f"{name}: downloaded {written} bytes of {size}")
         for directory in opened.values():
@@ -341,6 +353,48 @@ def _download_tables(filesystem, base, files, copy):
     finally:
         for directory in opened.values():
             directory.close()
+    if earlier is not None:
+        log.info("overture: %d of %d files taken from %s", taken, len(files), earlier)
+
+
+def _write_table_file(source, directory, leaf):
+    """Write the open ``source`` to the new file ``leaf`` in ``directory``,
+    synced to disk; the bytes written."""
+    with source:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | store.O_BINARY
+        with os.fdopen(directory.open(leaf, flags), "wb") as sink:
+            shutil.copyfileobj(source, sink, 2**24)
+            sink.flush()
+            os.fsync(sink.fileno())
+            return os.fstat(sink.fileno()).st_size
+
+
+def _earlier_file(earlier, name, size):
+    """The file ``name`` of the folder ``earlier`` opened for reading when it
+    is a regular file of ``size`` bytes, every folder on the way opened
+    through its parent's descriptor without following a link; else None. A
+    file rewritten at the same size while it is copied is not noticed: the
+    folder is the maintainer's own scratch, as the copies are."""
+    if earlier is None:
+        return None
+    *folders, leaf = name.split("/")
+    opened = []
+    try:
+        directory = store.Directory(earlier, create=False)
+        opened.append(directory)
+        for folder in folders:
+            directory = directory.subdirectory(folder)
+            opened.append(directory)
+        handle = store.open_regular(directory, leaf, None)
+    except (OSError, store.StoreError):
+        return None
+    finally:
+        for directory in opened:
+            directory.close()
+    if os.fstat(handle).st_size != size:
+        os.close(handle)
+        return None
+    return os.fdopen(handle, "rb")
 
 
 def _current_copy(folder, release):
@@ -481,7 +535,9 @@ def theme_dataset(path, release=None):
         if table not in LOCAL_TABLES:
             raise GazetteerError(f"{table}: not a table of the local Overture copy")
         if release not in _local_copies:
-            _local_copies[release] = ensure_local_copy(_local_root, release)
+            _local_copies[release] = ensure_local_copy(
+                _local_root, release, earlier=_local_earlier
+            )
         return ds.dataset(str(_local_copies[release] / table), format="parquet")
     location = f"{OVERTURE_BUCKET}/{path.format(release=release)}"
     try:

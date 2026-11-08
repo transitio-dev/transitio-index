@@ -425,6 +425,72 @@ def test_a_local_copy_is_downloaded_once_and_read_after(tmp_path, monkeypatch):
         overture.ensure_local_copy(tmp_path / "copies", release, bucket)
 
 
+@pytest.mark.parametrize(
+    "case, downloaded",
+    [
+        ("as held", ["division_area"]),
+        ("linked folder", ["division", "division_area"]),
+        ("linked table", ["division", "division_area"]),
+        ("changed while copied", ["division", "division_area"]),
+    ],
+)
+def test_a_local_copy_takes_the_files_an_earlier_download_holds(
+    tmp_path, monkeypatch, case, downloaded
+):
+    # An earlier download holds the division table at the listed size and the
+    # area table at another: the first is copied, the second downloaded; a
+    # link on the way or a file that changes while copied is downloaded too.
+    import io
+    import shutil
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    class Reads:
+        """The bucket, recording the tables opened from it."""
+
+        def __init__(self, filesystem):
+            self.filesystem, self.opened = filesystem, []
+
+        def get_file_info(self, selector):
+            return self.filesystem.get_file_info(selector)
+
+        def open_input_stream(self, path):
+            self.opened.append(path.rsplit("type=", 1)[1].split("/")[0])
+            return self.filesystem.open_input_stream(path)
+
+    release = "2026-10-21.0"
+    bucket = Reads(_bucket(tmp_path / "bucket", {release: True}))
+    theme = tmp_path / "bucket" / overture.OVERTURE_BUCKET / "release" / release
+    earlier = tmp_path / "earlier"
+    for table, ids in (("division", ["a", "b"]), ("division_area", ["a"])):
+        folder = f"theme=divisions/type={table}"
+        (theme / folder).mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"id": ids}), theme / folder / "part-0.parquet")
+        (earlier / folder).mkdir(parents=True)
+        shutil.copy(theme / folder / "part-0.parquet", earlier / folder)
+    area = earlier / "theme=divisions" / "type=division_area" / "part-0.parquet"
+    area.write_bytes(b"another size")
+    given = earlier
+    try:
+        if case == "linked folder":
+            given = tmp_path / "linked"
+            given.symlink_to(earlier)
+        elif case == "linked table":
+            table = earlier / "theme=divisions" / "type=division"
+            table.rename(tmp_path / "moved")
+            table.symlink_to(tmp_path / "moved")
+    except OSError:  # no symlinks on this platform
+        pytest.skip("this platform cannot create symlinks")
+    if case == "changed while copied":
+        monkeypatch.setattr(overture, "_earlier_file", lambda *a: io.BytesIO(b"cut"))
+    copy = overture.ensure_local_copy(tmp_path / "copies", release, bucket, given)
+    assert bucket.opened == downloaded
+    table = copy / "theme=divisions" / "type=division" / "part-0.parquet"
+    assert pq.read_table(table)["id"].to_pylist() == ["a", "b"]
+    assert overture._complete(copy, release)
+
+
 def test_a_build_waits_while_another_downloads(tmp_path, monkeypatch):
     from transitio_index import store
 
