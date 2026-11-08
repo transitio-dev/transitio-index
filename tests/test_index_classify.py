@@ -48,6 +48,21 @@ def test_the_decision_table(route_type, local, regions, span, tier, confidence, 
     assert decision["international"] is False
 
 
+@pytest.mark.parametrize(
+    ("local", "regions", "tier", "rule"),
+    [
+        ("one_metro", 2, "local", "one_metro"),  # one metro holds the zone
+        (None, 1, "regional", "regional"),
+        (None, 2, "regional", "zone"),  # two regions and long: still regional
+    ],
+)
+def test_a_route_with_a_zone_is_regional_at_most(local, regions, tier, rule):
+    decision = classify.classify_route(
+        3, _stops(AA=2), 400.0, local, regions, 140.0, zone=True
+    )
+    assert (decision["tier"], decision["rule"]) == (tier, rule)
+
+
 def test_the_margin_penalty_applies_within_a_fifth_of_the_reference():
     # 150 km is within 20 % of a 140 km reference, on either side.
     for span, tier in ((150.0, "national"), (130.0, "regional")):

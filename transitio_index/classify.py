@@ -29,7 +29,9 @@ A demand-responsive (GTFS-Flex) trip that names a zone or a stop group
 instead of a stop is read the same way: a group by its stops, a zone as a
 location of its own that lies in every place it reaches into past the
 boundary simplification, holds a route local only when one city or metro
-holds the whole of it, and spans its hull's vertices.
+holds the whole of it, and spans its hull's vertices. A route with a zone is
+regional at most: a dial-a-ride serves the places riders board in, however
+large its zone.
 
 ``unknown`` is an explicit tier, never a null: a route without a type or of
 no known mode, a feed without route evidence, and every declared-only feed
@@ -160,8 +162,8 @@ DEPARTURES_VERSION = 5
 # edge, by their own tier; 7 reads the zones and stop groups of
 # demand-responsive trips; 8 leaves the zones a trip only sets riders down in
 # out of its route's places and span; 9 reads a zone an older Flex draft names
-# in stop_id.
-RULES_VERSION = 9
+# in stop_id; 10 keeps a route with a zone regional at most.
+RULES_VERSION = 10
 
 # The route-span reference (written by ``scripts/route_span_reference.py``):
 # per home country and basic mode, the 90th percentile of the spans of the
@@ -309,7 +311,14 @@ def _outside(ids, held):
 
 
 def classify_route(
-    route_type, countries, span_km, local=None, regions=0, reference=None
+    route_type,
+    countries,
+    span_km,
+    local=None,
+    regions=0,
+    reference=None,
+    *,
+    zone=False,
 ):
     """The decision table; ``{tier, tier_confidence, rule, margin,
     border_stops, international}``.
@@ -321,7 +330,9 @@ def classify_route(
     than one top-level region (``regions``) and its span exceeds
     ``reference``, the 90th percentile of the spans of its feed's home
     country and mode (``regions_and_span``), else ``regional``, with less
-    confidence when the span or the reference is missing. A route without a
+    confidence when the span or the reference is missing. A route with a
+    demand-responsive ``zone`` reaching several regions is ``regional``
+    whatever its span (``zone``). A route without a
     type, or of no known mode, is ``unknown``; air, taxi and miscellaneous
     services are out of scope by design (``out_of_scope``).
 
@@ -331,7 +342,7 @@ def classify_route(
     stops outside the majority country. Below that gate ``border_stops``
     counts the minority stops per country.
     """
-    decision = _scale(route_type, span_km, local, regions, reference)
+    decision = _scale(route_type, span_km, local, regions, reference, zone)
     decision.update(border_stops={}, international=False)
     if not countries:
         return decision
@@ -349,9 +360,9 @@ def classify_route(
     return decision
 
 
-def _scale(route_type, span_km, local, regions, reference):
+def _scale(route_type, span_km, local, regions, reference, zone=False):
     """The tier before the border: the rules over the route's type, the
-    places holding its stops and its span."""
+    places holding its stops, whether it has a zone, and its span."""
     if route_type is None:
         return dict(_UNKNOWN)
     if route_type in DECLARED_TIERS:
@@ -367,6 +378,8 @@ def _scale(route_type, span_km, local, regions, reference):
         return _decide("local", 0.85, "one_metro")
     if regions < 2:
         return _decide("regional", 0.75, "regional")
+    if zone:
+        return _decide("regional", 0.75, "zone")
     if span_km is None or reference is None:
         return _decide("regional", 0.60, "regional")
     tier, rule = "regional", "regional"
@@ -1868,6 +1881,8 @@ def _classify_feed(
             majority, minority = _border(countries)
             minority_stops |= minority
         local, regions = _route_places(stop_ids, countries, majority, reach, places)
+        # A zone is keyed by a tuple; a stop group adds its stops' ids.
+        zone = any(isinstance(key, tuple) for key in parsed["flex"].get(route_id, ()))
         mode_key = basic_mode(route_type)
         reference = references.get((home, mode_key), references.get(("*", mode_key)))
         place_stops = collections.defaultdict(set)
@@ -1882,6 +1897,7 @@ def _classify_feed(
                 local,
                 regions,
                 reference,
+                zone=zone,
             ),
             "route_id": route_id,
             "route_type": route_type,
