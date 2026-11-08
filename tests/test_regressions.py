@@ -2745,6 +2745,7 @@ def test_the_merge_measures_overlap_across_builds():
         {"overlap": old},
     ]
     evidence[0]["overlap_routes"] = [["s1", "rail", 100.0, *box]]
+    evidence[0]["overlap_agencies"] = ["münchner"]
     evidence[1]["overlap_routes"] = [
         ["s1", "rail", 80.0, *box],
         ["x1", "bus", 20.0, *box],
@@ -2761,8 +2762,9 @@ def test_the_merge_measures_overlap_across_builds():
     assert found[0]["overlap"]["with"] == {"f-delfi": {"rail": 1.0}}
     assert found[1]["overlap"]["with"] == {"f-mvv": {"rail": 1.0}}
     assert found[0]["overlap"]["compared"] == ["f-delfi"]
-    # The route rows do not ship; an edge without them keeps its block.
-    assert not any("overlap_routes" in e for e in found)
+    # The route rows and agency words do not ship; an edge without them
+    # keeps its block.
+    assert not any({"overlap_routes", "overlap_agencies"} & e.keys() for e in found)
     assert found[2]["overlap"] == old
 
 

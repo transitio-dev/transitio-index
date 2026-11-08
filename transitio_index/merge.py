@@ -101,7 +101,8 @@ OVERRIDE_FIELDS = (
 # feeds without a read by cause. 23: feeds whose zones differ never fold.
 # 24: the NOTICE credits the whole MDB catalogue a build found twins in.
 # 25: a place's metro_ids and member_ids are every build's, merged.
-MERGE_FORMAT = 25
+# 26: route rows carry their stop cells; the agency words never ship.
+MERGE_FORMAT = 26
 # The schemas of the builds a merge takes: both load into the same tables.
 SOURCE_SCHEMAS = (11, 12)
 
@@ -458,14 +459,16 @@ def _cross_build_overlaps(edges):
     for i, (place_id, record) in enumerate(
         zip(edges["place_id"].to_pylist(), evidence)
     ):
+        record.pop("overlap_agencies", None)
         routes = record.pop("overlap_routes", None)
         if routes is not None:
-            by_place[place_id].append((i, None, classify.route_rows(routes, interned)))
+            rows, _ = classify.route_rows(routes, interned)
+            by_place[place_id].append((i, None, rows))
         repeats = record.pop("overlap_repeats_routes", None)
         if isinstance(repeats, dict):
             record.pop("overlap_repeats", None)
             for tier, routes in sorted(repeats.items()):
-                rows = classify.route_rows(routes, interned)
+                rows, _ = classify.route_rows(routes, interned)
                 by_place[place_id].append((i, tier, rows))
     if not by_place:
         return edges

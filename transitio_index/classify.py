@@ -64,7 +64,11 @@ basic mode, and per other feed at the place the share of them on routes
 that feed also runs — a route of the same family (tram, subway and rail are
 one, rail-bound) and line name (short, else long, without whitespace,
 casefolded) whose stops in the place come within ``OVERLAP_NEAR_DEG`` of the
-route's stop box there. A route's departures are its calendar-weighted
+route's stop box there, or, under another name, a route of the same family
+sharing its stop cells there (``OVERLAP_STOP_SHARE`` both ways) of a feed
+whose agencies are related and whose routes repeat the other's network
+(``OVERLAP_NETWORK_SHARE``); ``stop_matched`` lists the feeds matched so.
+A route's departures are its calendar-weighted
 stop-events spread evenly over its stops, times its stops in the place; a
 feed without a calendar gets no block, but its routes still count for the
 others. A route across a border counts in the block of its own tier's edge;
@@ -95,6 +99,7 @@ import heapq
 import json
 import os
 import pathlib
+import re
 import stat
 import math
 import statistics
@@ -217,6 +222,41 @@ OVERLAP_NEAR_DEG = 0.003
 OVERLAP_MIN_SHARE = 0.01
 # Rows per box test in the place pass.
 _OVERLAP_BLOCK = 2048
+# Another feed also runs a route under another line name when its route of
+# the same family holds this share of the route's stop cells in the place,
+# and the route as much of its own: the grid cells of OVERLAP_CELL_DEG its
+# stops lie in, one counting when the other route has its cell or a
+# neighbouring one. A route with fewer cells than OVERLAP_MIN_CELLS there is
+# not compared by its stops.
+OVERLAP_CELL_DEG = 0.003
+OVERLAP_STOP_SHARE = 0.8
+OVERLAP_MIN_CELLS = 3
+# Stop matches count only between feeds whose agencies share a name word and
+# where one feed has at least this share of its routes at the places both
+# serve matched: a feed repeating the other's network, not two networks
+# meeting on a few streets.
+OVERLAP_NETWORK_SHARE = 0.5
+# Operator-name words too common to relate two agencies.
+_AGENCY_GENERIC = frozenset(
+    """agency airport area authority autobuses autocars buses bussiliinid
+    busverkehr cars city coach coaches commuter company compagnie corporation
+    county department district express group groupe holdings liikenne limited
+    line lines linja metro metropolitan municipal national network omnibus
+    public rail railway railways region regional reisen service services
+    shuttle shuttles societe société system tourist tours train trains trans
+    transit transport transportation transporte transportes transports
+    trasporti travel trolley verkehr verkehrs verkehrsverbund""".split()
+)
+# Longer words are not names to relate feeds by.
+_AGENCY_WORD_LETTERS = 40
+# A grid cell packs its row, offset to be non-negative, and its column, taken
+# modulo the grid's width so that 180° and -180° are one meridian; the
+# packed columns wrap at 0° instead.
+_CELL_ROW_OFFSET = 1 << 16
+_CELL_SPAN = 1 << 17
+_CELL_COLUMNS = round(360 / OVERLAP_CELL_DEG)
+# A cell's neighbours away from the packed columns' wrap, as offsets.
+_CELL_OFFSETS = tuple(dy * _CELL_SPAN + dx for dy in (-1, 0, 1) for dx in (-1, 0, 1))
 
 EARTH_RADIUS_KM = 6371.0088
 
@@ -1509,14 +1549,17 @@ def _stops_inside(route, place_id, place):
 def _overlap_rows(
     routes, place_id, place, coords, route_events, interned, extents=None
 ):
-    """One row per route for :func:`_overlaps`: the interned ids of its line
-    key ``(family, name)`` (-1 without a name, matching nothing) and of its
-    basic mode, its departures a day in the place (NaN without a calendar),
-    and the box ``x0, y0, x1, y1`` of its stops in the place, a zone's by
-    its hull's vertices (``extents``) (NaN, meeting nothing, when the stops
-    span over 180 degrees of longitude: across the antimeridian)."""
+    """``(rows, cells)`` for :func:`_overlaps`, one row per route: the
+    interned ids of its line key ``(family, name)`` (-1 without a name,
+    matching nothing) and of its basic mode, its departures a day in the
+    place (NaN without a calendar), and the box ``x0, y0, x1, y1`` of its
+    stops in the place, a zone's by its hull's vertices (``extents``) (NaN,
+    meeting nothing, when the stops span over 180 degrees of longitude:
+    across the antimeridian); ``cells``, per route, the grid cells of its
+    stops in the place (:func:`_stop_cells`), zones left out."""
     extents = extents or {}
     rows = np.full((len(routes), 7), np.nan)
+    cells = []
     for row, route in zip(rows, routes):
         mode = basic_mode(route["route_type"])
         family = "rail-bound" if mode in RAIL_BOUND else mode
@@ -1536,7 +1579,131 @@ def _overlap_rows(
             xs, ys = zip(*points)
             if max(xs) - min(xs) <= 180:
                 row[3:] = min(xs), min(ys), max(xs), max(ys)
-    return rows
+        cells.append(_stop_cells(coords[s] for s in inside if s in coords))
+    return rows, cells
+
+
+def _stop_cells(points):
+    """The grid cells (``OVERLAP_CELL_DEG``) holding the ``(x, y)`` points,
+    each packed into one integer."""
+    return frozenset(
+        (math.floor(y / OVERLAP_CELL_DEG) + _CELL_ROW_OFFSET) * _CELL_SPAN
+        + math.floor(x / OVERLAP_CELL_DEG) % _CELL_COLUMNS
+        for x, y in points
+    )
+
+
+def _cells_around(cell):
+    """The cell and its eight neighbours, the columns wrapping."""
+    row, column = divmod(cell, _CELL_SPAN)
+    columns = (
+        (column - 1) % _CELL_COLUMNS,
+        column,
+        (column + 1) % _CELL_COLUMNS,
+    )
+    return [r * _CELL_SPAN + c for r in (row - 1, row, row + 1) for c in columns]
+
+
+def _cells_grown(cells):
+    """The cells and their neighbours."""
+    if all(0 < c % _CELL_SPAN < _CELL_COLUMNS - 1 for c in cells):
+        return frozenset(c + d for c in cells for d in _CELL_OFFSETS)
+    return frozenset(n for c in cells for n in _cells_around(c))
+
+
+def _cells_needed(cells):
+    """How many of the cells must lie near another route's to share its stops."""
+    return math.ceil(OVERLAP_STOP_SHARE * len(cells) - 1e-9)
+
+
+def _stop_matches(cell_sets, families, feeds, partners):
+    """The ``(row, other feed)`` pairs, each once, whose routes serve each
+    other's stops: ``OVERLAP_STOP_SHARE`` of a row's cells lie in or next to
+    the other row's, and as many of the other's next to the row's, both of
+    one family and with ``OVERLAP_MIN_CELLS`` cells or more, the row's feed
+    and the other one of the pairs ``partners`` (``{feed: other feeds}``).
+
+    A row is compared only with those feeds' rows of its family holding a
+    cell next to one of its rarest cells, as many as it may miss plus one
+    (a row near enough of its cells is near at least one of those), and with
+    a feed's rows only until one matches."""
+    found = set()
+    postings = collections.defaultdict(lambda: collections.defaultdict(list))
+    counts = collections.Counter()
+    for j, cells in enumerate(cell_sets):
+        if len(cells) >= OVERLAP_MIN_CELLS and partners.get(feeds[j]):
+            for c in cells:
+                postings[(families[j], c)][feeds[j]].append(j)
+                counts[c] += 1
+    grown = {}
+    for i, cells in enumerate(cell_sets):
+        others = partners.get(feeds[i])
+        if len(cells) < OVERLAP_MIN_CELLS or not others:
+            continue
+        need = _cells_needed(cells)
+        probes = sorted(cells, key=lambda c: (counts[c], c))[: len(cells) - need + 1]
+        tried = set()
+        for c in probes:
+            for n in _cells_around(c):
+                for feed, rows in postings.get((families[i], n), {}).items():
+                    if feed not in others or (i, feed) in found:
+                        continue
+                    for j in rows:
+                        if j in tried:
+                            continue
+                        tried.add(j)
+                        for k in (i, j):
+                            if k not in grown:
+                                grown[k] = _cells_grown(cell_sets[k])
+                        other = cell_sets[j]
+                        if len(cells & grown[j]) >= need and len(
+                            other & grown[i]
+                        ) >= _cells_needed(other):
+                            found.add((i, feed))
+                            break
+    return found
+
+
+def _agency_words(feed_dir, state):
+    """The words of the feed's agency names that can relate it to another
+    feed's: casefolded, four to ``_AGENCY_WORD_LETTERS`` letters,
+    ``_AGENCY_GENERIC`` left out; empty without a readable agency.txt."""
+    try:
+        with crawl.verified_member(feed_dir, state, "agency.txt") as opened:
+            if opened is None:
+                return frozenset()
+            names = [row.get("agency_name") or "" for row in crawl.member_rows(opened)]
+    except crawl.MEMBER_ERRORS:
+        return frozenset()
+    return frozenset(
+        word
+        for name in names
+        for word in re.findall(r"[^\W\d_]{4,}", name.casefold())
+        if word not in _AGENCY_GENERIC and len(word) <= _AGENCY_WORD_LETTERS
+    )
+
+
+def _related_feeds(words):
+    """``{feed: related feeds}`` from each feed's agency ``words``: two feeds
+    are related when they share a word or a word of one holds a word of the
+    other."""
+    holders = collections.defaultdict(set)
+    for feed, feed_words in words.items():
+        for word in feed_words:
+            holders[word].add(feed)
+    related = collections.defaultdict(set)
+    for word, feeds in holders.items():
+        held = set()
+        for start in range(len(word)):
+            for end in range(start + 4, len(word) + 1):
+                held.update(holders.get(word[start:end], ()))
+        for feed in feeds:
+            related[feed] |= held
+        for feed in held:
+            related[feed] |= feeds
+    for feed, others in related.items():
+        others.discard(feed)
+    return related
 
 
 def _overlap_matches(rows, feeds, count):
@@ -1603,10 +1770,14 @@ def _overlap_block(rows, matched, other, names, modes):
     }
 
 
-def place_overlaps(feed_ids, row_sets, interned):
+def place_overlaps(feed_ids, row_sets, interned, stop_pairs=()):
     """The overlap block of each of a place's edges, given as its feed id
     and its route rows (:func:`_overlap_rows`), measured against every other
-    feed's rows there; None for an edge whose feed has no calendar."""
+    feed's rows there; None for an edge whose feed has no calendar.
+
+    ``stop_pairs`` adds ``(row, other feed id)`` matches by stops, the rows
+    counted over the edges' rows in order; a block lists the feeds it holds
+    for a row matched by stops alone under ``stop_matched``."""
     modes = {i: name for name, i in interned.items() if isinstance(name, str)}
     names = sorted(set(feed_ids))
     index = {feed_id: i for i, feed_id in enumerate(names)}
@@ -1614,64 +1785,153 @@ def place_overlaps(feed_ids, row_sets, interned):
     stacked = np.concatenate(row_sets)
     feeds = np.repeat([index[feed_id] for feed_id in feed_ids], sizes)
     matched, other = _overlap_matches(stacked, feeds, len(names))
+    count = len(names)
+    by_name = set((matched * count + other).tolist())
+    by_stops = np.array(
+        sorted({i * count + index[f] for i, f in stop_pairs} - by_name), np.int64
+    )
+    if len(by_stops):
+        codes = np.array(sorted(by_name.union(by_stops.tolist())), np.int64)
+        matched, other = codes // count, codes % count
     bounds = np.cumsum([0] + sizes)
     cuts = np.searchsorted(matched, bounds)
+    stop_cuts = np.searchsorted(by_stops // count, bounds)
     blocks = []
-    for rows, low, lo, hi in zip(row_sets, bounds, cuts, cuts[1:]):
+    for n, (rows, low, lo, hi) in enumerate(zip(row_sets, bounds, cuts, cuts[1:])):
         if np.isnan(rows[:, 2]).any():
             blocks.append(None)
             continue
-        blocks.append(
-            _overlap_block(rows, matched[lo:hi] - low, other[lo:hi], names, modes)
-        )
+        block = _overlap_block(rows, matched[lo:hi] - low, other[lo:hi], names, modes)
+        alone = {names[c % count] for c in by_stops[stop_cuts[n] : stop_cuts[n + 1]]}
+        if alone & block["with"].keys():
+            block["stop_matched"] = sorted(alone & block["with"].keys())
+        blocks.append(block)
     return blocks
 
 
-def overlap_routes(rows, interned):
+def overlap_blocks(places, interned):
+    """The overlap blocks (:func:`place_overlaps`) of every place's edges,
+    ``places`` giving each place's edges as ``(feed id, rows, cells, agency
+    words, counted)``, in that order. Routes match by line key everywhere; by
+    stops (:func:`_stop_matches`) only between feeds whose agencies are
+    related (:func:`_related_feeds`) where one of them has
+    ``OVERLAP_NETWORK_SHARE`` of its rows at the places both serve matched
+    by the other's stops — counting the rows given as ``counted``, so a route
+    repeated on an international edge counts once."""
+    modes = {i: name for name, i in interned.items() if isinstance(name, str)}
+    words = collections.defaultdict(set)
+    for entries in places.values():
+        for feed, _, _, agency, _ in entries:
+            words[feed].update(agency)
+    related = _related_feeds(words)
+    found, rows_at = {}, collections.defaultdict(dict)
+    matched = collections.Counter()
+    for place_id, entries in places.items():
+        owners = [feed for feed, rows, *_ in entries for _ in range(len(rows))]
+        counted = [c for _, rows, _, _, c in entries for _ in range(len(rows))]
+        names = sorted(set(owners))
+        index = {feed: i for i, feed in enumerate(names)}
+        partners = {
+            index[feed]: {index[other] for other in related[feed] if other in index}
+            for feed in names
+            if feed in related
+        }
+        families = [
+            "rail-bound" if modes[int(m)] in RAIL_BOUND else modes[int(m)]
+            for _, rows, *_ in entries
+            for m in rows[:, 1]
+        ]
+        cells = [c for _, _, cell_sets, *_ in entries for c in cell_sets]
+        pairs = _stop_matches(cells, families, [index[f] for f in owners], partners)
+        found[place_id] = [(i, owners[i], names[f]) for i, f in sorted(pairs)]
+        for i, owner, other in found[place_id]:
+            matched[(owner, other)] += counted[i]
+        for feed, rows, _, _, own in entries:
+            if own:
+                rows_at[feed][place_id] = rows_at[feed].get(place_id, 0) + len(rows)
+
+    @functools.cache
+    def allowed(a, b):
+        for x, y in ((a, b), (b, a)):
+            shared = sum(n for p, n in rows_at[x].items() if p in rows_at[y])
+            if shared and matched[(x, y)] >= OVERLAP_NETWORK_SHARE * shared:
+                return True
+        return False
+
+    return {
+        place_id: place_overlaps(
+            [feed for feed, *_ in entries],
+            [rows for _, rows, *_ in entries],
+            interned,
+            [
+                (i, other)
+                for i, owner, other in found[place_id]
+                if allowed(owner, other)
+            ],
+        )
+        for place_id, entries in places.items()
+    }
+
+
+def overlap_routes(rows, cells, interned):
     """An edge's route ``rows`` as ``evidence["overlap_routes"]`` keeps them,
     so a merge of builds can measure overlap across them: per route its line
     name (None without one), mode, departures a day in the place and stop
-    box, None where a value is missing."""
+    box, None where a value is missing, and its stop ``cells``."""
     names = {i: key for key, i in interned.items()}
     kept = []
-    for row in rows:
+    for row, route_cells in zip(rows, cells):
         line = None if row[0] < 0 else names[int(row[0])][1]
         values = [None if np.isnan(v) else float(v) for v in row[2:]]
-        kept.append([line, names[int(row[1])], *values])
+        kept.append([line, names[int(row[1])], *values, sorted(route_cells)])
     return kept
 
 
 def route_rows(routes, interned):
-    """The route rows :func:`overlap_routes` kept, interned in ``interned``
-    as :func:`_overlap_rows` interns them."""
+    """``(rows, cells)`` from the route rows :func:`overlap_routes` kept,
+    interned in ``interned`` as :func:`_overlap_rows` interns them; a row
+    kept without its stop cells has none."""
     rows = np.full((len(routes), 7), np.nan)
+    cells = []
     for row, (line, mode, *values) in zip(rows, routes):
         family = "rail-bound" if mode in RAIL_BOUND else mode
         row[0] = interned.setdefault((family, line), len(interned)) if line else -1
         row[1] = interned.setdefault(mode, len(interned))
-        row[2:] = [np.nan if v is None else v for v in values]
-    return rows
+        row[2:] = [np.nan if v is None else v for v in values[:5]]
+        cells.append(frozenset(values[5]) if len(values) > 5 else frozenset())
+    return rows, cells
 
 
 def _overlaps(by_place, interned):
-    """Write ``evidence["overlap"]`` on the edges :func:`_overlap_rows` gave
-    rows, one place at a time, emptying ``by_place`` (``{place_id: [(edge,
-    tier, rows)]}``) as it goes, and keep every such edge's rows under
+    """Write ``evidence["overlap"]`` (:func:`overlap_blocks`) on the edges
+    :func:`_overlap_rows` gave rows, emptying ``by_place`` (``{place_id:
+    [(edge, tier, rows, cells)]}``), and keep every such edge's rows under
     ``evidence["overlap_routes"]``; how many edges got a block. An edge whose
     feed has no calendar gets none. Rows given with a ``tier`` are the
     international edge's routes of that tier across the border, written
     under ``overlap_repeats`` and ``overlap_repeats_routes`` by that tier."""
+    blocks = overlap_blocks(
+        {
+            place_id: [
+                (
+                    edge["feed_id"],
+                    rows,
+                    cells,
+                    edge["evidence"]["overlap_agencies"],
+                    tier is None,
+                )
+                for edge, tier, rows, cells in entries
+            ]
+            for place_id, entries in by_place.items()
+        },
+        interned,
+    )
     written = 0
     for place_id in sorted(by_place):
         entries = by_place.pop(place_id)
-        blocks = place_overlaps(
-            [edge["feed_id"] for edge, _, _ in entries],
-            [rows for _, _, rows in entries],
-            interned,
-        )
-        for (edge, tier, rows), block in zip(entries, blocks):
+        for (edge, tier, rows, cells), block in zip(entries, blocks.pop(place_id)):
             evidence = edge["evidence"]
-            kept = overlap_routes(rows, interned)
+            kept = overlap_routes(rows, cells, interned)
             if tier is not None:
                 evidence.setdefault("overlap_repeats_routes", {})[tier] = kept
                 if block is not None:
@@ -2056,6 +2316,7 @@ def _classify_feed(
 
     edges = []
     dropped = 0
+    agencies = None
     for place_id, candidate in candidates.items():
         place = places.get(place_id) or {}
         contributing = []
@@ -2102,6 +2363,8 @@ def _classify_feed(
                 interned,
                 extents,
             )
+            if agencies is None:
+                agencies = sorted(_agency_words(feed_dir, state))
             for edge in tier_edges:
                 # An international edge holding only routes of other tiers
                 # across the border has no rows of its own; it keeps theirs
@@ -2113,6 +2376,8 @@ def _classify_feed(
                         tier: _overlap_rows(routes, *shared)
                         for tier, routes in sorted(across.items())
                     }
+                if "_overlap" in edge or "_overlap_repeats" in edge:
+                    edge["evidence"]["overlap_agencies"] = agencies
         edges.extend(tier_edges)
     return (
         edges,
@@ -2544,12 +2809,12 @@ def classify(
                         )
                     )
                     for edge in classified:
-                        rows = edge.pop("_overlap", None)
-                        if rows is not None:
-                            by_place[edge["place_id"]].append((edge, None, rows))
+                        measured = edge.pop("_overlap", None)
+                        if measured is not None:
+                            by_place[edge["place_id"]].append((edge, None, *measured))
                         repeats = edge.pop("_overlap_repeats", {})
-                        for tier, rows in repeats.items():
-                            by_place[edge["place_id"]].append((edge, tier, rows))
+                        for tier, measured in repeats.items():
+                            by_place[edge["place_id"]].append((edge, tier, *measured))
                     routes_classified += routes
                     edges_dropped += dropped
                     for key, value in (gaps or {}).items():
@@ -2657,9 +2922,17 @@ def classify(
                 "needs_review": sum(1 for e in edges if e["needs_review"]),
                 "edges_near_threshold": near_threshold_count(edges),
                 "edges_with_overlap": edges_with_overlap,
+                "edges_matched_by_stops": sum(
+                    "stop_matched" in (e["evidence"].get("overlap") or {})
+                    for e in edges
+                ),
                 "overlap_settings": {
                     "near_deg": OVERLAP_NEAR_DEG,
                     "min_share": OVERLAP_MIN_SHARE,
+                    "cell_deg": OVERLAP_CELL_DEG,
+                    "stop_share": OVERLAP_STOP_SHARE,
+                    "min_cells": OVERLAP_MIN_CELLS,
+                    "network_share": OVERLAP_NETWORK_SHARE,
                 },
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
