@@ -367,22 +367,34 @@ def _read(path):
 class Registry:
     """The loaded registry: lookups, identification and the one save."""
 
-    def __init__(self, path, header, rows, base, *, read_only, locked=False):
+    def __init__(self, path, header, rows, raw, *, read_only, locked=False):
         self.path = path
         self.header = header
         self.rows = rows
         # ``base`` is the digest of the file as loaded, kept for provenance;
-        # ``digest`` follows the file through this session's saves.
-        self.base = base
+        # ``digest`` follows the file through this session's saves, and
+        # ``_raw`` holds the bytes it names.
+        self._raw = raw
+        self.base = hashlib.sha256(raw).hexdigest()
         self.read_only = read_only
         self._locked = locked
-        self.digest = base
+        self.digest = self.base
         self.minted = 0
         self.enriched = 0
         self.merged = 0
+        # Every id a method took or returned: the rows a stage built on.
+        self.used = set()
         self._index = _index(rows, str(path))
         # ``merge`` keeps both indexes current.
         self._former = _former_index(rows)
+
+    def _record_used(self, *place_ids):
+        self.used.update(place_ids)
+
+    def snapshot(self):
+        """The bytes of the file as this session last loaded or saved it,
+        whose SHA-256 is ``digest``."""
+        return self._raw
 
     @property
     def next_id(self):
@@ -394,12 +406,20 @@ class Registry:
         row = self.rows.get(place_id)
         if row is None:
             raise RegistryError(f"{place_id}: no such place")
+        # Recorded before any refusal: a caller that catches one still
+        # built on the row.
+        self._record_used(place_id)
         if row.get("status") == "retired":
             raise RegistryError(f"{place_id}: retired ({row['reason']})")
-        return _survivor(self.rows, place_id)
+        survivor = _survivor(self.rows, place_id)
+        self._record_used(survivor)
+        return survivor
 
     def effective(self, place_id):
-        return effective(self.rows[place_id])
+        """The concordances of row ``place_id`` net of its detached values."""
+        row = self.rows[place_id]
+        self._record_used(place_id)
+        return effective(row)
 
     def canonical_qid(self, place_id):
         """The first effective QID of the live place ``place_id`` stands for
@@ -409,10 +429,16 @@ class Registry:
     def former_ids(self, place_id):
         """The ids merged into the live place ``place_id``, each of which
         still resolves to it, in numeric order."""
-        return list(self._former.get(self.survivor(place_id), []))
+        former = list(self._former.get(self.survivor(place_id), []))
+        self._record_used(*former)
+        return former
 
     def lookup(self, namespace, value):
-        return self._index.get((namespace, value))
+        """The live id ``namespace:value`` resolves to, or None."""
+        found = self._index.get((namespace, value))
+        if found is not None:
+            self._record_used(found)
+        return found
 
     def resolve(self, reference):
         """The live id an override reference names: a ``tp_`` id, a bare
@@ -429,7 +455,7 @@ class Registry:
             raise RegistryError(f"{reference!r}: not a place reference")
         if namespace not in NAMESPACES or not value:
             raise RegistryError(f"{reference!r}: not a place reference")
-        found = self._index.get((namespace, value))
+        found = self.lookup(namespace, value)
         if found is None:
             raise RegistryError(f"{reference!r}: no place carries it")
         return found
@@ -481,6 +507,7 @@ class Registry:
         where = f"{minted_from}"
         wanted, pairs = self._candidate(concordances, kind, where)
         hits = sorted({self._index[pair] for pair in pairs if pair in self._index})
+        self._record_used(*hits)
         if len(hits) > 1:
             raise SeveralPlaces(
                 f"{where}: concordances name several places {hits}", hits
@@ -532,11 +559,14 @@ class Registry:
         minted as its own region) is a new id that the old one resolves to.
         The concordances may name no other place, nor a value detached from
         ``place_id``; the merge is dated by ``minted_in``."""
+        if place_id in self.rows:
+            self._record_used(place_id)
         where = f"{minted_from}"
         wanted, pairs = self._candidate(concordances, kind, where)
         others = sorted(
             {self._index[p] for p in pairs if p in self._index} - {place_id}
         )
+        self._record_used(*others)
         if others:
             raise RegistryError(f"{where}: concordances name several places {others}")
         row = self.rows.get(place_id)
@@ -569,6 +599,7 @@ class Registry:
         ``joining`` — the concordances of the candidate the merge is for —
         detached from either, before anything changes."""
         where = f"merging {place_id} into {into}"
+        self._record_used(*(each for each in (place_id, into) if each in self.rows))
         if place_id == into:
             raise RegistryError(f"{where}: a place cannot merge into itself")
         for each in (place_id, into):
@@ -631,6 +662,7 @@ class Registry:
             for namespace, entries in row.get("detached", {}).items():
                 for entry in entries:
                     if (namespace, entry["value"]) in pairs:
+                        self._record_used(owner)
                         raise RegistryError(
                             f"{where}: {namespace}:{entry['value']} was detached "
                             f"from {owner} ({entry['reason']})"
@@ -657,6 +689,7 @@ class Registry:
         for pair in pairs:
             self._index[pair] = place_id
         self.minted += 1
+        self._record_used(place_id)
         return place_id
 
     @property
@@ -681,6 +714,7 @@ class Registry:
             self.digest = store.write_bytes(
                 directory, self.path.name, payload, limit=MAX_REGISTRY_BYTES
             )
+            self._raw = payload
             directory.sync()
         finally:
             directory.close()
@@ -705,6 +739,39 @@ def file_digest(path):
     return hashlib.sha256(_read(path)).hexdigest()
 
 
+def grown(old, new, place_ids):
+    """Why ``new`` is not ``old`` grown for the places ``place_ids`` name,
+    or None when it is: the counter never goes back, and each place keeps
+    its status and merge target, kind, detached values, canonical QID and
+    every effective value, gaining values at most. Other rows may change
+    freely: they are places other builds identified."""
+    if new.next_id < old.next_id:
+        return f"the id counter went back from {old.next_id} to {new.next_id}"
+    for place_id in sorted(place_ids, key=_number):
+        before, after = old.rows.get(place_id), new.rows.get(place_id)
+        if before is None:
+            return f"{place_id} is not in the registry the build saved"
+        if after is None:
+            return f"{place_id} is gone"
+        if before.get("status") != after.get("status"):
+            return f"{place_id} is now {after.get('status') or 'live'}"
+        if before.get("into") != after.get("into"):
+            return f"{place_id} now resolves to {after['into']}"
+        if before.get("kind") != after.get("kind"):
+            return f"{place_id} is now a {after['kind']}"
+        if before.get("detached") != after.get("detached"):
+            return f"{place_id} has other detached values"
+        had, has = effective(before), effective(after)
+        for namespace, values in had.items():
+            lost = [v for v in values if v not in has.get(namespace, ())]
+            if lost:
+                return f"{place_id} lost {namespace}:{lost[0]}"
+        qid = (has.get("wikidata") or [None])[0]
+        if qid != (had.get("wikidata") or [None])[0]:
+            return f"{place_id} now has the QID {qid}"
+    return None
+
+
 def _mintable(reference):
     """A well-formed ``namespace:value`` no row carries: a place a curated
     ``add_place`` may mint from."""
@@ -720,17 +787,18 @@ def load(path):
     return _load(path, read_only=True)
 
 
+def loads(raw, path):
+    """A read-only registry from ``raw``, the bytes of a saved copy of the
+    file at ``path``."""
+    header, rows = parse(raw, str(path))
+    return Registry(path, header, rows, raw, read_only=True)
+
+
 def _load(path, *, read_only, locked=False):
+    """The registry file at ``path``, read and validated."""
     raw = _read(path)
     header, rows = parse(raw, str(path))
-    return Registry(
-        path,
-        header,
-        rows,
-        hashlib.sha256(raw).hexdigest(),
-        read_only=read_only,
-        locked=locked,
-    )
+    return Registry(path, header, rows, raw, read_only=read_only, locked=locked)
 
 
 @contextlib.contextmanager

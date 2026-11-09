@@ -77,10 +77,13 @@ output its predecessors already left in the cache.
 
 One piece of state lives outside the cache: the place registry
 (`overrides/places_registry.jsonl` by default, or `--registry`), which the
-`gazetteer` and `expand` stages write and the later stages read. The later
-stages refuse to run against a registry that no longer matches the cached
-gazetteer run, so resuming or moving a build means keeping the cache and its
-matching registry together.
+`gazetteer` and `expand` stages write and the later stages read. Each of the
+two keeps a copy of the registry it saved in the cache, and the later stages
+read that copy. Other builds may add places to the registry meanwhile, or
+values to places, but the later stages refuse to run once a place their
+build used is merged, retired, given another kind or other detached values,
+gains its first QID or loses a value. Resuming or moving a build therefore
+means keeping the cache and its matching registry together.
 
 ### The stages, in order
 

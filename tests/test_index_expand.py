@@ -543,7 +543,7 @@ def test_a_stop_in_a_council_area_discovers_its_city(tmp_path, kind):
     }
     cache = tmp_path / "cache"
     _publish_names(cache, SEED_PLACES + [council])
-    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    _publish_run_on(cache, path)
     _write_crawl(cache, "f-edi", ["s1,55.95,-3.19\n"])
     with registry.session(path) as reg:
         _, places, _ = _expand(tmp_path, cache, registry=reg)
@@ -1111,20 +1111,38 @@ def _crawled_cache(tmp_path):
     return cache
 
 
-def _publish_run(cache, registry_digest):
-    """A gazetteer run manifest naming no stage, for the registry chain."""
+def _publish_run(cache, registry_digest, saved=None):
+    """A gazetteer run manifest naming no stage, for the registry chain;
+    with ``saved``, a registry session, the run's copy of it."""
     directory = store.open_subdir(cache, "gazetteer")
     try:
         with store.exclusive_writer(directory):
+            generations = {}
+            if saved is not None:
+                generations[expand.SNAPSHOT_POINTER] = expand.publish_snapshot(
+                    cache / "gazetteer",
+                    saved,
+                    expand.SNAPSHOT_POINTER,
+                    held=directory,
+                    staged=True,
+                )["generation"]
             store.publish(
                 cache / "gazetteer",
                 store.RUN_POINTER,
                 {"generations.jsonl": store.jsonl_chunks([])},
-                {"generations": {}, "registry_digest": registry_digest},
+                {"generations": generations, "registry_digest": registry_digest},
                 held=directory,
             )
     finally:
         directory.close()
+
+
+def _publish_run_on(cache, path):
+    """A gazetteer run on the registry file at ``path``, with its copy."""
+    from transitio_index import registry
+
+    saved = registry.load(path)
+    _publish_run(cache, saved.digest, saved=saved)
 
 
 def _seeded_registry(path, *seeded):
@@ -1147,7 +1165,7 @@ def test_discoveries_are_identified_through_the_registry(tmp_path):
     cache = _crawled_cache(tmp_path)
     path = tmp_path / "places_registry.jsonl"
     run_digest = _seeded_registry(path)
-    _publish_run(cache, run_digest)
+    _publish_run_on(cache, path)
     with registry.session(path) as reg:
         manifest, places, _ = _expand(tmp_path, cache, registry=reg)
         # Tampere, Pirkanmaa, Springfield and its MSA minted; Finland, the
@@ -1175,13 +1193,66 @@ def test_discoveries_are_identified_through_the_registry(tmp_path):
     # A new gazetteer run on the registry expand saved: the stale expansion
     # blocks consumers until expand replaces it, anchored on the new run.
     new_run = hashlib.sha256(path.read_bytes()).hexdigest()
-    _publish_run(cache, new_run)
+    _publish_run_on(cache, path)
     with pytest.raises(registry.RegistryError, match="rerun expand"):
         expand.expected_registry_digest(cache / "gazetteer", path)
     with registry.session(path) as after:
         manifest, _, _ = _expand(tmp_path, cache, registry=after)
     assert manifest["registry_base"] == new_run
     assert expand.expected_registry_digest(cache / "gazetteer", path) == new_run
+
+
+def test_expand_builds_on_a_registry_other_builds_grew(tmp_path):
+    import shutil
+
+    from transitio_index import registry
+
+    cache = _crawled_cache(tmp_path)
+    path = tmp_path / "places_registry.jsonl"
+    _seeded_registry(path, {"wikidata": ["Q5"]})
+    with registry.session(path) as run:
+        # The run built on Finland and on a city expand never meets.
+        assert (run.key_for("Q33"), run.key_for("Q5")) == ("tp_1", "tp_2")
+        _publish_run(cache, run.digest, saved=run)
+
+    def another_build(*identified):
+        with registry.session(path) as other:
+            for concordances, kind in identified:
+                other.identify(concordances, kind=kind, minted_from="o", minted_in="o")
+            other.save()
+
+    another_build(
+        ({"wikidata": ["Q33"], "geonames": ["1"]}, "country"),
+        ({"wikidata": ["Q99"]}, "city"),
+    )
+    with registry.session(path) as reg:
+        manifest, _, _ = _expand(tmp_path, cache, registry=reg)
+        assert manifest["minted"] == 4
+    copy, _ = store.resolve_generation(
+        cache / "gazetteer", manifest["registry_snapshot"]
+    )
+    with copy:
+        raw = copy.read_bytes(expand.SNAPSHOT_ARTIFACT)
+        used = json.loads(copy.read_bytes(expand.USED_ARTIFACT))
+    assert hashlib.sha256(raw).hexdigest() == manifest["registry_digest"]
+    # The run's places and expand's own discoveries both carry forward.
+    tampere = registry.load(path).resolve("overture:fi-tre")
+    assert {"tp_1", "tp_2", tampere} <= set(used)
+    # A lost expansion copy: consumers of the grown registry ask for expand
+    # again, and expand, replacing that expansion, is judged by the run's.
+    shutil.rmtree(cache / "gazetteer" / manifest["registry_snapshot"])
+    another_build(({"wikidata": ["Q98"]}, "city"))
+    with pytest.raises(registry.RegistryError, match="no copy of the .*rerun expand"):
+        expand.consumable_registry(cache / "gazetteer", path)
+    with registry.session(path) as reg:
+        assert _expand(tmp_path, cache, registry=reg)[0]["minted"] == 0
+    # A build that merged a place the run used stops the next expansion.
+    with registry.session(path) as other:
+        other.merge("tp_1", other.resolve("Q99"), at="o", reason="o")
+        other.save()
+    with registry.session(path) as reg:
+        with pytest.raises(overture.GazetteerError, match="tp_1 is now merged; rerun"):
+            _expand(tmp_path, cache, registry=reg)
 
 
 def test_expand_refuses_a_read_only_mint_and_a_stale_registry(tmp_path):
@@ -1194,16 +1265,18 @@ def test_expand_refuses_a_read_only_mint_and_a_stale_registry(tmp_path):
     with registry.session(path) as reg:
         with pytest.raises(overture.GazetteerError, match="no gazetteer run"):
             _expand(tmp_path, cache, registry=reg)
-    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    _publish_run_on(cache, path)
     with registry.session(path, read_only=True) as reg:
         with pytest.raises(registry.RegistryError, match="read-only"):
             _expand(tmp_path, cache, registry=reg)
     assert store.current_generation(cache / "gazetteer", "expanded.json") is None
-    # The gazetteer ran on another registry: expand must not build on it.
-    _publish_run(cache, "0" * 64)
-    with registry.session(path) as reg:
-        with pytest.raises(overture.GazetteerError, match="rerun the gazetteer"):
-            _expand(tmp_path, cache, registry=reg)
+    # The gazetteer ran on another registry, or kept no copy of this one:
+    # expand must not build on it.
+    for digest in ("0" * 64, registry.load(path).digest):
+        _publish_run(cache, digest)
+        with registry.session(path) as reg:
+            with pytest.raises(overture.GazetteerError, match="no copy of the"):
+                _expand(tmp_path, cache, registry=reg)
 
 
 def test_a_seeded_place_reached_through_a_new_division_is_enriched(tmp_path):
@@ -1222,10 +1295,8 @@ def test_a_seeded_place_reached_through_a_new_division_is_enriched(tmp_path):
     _publish_names(cache, SEED_PLACES + [tampere])
     _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
     path = tmp_path / "places_registry.jsonl"
-    _publish_run(
-        cache,
-        _seeded_registry(path, {"wikidata": ["Q40840"], "overture": ["fi-tre-old"]}),
-    )
+    _seeded_registry(path, {"wikidata": ["Q40840"], "overture": ["fi-tre-old"]})
+    _publish_run_on(cache, path)
     # Read-only, the new concordance is refused; writable, it enriches the
     # seeded place's row while the seeded row itself stays.
     with registry.session(path, read_only=True) as reg:
@@ -1242,15 +1313,13 @@ def test_a_seeded_place_reached_through_a_new_division_is_enriched(tmp_path):
     assert places["Q40840"]["overture_id"] == "fi-tre-old"
 
 
-def test_a_crash_after_the_registry_save_is_recovered_by_a_gazetteer_rerun(
-    tmp_path, monkeypatch
-):
+def test_a_crash_after_the_registry_save_is_recovered_by_a_rerun(tmp_path, monkeypatch):
     from transitio_index import registry
 
     cache = _crawled_cache(tmp_path)
     path = tmp_path / "places_registry.jsonl"
     path.write_text(HEADER)
-    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    _publish_run_on(cache, path)
     real = store.publish
 
     def crash(directory, pointer, *args, **kwargs):
@@ -1263,13 +1332,9 @@ def test_a_crash_after_the_registry_save_is_recovered_by_a_gazetteer_rerun(
         with pytest.raises(RuntimeError, match="crash"):
             _expand(tmp_path, cache, registry=reg)
     monkeypatch.undo()
-    # The registry holds the mints, valid rows; expand cannot tell the file
-    # from an edit until the gazetteer re-anchors on it, then reproduces.
+    # The registry holds the mints, valid rows; it only grew from the run's
+    # copy, so expand reruns and finds every place again.
     assert registry.load(path).resolve("overture:fi-tre")
-    with registry.session(path) as reg:
-        with pytest.raises(overture.GazetteerError, match="rerun the gazetteer"):
-            _expand(tmp_path, cache, registry=reg)
-    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
     with registry.session(path) as reg:
         manifest, _, _ = _expand(tmp_path, cache, registry=reg)
         assert manifest["minted"] == 0
@@ -1304,7 +1369,7 @@ def test_a_curated_metro_keyed_by_its_code_takes_the_discovered_qid(tmp_path):
         ],
     )
     _write_crawl(cache, "f-us", ["s2,39.8,-89.65\n"])
-    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    _publish_run_on(cache, path)
     with registry.session(path) as reg:
         manifest, places, _ = _expand(tmp_path, cache, registry=reg)
         assert (manifest["metros_added"], reg.enriched) == (0, 1)
@@ -1344,7 +1409,7 @@ def test_a_discovered_alias_qid_is_its_survivor(tmp_path, seeded):
         '{"place_id": "tp_3", "status": "merged", "into": "tp_2", '
         '"concordances": {"wikidata": ["Q40840"]}, "at": "2026-09-08", "reason": "dup"}\n'
     )
-    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    _publish_run_on(cache, path)
     canonical = {"Q77777": {"labels": {"sv": "Tammerfors"}, "aliases": {}}}
     with registry.session(path) as reg:
         manifest, places, _ = _expand(tmp_path, cache, registry=reg, labels=canonical)
@@ -1385,7 +1450,7 @@ def test_a_crawled_qid_for_a_place_known_by_its_division_joins_it(tmp_path):
     }
     _publish_names(cache, SEED_PLACES + [tampere])
     _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
-    _publish_run(cache, hashlib.sha256(path.read_bytes()).hexdigest())
+    _publish_run_on(cache, path)
     with registry.session(path) as reg:
         manifest, places, _ = _expand(tmp_path, cache, registry=reg)
         assert (manifest["places_added"], reg.minted, reg.enriched) == (1, 1, 1)

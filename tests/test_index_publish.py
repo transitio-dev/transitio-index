@@ -1537,6 +1537,20 @@ def test_the_publisher_refuses_a_registry_the_gazetteer_did_not_run_with(tmp_pat
     _publish_run_manifest(cache, "0" * 64)
     with pytest.raises(publish.PublishError, match="rerun the gazetteer"):
         publish.publish(cache, registry=registry.load(path))
+    # Once another build grew the registry, the copy the run kept passes the
+    # check through the consumers' guard; the grown file does not.
+    from transitio_index import build as build_index
+
+    build_index.commit_run(cache, path, read_only=False, stages=[])
+    with registry.session(path) as other:
+        other.identify(
+            {"wikidata": ["Q2"]}, kind="city", minted_from="o", minted_in="o"
+        )
+        other.save()
+    with build_index.check_registry_state(cache, path) as copy:
+        publish._check_registry(cache, copy)
+    with pytest.raises(publish.PublishError, match="not the registry"):
+        publish._check_registry(cache, registry.load(path))
 
 
 def test_a_place_without_a_qid_publishes_and_reads_back(tmp_path):

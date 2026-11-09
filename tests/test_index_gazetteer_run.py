@@ -4,7 +4,7 @@ import pytest
 
 from transitio_index import build as build_index  # noqa: E402
 
-from transitio_index import registry, store  # noqa: E402
+from transitio_index import expand, registry, store  # noqa: E402
 
 HEADER = '{"next_id": 1, "registry": 1}\n'
 
@@ -50,9 +50,9 @@ def _registry(tmp_path):
 
 
 def _consume(cache, path):
-    """Enter the consumers' guard, which holds the registry read-only."""
-    with build_index.check_registry_state(cache, path):
-        pass
+    """The registry the consumers' guard yields."""
+    with build_index.check_registry_state(cache, path) as places:
+        return places
 
 
 def _committed(cache, path):
@@ -77,7 +77,11 @@ def test_a_run_commits_its_set_and_registry_together(tmp_path):
         _stub_stage(cache, "metros.json", "m"),
     ]
     manifest = build_index.commit_run(cache, path, read_only=False, stages=stages)[-1]
-    assert set(manifest["generations"]) == {"seed.json", "metros.json"}
+    assert set(manifest["generations"]) == {
+        "seed.json",
+        "metros.json",
+        expand.SNAPSHOT_POINTER,
+    }
     assert manifest["minted"] == 1 and manifest["next_id"] == 2
     assert manifest["registry_digest"] == hashlib.sha256(path.read_bytes()).hexdigest()
     # No per-stage pointer exists; consumers resolve through the run manifest.
@@ -88,10 +92,25 @@ def test_a_run_commits_its_set_and_registry_together(tmp_path):
         store.current_generation(cache / "gazetteer", "metros.json")
         == manifest["generations"]["metros.json"]
     )
-    _consume(cache, path)
-    # A registry changed after the commit: consumers refuse until a rerun.
-    path.write_text(path.read_text().replace('"next_id": 2', '"next_id": 3'))
-    with pytest.raises(registry.RegistryError, match="rerun the gazetteer"):
+    assert _consume(cache, path).digest == manifest["registry_digest"]
+    # Another build's places and values are no reason to rerun: consumers
+    # read the registry this run saved. A place the run used that lost a
+    # value is.
+    with registry.session(path) as other:
+        other.identify(
+            {"wikidata": ["Q1"], "cbsa": ["1"]},
+            kind="city",
+            minted_from="o",
+            minted_in="o",
+        )
+        other.identify(
+            {"wikidata": ["Q2"]}, kind="city", minted_from="o", minted_in="o"
+        )
+        other.save()
+    consumed = _consume(cache, path)
+    assert consumed.digest == manifest["registry_digest"] and consumed.next_id == 2
+    path.write_text(path.read_text().replace('"Q1"', '"Q9"'))
+    with pytest.raises(registry.RegistryError, match="tp_1 lost wikidata:Q1; rerun"):
         _consume(cache, path)
 
 
@@ -130,11 +149,10 @@ def test_a_crash_after_the_save_is_recovered_by_a_rerun(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="crash"):
         build_index.commit_run(cache, path, read_only=False, stages=stages)
     # The registry holds the mint, valid rows a rerun reproduces; the first
-    # run stays current, and its consumers refuse until the rerun.
+    # run stays current, and its consumers read the registry it saved.
     assert registry.load(path).resolve("Q2") == "tp_2"
     _assert_first_run_current(cache, path, first, registry_unchanged=False)
-    with pytest.raises(registry.RegistryError, match="rerun the gazetteer"):
-        _consume(cache, path)
+    assert _consume(cache, path).next_id == 2
     monkeypatch.undo()
     manifest = build_index.commit_run(cache, path, read_only=False, stages=stages)[-1]
     assert manifest["minted"] == 0 and manifest["generations"]["seed.json"]
@@ -221,17 +239,28 @@ def test_the_run_manifest_outranks_a_stale_pointer(tmp_path):
     assert rows == [{"place_id": "old"}]
 
 
-def test_a_consumer_holds_the_registry_while_it_reads_the_run(tmp_path):
+def test_a_consumer_holds_its_cache_but_not_the_registry(tmp_path):
     cache, path = tmp_path / "cache", _registry(tmp_path)
     _committed(cache, path)
-    with build_index.check_registry_state(cache, path):
-        with pytest.raises(registry.RegistryError, match="another build"):
+    other = tmp_path / "other"
+    with build_index.check_registry_state(cache, path) as places:
+        with pytest.raises(store.StoreError, match="another build"):
             build_index.commit_run(
                 cache,
                 path,
                 read_only=False,
                 stages=[_stub_stage(cache, "seed.json", "s")],
             )
+        # Another build's run writes the registry meanwhile.
+        stages = [_stub_stage(other, "seed.json", "o", identify={"wikidata": ["Q2"]})]
+        build_index.commit_run(other, path, read_only=False, stages=stages)
+    assert registry.load(path).next_id == 3 and places.next_id == 2
+    # Without a registry file the cache is held too.
+    fresh = tmp_path / "fresh"
+    with build_index.check_registry_state(fresh, tmp_path / "none.jsonl") as none:
+        assert none is None
+        with pytest.raises(store.StoreError, match="another build"):
+            build_index.commit_run(fresh, path, read_only=False, stages=[])
 
 
 def test_consumers_follow_the_registry_the_expand_stage_saved(tmp_path):
@@ -262,10 +291,11 @@ def test_consumers_follow_the_registry_the_expand_stage_saved(tmp_path):
 
     expanded(run_digest)
     _consume(cache, path)
-    # A registry changed after expand, and expanded places built on another
-    # registry than the run's, are both refused.
+    # A registry changed after an expansion that kept no copy of it, and
+    # expanded places built on another registry than the run's, are both
+    # refused.
     path.write_text(path.read_text().replace('"next_id": 3', '"next_id": 4'))
-    with pytest.raises(registry.RegistryError, match="rerun the gazetteer"):
+    with pytest.raises(registry.RegistryError, match="no copy of the .*rerun expand"):
         _consume(cache, path)
     path.write_text(path.read_text().replace('"next_id": 4', '"next_id": 3'))
     for base, generation in (
@@ -285,3 +315,25 @@ def test_consumers_follow_the_registry_the_expand_stage_saved(tmp_path):
     )(None, {})
     with pytest.raises(registry.RegistryError, match="no registry digest"):
         _consume(cache, path)
+
+
+@pytest.mark.parametrize("used, readable", [(["tp_1"], True), (["no-id"], False)])
+def test_a_copy_names_its_used_places_by_id(tmp_path, used, readable):
+    cache, path = tmp_path / "cache", _registry(tmp_path)
+    directory = store.open_subdir(cache, "gazetteer")
+    try:
+        with store.exclusive_writer(directory), registry.session(path) as reg:
+            published = expand.publish_snapshot(
+                cache / "gazetteer",
+                reg,
+                expand.SNAPSHOT_POINTER,
+                held=directory,
+                used=used,
+                staged=True,
+            )
+    finally:
+        directory.close()
+    copy = expand._registry_copy(
+        cache / "gazetteer", published["generation"], reg.digest
+    )
+    assert (copy is not None) == readable

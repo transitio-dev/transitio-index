@@ -21,6 +21,8 @@ to end.
 import collections
 import datetime
 import functools
+import hashlib
+import json
 
 import shapely
 
@@ -42,6 +44,12 @@ from transitio_index.progress import progress
 EXPANDED_POINTER = "expanded.json"
 PLACES_ARTIFACT = "places_expanded.jsonl"
 REPORT_ARTIFACT = "expansion_report.jsonl"
+# The registry as each registry-writing stage saved it, with the ids its
+# build used: the gazetteer run's, staged with the run, and expand's.
+SNAPSHOT_POINTER = "registry_snapshot.json"
+EXPANDED_SNAPSHOT_POINTER = "expanded_registry.json"
+SNAPSHOT_ARTIFACT = "places_registry.jsonl"
+USED_ARTIFACT = "used.json"
 
 
 def expected_registry_digest(gazetteer, path):
@@ -50,18 +58,26 @@ def expected_registry_digest(gazetteer, path):
     that registry afterwards — the newest registry-writing stage — or None
     when no run manifest exists. A manifest that records no valid digest is
     refused; it never means no check."""
-    return _registry_chain(gazetteer, path)[1]
+    return _registry_chain(gazetteer, path).head
+
+
+# The registry chain: the digest the gazetteer run saved, which every
+# expansion anchors on; the newest digest and whether expand saved it; the
+# run's generation; and the generations of the newest stage's registry copy
+# and of the run's (None where a stage kept none).
+_Chain = collections.namedtuple(
+    "_Chain", "run_digest head expanded run_generation head_copy run_copy"
+)
 
 
 def _registry_chain(gazetteer, path, *, replacing=False):
-    """``(run_digest, head, run_generation)``: the digest the gazetteer run
-    saved, which every expansion anchors on, the chain's newest digest, and
-    the run's generation. An expansion built on another run — by registry
-    or by generation — is refused to consumers; the expand stage itself
+    """The :data:`_Chain` the cached gazetteer run and expansion form, all
+    None without a run. An expansion built on another run — by registry or
+    by generation — is refused to consumers; the expand stage itself
     (``replacing``) passes over it, since its own output replaces it."""
     run = store.run_manifest(gazetteer)
     if run is None:
-        return None, None, None
+        return _Chain(None, None, False, None, None, None)
     run_digest = expected = run.get("registry_digest")
     if not _digest(expected):
         raise _registry.RegistryError(
@@ -69,6 +85,7 @@ def _registry_chain(gazetteer, path, *, replacing=False):
             "rerun the gazetteer"
         )
     generation = run.get("generation")
+    snapshot = run["generations"].get(SNAPSHOT_POINTER)
     expanded = store.pointer_manifest(gazetteer, EXPANDED_POINTER)
     if expanded is not None and (
         expanded.get("registry_base") != expected
@@ -78,21 +95,96 @@ def _registry_chain(gazetteer, path, *, replacing=False):
         # and its generation; ones from before, or without the proof, are
         # rerun.
         if replacing:
-            return run_digest, expected, generation
+            return _Chain(run_digest, expected, False, generation, snapshot, snapshot)
         raise _registry.RegistryError(
             f"{path}: the expanded places predate the gazetteer run; rerun expand"
         )
-    if expanded is not None:
-        expected = expanded.get("registry_digest")
-        if not _digest(expected):
-            raise _registry.RegistryError(
-                f"{path}: the expanded places record no registry digest; rerun expand"
-            )
-    return run_digest, expected, generation
+    if expanded is None:
+        return _Chain(run_digest, expected, False, generation, snapshot, snapshot)
+    head = expanded.get("registry_digest")
+    if not _digest(head):
+        raise _registry.RegistryError(
+            f"{path}: the expanded places record no registry digest; rerun expand"
+        )
+    copy = expanded.get("registry_snapshot")
+    return _Chain(run_digest, head, True, generation, copy, snapshot)
 
 
 def _digest(value):
     return isinstance(value, str) and bool(store.DIGEST_PATTERN.match(value))
+
+
+def publish_snapshot(gazetteer, registry, pointer, *, held, used=(), staged=False):
+    """Publish the registry as ``registry`` last saved it, with the ids it
+    used and ``used`` (those of the stage it built on), as a generation of
+    ``pointer``: the copy the build's later stages read once other builds
+    have written the registry. Returns the manifest."""
+    raw = registry.snapshot()
+    ids = sorted(registry.used.union(used))
+    return store.publish(
+        gazetteer,
+        pointer,
+        {
+            SNAPSHOT_ARTIFACT: lambda: iter((raw,)),
+            USED_ARTIFACT: lambda: iter((json.dumps(ids) + "\n",)),
+        },
+        {"source": "registry", "registry_digest": registry.digest, "used": len(ids)},
+        held=held,
+        staged=staged,
+    )
+
+
+def _registry_copy(gazetteer, generation, digest):
+    """``(raw, used)`` from the snapshot generation ``generation``, or None
+    when there is none or it holds another registry than ``digest``."""
+    if not isinstance(generation, str):
+        return None
+    try:
+        opened, _ = store.resolve_generation(gazetteer, generation)
+        with opened:
+            raw = opened.read_bytes(SNAPSHOT_ARTIFACT)
+            used = json.loads(opened.read_bytes(USED_ARTIFACT))
+    except (store.StoreError, ValueError):
+        return None
+    if hashlib.sha256(raw).hexdigest() != digest or not (
+        isinstance(used, list)
+        and all(isinstance(i, str) and _registry.ID_PATTERN.match(i) for i in used)
+    ):
+        return None
+    return raw, used
+
+
+def _grown_from(current, saved, digest, rerun):
+    """``(snapshot, used)`` for ``saved``, the copy ``(raw, used)`` of the
+    registry ``digest`` a stage saved, when the loaded registry ``current``
+    is that registry or grew from it over the places the build used
+    (:func:`registry.grown`); refused otherwise. A missing copy (None) is
+    refused with ``rerun``, the stage that would save one again."""
+    if saved is None:
+        raise _registry.RegistryError(
+            f"{current.path}: no copy of the registry the build saved; rerun {rerun}"
+        )
+    if current.digest == digest:
+        return current, saved[1]
+    snapshot = _registry.loads(saved[0], current.path)
+    reason = _registry.grown(snapshot, current, saved[1])
+    if reason is not None:
+        raise _registry.RegistryError(f"{current.path}: {reason}; rerun the gazetteer")
+    return snapshot, saved[1]
+
+
+def consumable_registry(gazetteer, path):
+    """The registry the gazetteer's outputs are consumed with, read-only:
+    the file while it is the chain's newest digest; once other builds have
+    written it, the copy that stage saved, when the places this build used
+    are unchanged in the file. Without a run manifest, the file."""
+    chain = _registry_chain(gazetteer, path)
+    current = _registry.load(path)
+    if chain.head is None or current.digest == chain.head:
+        return current
+    saved = _registry_copy(gazetteer, chain.head_copy, chain.head)
+    rerun = "expand" if chain.expanded else "the gazetteer"
+    return _grown_from(current, saved, chain.head, rerun)[0]
 
 
 def _canonical_place_key(registry, qid, row):
@@ -1196,23 +1288,34 @@ def expand(
             if registry is not None:
                 # Ids are minted only on a committed gazetteer run, against
                 # the registry it left or the one a previous expand saved on
-                # it: any other file is a change to rerun from — a crash
-                # between the save below and the publish included, which the
-                # gazetteer rerun re-anchors on. The manifest anchors on the
-                # run's digest and generation, so the chain stays
-                # run -> expand across reruns.
-                anchor, expected, run_generation = _registry_chain(
+                # it, grown since at most — by other builds, or by a crash
+                # between the save below and the publish — over the places
+                # the build used: any other change is one to rerun from. The
+                # manifest anchors on the run's digest and generation, so the
+                # chain stays run -> expand across reruns.
+                chain = _registry_chain(
                     cache_dir / "gazetteer", registry.path, replacing=True
                 )
+                anchor, run_generation = chain.run_digest, chain.run_generation
                 if anchor is None:
                     raise overture.GazetteerError(
                         "no gazetteer run to expand; rerun the gazetteer"
                     )
-                if expected != registry.base:
-                    raise overture.GazetteerError(
-                        "the registry changed since the gazetteer ran; "
-                        "rerun the gazetteer"
+                # The copy carries the places the chain used forward into
+                # expand's own; without one the chain cannot be judged. A
+                # previous expansion's lost copy is judged by the run's,
+                # since this expansion replaces it.
+                head = chain.head
+                saved = _registry_copy(cache_dir / "gazetteer", chain.head_copy, head)
+                if saved is None and chain.expanded:
+                    head = anchor
+                    saved = _registry_copy(
+                        cache_dir / "gazetteer", chain.run_copy, head
                     )
+                try:
+                    used = _grown_from(registry, saved, head, "the gazetteer")[1]
+                except _registry.RegistryError as error:
+                    raise overture.GazetteerError(str(error)) from None
             places_by_id = {place["place_id"]: place for place in places}
             if registry is not None:
                 # Discovery joins by QID; the rows are keyed by their ids
@@ -1251,14 +1354,22 @@ def expand(
                 )
             # Saved before the generation is visible, as the gazetteer run
             # does: a crash between the two leaves rows a rerun reproduces.
-            registry_digest = None
+            registry_digest = registry_snapshot = None
             if registry is not None:
                 places_by_id = seed.rekey_by_own_id(places_by_id, registry)
                 registry_digest = registry.save()
+                registry_snapshot = publish_snapshot(
+                    cache_dir / "gazetteer",
+                    registry,
+                    EXPANDED_SNAPSHOT_POINTER,
+                    held=directory,
+                    used=used,
+                )["generation"]
             manifest = {
                 "source": "expand",
                 "registry_base": anchor,
                 "registry_digest": registry_digest,
+                "registry_snapshot": registry_snapshot,
                 "run_generation": run_generation,
                 "minted": registry.minted if registry is not None else 0,
                 "enriched": registry.enriched if registry is not None else 0,
