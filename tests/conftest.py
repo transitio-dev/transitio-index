@@ -32,4 +32,8 @@ def overture_release(monkeypatch):
     monkeypatch.setattr(overture, "_release", FIXTURE_RELEASE)
     # The bucket stand-ins are read directly unless a test names a local copy.
     monkeypatch.setattr(overture, "_local_root", None)
+    monkeypatch.setattr(overture, "_local_earlier", None)
     monkeypatch.setattr(overture, "_local_copies", {})
+    # Wikidata is never answered from the machine's own copy.
+    monkeypatch.setattr(overture, "_wikidata_root", None)
+    monkeypatch.setattr(overture, "_wikidata_warned", False)

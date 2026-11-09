@@ -252,6 +252,30 @@ def test_the_lock_refuses_a_second_writer_and_a_changed_file_is_not_overwritten(
         kept.save()
 
 
+def test_a_waiting_session_takes_the_registry_when_its_holder_leaves(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+    import threading
+
+    monkeypatch.setattr(registry, "WAIT_SECONDS", 0.01)
+    path = _write(tmp_path / "r.jsonl")
+    opened = threading.Event()
+
+    def waiter():
+        with registry.session(path, wait=True):
+            opened.set()
+
+    with caplog.at_level(logging.INFO, logger="transitio_index.registry"):
+        with registry.session(path):
+            thread = threading.Thread(target=waiter)
+            thread.start()
+            assert not opened.wait(0.3)
+        thread.join(10)
+    assert opened.is_set()
+    assert caplog.text.count("waiting for the registry") == 1
+
+
 def test_a_changed_registry_is_saved_canonically_and_an_unchanged_one_not_at_all(
     tmp_path, monkeypatch
 ):
@@ -261,12 +285,13 @@ def test_a_changed_registry_is_saved_canonically_and_an_unchanged_one_not_at_all
         # Unchanged: no write at all, not even of identical bytes.
         monkeypatch.setattr(registry.store, "write_bytes", None)
         assert reg.save() == reg.base and path.read_bytes() == before
+        assert reg.snapshot() == before
         monkeypatch.undo()
         reg.rows["tp_1"]["concordances"]["cbsa"] = ["12345"]
         reg.enriched += 1
         digest = reg.save()
     saved = path.read_bytes()
-    assert hashlib.sha256(saved).hexdigest() == digest
+    assert hashlib.sha256(saved).hexdigest() == digest and reg.snapshot() == saved
     # Provenance keeps the digest loaded beside the one written.
     assert reg.manifest()["registry_base"] == hashlib.sha256(before).hexdigest()
     assert (
@@ -353,6 +378,151 @@ def test_identification_mints_enriches_refuses_and_saves_once(tmp_path):
         _identify(fresh, {"wikidata": ["Q999"]}, name="Elsewhere")
         fresh.save()
     assert other.read_bytes() == saved
+
+
+def test_a_session_records_the_places_its_stages_built_on(tmp_path):
+    path = _write(tmp_path / "r.jsonl")
+    with registry.session(path) as reg:
+        reg.key_for("Q777", internal=True)  # a merged alias's QID: the survivor
+        reg.key_for("Q424242")  # no row carries it
+        # A refused row counts too: a caller that catches the refusal
+        # still built on it.
+        with pytest.raises(registry.RegistryError, match="retired"):
+            reg.resolve("tp_4")
+        assert reg.used == {"tp_1", "tp_4"}
+        assert reg.former_ids("tp_1") == ["tp_3"]
+        assert _identify(reg, {"geonames": ["1"]}) == "tp_5"
+        assert reg.used == {"tp_1", "tp_3", "tp_4", "tp_5"}
+        reg.merge("tp_2", "tp_1", at="a", reason="r")
+        assert reg.used == {"tp_1", "tp_2", "tp_3", "tp_4", "tp_5"}
+    for refused in (
+        lambda reg: reg.merge("tp_2", "tp_2", at="a", reason="r"),
+        lambda reg: reg.supersede(
+            "tp_2",
+            kind="planet",
+            concordances={},
+            minted_from="t",
+            minted_in="t",
+            reason="r",
+        ),
+    ):
+        with registry.session(path) as other:
+            with pytest.raises(registry.RegistryError):
+                refused(other)
+            assert other.used == {"tp_2"}
+    for concordances, kind, used in (
+        ({"overture": ["ov-esp"]}, "city", {"tp_2"}),
+        ({"overture": ["ov-esp"]}, "metro", {"tp_2"}),
+        ({"wikidata": ["Q1757", "Q5342"]}, "city", {"tp_1", "tp_2"}),
+        # A value detached from a merged alias refuses through the alias.
+        ({"wikidata": ["Q1757", "Q778"]}, "city", {"tp_1", "tp_3"}),
+    ):
+        with registry.session(path) as other:
+            try:
+                _identify(other, concordances, kind=kind)
+            except registry.RegistryError:
+                pass
+            assert other.used == used, (concordances, kind)
+
+
+NEW_ROW = dict(HELSINKI, place_id="tp_6", concordances={"wikidata": ["Q6"]})
+
+
+@pytest.mark.parametrize(
+    ("next_id", "changed", "reason"),
+    [
+        (6, {}, None),
+        (
+            7,
+            {
+                "tp_1": dict(
+                    HELSINKI,
+                    concordances={**HELSINKI["concordances"], "cbsa": ["123"]},
+                ),
+                "tp_4": dict(RETIRED, reason="other"),
+                "tp_6": NEW_ROW,
+            },
+            None,
+        ),
+        (5, {}, "the id counter went back from 6 to 5"),
+        (6, {"tp_2": None}, "tp_2 is gone"),
+        (
+            6,
+            {
+                "tp_1": {
+                    "place_id": "tp_1",
+                    "status": "merged",
+                    "into": "tp_2",
+                    "concordances": HELSINKI["concordances"],
+                    "at": "a",
+                    "reason": "r",
+                },
+                "tp_3": dict(MERGED, into="tp_2"),
+            },
+            "tp_1 is now merged",
+        ),
+        (6, {"tp_3": dict(MERGED, into="tp_2")}, "tp_3 now resolves to tp_2"),
+        (6, {"tp_1": dict(HELSINKI, kind="region")}, "tp_1 is now a region"),
+        (
+            6,
+            {
+                "tp_1": dict(
+                    HELSINKI,
+                    detached={
+                        "overture": [{"value": "ov-hel", "at": "a", "reason": "r"}]
+                    },
+                )
+            },
+            "tp_1 has other detached values",
+        ),
+        (
+            6,
+            {
+                "tp_1": dict(
+                    HELSINKI, concordances={"wikidata": ["Q1757"], "overture": ["x"]}
+                )
+            },
+            "tp_1 lost overture:ov-hel",
+        ),
+        (
+            6,
+            {
+                "tp_2": dict(
+                    ESPOO,
+                    concordances={
+                        "wikidata": ["Q1", "Q999", "Q5342"],
+                        "overture": ["ov-esp"],
+                    },
+                )
+            },
+            "tp_2 now has the QID Q1",
+        ),
+    ],
+    ids=[
+        "same",
+        "grown",
+        "counter",
+        "gone",
+        "merged",
+        "retargeted",
+        "kind",
+        "detached",
+        "lost",
+        "first-qid",
+    ],
+)
+def test_a_registry_grew_when_the_places_a_build_used_kept_their_identity(
+    tmp_path, next_id, changed, reason
+):
+    old = registry.load(_write(tmp_path / "old.jsonl", header=dict(HEADER, next_id=6)))
+    rows = {row["place_id"]: row for row in ROWS}
+    rows.update(changed)
+    kept = [rows[k] for k in sorted(rows, key=lambda k: int(k[3:])) if rows[k]]
+    new = registry.load(
+        _write(tmp_path / "new.jsonl", header=dict(HEADER, next_id=next_id), rows=kept)
+    )
+    # Rows outside the ids — the retired tp_4 here — change freely.
+    assert registry.grown(old, new, {"tp_1", "tp_2", "tp_3"}) == reason
 
 
 def test_a_refused_mint_consumes_no_id_and_the_id_space_has_an_end(tmp_path):

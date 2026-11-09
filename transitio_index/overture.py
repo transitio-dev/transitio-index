@@ -17,8 +17,10 @@ copy of the release's divisions tables (:func:`use_local_copy`), downloaded
 from the bucket the first time a stage needs one.
 """
 
+import collections
 import contextlib
 import datetime
+import functools
 import http.client
 import json
 import logging
@@ -86,6 +88,7 @@ LOCAL_MARKER_MAX = 2**20
 # The directory holding one local copy per release (``use_local_copy``), and
 # the copies checked this process, by release.
 _local_root = None
+_local_earlier = None
 _local_copies = {}
 
 # Overture ``subtype`` to the gazetteer's ``kind``. Finer subtypes (borough,
@@ -121,9 +124,10 @@ PROJECT = [
     "geometry",
 ]
 
-# An OSM relation reference inside a source ``record_id`` (``relation/123`` or a
-# bare ``123``); ways and nodes are not admin boundaries and are not matched.
-_OSM_RELATION = re.compile(r"\Arelation[/:]?(\d+)\Z|\A(\d+)\Z")
+# An OSM relation reference inside a source ``record_id``: ``r123@4`` (the
+# relation and its version, as Overture writes it), ``relation/123`` or a bare
+# ``123``; ways and nodes are not admin boundaries and are not matched.
+_OSM_RELATION = re.compile(r"\Ar(\d+)@\d+\Z|\Arelation[/:](\d+)\Z|\A(\d+)\Z")
 
 WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
@@ -248,20 +252,25 @@ def current_release():
     return _release
 
 
-def use_local_copy(root):
+def use_local_copy(root, earlier=None):
     """Read every Overture table from a local copy under ``root``, one
     directory per release that :func:`ensure_local_copy` downloads, for the
-    rest of the process; None reads the bucket."""
-    global _local_root
+    rest of the process, taking the files an ``earlier`` download holds;
+    None reads the bucket."""
+    global _local_root, _local_earlier
     _local_root = None if root is None else pathlib.Path(root)
+    _local_earlier = None if earlier is None else pathlib.Path(earlier)
     _local_copies.clear()
 
 
-def ensure_local_copy(root, release, filesystem=None):
+def ensure_local_copy(root, release, filesystem=None, earlier=None):
     """A folder holding a complete local copy of ``release``'s divisions
     tables (``LOCAL_TABLES``): the one ``root/<release>/current.json``
     names, else a new one downloaded from the Overture bucket
-    (``filesystem``, by default the anonymous S3 one). A download runs under
+    (``filesystem``, by default the anonymous S3 one), each listed file
+    taken instead from the folder ``earlier`` when it holds the file at the
+    same path under the release and at the listed size (an earlier download
+    of the release, in the bucket's layout). A download runs under
     a writer lock over ``root`` (another build needing a download waits;
     one finding its copy complete does not) into a new private
     folder ``root/<release>/copy-<id>``, every folder and file created
@@ -293,7 +302,7 @@ def ensure_local_copy(root, release, filesystem=None):
         name = f"copy-{os.urandom(8).hex()}"
         with folder.make_subdirectory(name) as copy:
             try:
-                _download_tables(filesystem, base, files, copy)
+                _download_tables(filesystem, base, files, copy, earlier)
                 copy.sync()
                 store.write_bytes(copy, LOCAL_COMPLETE, listing.encode())
                 copy.sync()
@@ -312,13 +321,15 @@ def ensure_local_copy(root, release, filesystem=None):
         return copy.path
 
 
-def _download_tables(filesystem, base, files, copy):
+def _download_tables(filesystem, base, files, copy, earlier=None):
     """Download ``files`` (``{path under the release: size}``) from ``base``
-    into ``copy``, a :class:`store.Directory`: each table folder opened
-    through its parent's descriptor, each file created exclusively and
-    synced to disk with its folder; a file of another size than listed is
-    refused."""
+    into ``copy``, a :class:`store.Directory`, or copy each from ``earlier``
+    (:func:`_earlier_file`), downloading it after all when it changed size
+    while being copied: each table folder opened through its parent's
+    descriptor, each file created exclusively and synced to disk with its
+    folder; a file of another size than listed is refused."""
     opened = {}
+    taken = 0
     try:
         for name, size in sorted(files.items()):
             table, leaf = name.rsplit("/", 1)
@@ -327,13 +338,17 @@ def _download_tables(filesystem, base, files, copy):
                 if theme not in opened:
                     opened[theme] = copy.child(theme)
                 opened[table] = opened[theme].child(kind)
-            with filesystem.open_input_stream(f"{base}/{name}") as source:
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | store.O_BINARY
-                with os.fdopen(opened[table].open(leaf, flags), "wb") as sink:
-                    shutil.copyfileobj(source, sink, 2**24)
-                    sink.flush()
-                    os.fsync(sink.fileno())
-                    written = os.fstat(sink.fileno()).st_size
+            written = None
+            source = _earlier_file(earlier, name, size)
+            if source is not None:
+                written = _write_table_file(source, opened[table], leaf)
+                if written == size:
+                    taken += 1
+                else:
+                    opened[table].unlink(leaf)
+            if written != size:
+                source = filesystem.open_input_stream(f"{base}/{name}")
+                written = _write_table_file(source, opened[table], leaf)
             if written != size:
                 raise GazetteerError(f"{name}: downloaded {written} bytes of {size}")
         for directory in opened.values():
@@ -341,6 +356,48 @@ def _download_tables(filesystem, base, files, copy):
     finally:
         for directory in opened.values():
             directory.close()
+    if earlier is not None:
+        log.info("overture: %d of %d files taken from %s", taken, len(files), earlier)
+
+
+def _write_table_file(source, directory, leaf):
+    """Write the open ``source`` to the new file ``leaf`` in ``directory``,
+    synced to disk; the bytes written."""
+    with source:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | store.O_BINARY
+        with os.fdopen(directory.open(leaf, flags), "wb") as sink:
+            shutil.copyfileobj(source, sink, 2**24)
+            sink.flush()
+            os.fsync(sink.fileno())
+            return os.fstat(sink.fileno()).st_size
+
+
+def _earlier_file(earlier, name, size):
+    """The file ``name`` of the folder ``earlier`` opened for reading when it
+    is a regular file of ``size`` bytes, every folder on the way opened
+    through its parent's descriptor without following a link; else None. A
+    file rewritten at the same size while it is copied is not noticed: the
+    folder is the maintainer's own scratch, as the copies are."""
+    if earlier is None:
+        return None
+    *folders, leaf = name.split("/")
+    opened = []
+    try:
+        directory = store.Directory(earlier, create=False)
+        opened.append(directory)
+        for folder in folders:
+            directory = directory.subdirectory(folder)
+            opened.append(directory)
+        handle = store.open_regular(directory, leaf, None)
+    except (OSError, store.StoreError):
+        return None
+    finally:
+        for directory in opened:
+            directory.close()
+    if os.fstat(handle).st_size != size:
+        os.close(handle)
+        return None
+    return os.fdopen(handle, "rb")
 
 
 def _current_copy(folder, release):
@@ -481,7 +538,9 @@ def theme_dataset(path, release=None):
         if table not in LOCAL_TABLES:
             raise GazetteerError(f"{table}: not a table of the local Overture copy")
         if release not in _local_copies:
-            _local_copies[release] = ensure_local_copy(_local_root, release)
+            _local_copies[release] = ensure_local_copy(
+                _local_root, release, earlier=_local_earlier
+            )
         return ds.dataset(str(_local_copies[release] / table), format="parquet")
     location = f"{OVERTURE_BUCKET}/{path.format(release=release)}"
     try:
@@ -553,7 +612,7 @@ def _osm_relation_ids(sources):
             continue
         match = _OSM_RELATION.match((source.get("record_id") or "").strip())
         if match:
-            relation = match.group(1) or match.group(2)
+            relation = next(group for group in match.groups() if group)
             if relation not in found:
                 found.append(relation)
     return found
@@ -690,6 +749,63 @@ def _label(error):
     return type(error).__name__
 
 
+# The root of the local Wikidata copies a process answers from
+# (``use_wikidata_copy``), and whether a missing copy was warned about.
+_wikidata_root = None
+_wikidata_warned = False
+
+
+def use_wikidata_copy(root):
+    """Answer the Wikidata lookups from the copy ``root/current.json`` names
+    (:mod:`transitio_index.wikidata_copy`) for the rest of the process; None
+    asks every key live."""
+    global _wikidata_root
+    _wikidata_root = None if root is None else pathlib.Path(root)
+
+
+def _opened_wikidata_copy():
+    """The copy :func:`use_wikidata_copy` names, opened, or None; a missing
+    one is warned about once."""
+    global _wikidata_warned
+    if _wikidata_root is None:
+        return None
+    from transitio_index import wikidata_copy
+
+    copy = wikidata_copy.current_copy(_wikidata_root)
+    if copy is None and not _wikidata_warned:
+        log.warning(
+            "no Wikidata copy under %s; every key is asked live", _wikidata_root
+        )
+        _wikidata_warned = True
+    return copy
+
+
+def wikidata_provenance(client):
+    """What answered ``client``'s lookups (:meth:`WikidataClient.provenance`);
+    None for no client or one that keeps no such record (a test stand-in)."""
+    record = getattr(client, "provenance", None)
+    return record() if callable(record) else None
+
+
+def _from_copy(lookup):
+    """A lookup answered from the client's copy for the keys it covers and
+    live for the others, which are counted; sorted by key, as both give."""
+
+    @functools.wraps(lookup)
+    def answered(self, keys):
+        keys = sorted({str(key) for key in keys if key})
+        if self.copy is None:
+            self.live[lookup.__name__] += len(keys)
+            return dict(sorted(lookup(self, keys).items()))
+        found, uncovered = self.copy.answers(lookup.__name__, keys)
+        if uncovered:
+            self.live[lookup.__name__] += len(uncovered)
+            found.update(lookup(self, uncovered))
+        return dict(sorted(found.items()))
+
+    return answered
+
+
 class WikidataClient:
     """Batched lookups against the Wikidata SPARQL endpoint.
 
@@ -712,7 +828,21 @@ class WikidataClient:
         self.batch_size = batch_size
         # Total tries per request (>=1), not retries-after-the-first.
         self.attempts = max(1, attempts)
+        # The local copy answering first (``use_wikidata_copy``), and the keys
+        # asked live, per lookup.
+        self.copy = _opened_wikidata_copy()
+        self.live = collections.Counter()
 
+    def provenance(self):
+        """``{"copy": day, "live": {lookup: keys}}``: the day of the copy that
+        answered (None without one) and how many keys each lookup asked
+        live."""
+        return {
+            "copy": self.copy.day if self.copy is not None else None,
+            "live": dict(sorted(self.live.items())),
+        }
+
+    @_from_copy
     def p402(self, osm_relation_ids):
         """``{osm_relation_id: qid}``; an ambiguous id maps to ``None``.
 
@@ -726,6 +856,7 @@ class WikidataClient:
             self._query_batch(ids[start : start + self.batch_size], found)
         return found
 
+    @_from_copy
     def statistical_metros(self, city_qids):
         """``{city_qid: [{"qid", "name", "cbsa"}, ...]}`` — US metros per city.
 
@@ -749,6 +880,7 @@ class WikidataClient:
             ]
         return result
 
+    @_from_copy
     def fips_items(self, codes):
         """``{code: sorted QIDs}`` — the items whose FIPS code (P882) is one
         of the five-digit ``codes``. A metro's CBSA code shares the property,
@@ -774,6 +906,7 @@ class WikidataClient:
                     found.setdefault(code, set()).add(qid)
         return {code: sorted(qids) for code, qids in sorted(found.items())}
 
+    @_from_copy
     def metro_candidates(self, city_qids):
         """``{city_qid: [{"qid", "name"}, ...]}`` — metro-like entities per city.
 
@@ -801,6 +934,7 @@ class WikidataClient:
             "wikidata areas",
         )
 
+    @_from_copy
     def coordinates(self, qids):
         """``{qid: [(lon, lat), ...]}`` — each QID's coordinate locations
         (P625) on Earth. A QID without one is absent."""
@@ -900,6 +1034,7 @@ class WikidataClient:
             elif osm not in found:
                 found[osm] = qid
 
+    @_from_copy
     def labels_and_aliases(self, qids):
         """``{qid: {"labels": {lang: label}, "aliases": {lang: [alias, ...]}}}``.
 
@@ -1123,6 +1258,7 @@ def resolve(cache_dir, *, dataset=None, wikidata=None, run=None):
         "source": "overture",
         "overture_release": current_release(),
         "wikidata_endpoint": wikidata.endpoint,
+        "wikidata": wikidata_provenance(wikidata),
         "countries": sorted({r["country"] for r in resolved if r["country"]}),
         "divisions_read": len(records),
         "resolved": len(resolved),

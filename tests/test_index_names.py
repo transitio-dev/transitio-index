@@ -43,9 +43,9 @@ def _hex(x, y):
     return shapely.to_wkb(shapely.Point(x, y)).hex()
 
 
-def _merge_fixture_names(tmp_path, overrides_dir=None, strict=False):
+def _merge_fixture_names(tmp_path, overrides_dir=None, strict=False, wikidata=None):
     """Publish ``PLACES`` as a geometry generation and run the names stage
-    over stub labels; ``(manifest, places by id)``."""
+    over stub labels (or ``wikidata``); ``(manifest, places by id)``."""
     from transitio_index import overrides
 
     cache = tmp_path / "cache"
@@ -66,7 +66,8 @@ def _merge_fixture_names(tmp_path, overrides_dir=None, strict=False):
         directory.close()
     manifest = names.merge_names(
         cache,
-        wikidata=fx.StubWikidata(labels=LABELS, points={"Q1757": [(24.9, 60.2)]}),
+        wikidata=wikidata
+        or fx.StubWikidata(labels=LABELS, points={"Q1757": [(24.9, 60.2)]}),
         overrides_dir=overrides_dir,
         strict=strict,
     )
@@ -82,6 +83,18 @@ def test_wikidata_fills_missing_languages_and_overture_wins(tmp_path):
     assert hel["names"]["sv"] == "Helsingfors"  # filled from Wikidata
     assert hel["names"]["en"] == "Helsinki"  # Overture keeps the shared language
     assert hel["names"]["fi"] == "Helsinki"
+
+
+def test_the_manifest_says_what_answered_wikidata(tmp_path):
+    class Recorded(fx.StubWikidata):
+        def provenance(self):
+            return {"copy": "2026-11-08", "live": {"labels_and_aliases": 1}}
+
+    manifest, _ = _merge_fixture_names(tmp_path, wikidata=Recorded(labels=LABELS))
+    assert manifest["wikidata"] == {
+        "copy": "2026-11-08",
+        "live": {"labels_and_aliases": 1},
+    }
 
 
 def test_name_becomes_the_english_label(tmp_path):

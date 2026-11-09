@@ -21,7 +21,9 @@
 # needed until the first run copies it into the run's logs); READER (a pip
 # requirement such as transitio==0.29.0 that prepare installs); ARCHIVE_ROOT
 # (default ~/.cache/transitio-index/builds-<run>); MIN_FREE_GB (default 50);
-# RUN_DIR, BUILD_CHECKOUT and PYTHON (see common.sh).
+# SLOTS, the labels rest, resume and fix build at a time (1 to 9, default 1;
+# first builds its one label alone), and WORKERS, each crawl's threads (see
+# build_labels.sh); RUN_DIR, BUILD_CHECKOUT and PYTHON (see common.sh).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 [ "$#" -eq 2 ] || { echo "usage: rebuild.sh <run> prepare | check | first | rest | resume | fix" >&2; exit 2; }
@@ -34,6 +36,10 @@ esac
 . "$HERE/common.sh" || { echo "refusing: cannot read common.sh" >&2; exit 2; }
 READER="${READER:-}"
 MIN_FREE_GB="${MIN_FREE_GB:-50}"
+SLOTS="${SLOTS:-1}"
+case "$SLOTS" in [123456789]) ;; *) echo "refusing: bad SLOTS '$SLOTS' (1 to 9)" >&2; exit 2;; esac
+WORKERS="${WORKERS:-}"
+case "$WORKERS" in ""|[123456789]|1[0123456]) ;; *) echo "refusing: bad WORKERS '$WORKERS'" >&2; exit 2;; esac
 MDB_CATALOGUE="${MDB_CATALOGUE:-}"
 # Each resume gets a map of its own, named by its start time.
 RESUME_MAP="$RUN_DIR/map-resume-$(date '+%Y%m%d-%H%M%S').txt"
@@ -207,7 +213,7 @@ case "$MODE" in
   prepare|check|first)
     empty_dir "$ARCHIVE_ROOT" || refuse "$ARCHIVE_ROOT holds builds already: use 'rest' or 'resume', or choose another ARCHIVE_ROOT"
     empty_dir "$ARCHIVE_ROOT-feeds-only" || refuse "$ARCHIVE_ROOT-feeds-only is not empty: use 'rest' or 'resume', or choose another ARCHIVE_ROOT"
-    RUNMAP="$CHECK_MAP"; stop_first=1
+    RUNMAP="$CHECK_MAP"; stop_first=1; SLOTS=1
     ;;
   rest)
     archived "$CHECK_LABEL" || refuse "the check label $CHECK_LABEL is not archived under $ARCHIVE_ROOT: run 'first' (or 'resume')"
@@ -251,7 +257,7 @@ say "reader: transitio $(PYTHONPATH="" "$PY" -c 'import importlib.metadata as m;
 say "cut $PART, MDB catalogue ${CUT_MDB_SHA:0:16}"
 say "Overture release $RELEASE (the bucket holds: $(printf '%s\n' "$held" | paste -sd ' ' -))"
 say "free disk: $free_gb GB on the fuller of the cache and archive volumes (MIN_FREE_GB $MIN_FREE_GB)"
-say "would build $count label(s) from $(basename "$RUNMAP"), first $(awk 'NF { print $1; exit }' "$RUNMAP"), archive root $ARCHIVE_ROOT"
+say "would build $count label(s) from $(basename "$RUNMAP"), $SLOTS at a time, first $(awk 'NF { print $1; exit }' "$RUNMAP"), archive root $ARCHIVE_ROOT"
 case "$MODE" in prepare|check) say "checks passed; start with: $0 $RUN first"; exit 0;; esac
 
 # --- the label builds, in the background -------------------------------------
@@ -280,9 +286,10 @@ if [ "$MODE" = fix ] && [ ! -e "$FIXED" ]; then
   copy_into "$record" "$FIXED"
   rm -f "$record"
 fi
-echo "[$(stamp)] REBUILD $RUN $MODE: map $RUNMAP, $count labels, code ${head:0:7}, archive root $ARCHIVE_ROOT, $free_gb GB free, Overture $RELEASE" >> "$PROG" \
+echo "[$(stamp)] REBUILD $RUN $MODE: map $RUNMAP, $count labels, code ${head:0:7}, archive root $ARCHIVE_ROOT, $free_gb GB free, Overture $RELEASE, $SLOTS at a time" >> "$PROG" \
   || refuse "cannot write $PROG"
 nohup env ARCHIVE_ROOT="$ARCHIVE_ROOT" LOGDIR="$LOGDIR" STOP_IF_FIRST_FAILS="$stop_first" RUN_LOCK="$LOCK" \
+  SLOTS="$SLOTS" WORKERS="$WORKERS" \
   MDB_CATALOGUE="$RUN_CATALOGUE" OVERTURE_RELEASE="$RELEASE" \
   "$HERE/supervise.sh" "$PROG" "$HERE/build_labels.sh" "$RUNMAP" >> "$OUT" 2>&1 < /dev/null &
 bg=$!

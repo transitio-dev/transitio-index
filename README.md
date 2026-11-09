@@ -77,10 +77,16 @@ output its predecessors already left in the cache.
 
 One piece of state lives outside the cache: the place registry
 (`overrides/places_registry.jsonl` by default, or `--registry`), which the
-`gazetteer` and `expand` stages write and the later stages read. The later
-stages refuse to run against a registry that no longer matches the cached
-gazetteer run, so resuming or moving a build means keeping the cache and its
-matching registry together.
+`gazetteer` and `expand` stages write and the later stages read. Each of the
+two keeps a copy of the registry it saved in the cache, and the later stages
+read that copy. Other builds may add places to the registry meanwhile, or
+values to places, but the later stages refuse to run once a place their
+build used is merged, retired, given another kind or other detached values,
+gains its first QID or loses a value. Resuming or moving a build therefore
+means keeping the cache and its matching registry together. Builds with
+caches of their own can run side by side: with `--wait-for-registry`, a
+build whose `gazetteer` or `expand` stage finds another build's holding the
+registry waits for its turn instead of refusing.
 
 ### The stages, in order
 
@@ -105,7 +111,14 @@ matching registry together.
    `~/.cache/transitio-index/overture/<release>/`; `--overture-dir` names
    another folder, and `--overture-remote` reads the Overture bucket instead.
    A copy found incomplete is downloaded again into a folder of its own, and
-   the old folder can then be removed by hand.
+   the old folder can then be removed by hand; `--overture-from DIR` takes
+   the files of an earlier download of the release (in the bucket's layout)
+   instead of downloading them. Wikidata is read the same way, from a local
+   copy under `~/.cache/transitio-index/wikidata/` (`--wikidata-copy` names
+   another folder) that `python -m transitio_index.wikidata_copy` makes
+   (about 9 hours for a first copy; refreshed every six months); keys the
+   copy lacks are asked live, and each stage's manifest records the copy's
+   day and how many keys each lookup asked live.
 4. `resolve` — settle each feed's identity, its access details and whether
    it is crawlable (from the overrides), before anything is fetched. A feed
    that needs a key takes its provider from `overrides/access_providers.yaml`;

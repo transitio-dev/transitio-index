@@ -125,7 +125,8 @@ def test_a_crawled_qidless_division_is_minted_through_the_registry(tmp_path):
     ex._publish_names(cache, ex.SEED_PLACES)
     ex._write_crawl(cache, "f-noqid", ["s1,62.1,26.2\n"])
     path = tmp_path / "places_registry.jsonl"
-    ex._publish_run(cache, ex._seeded_registry(path))
+    ex._seeded_registry(path)
+    ex._publish_run_on(cache, path)
     with registry.session(path) as reg:
         manifest, places, report = ex._expand(tmp_path, cache, registry=reg)
         assert (reg.minted, manifest["minted"], manifest["places_added"]) == (1, 1, 1)
@@ -910,7 +911,8 @@ def test_a_crawled_division_the_registry_refuses_is_reported_by_expand(
     ex._publish_names(cache, ex.SEED_PLACES)
     ex._write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
     path = tmp_path / "places_registry.jsonl"
-    ex._publish_run(cache, ex._seeded_registry(path))
+    ex._seeded_registry(path)
+    ex._publish_run_on(cache, path)
     with registry.session(path) as reg:
         # Tampere's QID, held as another kind before the crawl discovers the city.
         reg.identify(
@@ -1987,7 +1989,8 @@ def test_set_boundary_applies_to_a_place_expand_discovers(tmp_path, stale, joine
     )
     ex._write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
     path = tmp_path / "places_registry.jsonl"
-    ex._publish_run(cache, ex._seeded_registry(path, *known))
+    ex._seeded_registry(path, *known)
+    ex._publish_run_on(cache, path)
     with registry.session(path) as reg:
         manifest, places, report = ex._expand(
             tmp_path, cache, registry=reg, overrides_dir=directory

@@ -51,10 +51,11 @@ from transitio_index import (  # noqa: E402
     publish,
     rank,
     registry,
-    stats,
     resolve,
     seed,
+    stats,
     store,
+    wikidata_copy,
 )
 
 log = logging.getLogger(__name__)
@@ -124,49 +125,61 @@ def registry_path(arguments):
     return arguments.registry or arguments.overrides_dir / registry.FILE
 
 
-def commit_run(cache_dir, path, *, read_only, stages):
+def commit_run(cache_dir, path, *, read_only, stages, prepare=(), wait=False):
     """Run the gazetteer stages as one transaction: every stage identifies
     places through one registry session and publishes its generation
-    staged, the registry is saved once after the last stage, and the run
-    manifest published last makes the whole set visible together — so a
-    failure anywhere before that leaves the previous set current and, until
-    the save, the registry untouched. The run lock is held throughout, so runs on
-    one cache never interleave. Returns the stage summaries and the run
-    manifest."""
+    staged, the registry is saved once after the last stage and staged as
+    the run's copy, and the run manifest published last makes the whole set
+    visible together — so a failure anywhere before that leaves the previous
+    set current and, until the save, the registry untouched. The run lock is
+    held throughout, so runs on one cache never interleave. The ``prepare``
+    stages, which take only the run, run first, before the registry session
+    opens; with ``wait`` the session waits for another build's to end.
+    Returns the stage summaries and the run manifest."""
     run = {}
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
         # The run lock outlives every stage: a second run on this cache
         # cannot stage, prune or publish under this one.
-        with (
-            store.exclusive_writer(directory, store.RUN_LOCK),
-            registry.session(path, read_only=read_only) as places,
-        ):
-            summaries = [stage(places, run) for stage in stages]
-            digest = places.save()
-            manifest = {
-                "source": "gazetteer-run",
-                "generations": dict(run),
-                "registry_base": places.base,
-                "registry_digest": digest,
-                "next_id": places.next_id,
-                "minted": places.minted,
-                "enriched": places.enriched,
-                "retrieved_at": datetime.datetime.now(
-                    datetime.timezone.utc
-                ).isoformat(),
-            }
-            rows = [{"pointer": p, "generation": g} for p, g in sorted(run.items())]
-            with store.exclusive_writer(directory):
-                summaries.append(
-                    store.publish(
+        with store.exclusive_writer(directory, store.RUN_LOCK):
+            # Stages that read no registry run before its session opens, so
+            # a build waiting its turn reads them meanwhile.
+            summaries = [stage(run) for stage in prepare]
+            with registry.session(path, read_only=read_only, wait=wait) as places:
+                summaries += [stage(places, run) for stage in stages]
+                digest = places.save()
+                with store.exclusive_writer(directory):
+                    run[expand.SNAPSHOT_POINTER] = expand.publish_snapshot(
                         cache_dir / "gazetteer",
-                        store.RUN_POINTER,
-                        {"generations.jsonl": store.jsonl_chunks(rows)},
-                        manifest,
+                        places,
+                        expand.SNAPSHOT_POINTER,
                         held=directory,
+                        staged=True,
+                    )["generation"]
+                    manifest = {
+                        "source": "gazetteer-run",
+                        "generations": dict(run),
+                        "registry_base": places.base,
+                        "registry_digest": digest,
+                        "next_id": places.next_id,
+                        "minted": places.minted,
+                        "enriched": places.enriched,
+                        "retrieved_at": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    }
+                    rows = [
+                        {"pointer": p, "generation": g} for p, g in sorted(run.items())
+                    ]
+                    summaries.append(
+                        store.publish(
+                            cache_dir / "gazetteer",
+                            store.RUN_POINTER,
+                            {"generations.jsonl": store.jsonl_chunks(rows)},
+                            manifest,
+                            held=directory,
+                        )
                     )
-                )
     finally:
         directory.close()
     return summaries
@@ -174,25 +187,25 @@ def commit_run(cache_dir, path, *, read_only, stages):
 
 @contextlib.contextmanager
 def check_registry_state(cache_dir, path):
-    """Refuse to consume a gazetteer run whose registry is not the file on
-    disk: after a pull, a branch switch or a curation edit, the gazetteer
-    must run again before anything reads its places. The registry is held
-    read-only for the block, so no run can save it under the consumer, and
-    yields it for resolving override references."""
+    """Refuse to consume a gazetteer run whose registry lost what its places
+    rest on: after a branch switch or a curation edit that changed a place
+    the build used, the gazetteer must run again before anything reads its
+    places; places other builds added or enriched are no reason
+    (:func:`expand.consumable_registry`). Yields the registry the build
+    saved, read-only, for resolving override references. The cache's run
+    lock is held for the block, so no gazetteer run or expand on this cache
+    commits under the consumer; other builds may write the registry."""
     gazetteer = cache_dir / "gazetteer"
-    if not path.is_file():
-        _refuse_missing_registry(gazetteer, path)
-        yield None
-        return
-    # The manifests are read under the registry lock, so they and the file
-    # are one consistent view: no run can commit between them.
-    with registry.session(path, read_only=True) as places:
-        expected = expand.expected_registry_digest(gazetteer, path)
-        if expected is not None and expected != places.digest:
-            raise registry.RegistryError(
-                f"{path}: changed since the gazetteer ran; rerun the gazetteer"
-            )
-        yield places
+    directory = store.open_subdir(cache_dir, "gazetteer")
+    try:
+        with store.exclusive_writer(directory, store.RUN_LOCK):
+            if path.is_file():
+                yield expand.consumable_registry(gazetteer, path)
+            else:
+                _refuse_missing_registry(gazetteer, path)
+                yield None
+    finally:
+        directory.close()
 
 
 def _refuse_missing_registry(gazetteer, path):
@@ -217,13 +230,14 @@ def consumes_run(command):
 
 
 def run_gazetteer(arguments):
+    """The gazetteer stages as one run: the Overture read before the
+    registry session opens, then the stages that identify places."""
     cache_dir = arguments.cache_dir
     options = {
         "overrides_dir": arguments.overrides_dir,
         "strict": arguments.strict_overrides,
     }
     stages = [
-        lambda places, run: overture.resolve(cache_dir, run=run),
         lambda places, run: seed.resolve_seed(
             cache_dir,
             registry=places,
@@ -252,6 +266,8 @@ def run_gazetteer(arguments):
         registry_path(arguments),
         read_only=arguments.registry_read_only,
         stages=stages,
+        prepare=[lambda run: overture.resolve(cache_dir, run=run)],
+        wait=arguments.wait_for_registry,
     )
 
 
@@ -261,22 +277,34 @@ def run_resolve(arguments):
 
 def run_expand(arguments):
     """Expand under its own registry session: it identifies what it discovers,
-    so it writes the registry the gazetteer run left, as a second transaction."""
+    so it writes the registry the gazetteer run left, as a second transaction.
+    The cache's run lock is held, as by the gazetteer run and the consumers."""
     path = registry_path(arguments)
     gazetteer = arguments.cache_dir / "gazetteer"
-    if not path.is_file():
-        _refuse_missing_registry(gazetteer, path)
-        return [
-            expand.expand(arguments.cache_dir, overrides_dir=arguments.overrides_dir)
-        ]
-    with registry.session(path, read_only=arguments.registry_read_only) as places:
-        return [
-            expand.expand(
-                arguments.cache_dir,
-                overrides_dir=arguments.overrides_dir,
-                registry=places,
-            )
-        ]
+    directory = store.open_subdir(arguments.cache_dir, "gazetteer")
+    try:
+        with store.exclusive_writer(directory, store.RUN_LOCK):
+            if not path.is_file():
+                _refuse_missing_registry(gazetteer, path)
+                return [
+                    expand.expand(
+                        arguments.cache_dir, overrides_dir=arguments.overrides_dir
+                    )
+                ]
+            with registry.session(
+                path,
+                read_only=arguments.registry_read_only,
+                wait=arguments.wait_for_registry,
+            ) as places:
+                return [
+                    expand.expand(
+                        arguments.cache_dir,
+                        overrides_dir=arguments.overrides_dir,
+                        registry=places,
+                    )
+                ]
+    finally:
+        directory.close()
 
 
 def run_crawl(arguments):
@@ -439,6 +467,21 @@ def parse_args(argv=None):
         f"(default: {DEFAULT_OVERTURE_DIR})",
     )
     parser.add_argument(
+        "--overture-from",
+        type=pathlib.Path,
+        help="a folder holding an earlier download of the release in the "
+        "bucket's layout: a local copy made anew takes each file found there "
+        "at the listed size instead of downloading it",
+    )
+    parser.add_argument(
+        "--wikidata-copy",
+        type=pathlib.Path,
+        default=wikidata_copy.DEFAULT_ROOT,
+        help="the local Wikidata copies (python -m transitio_index.wikidata_copy): "
+        "lookups are answered from the one current.json names, keys it lacks "
+        f"are asked live (default: {wikidata_copy.DEFAULT_ROOT})",
+    )
+    parser.add_argument(
         "--overture-remote",
         action="store_true",
         help="read Overture from its bucket at every stage, not a local copy",
@@ -479,6 +522,12 @@ def parse_args(argv=None):
         action="store_true",
         help="refuse to mint or enrich a place: the gazetteer fails at the first "
         "change the registry would need, and never writes it (CI, pinned builds)",
+    )
+    parser.add_argument(
+        "--wait-for-registry",
+        action="store_true",
+        help="when another build's gazetteer or expand stage holds the registry, "
+        "wait for it to finish instead of refusing (builds run side by side)",
     )
     parser.add_argument(
         "--strict-overrides",
@@ -573,8 +622,10 @@ def main(argv=None):
     if arguments.overture_release is not None:
         overture.use_release(arguments.overture_release)
     overture.use_local_copy(
-        None if arguments.overture_remote else arguments.overture_dir
+        None if arguments.overture_remote else arguments.overture_dir,
+        arguments.overture_from,
     )
+    overture.use_wikidata_copy(arguments.wikidata_copy)
     stage = arguments.stage
     try:
         progress.configure(
