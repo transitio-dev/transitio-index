@@ -318,7 +318,24 @@ def _write_crawl(cache, feed_id, stops_rows, members=None):
     log_path.write_text(existing + json.dumps(log) + "\n")
 
 
-def _expand(tmp_path, cache, registry=None, labels=None, overrides_dir=None, rows=None):
+class _KeptStub(fx.StubWikidata):
+    """The stub, keeping what answered it as a real client does."""
+
+    def provenance(self):
+        return {"copy": "2026-11-08", "live": {}}
+
+
+def _expand(
+    tmp_path,
+    cache,
+    registry=None,
+    labels=None,
+    overrides_dir=None,
+    rows=None,
+    default_client=False,
+):
+    """Run expand over the fixtures; with ``default_client`` the stage makes
+    its own client (the stub, patched in)."""
     divisions = fx.write_dataset(
         tmp_path / "divisions.parquet", DIVISIONS if rows is None else rows
     )
@@ -326,7 +343,7 @@ def _expand(tmp_path, cache, registry=None, labels=None, overrides_dir=None, row
     lookup = boundaries.BoundaryLookup(
         cache, release="2026-08-19.0", area_dataset=areas, division_dataset=divisions
     )
-    wikidata = fx.StubWikidata(
+    wikidata = _KeptStub(
         {},
         {"Q28515": [{"qid": "Q912579", "name": "Springfield MSA", "cbsa": "44100"}]},
         {
@@ -342,14 +359,17 @@ def _expand(tmp_path, cache, registry=None, labels=None, overrides_dir=None, row
         },
     )
     try:
-        manifest = expand.expand(
-            cache,
-            lookup=lookup,
-            wikidata=wikidata,
-            area_dataset=areas,
-            registry=registry,
-            overrides_dir=overrides_dir,
-        )
+        with pytest.MonkeyPatch.context() as patch:
+            if default_client:
+                patch.setattr(overture, "WikidataClient", lambda: wikidata)
+            manifest = expand.expand(
+                cache,
+                lookup=lookup,
+                wikidata=None if default_client else wikidata,
+                area_dataset=areas,
+                registry=registry,
+                overrides_dir=overrides_dir,
+            )
     finally:
         lookup.close()
     places, _ = store.read_jsonl(
@@ -378,8 +398,10 @@ def test_a_crawled_stop_discovers_an_unseeded_city(tmp_path):
     cache = tmp_path / "cache"
     _publish_names(cache, SEED_PLACES)
     _write_crawl(cache, "f-tre", ["s1,61.5,23.8\n"])
-    manifest, places, _ = _expand(tmp_path, cache)
+    manifest, places, _ = _expand(tmp_path, cache, default_client=True)
     assert manifest["mode"] == "expanded"
+    # The client the stage made records what answered it.
+    assert manifest["wikidata"] == {"copy": "2026-11-08", "live": {}}
     tampere = places["Q40840"]
     assert tampere["kind"] == "city"
     # The unseeded intermediate region was added too, chained to the seed.

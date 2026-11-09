@@ -17,8 +17,10 @@ copy of the release's divisions tables (:func:`use_local_copy`), downloaded
 from the bucket the first time a stage needs one.
 """
 
+import collections
 import contextlib
 import datetime
+import functools
 import http.client
 import json
 import logging
@@ -747,6 +749,63 @@ def _label(error):
     return type(error).__name__
 
 
+# The root of the local Wikidata copies a process answers from
+# (``use_wikidata_copy``), and whether a missing copy was warned about.
+_wikidata_root = None
+_wikidata_warned = False
+
+
+def use_wikidata_copy(root):
+    """Answer the Wikidata lookups from the copy ``root/current.json`` names
+    (:mod:`transitio_index.wikidata_copy`) for the rest of the process; None
+    asks every key live."""
+    global _wikidata_root
+    _wikidata_root = None if root is None else pathlib.Path(root)
+
+
+def _opened_wikidata_copy():
+    """The copy :func:`use_wikidata_copy` names, opened, or None; a missing
+    one is warned about once."""
+    global _wikidata_warned
+    if _wikidata_root is None:
+        return None
+    from transitio_index import wikidata_copy
+
+    copy = wikidata_copy.current_copy(_wikidata_root)
+    if copy is None and not _wikidata_warned:
+        log.warning(
+            "no Wikidata copy under %s; every key is asked live", _wikidata_root
+        )
+        _wikidata_warned = True
+    return copy
+
+
+def wikidata_provenance(client):
+    """What answered ``client``'s lookups (:meth:`WikidataClient.provenance`);
+    None for no client or one that keeps no such record (a test stand-in)."""
+    record = getattr(client, "provenance", None)
+    return record() if callable(record) else None
+
+
+def _from_copy(lookup):
+    """A lookup answered from the client's copy for the keys it covers and
+    live for the others, which are counted; sorted by key, as both give."""
+
+    @functools.wraps(lookup)
+    def answered(self, keys):
+        keys = sorted({str(key) for key in keys if key})
+        if self.copy is None:
+            self.live[lookup.__name__] += len(keys)
+            return dict(sorted(lookup(self, keys).items()))
+        found, uncovered = self.copy.answers(lookup.__name__, keys)
+        if uncovered:
+            self.live[lookup.__name__] += len(uncovered)
+            found.update(lookup(self, uncovered))
+        return dict(sorted(found.items()))
+
+    return answered
+
+
 class WikidataClient:
     """Batched lookups against the Wikidata SPARQL endpoint.
 
@@ -769,7 +828,21 @@ class WikidataClient:
         self.batch_size = batch_size
         # Total tries per request (>=1), not retries-after-the-first.
         self.attempts = max(1, attempts)
+        # The local copy answering first (``use_wikidata_copy``), and the keys
+        # asked live, per lookup.
+        self.copy = _opened_wikidata_copy()
+        self.live = collections.Counter()
 
+    def provenance(self):
+        """``{"copy": day, "live": {lookup: keys}}``: the day of the copy that
+        answered (None without one) and how many keys each lookup asked
+        live."""
+        return {
+            "copy": self.copy.day if self.copy is not None else None,
+            "live": dict(sorted(self.live.items())),
+        }
+
+    @_from_copy
     def p402(self, osm_relation_ids):
         """``{osm_relation_id: qid}``; an ambiguous id maps to ``None``.
 
@@ -783,6 +856,7 @@ class WikidataClient:
             self._query_batch(ids[start : start + self.batch_size], found)
         return found
 
+    @_from_copy
     def statistical_metros(self, city_qids):
         """``{city_qid: [{"qid", "name", "cbsa"}, ...]}`` — US metros per city.
 
@@ -806,6 +880,7 @@ class WikidataClient:
             ]
         return result
 
+    @_from_copy
     def fips_items(self, codes):
         """``{code: sorted QIDs}`` — the items whose FIPS code (P882) is one
         of the five-digit ``codes``. A metro's CBSA code shares the property,
@@ -831,6 +906,7 @@ class WikidataClient:
                     found.setdefault(code, set()).add(qid)
         return {code: sorted(qids) for code, qids in sorted(found.items())}
 
+    @_from_copy
     def metro_candidates(self, city_qids):
         """``{city_qid: [{"qid", "name"}, ...]}`` — metro-like entities per city.
 
@@ -858,6 +934,7 @@ class WikidataClient:
             "wikidata areas",
         )
 
+    @_from_copy
     def coordinates(self, qids):
         """``{qid: [(lon, lat), ...]}`` — each QID's coordinate locations
         (P625) on Earth. A QID without one is absent."""
@@ -957,6 +1034,7 @@ class WikidataClient:
             elif osm not in found:
                 found[osm] = qid
 
+    @_from_copy
     def labels_and_aliases(self, qids):
         """``{qid: {"labels": {lang: label}, "aliases": {lang: [alias, ...]}}}``.
 
@@ -1180,6 +1258,7 @@ def resolve(cache_dir, *, dataset=None, wikidata=None, run=None):
         "source": "overture",
         "overture_release": current_release(),
         "wikidata_endpoint": wikidata.endpoint,
+        "wikidata": wikidata_provenance(wikidata),
         "countries": sorted({r["country"] for r in resolved if r["country"]}),
         "divisions_read": len(records),
         "resolved": len(resolved),

@@ -105,7 +105,14 @@ matching registry together.
    `~/.cache/transitio-index/overture/<release>/`; `--overture-dir` names
    another folder, and `--overture-remote` reads the Overture bucket instead.
    A copy found incomplete is downloaded again into a folder of its own, and
-   the old folder can then be removed by hand.
+   the old folder can then be removed by hand; `--overture-from DIR` takes
+   the files of an earlier download of the release (in the bucket's layout)
+   instead of downloading them. Wikidata is read the same way, from a local
+   copy under `~/.cache/transitio-index/wikidata/` (`--wikidata-copy` names
+   another folder) that `python -m transitio_index.wikidata_copy` makes
+   (about 9 hours for a first copy; refreshed every six months); keys the
+   copy lacks are asked live, and each stage's manifest records the copy's
+   day and how many keys each lookup asked live.
 4. `resolve` — settle each feed's identity, its access details and whether
    it is crawlable (from the overrides), before anything is fetched. A feed
    that needs a key takes its provider from `overrides/access_providers.yaml`;

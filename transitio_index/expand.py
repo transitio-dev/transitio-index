@@ -1082,7 +1082,9 @@ def _expanded(
     curated,
     seed_generation=None,
 ):
-    """Discovery under the crawl lock; ``(crawl_digest, counts, mode)``.
+    """Discovery under the crawl lock; ``(crawl_digest, counts, mode,
+    wikidata)``, ``wikidata`` the client discovery asked (None when nothing
+    was crawled).
 
     The digest is taken while the lock is still held, so it describes
     exactly the states discovery read.
@@ -1129,7 +1131,7 @@ def _expanded(
     finally:
         if opened_lookup is not None:
             opened_lookup.close()
-    return crawl.states_digest(cache_dir), counts, mode
+    return crawl.states_digest(cache_dir), counts, mode, wikidata
 
 
 def expand(
@@ -1232,7 +1234,7 @@ def expand(
                 "licence_omissions": [],
             }
             with crawl.reading(cache_dir):
-                crawl_digest, counts, mode = _expanded(
+                crawl_digest, counts, mode, wikidata = _expanded(
                     cache_dir,
                     places_by_id,
                     report,
@@ -1279,6 +1281,7 @@ def expand(
                 "simplify_tolerance_deg": geometry.SIMPLIFY_TOLERANCE_DEG,
                 "reported": len(report),
                 **counts,
+                "wikidata": overture.wikidata_provenance(wikidata),
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),

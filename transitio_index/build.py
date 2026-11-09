@@ -51,10 +51,11 @@ from transitio_index import (  # noqa: E402
     publish,
     rank,
     registry,
-    stats,
     resolve,
     seed,
+    stats,
     store,
+    wikidata_copy,
 )
 
 log = logging.getLogger(__name__)
@@ -446,6 +447,14 @@ def parse_args(argv=None):
         "at the listed size instead of downloading it",
     )
     parser.add_argument(
+        "--wikidata-copy",
+        type=pathlib.Path,
+        default=wikidata_copy.DEFAULT_ROOT,
+        help="the local Wikidata copies (python -m transitio_index.wikidata_copy): "
+        "lookups are answered from the one current.json names, keys it lacks "
+        f"are asked live (default: {wikidata_copy.DEFAULT_ROOT})",
+    )
+    parser.add_argument(
         "--overture-remote",
         action="store_true",
         help="read Overture from its bucket at every stage, not a local copy",
@@ -583,6 +592,7 @@ def main(argv=None):
         None if arguments.overture_remote else arguments.overture_dir,
         arguments.overture_from,
     )
+    overture.use_wikidata_copy(arguments.wikidata_copy)
     stage = arguments.stage
     try:
         progress.configure(

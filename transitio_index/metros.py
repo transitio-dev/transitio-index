@@ -1804,6 +1804,7 @@ def attach_metros(
                 )
                 + len(override_report),
                 "places": len(output),
+                "wikidata": overture.wikidata_provenance(wikidata),
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),

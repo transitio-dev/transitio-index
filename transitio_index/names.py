@@ -189,6 +189,7 @@ def merge_names(
                     geometry_manifest.get("stale_place_overrides") or 0
                 )
                 + len(override_report),
+                "wikidata": overture.wikidata_provenance(wikidata),
                 "retrieved_at": datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat(),

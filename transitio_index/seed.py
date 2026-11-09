@@ -1579,6 +1579,7 @@ def resolve_seed(
         "centre_rows_unplaced": (
             len(centres_manifest["unplaced"]) if centres_manifest else None
         ),
+        "wikidata": overture.wikidata_provenance(wikidata),
         "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     directory = store.open_subdir(cache_dir, "gazetteer")

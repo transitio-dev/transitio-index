@@ -156,3 +156,32 @@ def test_a_failed_call_is_asked_again(tmp_path, monkeypatch):
     copy = wikidata_copy.WikidataCopy(folder)
     assert copy.answers("p402", ["123"]) == ({"123": "Q5"}, [])
     copy.close()
+
+
+def test_a_client_answers_from_the_copy_and_asks_the_rest_live(
+    tmp_path, monkeypatch, caplog
+):
+    from transitio_index import overture
+
+    root = tmp_path / "wikidata"
+    keys = {"p402": ["123", "456"]}
+    wikidata_copy.make_copy(root, keys, Stub(mapping={"123": "Q5"}), day="2026-11-08")
+
+    def live(query):
+        """Wikidata's answer for relation 789 only."""
+        assert '"789"' in query and '"123"' not in query
+        return [{"osm": {"value": "789"}, "item": {"value": "http://x/entity/Q7"}}]
+
+    # Relation 456 is covered without an item; only 789 is asked live.
+    overture.use_wikidata_copy(root)
+    client = overture.WikidataClient()
+    monkeypatch.setattr(client, "_get", live)
+    assert client.p402(["789", "456", "123"]) == {"123": "Q5", "789": "Q7"}
+    assert client.provenance() == {"copy": "2026-11-08", "live": {"p402": 1}}
+    # Without a copy every key is asked live, with one warning.
+    overture.use_wikidata_copy(tmp_path / "none")
+    client = overture.WikidataClient()
+    monkeypatch.setattr(client, "_get", live)
+    assert client.p402(["789"]) == {"789": "Q7"}
+    assert client.provenance() == {"copy": None, "live": {"p402": 1}}
+    assert "no Wikidata copy" in caplog.text
