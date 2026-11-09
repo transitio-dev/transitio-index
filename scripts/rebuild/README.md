@@ -3,7 +3,8 @@
 A full rebuild builds every label of a partition of the catalogues again from
 the current `main`, with a fresh crawl, then merges the label builds into one
 snapshot and releases it. The scripts here run it from a terminal of the build
-checkout; a rebuild of about a hundred labels takes about a day.
+checkout; a rebuild of about a hundred labels takes about a day when the
+labels are built one at a time.
 
 ## Prepare a run
 
@@ -22,6 +23,13 @@ checkout; a rebuild of about a hundred labels takes about a day.
    installed by `prepare`; `ARCHIVE_ROOT` (default
    `~/.cache/transitio-index/builds-<run>`) and `MIN_FREE_GB` (default 50) are
    optional.
+4. Optionally set `SLOTS` (1 to 9, default 1): `rest`, `resume` and `fix`
+   then build that many labels at a time, each in a cache folder of its own
+   (`cache/slot-<n>`), taking turns on the place registry
+   (`--wait-for-registry`); `first` always builds its label alone. `WORKERS`
+   sets each crawl's threads (default 4 with one slot, 2 with more, so a
+   feed host that several countries share is asked less often at once).
+   Each slot needs the memory and disk of one label's build.
 
 ## Run it
 
@@ -75,15 +83,15 @@ still lists those checks.
 - Progress: `tail -f ~/.cache/transitio-index/runs/<run>/logs/progress.log`;
   one label's log is `logs/<label>.log` beside it.
 - A status table (labels done and failed, places and feeds archived, free
-  disk, the label being built and an estimate of the time left):
+  disk, the labels being built and an estimate of the time left):
   `${PYTHON:-python3} $R/status.py --run <run>`. With `--previous-archive` naming an
   earlier rebuild's archive root, the estimate uses its place counts for the
   labels not built yet. `$R/watch.sh <run>` prints the table every five
   minutes (`INTERVAL` seconds) and stops once the `rest`, `resume` or `fix`
   run has ended.
-- Stop after the current label with `kill <pid>`: the driver prints the pid,
-  which is also in `cache/.rebuild.lock/pid`. A `REBUILD ENDED` line then
-  closes the progress log; continue later with `resume`.
+- Stop after the labels being built with `kill <pid>`: the driver prints the
+  pid, which is also in `cache/.rebuild.lock/pid`. A `REBUILD ENDED` line
+  then closes the progress log; continue later with `resume`.
 
 ## The run folder
 

@@ -124,13 +124,15 @@ clean_checkout() {
 # No rebuild, merge, release or build of any harness runs, and no crawl is
 # left unparked.
 no_running_build() {
-  local running code
+  local running code runner crawl
   if [ -f "$LOCK/pid" ] && kill -0 "$(cat "$LOCK/pid")" 2>/dev/null; then
     refuse "the rebuild, a merge or a release is running (pid $(cat "$LOCK/pid"))"
   fi
-  if [ -f "$REPO/cache/.runner.lock/pid" ] && kill -0 "$(cat "$REPO/cache/.runner.lock/pid")" 2>/dev/null; then
-    refuse "a build is running (pid $(cat "$REPO/cache/.runner.lock/pid"))"
-  fi
+  for runner in "$REPO"/cache/.runner.lock "$REPO"/cache/slot-*/.runner.lock; do
+    if [ -f "$runner/pid" ] && kill -0 "$(cat "$runner/pid")" 2>/dev/null; then
+      refuse "a build is running (pid $(cat "$runner/pid"))"
+    fi
+  done
   command -v lsof > /dev/null || refuse "cannot inspect the registry lock (no lsof)"
   if lsof "$REPO/overrides/places_registry.jsonl.lock" 2>/dev/null | grep -qi python; then
     refuse "another build holds the registry"
@@ -139,7 +141,9 @@ no_running_build() {
   code=$?
   [ "$code" -le 1 ] || refuse "cannot list the running processes (pgrep exit $code)"
   [ -z "$running" ] || refuse "build processes are running: $(echo $running)"
-  [ ! -e "$REPO/cache/crawl" ] || refuse "$REPO/cache/crawl exists (an unparked crawl): park or remove it first"
+  for crawl in "$REPO"/cache/crawl "$REPO"/cache/slot-*/crawl; do
+    [ ! -e "$crawl" ] || refuse "$crawl exists (an unparked crawl): park or remove it first"
+  done
 }
 
 # The run's cut: sets PART and CUT_MDB_SHA (its MDB catalogue's SHA-256),

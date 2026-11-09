@@ -1,6 +1,6 @@
 #!/bin/sh
 # archive_index.sh <label> [expected-snapshot-id] — keep the just-published
-# index: copy cache/index to $ARCHIVE_ROOT/<label>-<snapshot_id>/index
+# index: copy <cache folder>/index to $ARCHIVE_ROOT/<label>-<snapshot_id>/index
 # (default root ~/.cache/transitio-index/builds) with its stats and the map
 # layer. Built in a staging directory beside the root ($ARCHIVE_ROOT.staging,
 # so the merge never reads a half-copied run) and renamed into place, so a
@@ -8,8 +8,9 @@
 # refused. An index with feeds but no places is archived without the map layer
 # under $ARCHIVE_ROOT-feeds-only: the merge cannot load a build without places
 # and would refuse the whole merge over one.
-# BUILD_CHECKOUT is the checkout whose index is archived (default: this
-# repository), PYTHON its Python (default: python3).
+# CACHE is the build cache folder holding the index (default cache, or a
+# slot's cache/slot-<n>); BUILD_CHECKOUT is the checkout whose index is
+# archived (default: this repository), PYTHON its Python (default: python3).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/checks.sh"
@@ -26,8 +27,11 @@ ROOT="${ROOT%/}"
 plain_path "$ROOT" || { echo "ARCHIVE_ROOT must be a plain absolute path" >&2; exit 2; }
 STAGING="$ROOT.staging"
 FEEDS_ONLY="$ROOT-feeds-only"
+CACHE="${CACHE:-cache}"
+cache_folder "$CACHE" || { echo "bad CACHE '$CACHE'" >&2; exit 2; }
 # Nothing under cache is written through a symlink.
-if [ -L cache ] || [ -L cache/index ] || [ -L "$ROOT" ] || [ -L "$STAGING" ] || [ -L "$FEEDS_ONLY" ]; then
+if [ -L cache ] || [ -L "$CACHE" ] || [ -L "$CACHE/index" ] || [ -L "$CACHE/stats" ] \
+  || [ -L "$ROOT" ] || [ -L "$STAGING" ] || [ -L "$FEEDS_ONLY" ]; then
   echo "a symlink under cache" >&2; exit 2
 fi
 # The manifest's snapshot id, checked before the shell sees it: 16 hex digits.
@@ -36,9 +40,9 @@ snapshot_id() {
 v = json.load(open(sys.argv[1])).get('snapshot_id')
 sys.exit(2) if not (isinstance(v, str) and re.fullmatch('[0-9a-f]{16}', v)) else print(v)" "$1"
 }
-SNAP=$(snapshot_id cache/index/snapshot.json) || { echo "bad snapshot id in cache/index/snapshot.json" >&2; exit 2; }
+SNAP=$(snapshot_id "$CACHE/index/snapshot.json") || { echo "bad snapshot id in $CACHE/index/snapshot.json" >&2; exit 2; }
 # The index must be the snapshot the caller's build published, not a later one.
-[ -z "$EXPECT" ] || [ "$SNAP" = "$EXPECT" ] || { echo "cache/index holds $SNAP, expected $EXPECT" >&2; exit 2; }
+[ -z "$EXPECT" ] || [ "$SNAP" = "$EXPECT" ] || { echo "$CACHE/index holds $SNAP, expected $EXPECT" >&2; exit 2; }
 mkdir -p "$ROOT" "$STAGING"
 # The final rename must not turn into a copy across file systems.
 same_device() {
@@ -52,10 +56,10 @@ done
 STAGE=$(mktemp -d "$STAGING/$LABEL-$SNAP.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
 mkdir "$STAGE/index"
-cp -R cache/index/. "$STAGE/index/"
+cp -R "$CACHE/index/." "$STAGE/index/"
 rm -f "$STAGE/index/.lock"
 LINKS=$(find "$STAGE/index" -type l)
-[ -z "$LINKS" ] || { echo "a symlink inside cache/index" >&2; exit 2; }
+[ -z "$LINKS" ] || { echo "a symlink inside $CACHE/index" >&2; exit 2; }
 # The copy must be the snapshot the name says: a publish landing mid-copy
 # would leave a mixed archive.
 STAGED=$(snapshot_id "$STAGE/index/snapshot.json") || { echo "bad snapshot id in the copied index" >&2; exit 2; }
@@ -83,20 +87,20 @@ else
   echo "no places and no feeds in the index; not archived" >&2; exit 2
 fi
 # The stats generation the build wrote for this snapshot, beside the index.
-STATS=$("$PY" - "$SNAP" <<'PYEOF'
+STATS=$("$PY" - "$SNAP" "$CACHE/stats" <<'PYEOF'
 import json, sys
 from pathlib import Path
 from transitio_index import store
 try:
-    generation, manifest = store.resolve(Path("cache/stats"), "stats.json")
+    generation, manifest = store.resolve(Path(sys.argv[2]), "stats.json")
 except Exception:
     sys.exit(0)
 with generation:
     if manifest.get("snapshot_id") == sys.argv[1]:
-        print(Path("cache/stats") / manifest["generation"])
+        print(Path(sys.argv[2]) / manifest["generation"])
 PYEOF
 )
-if [ -n "$STATS" ] && [ -d "$STATS" ]; then
+if [ -n "$STATS" ] && [ -d "$STATS" ] && [ ! -L "$STATS" ]; then
   mkdir "$STAGE/stats"
   for f in catalogue.parquet feeds.parquet places.parquet summary.json report.md manifest.json; do
     [ -f "$STATS/$f" ] && [ ! -L "$STATS/$f" ] && cp "$STATS/$f" "$STAGE/stats/"

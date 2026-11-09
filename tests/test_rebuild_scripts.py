@@ -3,6 +3,7 @@ one published index."""
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -22,10 +23,10 @@ _CUT = [
 ]
 
 
-def _run_script(name, *args, checkout, **env):
-    """Run ``scripts/rebuild/<name>`` with ``args`` over the build checkout
-    ``checkout``, with ``env`` added to the environment."""
-    environ = {
+def _script_environ(checkout, **env):
+    """The environment a script runs in over the build checkout ``checkout``,
+    with ``env`` added."""
+    return {
         **os.environ,
         "BUILD_CHECKOUT": str(checkout),
         "PYTHON": sys.executable,
@@ -35,14 +36,46 @@ def _run_script(name, *args, checkout, **env):
         "LC_ALL": "en_US.UTF-8",
         **env,
     }
+
+
+def _run_script(name, *args, checkout, **env):
+    """Run ``scripts/rebuild/<name>`` with ``args`` over the build checkout
+    ``checkout``, with ``env`` added to the environment."""
     return subprocess.run(
         [str(_SCRIPTS / name), *args],
         cwd=checkout,
-        env=environ,
+        env=_script_environ(checkout, **env),
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def _slot_checkout(tmp_path):
+    """A checkout on main with a map of three labels, aa, bb and cc, and a
+    stub label build (noted at its start and end in ``RECORD``, with a crawl
+    to park; bb fails, and with ``STOP=crawl`` leaves its crawl unparkable);
+    returns the environment the scheduler runs with."""
+    stub = tmp_path / "stub.sh"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'echo "start $1 $CACHE $WORKERS $WAIT_FOR_REGISTRY" >> "$RECORD"\n'
+        'mkdir -p "$CACHE/crawl"\n'
+        "sleep 1\n"
+        'echo "end $1" >> "$RECORD"\n'
+        'echo "built $1" > "$LOGDIR/$1.log"\n'
+        '[ "$1:${STOP:-}" != bb:crawl ] || : > cache/crawl.bb.bak\n'
+        '[ "$1" != bb ]\n'
+    )
+    stub.chmod(0o755)
+    git = ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "t"], check=True)
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "map.txt").write_text(
+        "".join(f"{label} cache/sample/run-{label}_a\n" for label in ("aa", "bb", "cc"))
+    )
+    return {"BUILD_LABEL": str(stub), "RECORD": str(tmp_path / "record.txt")}
 
 
 @pytest.mark.parametrize(
@@ -66,7 +99,21 @@ def _run_script(name, *args, checkout, **env):
             {"OVERTURE_RELEASE": "latest"},
             "bad OVERTURE_RELEASE",
         ),
+        (
+            "build_label.sh",
+            ["us2", "cache/sample/run-a"],
+            [],
+            {"CACHE": "c"},
+            "bad CACHE",
+        ),
         ("archive_index.sh", ["us2"], [], {"ARCHIVE_ROOT": "builds"}, "absolute"),
+        (
+            "archive_index.sh",
+            ["us2"],
+            [],
+            {"ARCHIVE_ROOT": "/x/builds", "CACHE": "cache/slot-0"},
+            "bad CACHE",
+        ),
         ("archive_index.sh", ["us2"], [], {"ARCHIVE_ROOT": "/x/builds/."}, "plain"),
         ("build_labels.sh", ["missing.txt"], [], {}, "no map file"),
         # The last line counts without a newline after it.
@@ -78,6 +125,28 @@ def _run_script(name, *args, checkout, **env):
             "bad map line",
         ),
         ("build_labels.sh", ["map.txt"], [("map.txt", "\n  \n")], {}, "no labels"),
+        (
+            "build_labels.sh",
+            ["map.txt"],
+            [("map.txt", "us2 cache/sample/run-a\nus2 cache/sample/run-b\n")],
+            {},
+            "us2 is twice",
+        ),
+        (
+            "build_labels.sh",
+            ["map.txt"],
+            [("map.txt", "")],
+            {"SLOTS": "10"},
+            "bad SLOTS",
+        ),
+        (
+            "build_labels.sh",
+            ["map.txt"],
+            [("map.txt", "")],
+            {"SLOTS": "2", "STOP_IF_FIRST_FAILS": "1"},
+            "needs SLOTS=1",
+        ),
+        ("rebuild.sh", ["2026-11", "check"], [], {"SLOTS": "0"}, "bad SLOTS"),
         ("rebuild.sh", ["2026-11"], [], {}, "usage"),
         ("rebuild.sh", ["2026-11", "go"], [], {}, "usage"),
         ("rebuild.sh", ["Run 1", "check"], [], {}, "bad run name"),
@@ -148,6 +217,70 @@ def test_a_published_index_is_archived_once(tmp_path):
     assert again.returncode == 2 and "already exists" in again.stderr
 
 
+@pytest.mark.skipif(not shutil.which("lsof"), reason="the scripts need lsof")
+@pytest.mark.parametrize("slots", [1, 2])
+def test_slots_build_labels_side_by_side_in_caches_of_their_own(tmp_path, slots):
+    env = _slot_checkout(tmp_path)
+    (tmp_path / "cache" / "crawl.cc.bak").mkdir()
+    result = _run_script(
+        "build_labels.sh", "map.txt", checkout=tmp_path, SLOTS=str(slots), **env
+    )
+    assert result.returncode == 0, result.stderr
+    events = (tmp_path / "record.txt").read_text().splitlines()
+    if slots == 1:
+        # One after another in cache, on four crawl threads.
+        assert events[:2] == ["start aa cache 4 ", "end aa"]
+    else:
+        # aa and bb start together, each in its slot's cache, taking registry
+        # turns on two crawl threads; cc waits for a slot.
+        assert sorted(events[:2]) == [
+            "start aa cache/slot-1 2 1",
+            "start bb cache/slot-2 2 1",
+        ]
+    assert [e.split()[1] for e in events if e.startswith("start")][2] == "cc"
+    progress = (tmp_path / "logs" / "progress.log").read_text()
+    for line in (
+        "(1/3) OK aa (fresh crawl)",
+        "(2/3) FAIL bb (fresh crawl)",
+        "(3/3) OK cc (parked crawl)",
+        "REBUILD COMPLETE: ok=2 fail=1 of 3",
+    ):
+        assert line in progress, progress
+    # Every crawl is parked in cache, none left in a slot.
+    for label in ("aa", "bb", "cc"):
+        assert (tmp_path / "cache" / f"crawl.{label}.bak").is_dir()
+    assert not list((tmp_path / "cache").glob("slot-*/crawl"))
+
+
+@pytest.mark.skipif(not shutil.which("lsof"), reason="the scripts need lsof")
+@pytest.mark.parametrize("stop", ["crawl", "term"])
+def test_slots_stop_together_and_log_it_once(tmp_path, stop):
+    # bb's crawl cannot be parked, or the scheduler is asked to stop while
+    # aa and bb build: cc never starts, and the stop is logged once, last.
+    env = _slot_checkout(tmp_path)
+    record = Path(env["RECORD"])
+    run = subprocess.Popen(
+        [str(_SCRIPTS / "build_labels.sh"), "map.txt"],
+        cwd=tmp_path,
+        env=_script_environ(tmp_path, SLOTS="2", STOP=stop, **env),
+    )
+    if stop == "term":
+        for _ in range(100):
+            if record.exists() and record.read_text().count("start") == 2:
+                break
+            time.sleep(0.05)
+        run.send_signal(signal.SIGTERM)
+    assert run.wait(timeout=30) == 1
+    assert "cc" not in record.read_text()
+    progress = (tmp_path / "logs" / "progress.log").read_text().splitlines()
+    stops = [line for line in progress if "REBUILD STOPPED" in line]
+    reason = "cannot park the crawl of bb" if stop == "crawl" else "asked to stop"
+    assert len(stops) == 1 and reason in stops[0] and progress[-1] == stops[0]
+    # A label whose crawl cannot be parked logs the stop instead of a result.
+    outcomes = [line for line in progress if " aa (" in line or " bb (" in line]
+    assert len(outcomes) == (1 if stop == "crawl" else 2)
+
+
 def test_the_supervisor_records_how_the_run_ended(tmp_path):
     progress = tmp_path / "progress.log"
     supervise = str(_SCRIPTS / "supervise.sh")
@@ -182,6 +315,7 @@ def test_the_status_tables_follow_a_run(tmp_path):
     (run_dir / "started").write_text(f"abc\n{archive}\nmdb\ninputs\n2026-10-21.0\n")
     (run_dir / "map-check.txt").write_text(
         "us2 cache/sample/run-us2_a\nfr1 cache/sample/run-fr1_b\n"
+        "de cache/sample/run-de_c\n"
     )
 
     def status():
@@ -198,15 +332,24 @@ def test_the_status_tables_follow_a_run(tmp_path):
     assert status().startswith("No 2026-11 run")
     with progress.open("a") as log:
         log.write(
-            f"[11-07 10:00:00] REBUILD 2026-11 first: map {run_dir}/map-check.txt, 2 labels\n"
+            f"[11-07 10:00:00] REBUILD 2026-11 first: map {run_dir}/map-check.txt, 3 labels\n"
         )
         log.write(
-            "[11-07 11:00:00] (1/2) OK us2 (fresh crawl) | [us2 done: runner exit 0]\n"
+            "[11-07 11:00:00] (1/3) OK us2 (fresh crawl) | [us2 done: runner exit 0]\n"
         )
     running = status()
-    assert "| 1 of 2 | 1 | 0 |" in running and "| fr1 |" in running
+    assert "| 1 of 3 | 1 | 0 |" in running and "| fr1 |" in running
+    assert "| de |" not in running
+    # Builds side by side: every label whose log this run wrote.
+    for label in ("fr1", "de"):
+        (run_dir / "logs" / f"{label}.log").write_text("10:01:00 INFO crawl: 1/2\n")
+    running = status()
+    assert "| fr1 | crawl |" in running and "| de | crawl |" in running
     with progress.open("a") as log:
         log.write(
-            "[11-07 12:00:00] (2/2) FAIL fr1 (fresh crawl) | [fr1 done: runner exit 1]\n"
+            "[11-07 12:00:00] (2/3) FAIL fr1 (fresh crawl) | [fr1 done: runner exit 1]\n"
+        )
+        log.write(
+            "[11-07 12:10:00] (3/3) OK de (fresh crawl) | [de done: runner exit 0]\n"
         )
     assert status().rstrip().endswith("This run (first) is finished with failures.")

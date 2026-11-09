@@ -17,3 +17,11 @@ plain_path() (
     *) exit 1;;
   esac
 )
+
+# A build cache folder of the checkout: cache, or a slot's cache/slot-<n>.
+cache_folder() {
+  case "$1" in
+    cache|cache/slot-[123456789]) return 0;;
+    *) return 1;;
+  esac
+}

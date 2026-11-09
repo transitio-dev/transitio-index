@@ -104,15 +104,14 @@ def archive_places(archives, label):
     )
 
 
-def model_estimate(
-    minutes, todo, run_labels, succeeded, current, current_spent, archives
-):
-    """Minutes left, from a least-squares fit of each finished build's minutes
-    on its catalogue entries and place count (``minutes``: label -> minutes).
-    Remaining builds take their place count from the previous rebuild's
-    archive of the same label (``PREVIOUS``), else the median. Returns
-    (minutes left, entries done, entries total, R²) or None without a cut or
-    enough builds."""
+def model_estimate(minutes, todo, run_labels, succeeded, spent, archives):
+    """Minutes of builds left, from a least-squares fit of each finished
+    build's minutes on its catalogue entries and place count (``minutes``:
+    label -> minutes), less what the builds under way have spent (``spent``:
+    label -> minutes). Remaining builds take their place count from the
+    previous rebuild's archive of the same label (``PREVIOUS``), else the
+    median. Returns (minutes left, entries done, entries total, R²) or None
+    without a cut or enough builds."""
     import json
 
     import numpy as np
@@ -148,8 +147,8 @@ def model_estimate(
         predicted = max(
             float(coef @ [1, entries[label], median if places is None else places]), 2.0
         )
-        if label == current:
-            predicted = max(predicted - current_spent, 1.0)
+        if label in spent:
+            predicted = max(predicted - spent[label], 1.0)
         left += predicted
     done = sum(entries[k] for k in run_labels if k in succeeded and k in entries)
     return left, done, sum(entries[k] for k in run_labels if k in entries), r2
@@ -236,6 +235,16 @@ def label_log(label):
     regular file there."""
     log = LOGS / f"{label}.log"
     return log if regular_file(log) else None
+
+
+def log_time(label):
+    """When the build log of ``label`` was last written, or None without
+    one; a log the scheduler replaces while it is read counts as none."""
+    log = label_log(label)
+    try:
+        return None if log is None else dt.datetime.fromtimestamp(log.stat().st_mtime)
+    except OSError:
+        return None
 
 
 def cut_labels():
@@ -341,30 +350,38 @@ def main():
     over = finished == wanted or stopped
     now = dt.datetime.now()
     succeeded = {row[4] for row in done if row[3] == "OK"}
-    current = (
-        None
-        if over
-        else next((label for label in labels if label not in finished), None)
-    )
+    # The labels being built: unfinished ones whose log this run wrote (builds
+    # run side by side with SLOTS), else the next of the map.
+    running = [
+        label
+        for label in labels
+        if not over
+        and label not in finished
+        and (written := log_time(label)) is not None
+        and written >= begun
+    ]
+    if not over and not running:
+        running = [label for label in labels if label not in finished][:1]
 
-    stage, since, last_line = "-", None, ""
-    if current and label_log(current):
-        log = (
-            (LOGS / f"{current}.log")
-            .read_text(errors="replace")
-            .replace("\r", "\n")
-            .splitlines()
-        )
-        info = [line for line in log if LOG_LINE.match(line)]
+    building = {}
+    for current in running:
+        stage, since, last_line = "-", None, ""
+        log = label_log(current)
+        try:
+            text = log.read_text(errors="replace") if log else ""
+        except OSError:  # replaced while read
+            text = ""
+        log_lines = text.replace("\r", "\n").splitlines()
+        info = [line for line in log_lines if LOG_LINE.match(line)]
         if info:
             last_line = table_text(info[-1][:110])
             parts = info[-1].split()
             stage = table_text(parts[2].rstrip(":")) if len(parts) > 2 else "-"
-        if info:
             hh, mm, ss = map(int, info[0][:8].split(":"))
             since = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
             if since > now:
                 since -= dt.timedelta(days=1)
+        building[current] = (stage, since, last_line)
 
     # A run that is over ran until its last result or rebuild line; a merge or
     # a release logged after it is not part of it.
@@ -392,7 +409,9 @@ def main():
                 minutes[row[4]] = (end - start).total_seconds() / 60
     if spans:
         per = sum(spans, dt.timedelta()) / len(spans)
-    eta = (per * (total - len(done))) if per and not over else None
+    # Builds side by side share the time left.
+    parallel = max(1, len(running))
+    eta = (per * (total - len(done)) / parallel) if per and not over else None
     archives = run_archives()
     places, feeds = coverage(archives)
 
@@ -402,16 +421,20 @@ def main():
         minutes = int(delta.total_seconds() // 60)
         return f"{minutes // 60} h {minutes % 60:02d} min"
 
-    spent = (now - since).total_seconds() / 60 if since else 0.0
+    spent = {
+        label: (now - since).total_seconds() / 60
+        for label, (_, since, _) in building.items()
+        if since
+    }
     todo = [label for label in labels if label not in finished]
     model = (
         None
         if over
-        else model_estimate(minutes, todo, labels, succeeded, current, spent, archives)
+        else model_estimate(minutes, todo, labels, succeeded, spent, archives)
     )
     if model:
         left, entries_done, entries_total, r2 = model
-        eta = dt.timedelta(minutes=left)
+        eta = dt.timedelta(minutes=left / parallel)
         share = 100 * entries_done / entries_total
         entries = f"{entries_done:,} of {entries_total:,} ({share:.0f}%)"
     else:
@@ -447,11 +470,12 @@ def main():
     print()
     print("| Now building | Stage | Started | Last log line |")
     print("|---|---|---|---|")
-    print(
-        f"| {current} | {stage} | {since:%H:%M} | `{last_line}` |"
-        if since
-        else f"| {current} | - | - | - |"
-    )
+    for current, (stage, since, last_line) in building.items():
+        print(
+            f"| {current} | {stage} | {since:%H:%M} | `{last_line}` |"
+            if since
+            else f"| {current} | - | - | - |"
+        )
     if done:
         print(
             "\nLast finished: "

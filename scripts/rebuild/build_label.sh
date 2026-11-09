@@ -4,7 +4,8 @@
 # sample cut, archive the published index and map layer on success
 # (archive_index.sh), then park the label's crawl cache as
 # cache/crawl.<label>.bak so the next label starts from an empty crawl.
-# REUSE_CRAWL=1 keeps an existing cache/crawl (a relaunch of the same label).
+# REUSE_CRAWL=1 keeps an existing crawl in the cache folder (a relaunch of the
+# same label).
 # A partition cut's countries.txt is passed as --seed-countries, and the Atlas
 # commit its partition.json records as --commit (other cuts: the build's
 # pinned commit).
@@ -13,6 +14,11 @@
 # --overture-release (else the build reads the newest release); OVERTURE_FROM,
 # when set, as --overture-from (an earlier download a new local copy takes
 # its files from).
+# CACHE is the build cache folder (default cache; cache/slot-<n> for a slot
+# of builds running side by side); a parked crawl stays cache/crawl.<label>.bak
+# whatever the folder. WORKERS is the crawl's thread count (default 4).
+# WAIT_FOR_REGISTRY=1 passes --wait-for-registry, for builds taking turns on
+# the registry, and skips the refusal while another build holds it.
 # BUILD_CHECKOUT is the checkout to build in (default: this repository),
 # PYTHON its Python (default: python3), LOGDIR where <label>.log goes
 # (default: $TMPDIR).
@@ -32,8 +38,13 @@ case "$B" in
   cache/sample/run-*) ;;
   *) echo "refusing: bad run dir '$B'" >&2; exit 2;;
 esac
+CACHE="${CACHE:-cache}"
+cache_folder "$CACHE" || { echo "refusing: bad CACHE '$CACHE'" >&2; exit 2; }
+WORKERS="${WORKERS:-4}"
+case "$WORKERS" in [123456789]|1[0123456]) ;; *) echo "refusing: bad WORKERS '$WORKERS'" >&2; exit 2;; esac
 # Nothing under cache is written or read through a symlink.
-if [ -L cache ] || [ -L cache/sample ] || [ -L cache/crawl ] || [ -L "$B" ]; then
+if [ -L cache ] || [ -L cache/sample ] || [ -L "$CACHE" ] || [ -L "$CACHE/crawl" ] \
+  || [ -L "$CACHE/index" ] || [ -L "$CACHE/stats" ] || [ -L "$B" ]; then
   echo "refusing: a symlink under cache" >&2; exit 2
 fi
 [ -d "$B" ] || { echo "refusing: no such run dir '$B'" >&2; exit 2; }
@@ -61,9 +72,10 @@ esac
 LOG="${LOGDIR:-${TMPDIR:-/tmp}}/$LABEL.log"
 [ -L "$LOG" ] && { echo "refusing: $LOG is a symlink" >&2; exit 2; }
 command -v lsof >/dev/null || { echo "refusing: cannot inspect the registry lock (no lsof)" >&2; exit 2; }
-# One runner at a time, held through the build, the archive and the parking:
-# an atomic mkdir lock, released on any exit.
-LOCK="cache/.runner.lock"
+# One runner at a time per cache folder, held through the build, the archive
+# and the parking: an atomic mkdir lock, released on any exit.
+mkdir -p "$CACHE" || { echo "refusing: cannot create $CACHE" >&2; exit 2; }
+LOCK="$CACHE/.runner.lock"
 [ -L "$LOCK" ] && { echo "refusing: $LOCK is a symlink" >&2; exit 2; }
 if ! mkdir "$LOCK" 2>/dev/null; then
   # A lock whose recorded runner is gone (killed, crashed) is stale: reclaimed.
@@ -83,11 +95,11 @@ if ! echo $$ > "$LOCK/pid" || [ ! -s "$LOCK/pid" ]; then
   echo "refusing: cannot record the owner of $LOCK" >&2; exit 2
 fi
 trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null' EXIT
-if lsof overrides/places_registry.jsonl.lock 2>/dev/null | grep -qi python; then
+if [ -z "${WAIT_FOR_REGISTRY:-}" ] && lsof overrides/places_registry.jsonl.lock 2>/dev/null | grep -qi python; then
   echo "refusing: another build holds the registry" >&2; exit 2
 fi
-if [ -d cache/crawl ] && [ -z "${REUSE_CRAWL:-}" ]; then
-  echo "refusing: cache/crawl exists — park the previous label's crawl first" >&2; exit 2
+if [ -d "$CACHE/crawl" ] && [ -z "${REUSE_CRAWL:-}" ]; then
+  echo "refusing: $CACHE/crawl exists — park the previous label's crawl first" >&2; exit 2
 fi
 # The Atlas commit of the partition whose cut this run dir is, when exactly one
 # partition lists it (one commit across them); else none.
@@ -110,7 +122,7 @@ PYEOF
 case "$ATLAS" in
   *[!$HEX]*) ATLAS="";;
 esac
-snapshot_id() { "$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['snapshot_id'])" cache/index/snapshot.json 2>/dev/null || echo; }
+snapshot_id() { "$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['snapshot_id'])" "$CACHE/index/snapshot.json" 2>/dev/null || echo; }
 BEFORE=$(snapshot_id)
 : > "$LOG" || exit 2
 echo "log: $LOG"
@@ -122,21 +134,25 @@ finish() {
   code=$1
   echo "[exited with code $code]" >> "$LOG"
   if [ "$code" -eq 0 ]; then
-    # Published means cache/index now names a snapshot it did not before.
+    # Published means the cache folder's index now names a snapshot it did
+    # not before.
     SNAP=$(snapshot_id)
     if [ -z "$SNAP" ] || [ "$SNAP" = "$BEFORE" ]; then
       echo "[build exited 0 without publishing a new snapshot]" >> "$LOG"; code=3
-    elif "$HERE/archive_index.sh" "$LABEL" "$SNAP" >> "$LOG" 2>&1; then
+    elif CACHE="$CACHE" "$HERE/archive_index.sh" "$LABEL" "$SNAP" >> "$LOG" 2>&1; then
       echo "archived $LABEL" >> "$LOG"
     else
       echo "[archiving failed]" >> "$LOG"; code=4
     fi
   fi
-  if [ -d cache/crawl ] && [ ! -L cache/crawl ]; then
+  if [ -L "$CACHE/crawl" ]; then
+    echo "[$CACHE/crawl is a symlink; crawl not parked]" >> "$LOG"
+    [ "$code" -eq 0 ] && code=5
+  elif [ -d "$CACHE/crawl" ]; then
     if [ -e "cache/crawl.$LABEL.bak" ]; then
       echo "[cache/crawl.$LABEL.bak already exists; crawl left in place]" >> "$LOG"
       [ "$code" -eq 0 ] && code=5
-    elif ! mv cache/crawl "cache/crawl.$LABEL.bak" >> "$LOG" 2>&1; then
+    elif ! mv "$CACHE/crawl" "cache/crawl.$LABEL.bak" >> "$LOG" 2>&1; then
       echo "[parking the crawl failed]" >> "$LOG"
       [ "$code" -eq 0 ] && code=5
     fi
@@ -146,8 +162,10 @@ finish() {
 }
 trap 'finish 130' INT
 trap 'finish 143' TERM
-set -- --stage ingest --downstream --no-golden --allow-empty-mdb --workers 4 \
+set -- --stage ingest --downstream --no-golden --allow-empty-mdb --workers "$WORKERS" \
+  --cache-dir "$CACHE" \
   --archive "$B/atlas_sample.tar.gz" --mdb-csv "$B/mdb_sample.csv" --gbfs-csv "$B/gbfs_sample.csv"
+[ -z "${WAIT_FOR_REGISTRY:-}" ] || set -- "$@" --wait-for-registry
 [ -z "$ATLAS" ] || set -- "$@" --commit "$ATLAS"
 [ -z "$SEED" ] || set -- "$@" --seed-countries "$SEED"
 [ -z "${MDB_CATALOGUE:-}" ] || set -- "$@" --mdb-catalogue "$MDB_CATALOGUE"
