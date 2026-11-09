@@ -1,5 +1,6 @@
 import contextlib
 import json
+import os
 
 import pytest
 
@@ -76,7 +77,8 @@ def test_a_copy_answers_as_the_lookups_did_and_resumes(tmp_path, monkeypatch):
         "labels_and_aliases": ["Q1757", "Q33", "Q60"],
         "coordinates": ["Q1757", "Q33", "Q60"],
     }
-    root = tmp_path / "wiki?data#%"
+    # A folder name the read-only link must escape; Windows refuses "?".
+    root = tmp_path / ("wiki data#%" if os.name == "nt" else "wiki?data#%")
     # A job stopped midway leaves no current copy and resumes where it stopped.
     stopped = Stub(fail_at=5, **maps)
     with pytest.raises(RuntimeError, match="dropped"):
