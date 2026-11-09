@@ -252,6 +252,30 @@ def test_the_lock_refuses_a_second_writer_and_a_changed_file_is_not_overwritten(
         kept.save()
 
 
+def test_a_waiting_session_takes_the_registry_when_its_holder_leaves(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+    import threading
+
+    monkeypatch.setattr(registry, "WAIT_SECONDS", 0.01)
+    path = _write(tmp_path / "r.jsonl")
+    opened = threading.Event()
+
+    def waiter():
+        with registry.session(path, wait=True):
+            opened.set()
+
+    with caplog.at_level(logging.INFO, logger="transitio_index.registry"):
+        with registry.session(path):
+            thread = threading.Thread(target=waiter)
+            thread.start()
+            assert not opened.wait(0.3)
+        thread.join(10)
+    assert opened.is_set()
+    assert caplog.text.count("waiting for the registry") == 1
+
+
 def test_a_changed_registry_is_saved_canonically_and_an_unchanged_one_not_at_all(
     tmp_path, monkeypatch
 ):

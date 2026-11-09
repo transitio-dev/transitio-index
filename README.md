@@ -83,7 +83,10 @@ read that copy. Other builds may add places to the registry meanwhile, or
 values to places, but the later stages refuse to run once a place their
 build used is merged, retired, given another kind or other detached values,
 gains its first QID or loses a value. Resuming or moving a build therefore
-means keeping the cache and its matching registry together.
+means keeping the cache and its matching registry together. Builds with
+caches of their own can run side by side: with `--wait-for-registry`, a
+build whose `gazetteer` or `expand` stage finds another build's holding the
+registry waits for its turn instead of refusing.
 
 ### The stages, in order
 

@@ -125,56 +125,61 @@ def registry_path(arguments):
     return arguments.registry or arguments.overrides_dir / registry.FILE
 
 
-def commit_run(cache_dir, path, *, read_only, stages):
+def commit_run(cache_dir, path, *, read_only, stages, prepare=(), wait=False):
     """Run the gazetteer stages as one transaction: every stage identifies
     places through one registry session and publishes its generation
     staged, the registry is saved once after the last stage and staged as
     the run's copy, and the run manifest published last makes the whole set
     visible together — so a failure anywhere before that leaves the previous
     set current and, until the save, the registry untouched. The run lock is
-    held throughout, so runs on one cache never interleave. Returns the
-    stage summaries and the run manifest."""
+    held throughout, so runs on one cache never interleave. The ``prepare``
+    stages, which take only the run, run first, before the registry session
+    opens; with ``wait`` the session waits for another build's to end.
+    Returns the stage summaries and the run manifest."""
     run = {}
     directory = store.open_subdir(cache_dir, "gazetteer")
     try:
         # The run lock outlives every stage: a second run on this cache
         # cannot stage, prune or publish under this one.
-        with (
-            store.exclusive_writer(directory, store.RUN_LOCK),
-            registry.session(path, read_only=read_only) as places,
-        ):
-            summaries = [stage(places, run) for stage in stages]
-            digest = places.save()
-            with store.exclusive_writer(directory):
-                run[expand.SNAPSHOT_POINTER] = expand.publish_snapshot(
-                    cache_dir / "gazetteer",
-                    places,
-                    expand.SNAPSHOT_POINTER,
-                    held=directory,
-                    staged=True,
-                )["generation"]
-                manifest = {
-                    "source": "gazetteer-run",
-                    "generations": dict(run),
-                    "registry_base": places.base,
-                    "registry_digest": digest,
-                    "next_id": places.next_id,
-                    "minted": places.minted,
-                    "enriched": places.enriched,
-                    "retrieved_at": datetime.datetime.now(
-                        datetime.timezone.utc
-                    ).isoformat(),
-                }
-                rows = [{"pointer": p, "generation": g} for p, g in sorted(run.items())]
-                summaries.append(
-                    store.publish(
+        with store.exclusive_writer(directory, store.RUN_LOCK):
+            # Stages that read no registry run before its session opens, so
+            # a build waiting its turn reads them meanwhile.
+            summaries = [stage(run) for stage in prepare]
+            with registry.session(path, read_only=read_only, wait=wait) as places:
+                summaries += [stage(places, run) for stage in stages]
+                digest = places.save()
+                with store.exclusive_writer(directory):
+                    run[expand.SNAPSHOT_POINTER] = expand.publish_snapshot(
                         cache_dir / "gazetteer",
-                        store.RUN_POINTER,
-                        {"generations.jsonl": store.jsonl_chunks(rows)},
-                        manifest,
+                        places,
+                        expand.SNAPSHOT_POINTER,
                         held=directory,
+                        staged=True,
+                    )["generation"]
+                    manifest = {
+                        "source": "gazetteer-run",
+                        "generations": dict(run),
+                        "registry_base": places.base,
+                        "registry_digest": digest,
+                        "next_id": places.next_id,
+                        "minted": places.minted,
+                        "enriched": places.enriched,
+                        "retrieved_at": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    }
+                    rows = [
+                        {"pointer": p, "generation": g} for p, g in sorted(run.items())
+                    ]
+                    summaries.append(
+                        store.publish(
+                            cache_dir / "gazetteer",
+                            store.RUN_POINTER,
+                            {"generations.jsonl": store.jsonl_chunks(rows)},
+                            manifest,
+                            held=directory,
+                        )
                     )
-                )
     finally:
         directory.close()
     return summaries
@@ -225,13 +230,14 @@ def consumes_run(command):
 
 
 def run_gazetteer(arguments):
+    """The gazetteer stages as one run: the Overture read before the
+    registry session opens, then the stages that identify places."""
     cache_dir = arguments.cache_dir
     options = {
         "overrides_dir": arguments.overrides_dir,
         "strict": arguments.strict_overrides,
     }
     stages = [
-        lambda places, run: overture.resolve(cache_dir, run=run),
         lambda places, run: seed.resolve_seed(
             cache_dir,
             registry=places,
@@ -260,6 +266,8 @@ def run_gazetteer(arguments):
         registry_path(arguments),
         read_only=arguments.registry_read_only,
         stages=stages,
+        prepare=[lambda run: overture.resolve(cache_dir, run=run)],
+        wait=arguments.wait_for_registry,
     )
 
 
@@ -284,7 +292,9 @@ def run_expand(arguments):
                     )
                 ]
             with registry.session(
-                path, read_only=arguments.registry_read_only
+                path,
+                read_only=arguments.registry_read_only,
+                wait=arguments.wait_for_registry,
             ) as places:
                 return [
                     expand.expand(
@@ -512,6 +522,12 @@ def parse_args(argv=None):
         action="store_true",
         help="refuse to mint or enrich a place: the gazetteer fails at the first "
         "change the registry would need, and never writes it (CI, pinned builds)",
+    )
+    parser.add_argument(
+        "--wait-for-registry",
+        action="store_true",
+        help="when another build's gazetteer or expand stage holds the registry, "
+        "wait for it to finish instead of refusing (builds run side by side)",
     )
     parser.add_argument(
         "--strict-overrides",

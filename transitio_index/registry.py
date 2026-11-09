@@ -16,10 +16,14 @@ in a row's history but count for nothing. See ``plans/place-identity.md``.
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
+import time
 
 from transitio_index import store
+
+log = logging.getLogger(__name__)
 
 VERSION = 1
 FILE = "places_registry.jsonl"
@@ -59,6 +63,8 @@ MERGED_FIELDS = frozenset(
 )
 RETIRED_FIELDS = frozenset({"place_id", "status", "at", "reason"})
 MAX_REGISTRY_BYTES = 256 * 1024 * 1024
+# How often a session waiting for its turn asks for the lock again.
+WAIT_SECONDS = 5
 
 
 class RegistryError(RuntimeError):
@@ -802,17 +808,15 @@ def _load(path, *, read_only, locked=False):
 
 
 @contextlib.contextmanager
-def session(path, *, read_only=False):
+def session(path, *, read_only=False, wait=False):
     """The registry loaded under the writer lock beside its file, held until
     the block ends; the caller saves explicitly, before it publishes what
-    depends on the ids. A second writer is refused rather than queued."""
+    depends on the ids. A second writer is refused rather than queued, or
+    with ``wait`` waits until the holder leaves: the turns builds running
+    side by side take."""
     directory = store.open_directory(path.parent)
     try:
-        try:
-            lock = store.exclusive_writer(directory, path.name + ".lock")
-            lock.__enter__()
-        except store.StoreError:
-            raise RegistryError(f"{path}: another build holds the registry") from None
+        lock = _registry_lock(directory, path, wait)
         loaded = None
         try:
             loaded = _load(path, read_only=read_only, locked=True)
@@ -825,3 +829,25 @@ def session(path, *, read_only=False):
             lock.__exit__(None, None, None)
     finally:
         directory.close()
+
+
+def _registry_lock(directory, path, wait):
+    """The writer lock beside the registry, entered; a held lock is refused,
+    or with ``wait`` asked for again every :data:`WAIT_SECONDS`."""
+    waiting = False
+    while True:
+        lock = store.exclusive_writer(directory, path.name + ".lock")
+        try:
+            lock.__enter__()
+            return lock
+        except store.LockHeld:
+            if not wait:
+                raise RegistryError(
+                    f"{path}: another build holds the registry"
+                ) from None
+        except store.StoreError:
+            raise RegistryError(f"{path}: another build holds the registry") from None
+        if not waiting:
+            log.info("waiting for the registry: another build holds it")
+            waiting = True
+        time.sleep(WAIT_SECONDS)

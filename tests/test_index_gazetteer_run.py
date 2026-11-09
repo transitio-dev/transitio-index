@@ -337,3 +337,34 @@ def test_a_copy_names_its_used_places_by_id(tmp_path, used, readable):
         cache / "gazetteer", published["generation"], reg.digest
     )
     assert (copy is not None) == readable
+
+
+def test_prepare_stages_run_before_the_registry_is_taken(tmp_path):
+    cache, path = tmp_path / "cache", _registry(tmp_path)
+
+    def prepare(run):
+        with registry.session(path):  # free: the run holds no session yet
+            pass
+        return _stub_stage(cache, "overture.json", "o")(None, run)
+
+    stages = [_stub_stage(cache, "seed.json", "s")]
+    manifest = build_index.commit_run(
+        cache, path, read_only=False, stages=stages, prepare=[prepare]
+    )[-1]
+    assert set(manifest["generations"]) == {
+        "overture.json",
+        "seed.json",
+        expand.SNAPSHOT_POINTER,
+    }
+
+
+def test_the_gazetteer_reads_overture_before_its_registry_turn(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        build_index, "commit_run", lambda *args, **kwargs: seen.update(kwargs) or []
+    )
+    build_index.run_gazetteer(
+        build_index.parse_args(["--stage", "gazetteer", "--wait-for-registry"])
+    )
+    assert seen["wait"] is True
+    assert (len(seen["prepare"]), len(seen["stages"])) == (1, 5)
