@@ -21,7 +21,10 @@ into the cache's ``index/`` as publish commits its own. Given the
 ``partition.json`` of the catalogue cut the builds came from,
 ``catalogue_check`` records which of its
 feeds and labels, and which ``add_feed`` feeds of ``overrides/feeds.yaml``, the
-merged index lacks; the publisher refuses the gaps.
+merged index lacks; the publisher refuses the gaps. Given the place
+registry, a build holding a place the registry no longer has live (merged
+into another after the build published it) is refused, so no place is
+carried twice.
 """
 
 import argparse
@@ -49,6 +52,7 @@ from . import (
     overrides,
     publish,
     rank,
+    registry,
     store,
 )
 from .builds import (
@@ -915,6 +919,35 @@ def load_sources(sources, read_bytes=_read_file):
     loaded.sort(key=lambda source: source["label"])
     _refuse_curated_clashes(loaded)
     return loaded
+
+
+def _refuse_former_places(loaded, places_registry):
+    """Refuse the builds holding a place id ``places_registry`` no longer has
+    live: one merged into another place, retired or unknown since the build
+    published it, which the merged index would carry beside its survivor.
+    The error names each build with up to three such ids."""
+    stale = {}
+    for source in loaded:
+        ids = source["tables"]["places.parquet"]["place_id"].to_pylist()
+        for place_id in ids:
+            if not registry.ID_PATTERN.match(place_id or ""):
+                continue
+            try:
+                live = places_registry.survivor(place_id)
+            except registry.RegistryError:
+                live = None
+            if live != place_id:
+                stale.setdefault(source["build_id"], []).append(
+                    f"{place_id} -> {live or 'gone'}"
+                )
+    if stale:
+        builds = "; ".join(
+            f"{build_id} ({', '.join(ids[:3])}{', ...' if len(ids) > 3 else ''})"
+            for build_id, ids in sorted(stale.items())
+        )
+        raise MergeError(
+            f"places the registry no longer has live; rebuild these labels: {builds}"
+        )
 
 
 def _refuse_curated_clashes(loaded):
@@ -1809,6 +1842,7 @@ def merge_builds(
     log=print,
     partition=None,
     overrides_dir=None,
+    places_registry=None,
 ):
     """Merge the newest run of every label archived under ``builds`` into
     ``<cache_dir>/index``; returns the manifest. The labels whose newest
@@ -1817,7 +1851,8 @@ def merge_builds(
     the path of a cut's ``partition`` the merged feeds are checked against
     it and the ``add_feed`` entries of ``overrides_dir``'s ``feeds.yaml``
     (:func:`catalogue_check`), the gaps reported through ``log`` and
-    recorded in the manifest."""
+    recorded in the manifest. With ``places_registry`` a build holding a
+    place it no longer has live is refused (:func:`_refuse_former_places`)."""
     cut = None
     if partition is not None:
         cut = read_partition(partition)
@@ -1828,6 +1863,8 @@ def merge_builds(
     if not sources:
         raise MergeError(f"no build to merge under {builds}")
     loaded = load_sources(sources, read_bytes)
+    if places_registry is not None:
+        _refuse_former_places(loaded, places_registry)
     catalogue, tables = merge_tables(
         [(s["build_id"], s["snapshot"], s["tables"]) for s in loaded]
     )
@@ -1892,6 +1929,13 @@ def parse_args(argv=None):
         help="directory of override YAML files; with --partition the merge also "
         "checks every add_feed feed of its feeds.yaml (default: overrides)",
     )
+    parser.add_argument(
+        "--registry",
+        type=Path,
+        default=None,
+        help="the place registry every merged place must be live in (default: "
+        f"{registry.FILE} in the overrides directory)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1906,8 +1950,16 @@ def main(argv=None):
             arguments.cache_dir,
             partition=arguments.partition,
             overrides_dir=arguments.overrides_dir,
+            places_registry=registry.load(
+                arguments.registry or arguments.overrides_dir / registry.FILE
+            ),
         )
-    except (MergeError, store.StoreError, overrides.OverrideError) as error:
+    except (
+        MergeError,
+        store.StoreError,
+        overrides.OverrideError,
+        registry.RegistryError,
+    ) as error:
         print(f"merge: {error}", file=sys.stderr)
         return 1
     counts, check = manifest["counts"], manifest["catalogue_check"]

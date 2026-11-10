@@ -68,7 +68,9 @@ accept the fix's commit once every label of the fix map is rebuilt at it.
 
 The merge writes `~/.cache/transitio-index/merged-<run>/` (`MERGED` names
 another) and refuses a label without an archived build unless
-`ALLOW_MISSING=1`. Publishing needs `TRANSITIO_TESTS`, a transitio checkout's
+`ALLOW_MISSING=1`. It also refuses a label whose build holds a place the
+registry no longer has live, merged into another since that label was built,
+and names those labels: rebuild them with `fix`. Publishing needs `TRANSITIO_TESTS`, a transitio checkout's
 `tests` folder, and `TOKEN_HELPER`, a command that prints a GitHub token
 allowed to make releases. It installs the current release, writes the release
 report with transitio's reference checks on both indexes, and refuses a check
