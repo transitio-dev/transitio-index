@@ -146,7 +146,8 @@ no_running_build() {
   done
 }
 
-# The run's cut: sets PART and CUT_MDB_SHA (its MDB catalogue's SHA-256),
+# The run's cut: sets PART, CUT_MDB_SHA (its MDB catalogue's SHA-256) and
+# CUT_RELEASE (the Overture release it lists the countries of, or empty),
 # from the checkout.
 check_cut() {
   [ -f "$STATE" ] && [ ! -L "$STATE" ] || refuse "no cut recorded in $STATE"
@@ -163,6 +164,9 @@ check_cut() {
     || refuse "cannot read the cut's MDB digest from $PART/partition.json"
   case "$CUT_MDB_SHA" in *[!$HEX]*|"") refuse "the cut records no MDB digest";; esac
   [ "${#CUT_MDB_SHA}" -eq 64 ] || refuse "the cut records no MDB digest"
+  CUT_RELEASE=$(PYTHONPATH="" "$PY" -c 'import json, sys; print(json.load(open(sys.argv[1])).get("overture_release") or "")' "$PART/partition.json") \
+    || refuse "cannot read the cut's Overture release from $PART/partition.json"
+  [ -z "$CUT_RELEASE" ] || release_name "$CUT_RELEASE" || refuse "the cut records a bad Overture release '$CUT_RELEASE'"
 }
 
 # The SHA-256 of a regular file (not a symlink) that must be the cut's MDB

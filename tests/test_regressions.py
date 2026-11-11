@@ -1169,6 +1169,52 @@ def test_a_partition_cut_places_every_static_feed_in_exactly_one_label(
     assert manifest["labels"]["jp1"]["mdb_sha256"] == digest.hexdigest()
 
 
+def test_a_partition_cut_keeps_its_catalogue_and_lists_overture_countries(
+    tmp_path, monkeypatch
+):
+    """A rebuild's first run needs the MDB catalogue its cut was taken from (by
+    digest), but the cut deleted it, and the countries without feeds had their
+    label only from a hand-kept list of the Overture skeleton's codes. The cut
+    keeps the catalogue, and --overture-countries lists the newest release's
+    countries and dependencies with a QID or a name, recording the release."""
+    import test_sample_catalogues as sct
+
+    sct._partition_inputs(
+        tmp_path, monkeypatch, [sct._mdb_gtfs("f1", "FI", "https://f.fi/1.zip")], []
+    )
+    divisions = fx.write_dataset(
+        tmp_path / "divisions.parquet",
+        [
+            fx.division("fi", "FI", "country", wikidata="Q33"),
+            fx.division("ke", "KE", "country"),
+            fx.division("xa", "XA", "dependency", wikidata="Q1", name=""),
+            fx.division("xb", "XB", "dependency", name=""),
+            fx.division("se-ab", "SE", "region", wikidata="Q2"),
+        ],
+    )
+    roots = []
+    monkeypatch.setattr(overture, "use_local_copy", roots.append)
+    monkeypatch.setattr(overture, "current_release", lambda: "2026-10-21.0")
+    monkeypatch.setattr(overture, "overture_dataset", lambda release: divisions)
+    out = tmp_path / "out"
+    sct.sc.main(["--partition", "--out-dir", str(out), "--overture-countries"])
+
+    (published,) = out.glob("partition-*")
+    manifest = json.loads((published / "partition.json").read_text())
+    assert roots == [overture.LOCAL_ROOT]
+    assert manifest["overture_release"] == "2026-10-21.0"
+    assert {
+        label: entry["countries"] for label, entry in manifest["labels"].items()
+    } == {
+        "cities": ["KE", "XA"],
+        "fi": ["FI"],
+        "other": [],
+    }
+    kept = (published / "mdb_catalogue.csv").read_bytes()
+    assert kept == (tmp_path / "feeds_v2.csv").read_bytes()
+    assert hashlib.sha256(kept).hexdigest() == manifest["catalogues"]["mdb_sha256"]
+
+
 def test_stats_keys_gbfs_systems_sharing_id_and_country_by_ordinal():
     """The ES build's stats stage refused two GBFS systems both listed as
     ``seville`` in ES (Cooltra and Sevici): the crosswalk skips both as

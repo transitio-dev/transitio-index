@@ -358,7 +358,7 @@ def parse_args(argv):
     parser.add_argument(
         "--overture-dir",
         type=pathlib.Path,
-        default=pathlib.Path("~/.cache/transitio-index/overture").expanduser(),
+        default=overture.LOCAL_ROOT,
     )
     parser.add_argument("--release", help="the Overture release (default: newest)")
     parser.add_argument(
