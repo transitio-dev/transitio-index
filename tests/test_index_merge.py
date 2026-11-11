@@ -30,7 +30,7 @@ from builds_fixture import (
 from test_index_publish import _read_on_demand
 from transitio.index import fingerprint
 
-from transitio_index import builds, classify, licensing, merge, store
+from transitio_index import builds, classify, licensing, merge, registry, store
 
 BUILT = "2026-09-{:02d}T00:00:00+00:00".format
 
@@ -1667,6 +1667,7 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
     )
     _archived_build(builds, "nl", 3, feeds=[], edges={})  # no feeds: skipped, reported
     partition = _partition(tmp_path, lambda p: p["atlas"].update(lost="fi"))
+    (tmp_path / registry.FILE).write_text(REGISTRY_HEADER)
     assert (
         merge.main(
             [
@@ -1714,12 +1715,66 @@ def test_the_merge_command_writes_an_index_the_reader_reads_back(tmp_path, capsy
     assert notice.startswith(b"This index includes place boundary geometry")
     assert hashlib.sha256(notice).hexdigest() == index.snapshot["notice_sha256"]
     assert not list(cache.glob("index.*.tmp"))
-    # Nothing to merge is refused, and said so.
+    # Nothing to merge is refused, and said so; so is a missing registry.
     assert (
         merge.main(["--builds", str(tmp_path / "empty"), "--cache-dir", str(cache)])
         == 1
     )
     assert "no build to merge" in capsys.readouterr().err
+    missing = ["--registry", str(tmp_path / "none.jsonl")]
+    assert (
+        merge.main(["--builds", str(builds), "--cache-dir", str(cache), *missing]) == 1
+    )
+    assert "no registry" in capsys.readouterr().err
+
+
+REGISTRY_HEADER = '{"next_id": 1, "registry": 1}\n'
+
+
+def test_a_build_holding_a_place_the_registry_no_longer_has_live_is_refused(
+    tmp_path,
+):
+    rows = [
+        {"next_id": 4, "registry": 1},
+        {
+            "place_id": "tp_1",
+            "kind": "city",
+            "concordances": {"wikidata": ["Q1"]},
+            "name": "A",
+            "country_code": "FI",
+            "minted_from": "t",
+            "minted_in": "t",
+        },
+        {
+            "place_id": "tp_2",
+            "status": "merged",
+            "into": "tp_1",
+            "concordances": {"wikidata": ["Q2"]},
+            "at": "t",
+            "reason": "r",
+        },
+        {"place_id": "tp_3", "status": "retired", "at": "t", "reason": "r"},
+    ]
+    path = tmp_path / registry.FILE
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    places_registry = registry.load(path)
+
+    def source(build_id, ids):
+        return {
+            "build_id": build_id,
+            "tables": {"places.parquet": pa.table({"place_id": ids})},
+        }
+
+    # Live ids and keys that are no registry id pass.
+    merge._refuse_former_places([source("fi-1", ["tp_1", "hel"])], places_registry)
+    with pytest.raises(merge.MergeError) as refused:
+        merge._refuse_former_places(
+            [source("fi-1", ["tp_1"]), source("de-2", ["tp_2", "tp_3", "tp_9"])],
+            places_registry,
+        )
+    assert str(refused.value).endswith(
+        "rebuild these labels: de-2 (tp_2 -> tp_1, tp_3 -> gone, tp_9 -> gone)"
+    )
 
 
 def test_a_merge_is_refused_while_another_holds_the_index(tmp_path):
