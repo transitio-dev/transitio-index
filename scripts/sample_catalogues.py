@@ -42,8 +42,9 @@ country; GBFS systems and Atlas overlap are optional, so a country served by a
 single national feed with no Atlas crosswalk still yields an MDB-only sample.
 
 ``--partition`` cuts the whole catalogue instead, every MDB row and Atlas GTFS
-feed in exactly one ``run-<label>_*`` cut, and publishes ``rebuild_map.txt``
-and ``partition.json`` last, in a ``partition-*`` directory.
+feed in exactly one ``run-<label>_*`` cut, and publishes ``rebuild_map.txt``,
+``partition.json`` and the full MDB catalogue (``mdb_catalogue.csv``) last, in
+a ``partition-*`` directory.
 """
 
 import argparse
@@ -55,12 +56,13 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sys
 import tarfile
 import tempfile
 from pathlib import Path
 
-from transitio_index import atlas, csv_source, gbfs, mdb, store
+from transitio_index import atlas, csv_source, gbfs, mdb, overture, store
 from transitio_index.crosswalk import (
     GEOHASH_PRECISION,
     _ONESTOP_GEOHASH,
@@ -77,6 +79,8 @@ from transitio_index.crosswalk import (
 DEFAULT_COUNTRIES = ("FI", "EE")
 # The partition's default --batch-size: a country of more MDB rows is split.
 PARTITION_BATCH_SIZE = 600
+# The full MDB catalogue a partition was cut from, kept in its directory.
+PARTITION_CATALOGUE = "mdb_catalogue.csv"
 
 # ISO country_code lives in these columns of the two CSV exports.
 MDB_ID = "id"
@@ -807,10 +811,11 @@ def _check_partition(planned, mdb_rows, files):
             )
 
 
-def _write_partition(out_dir, planned, mdb_fields, gbfs_fields, manifest):
-    """Write one cut per label, then publish ``rebuild_map.txt`` and
-    ``partition.json`` together by renaming their staging directory, so a run
-    stopped earlier leaves no ``partition-*`` directory."""
+def _write_partition(out_dir, planned, mdb_fields, gbfs_fields, manifest, catalogue):
+    """Write one cut per label, then publish ``rebuild_map.txt``,
+    ``partition.json`` and a copy of the MDB ``catalogue`` together by
+    renaming their staging directory, so a run stopped earlier leaves no
+    ``partition-*`` directory."""
     out_dir.mkdir(parents=True, exist_ok=True)
     labels, mdb_map, atlas_map = {}, {}, {}
     for label, (countries, rows, files) in planned.items():
@@ -842,6 +847,7 @@ def _write_partition(out_dir, planned, mdb_fields, gbfs_fields, manifest):
     (staging / "partition.json").write_text(
         json.dumps(manifest, indent=1), encoding="utf-8"
     )
+    shutil.copyfile(catalogue, staging / PARTITION_CATALOGUE)
     final = out_dir / ("partition-" + staging.name[len(".partition-") :])
     os.rename(staging, final)
     print(f"labels: {len(labels)}")
@@ -849,8 +855,18 @@ def _write_partition(out_dir, planned, mdb_fields, gbfs_fields, manifest):
     print(f"manifest: {final / 'partition.json'}")
 
 
-def _run_partition(args, extra, excluded):
-    """Cut every MDB row and every Atlas GTFS feed into exactly one label."""
+def _overture_countries():
+    """The newest Overture release and the codes of its countries and
+    dependencies, read from the build's local copy (downloaded once when
+    absent)."""
+    overture.use_local_copy(overture.LOCAL_ROOT)
+    release = overture.current_release()
+    return release, overture.country_codes(overture.overture_dataset(release))
+
+
+def _run_partition(args, extra, excluded, release=None):
+    """Cut every MDB row and every Atlas GTFS feed into exactly one label;
+    ``release`` is the Overture release ``extra`` lists the countries of."""
     size = args.batch_size or PARTITION_BATCH_SIZE
     with tempfile.TemporaryDirectory(prefix="sample-catalogues-") as tmp:
         atlas_full, mdb_full, gbfs_full = _download(Path(tmp), args.commit)
@@ -878,11 +894,17 @@ def _run_partition(args, extra, excluded):
             },
             "batch_size": size,
         }
-    _write_partition(args.out_dir, planned, mdb_fields, gbfs_fields, manifest)
+        if release:
+            manifest["overture_release"] = release
+        _write_partition(
+            args.out_dir, planned, mdb_fields, gbfs_fields, manifest, mdb_full
+        )
     return 0
 
 
 def main(argv=None):
+    """Cut the sample the command line asks for, or with ``--partition`` the
+    whole catalogue; return the exit status."""
     parser = argparse.ArgumentParser(
         prog="python scripts/sample_catalogues.py",
         description="Cut a small multi-place sample of the source catalogues",
@@ -967,6 +989,13 @@ def main(argv=None):
         "'cities' for --country codes without a label) and write "
         "rebuild_map.txt and partition.json last",
     )
+    parser.add_argument(
+        "--overture-countries",
+        action="store_true",
+        help="with --partition, add every country and dependency code of the "
+        "newest Overture release to --country, so the countries without feeds "
+        "get the 'cities' label, and record the release in partition.json",
+    )
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
@@ -984,6 +1013,8 @@ def main(argv=None):
         if any(char in str(args.out_dir) for char in "\r\n"):
             # rebuild_map.txt holds one "<label> <cut>" line per label.
             parser.error("--out-dir must not contain a line break")
+    elif args.overture_countries:
+        parser.error("--overture-countries needs --partition")
     default = () if args.partition else DEFAULT_COUNTRIES
     raw = [c.strip() for c in (args.countries or default)]
     # Requests may be ISO codes or full names; a token that is neither an ASCII
@@ -1008,7 +1039,11 @@ def main(argv=None):
     if "" in excluded:
         parser.error("--exclude must name a catalogue id")
     if args.partition:
-        return _run_partition(args, sorted(countries), excluded)
+        release = None
+        if args.overture_countries:
+            release, codes = _overture_countries()
+            countries |= set(codes)
+        return _run_partition(args, sorted(countries), excluded, release)
     included = {i.strip() for i in args.includes or ()}
     if "" in included:
         parser.error("--include must name a catalogue or Atlas id")

@@ -184,6 +184,61 @@ def test_the_rebuild_scripts_refuse_bad_input(
     assert result.returncode == 2 and message in result.stderr, result.stderr
 
 
+@pytest.mark.parametrize(
+    "recorded, message",
+    [
+        ({}, "no MDB catalogue at {checkout}/{cut}/mdb_catalogue.csv"),
+        ({"overture_release": "newest"}, "a bad Overture release 'newest'"),
+    ],
+    ids=["catalogue-of-the-cut", "bad-release"],
+)
+def test_the_check_reads_the_cut_and_its_catalogue(tmp_path, recorded, message):
+    # A checkout on GitHub's main (its own origin) with a one-label cut; without
+    # MDB_CATALOGUE the check reads the cut's own copy.
+    checkout, run, cut = (
+        tmp_path / "checkout",
+        tmp_path / "run",
+        "cache/sample/partition-p",
+    )
+    git = ["git", "-C", str(checkout), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q", "-b", "main", str(checkout)], check=True)
+    (checkout / "pyproject.toml").write_text(
+        '[project]\nname = "t"\nversion = "0"\ndependencies = []\n'
+    )
+    subprocess.run([*git, "add", "pyproject.toml"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "t"], check=True)
+    subprocess.run([*git, "remote", "add", "origin", str(checkout)], check=True)
+    label = checkout / "cache/sample/run-aa_x"
+    label.mkdir(parents=True)
+    for name in (
+        "atlas_sample.tar.gz",
+        "mdb_sample.csv",
+        "gbfs_sample.csv",
+        "countries.txt",
+    ):
+        (label / name).write_text("")
+    (checkout / cut).mkdir()
+    (checkout / cut / "rebuild_map.txt").write_text("aa cache/sample/run-aa_x\n")
+    manifest = {"catalogues": {"mdb_sha256": "0" * 64}, **recorded}
+    (checkout / cut / "partition.json").write_text(json.dumps(manifest))
+    run.mkdir()
+    (run / "partition").write_text(f"{cut}\n")
+    (run / "map-check.txt").write_text("aa cache/sample/run-aa_x\n")
+    (run / "map-rest.txt").write_text("")
+    # No other process is a build: pgrep and lsof find nothing.
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    for name in ("pgrep", "lsof"):
+        (stubs / name).write_text("#!/bin/sh\nexit 1\n")
+        (stubs / name).chmod(0o755)
+    path = f"{stubs}{os.pathsep}{os.environ['PATH']}"
+    result = _run_script(
+        "rebuild.sh", "2026-11", "check", checkout=checkout, RUN_DIR=str(run), PATH=path
+    )
+    expected = message.format(checkout=checkout.resolve(), cut=cut)
+    assert result.returncode == 2 and expected in result.stderr, result.stderr
+
+
 def test_a_published_index_is_archived_once(tmp_path):
     # An index with feeds and no places goes to the feeds-only root, outside
     # the merge root, through a staging folder that is emptied after.

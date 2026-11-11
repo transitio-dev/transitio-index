@@ -84,6 +84,8 @@ LOCAL_LOCK = ".overture.lock"
 LOCAL_LOCK_WAIT = 10
 # The largest complete.json a copy's check reads.
 LOCAL_MARKER_MAX = 2**20
+# The local copies' default directory, one directory per release.
+LOCAL_ROOT = pathlib.Path("~/.cache/transitio-index/overture").expanduser()
 
 # The directory holding one local copy per release (``use_local_copy``), and
 # the copies checked this process, by release.
@@ -571,6 +573,18 @@ def read_divisions(dataset, *, subtypes=SKELETON_SUBTYPES):
     """
     predicate = ds.field("subtype").isin(list(subtypes))
     return dataset.to_table(columns=PROJECT, filter=predicate).to_pylist()
+
+
+def country_codes(dataset):
+    """The codes of the countries and dependencies ``dataset`` holds with a
+    QID or a name: those the resolved skeleton keeps a country for, so the
+    codes ``--seed-countries`` accepts (a P402 conflict, judged against
+    Wikidata, aside)."""
+    subtypes = [s for s, kind in SUBTYPE_TO_KIND.items() if kind == "country"]
+    records = map(normalize_division, read_divisions(dataset, subtypes=subtypes))
+    return sorted(
+        {r["country"] for r in records if r["country"] and (r["wikidata"] or r["name"])}
+    )
 
 
 def _names(names):

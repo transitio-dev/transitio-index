@@ -8,18 +8,29 @@ labels are built one at a time.
 
 ## Prepare a run
 
-1. Cut the catalogues into labels with
-   `python scripts/sample_catalogues.py --partition` (see the main README).
-   The cut is `cache/sample/partition-<id>/`, with its `rebuild_map.txt`.
+1. Cut the catalogues into labels (see the main README):
+
+   ```
+   python scripts/sample_catalogues.py --partition --overture-countries --exclude mdb-1090
+   ```
+
+   `--overture-countries` lists every country and dependency of the newest
+   Overture release, so the countries without feeds get the label `cities`;
+   `--exclude mdb-1090` moves the Germany-wide feed the catalogue files under
+   FI to `other`. The cut is `cache/sample/partition-<id>/`, with its
+   `rebuild_map.txt` and the MDB catalogue it was taken from
+   (`mdb_catalogue.csv`). Cut shortly before `first`: `first` refuses a cut
+   made from another Overture release than the newest.
 2. Make the run's folder, `~/.cache/transitio-index/runs/<run>/` (`RUN_DIR`
    names another), with three files:
    - `partition`: one line, the cut (`cache/sample/partition-<id>`);
    - `map-check.txt`: one line of the cut's `rebuild_map.txt`, the label
      built first to check the code;
    - `map-rest.txt`: every other line of `rebuild_map.txt`.
-3. Set `PYTHON` to the build environment's Python (default `python3`) and
-   `MDB_CATALOGUE` to the absolute path of the whole MDB catalogue the cut was
-   taken from. `READER`, a pip requirement such as `transitio==0.29.0`, is
+3. Set `PYTHON` to the build environment's Python (default `python3`).
+   `MDB_CATALOGUE`, the absolute path of the whole MDB catalogue the cut was
+   taken from, is needed only for a cut without its own copy. `READER`, a pip
+   requirement such as `transitio==0.29.0`, is
    installed by `prepare`; `ARCHIVE_ROOT` (default
    `~/.cache/transitio-index/builds-<run>`) and `MIN_FREE_GB` (default 50) are
    optional.

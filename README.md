@@ -264,11 +264,14 @@ rows without a country code or moved there with `--exclude`, and `atlas1..K`
 for the Atlas feeds no label picks. A deprecated row stays with the live row
 it folds into. Each cut's `countries.txt` names the countries its label owns:
 `<cc>`, or `<cc>1` for a split country, and `cities`, a label without feeds,
-for the `--country` codes that have no label of their own. The cuts go to
-`cache/sample/run-<label>_*`; once all are written, a `partition-*` directory
-gets `rebuild_map.txt` (a `<label> <cut>` line per label) and
-`partition.json` (each label's cut, countries and digests, and the label of
-every GTFS id).
+for the `--country` codes that have no label of their own;
+`--overture-countries` adds every country and dependency code of the newest
+Overture release to them. The cuts go to `cache/sample/run-<label>_*`; once
+all are written, a `partition-*` directory gets `rebuild_map.txt` (a
+`<label> <cut>` line per label), `partition.json` (each label's cut,
+countries and digests, the label of every GTFS id, and the Overture release
+the countries came from) and `mdb_catalogue.csv`, the MDB catalogue the cut
+was taken from.
 
 ### Build every label
 

@@ -18,7 +18,8 @@
 # was newest when the first run started. The run's files are described in
 # common.sh.
 # Environment: MDB_CATALOGUE (the whole MDB catalogue the cut was taken from,
-# needed until the first run copies it into the run's logs); READER (a pip
+# needed until the first run copies it into the run's logs; default the cut's
+# own copy, mdb_catalogue.csv); READER (a pip
 # requirement such as transitio==0.29.0 that prepare installs); ARCHIVE_ROOT
 # (default ~/.cache/transitio-index/builds-<run>); MIN_FREE_GB (default 50);
 # SLOTS, the labels rest, resume and fix build at a time (1 to 9, default 1;
@@ -152,6 +153,7 @@ PYEOF
 check_cut
 check_maps
 set_inputs_digest
+[ -n "$MDB_CATALOGUE" ] || MDB_CATALOGUE="$REPO/$PART/mdb_catalogue.csv"
 case "$MODE" in
   prepare|check|first)
     plain_path "$MDB_CATALOGUE" || refuse "MDB_CATALOGUE must name the MDB catalogue the cut was taken from, as a plain absolute path"
@@ -177,6 +179,8 @@ held=$(overture_releases) || refuse "cannot list the Overture releases"
 case "$MODE" in
   prepare|check|first)
     RELEASE=$(printf '%s\n' "$held" | tail -n 1)
+    [ -z "$CUT_RELEASE" ] || [ "$CUT_RELEASE" = "$RELEASE" ] \
+      || refuse "the cut lists the countries of Overture $CUT_RELEASE, but the newest release is $RELEASE: cut again"
     ;;
   rest|resume|fix)
     RELEASE=$(sed -n 5p "$STARTED")

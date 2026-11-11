@@ -61,7 +61,7 @@ from transitio_index import (  # noqa: E402
 log = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = pathlib.Path("cache")
-DEFAULT_OVERTURE_DIR = pathlib.Path("~/.cache/transitio-index/overture").expanduser()
+DEFAULT_OVERTURE_DIR = overture.LOCAL_ROOT
 
 SOURCES = ("atlas", "mdb", "gbfs")
 
