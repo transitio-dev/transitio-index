@@ -4,6 +4,7 @@ import json
 import math
 import os
 
+import numpy as np
 import pytest
 
 from transitio_index import classify, coverage, crawl, publish, store  # noqa: E402
@@ -1567,9 +1568,10 @@ DAILY = (
 )
 
 
-def _lines(cache, feed_id, lines, xs=(10.0, 10.01), calendar=True):
+def _lines(cache, feed_id, lines, xs=(10.0, 10.01), calendar=True, agency=None):
     """``(feed, candidate)`` of a crawled feed whose ``(name, route_type)``
-    lines each run one trip a day over stops at ``xs`` in Q-city."""
+    lines each run one trip a day over stops at ``xs`` in Q-city, run by
+    ``agency`` when given."""
     stops = "".join(f"p{j},1.0,{x}\n" for j, x in enumerate(xs))
     routes = "".join(f"r{i},{name},{kind}\n" for i, (name, kind) in enumerate(lines))
     trips = "".join(f"t{i},r{i},d\n" for i in range(len(lines)))
@@ -1582,6 +1584,8 @@ def _lines(cache, feed_id, lines, xs=(10.0, 10.01), calendar=True):
         "trips.txt": "trip_id,route_id,service_id\n" + trips,
         "stop_times.txt": "trip_id,stop_id,stop_sequence\n" + times,
     }
+    if agency is not None:
+        members["agency.txt"] = f"agency_id,agency_name\na,{agency}\n"
     members = {name: text.encode() for name, text in members.items()}
     if calendar:
         members["calendar.txt"] = DAILY
@@ -1654,6 +1658,95 @@ def test_an_edge_records_how_much_of_it_other_feeds_run(
         assert ("f-big", "local") not in blocks
     else:
         assert blocks[("f-big", "local")]["departures"] == {"tram": 2.0, "bus": 2.0}
+
+
+OPERATOR_XS = (10.0, 10.01, 10.02, 10.03)
+
+
+@pytest.mark.parametrize(
+    "case, agency, xs, matched",
+    [
+        ("same stops", "Lawndale Beat", OPERATOR_XS, True),
+        ("next cell", "Lawndale Beat", tuple(x + 0.002 for x in OPERATOR_XS), True),
+        ("other agency", "Sunrise Coaches Ltd", OPERATOR_XS, False),
+        ("shared word", "Beat-Free City Transit", OPERATOR_XS, True),
+        ("only generic", "City Transit", OPERATOR_XS, False),
+        ("two stops", "Lawndale Beat", OPERATOR_XS[:2], False),
+        ("half the stops", "Lawndale Beat", (10.0, 10.01, 10.06, 10.07), False),
+    ],
+)
+def test_a_copy_under_other_line_names_is_matched_by_its_stops(
+    tmp_path, case, agency, xs, matched
+):
+    # f-copy republishes f-op's two lines as "Residential Route" and
+    # "Express Route": no line name matches, only the stops can.
+    cache = tmp_path / "cache"
+    operator_xs = OPERATOR_XS[: len(xs)] if case == "two stops" else OPERATOR_XS
+    op_agency = "City Bus Transit" if case == "only generic" else "Lawndale Beat"
+    built = [
+        _lines(cache, "f-op", [("Res", 3), ("EX", 3)], operator_xs, agency=op_agency),
+        _lines(
+            cache,
+            "f-copy",
+            [("Residential Route", 3), ("Express Route", 3)],
+            xs,
+            agency=agency,
+        ),
+    ]
+    feeds, candidates = zip(*built)
+    _coverage(cache, list(feeds), list(candidates))
+    city = {x: _records("Q-city") for x in operator_xs + xs}
+    manifest = classify.classify(cache, lookup=StubLookup({**LOOKUP.by_x, **city}))
+    edges, _ = store.read_jsonl(cache / "classify", "edges.json", "edges.jsonl")
+    copy = next(e["evidence"] for e in edges if e["feed_id"] == "f-copy")
+    expected = {"f-op": {"bus": 1.0}} if matched else {}
+    assert copy["overlap"]["with"] == expected
+    assert copy["overlap"].get("stop_matched", []) == (["f-op"] if matched else [])
+    assert manifest["edges_matched_by_stops"] == (2 if matched else 0)
+    assert manifest["overlap_settings"]["stop_share"] == classify.OVERLAP_STOP_SHARE
+    # Each route keeps its stop cells for the merge; the agency words too.
+    assert len(copy["overlap_routes"][0][-1]) == len(xs)
+    words = {"other agency": ["sunrise"], "shared word": ["beat", "free"]}
+    words["only generic"] = []
+    assert copy["overlap_agencies"] == words.get(case, ["beat", "lawndale"])
+
+
+@pytest.mark.parametrize(
+    "shared, repeats, matched", [(1, False, False), (2, False, True), (2, True, True)]
+)
+def test_stop_matches_count_only_where_one_network_repeats_the_other(
+    shared, repeats, matched
+):
+    # f-a runs four unnamed bus routes of three stops at the place, f-b five;
+    # the first ``shared`` routes of f-b serve f-a's stops. f-a's two other
+    # routes repeated on an international edge do not count again.
+    def routes(offsets):
+        rows = np.full((len(offsets), 7), 1.0)
+        rows[:, 0] = -1
+        rows[:, 1] = 0
+        points = [[(x + k * 0.01, 1.0) for k in range(3)] for x in offsets]
+        return rows, [classify._stop_cells(p) for p in points]
+
+    own = [10.0, 10.5, 11.0, 11.5]
+    elsewhere = [20.0, 20.5, 21.0, 21.5]
+    rows_a, cells_a = routes(own)
+    rows_b, cells_b = routes(own[:shared] + elsewhere[shared:] + [22.0])
+    entries = [
+        ("f-a", rows_a, cells_a, ["beat"], True),
+        ("f-b", rows_b, cells_b, ["beat"], True),
+    ]
+    if repeats:
+        entries.append(("f-a", *routes(own[2:]), ["beat"], False))
+    blocks = classify.overlap_blocks({"P": entries}, {"bus": 0})
+    first = blocks["P"][0]
+    assert ("f-b" in first["with"]) is matched
+    assert first.get("stop_matched", []) == (["f-b"] if matched else [])
+
+
+def test_stop_cells_are_neighbours_across_the_antimeridian():
+    east = classify._stop_cells([(179.9995, 1.0), (180.0, 1.01)])
+    west = classify._stop_cells([(-179.9995, 1.0), (-180.0, 1.01)])
+    assert len(east & classify._cells_grown(west)) == 2
 
 
 def test_a_route_across_a_border_counts_its_departures_at_its_own_tier(

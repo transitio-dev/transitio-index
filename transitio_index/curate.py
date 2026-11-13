@@ -119,9 +119,11 @@ _OVERLAP_KEYS = (
     "overlap_routes",
     "overlap_repeats",
     "overlap_repeats_routes",
+    "overlap_agencies",
 )
-# The route rows the merge measures overlap from; they never ship.
-_ROUTE_ROWS = ("overlap_routes", "overlap_repeats_routes")
+# The route rows and agency words the merge measures overlap from; they
+# never ship.
+_ROUTE_ROWS = ("overlap_routes", "overlap_repeats_routes", "overlap_agencies")
 
 
 def _own_evidence(evidence):
